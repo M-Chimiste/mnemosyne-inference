@@ -195,6 +195,76 @@ else:
   echo ""
 }
 
+cmd_reload() {
+  echo ""
+  green "Reloading config ..."
+  local result http_code
+  result=$(curl -s -o /tmp/vllm-ctl-reload.$$ -w "%{http_code}" \
+    -X POST "${MANAGER_URL}/manager/reload" \
+    -H "Content-Type: application/json")
+  http_code="$result"
+  result=$(cat /tmp/vllm-ctl-reload.$$ 2>/dev/null); rm -f /tmp/vllm-ctl-reload.$$
+
+  if [[ "$http_code" != "200" ]]; then
+    red "  ✗ Reload failed (HTTP $http_code)"
+    echo "$result" | python3 -c "import sys,json; d=json.load(sys.stdin); print('   ', d.get('detail','unknown'))" 2>/dev/null || echo "   $result"
+    exit 1
+  fi
+  echo "$result" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+s = d['sync']; r = d['reconcile']
+print(f\"  ✓ Sync:        +{s['added']}  ~{s['updated']}  -{s['removed_config_orphans']}  (ui_preserved={s['ui_preserved']}  ui_overwritten={s['ui_overwritten']})\")
+print(f\"  ✓ Reconcile:   installed={r['installed']}  partial={r['partial']}  location_missing={r['location_missing']}\")
+"
+  echo ""
+}
+
+cmd_list() {
+  echo ""
+  bold "── Configured Profiles ───────────────────────────────────"
+  local result
+  result=$(api GET /manager/profiles) || { red "Manager not reachable"; exit 1; }
+  echo "$result" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+profiles = d.get('profiles', [])
+if not profiles:
+    print('  (no profiles configured — edit \$VLLM_COMPOSE_DIR/config.yaml)')
+else:
+    for p in profiles:
+        gpus = p['gpus']
+        gpus_str = '[' + ','.join(str(x) for x in gpus) + ']' if isinstance(gpus, list) else gpus
+        q = p.get('quantization') or '-'
+        print(f\"  • {p['alias']:24}  {p['model']:50}  gpus={gpus_str:8}  quant={q:6}  storage={p['storage']}\")
+"
+  echo ""
+}
+
+cmd_storage() {
+  echo ""
+  bold "── Storage Locations ─────────────────────────────────────"
+  local result
+  result=$(api GET /manager/storage) || { red "Manager not reachable"; exit 1; }
+  echo "$result" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+locs = d.get('locations', [])
+if not locs:
+    print('  (no storage locations configured)')
+else:
+    for l in locs:
+        free = f\"{l['free_bytes']/1e9:.1f} GB\" if l.get('free_bytes') else '?'
+        total = f\"{l['total_bytes']/1e9:.1f} GB\" if l.get('total_bytes') else '?'
+        flags = []
+        if l['is_default']: flags.append('default')
+        if not l['writable']: flags.append('READONLY')
+        flag_str = ('  [' + ', '.join(flags) + ']') if flags else ''
+        print(f\"  • {l['name']:16}  {l['path']:40}  free={free}/{total}{flag_str}\")
+"
+  echo ""
+}
+
 cmd_models() {
   echo ""
   bold "── Cached Models (HF volume) ─────────────────────────────"
@@ -446,7 +516,12 @@ $(bold "Model control:")
     --gpu-mem 0.90          GPU memory fraction
     -- <vllm args>          Extra args passed to vllm server
   unload                  Unload current model, free all VRAM
+  list                    List configured profiles (config.yaml aliases)
   models                  List models in local HF cache volume
+
+$(bold "Config:")
+  reload                  Reread config.yaml without restarting the container
+  storage                 List storage locations with free space
 
 $(bold "Downloads:")
   download <model> [opts]     Download a model from HuggingFace Hub
@@ -488,6 +563,9 @@ case "${1:-help}" in
   status)  cmd_status ;;
   load)    shift; cmd_load "$@" ;;
   unload)  cmd_unload ;;
+  reload)  cmd_reload ;;
+  list)    cmd_list ;;
+  storage) cmd_storage ;;
   models)  cmd_models ;;
   download) shift; cmd_download "$@" ;;
   download-status) shift; cmd_download_status "$@" ;;

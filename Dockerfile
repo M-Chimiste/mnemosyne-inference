@@ -50,11 +50,13 @@ RUN pip install --no-cache-dir \
       fastapi \
       "uvicorn[standard]" \
       httpx \
-      huggingface_hub
+      huggingface_hub \
+      pydantic \
+      pyyaml
 
 # ── App ────────────────────────────────────────────────────────────
 WORKDIR /app
-COPY vllm_manager.py .
+COPY vllm_manager.py config.py catalog.py profiles.py ./
 
 # HuggingFace cache lives in a volume (models persist across restarts)
 ENV HF_HOME=/hf-cache

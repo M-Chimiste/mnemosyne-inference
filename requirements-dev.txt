@@ -15,3 +15,4 @@ fastapi
 huggingface_hub
 uvicorn
 pyyaml
+pydantic>=2

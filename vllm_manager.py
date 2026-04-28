@@ -10,6 +10,8 @@ on demand and swapping when requested. Exposes:
 
 import asyncio
 import httpx
+import shutil
+import signal
 import subprocess
 import sys
 import logging
@@ -17,15 +19,19 @@ import os
 import json
 import time
 import threading
-from typing import Optional, AsyncIterator
 from contextlib import asynccontextmanager
+from dataclasses import asdict, dataclass
+from typing import Optional, AsyncIterator
 
 from huggingface_hub import snapshot_download, HfApi
 from huggingface_hub.utils import RepositoryNotFoundError, GatedRepoError
 
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 import uvicorn
+
+from catalog import Catalog, ReconcileResult, SyncResult, is_cache_only_alias, open_catalog
+from config import Config, ConfigError, load_config, load_env
 
 # ──────────────────────────────────────────────
 # Configuration (set via docker-compose environment)
@@ -60,6 +66,10 @@ _current_gpu_mem: float                     = DEFAULT_GPU_MEM
 # Download state — keyed by model_id
 # Each entry: {status, started_at, finished_at, error, path}
 _downloads: dict[str, dict] = {}
+
+# Phase 1 globals — populated by lifespan, reset by tests/conftest.py::client.
+_config: Optional[Config] = None
+_catalog: Optional[Catalog] = None
 
 # ──────────────────────────────────────────────
 # vLLM process management
@@ -138,8 +148,82 @@ async def _start_vllm(model_id: str, tp: int, gpu_mem: float, extra_args: list[s
 # FastAPI app
 # ──────────────────────────────────────────────
 
+@dataclass
+class ReloadResult:
+    sync: SyncResult
+    reconcile: ReconcileResult
+
+    def to_dict(self) -> dict:
+        return {"sync": asdict(self.sync), "reconcile": asdict(self.reconcile)}
+
+
+def _install_sighup_handler() -> None:
+    """Install SIGHUP → _reload_config. Skips cleanly under TestClient or
+    on platforms without signal-handler support."""
+    if sys.platform == "win32":
+        logger.debug("SIGHUP not available on Windows; skipping.")
+        return
+    if threading.current_thread() is not threading.main_thread():
+        logger.debug("SIGHUP handler skipped: not on main thread (likely TestClient).")
+        return
+    try:
+        loop = asyncio.get_running_loop()
+        loop.add_signal_handler(signal.SIGHUP, _on_sighup)
+        logger.info("SIGHUP handler installed.")
+    except (NotImplementedError, RuntimeError) as e:
+        logger.warning("SIGHUP install failed: %s", e)
+
+
+def _on_sighup() -> None:
+    async def runner():
+        try:
+            res = await _reload_config()
+            logger.info("SIGHUP reload complete: %s", res.to_dict())
+        except Exception as e:
+            logger.error("SIGHUP reload failed: %s", e)
+    asyncio.create_task(runner())
+
+
+async def _reload_config() -> ReloadResult:
+    """Reread config, re-sync catalog. Sync first, swap _config last so a
+    failure leaves both DB state and in-memory config untouched.
+    Resident vLLM model is not affected."""
+    global _config
+    if _catalog is None:
+        raise RuntimeError("catalog not initialized")
+    new = load_config()
+    sync, rec = _catalog.apply_config(
+        new.models,
+        new.storage.default,
+        {l.name: l.path for l in new.storage.locations},
+    )
+    _config = new
+    return ReloadResult(sync=sync, reconcile=rec)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global _config, _catalog
+    load_env()
+    _config = load_config()
+    _catalog = open_catalog()
+    sync, rec = _catalog.apply_config(
+        _config.models,
+        _config.storage.default,
+        {l.name: l.path for l in _config.storage.locations},
+    )
+    logger.info(
+        "Catalog ready: sync=%s reconcile=%s",
+        asdict(sync), asdict(rec),
+    )
+    logger.info(
+        "Phase 1: server.{inference,admin}_{port,bind} parsed but not bound. "
+        "Listening via legacy MANAGER_HOST/MANAGER_PORT. "
+        "config.server: inference_port=%d admin_port=%d",
+        _config.server.inference_port, _config.server.admin_port,
+    )
+    _install_sighup_handler()
+
     logger.info(
         f"\n"
         f"  ┌─────────────────────────────────────────────┐\n"
@@ -156,6 +240,10 @@ async def lifespan(app: FastAPI):
     yield
     logger.info("Shutting down — stopping vLLM ...")
     _kill_vllm()
+    if _catalog is not None:
+        _catalog.close()
+        _catalog = None
+    _config = None
 
 
 app = FastAPI(
@@ -183,6 +271,91 @@ async def status():
         "gpu_mem_util":   _current_gpu_mem,
         "inner_endpoint": f"http://{VLLM_INNER_HOST}:{VLLM_INNER_PORT}",
     }
+
+
+@app.post("/manager/reload", tags=["manager"])
+async def reload_endpoint():
+    """Reread config.yaml, re-sync the catalog. Resident vLLM model is
+    untouched. Soft-fails with 400 on bad config (existing config remains
+    loaded)."""
+    try:
+        result = await _reload_config()
+    except Exception as e:
+        logger.error("reload failed: %s", e)
+        raise HTTPException(status_code=400, detail=str(e))
+    return result.to_dict()
+
+
+@app.get("/manager/profiles", tags=["manager"])
+async def list_profiles():
+    """List config-defined aliases. Reflects YAML state, not the catalog."""
+    if _config is None:
+        return {"profiles": []}
+    return {
+        "profiles": [
+            {
+                "alias": m.alias,
+                "model": m.model,
+                "quantization": m.quantization,
+                "gpus": m.gpus,
+                "storage": m.storage if m.storage is not None else _config.storage.default,
+                "max_model_len": m.max_model_len,
+                "extra_args": list(m.extra_args),
+            }
+            for m in _config.models
+        ]
+    }
+
+
+@app.get("/manager/storage", tags=["manager"])
+async def list_storage():
+    """List configured storage locations with current free space."""
+    if _config is None:
+        return {"locations": []}
+    out = []
+    for loc in _config.storage.locations:
+        free_bytes: Optional[int] = None
+        total_bytes: Optional[int] = None
+        try:
+            usage = shutil.disk_usage(loc.path)
+            free_bytes = usage.free
+            total_bytes = usage.total
+        except (FileNotFoundError, OSError):
+            pass
+        writable = os.path.isdir(loc.path) and os.access(loc.path, os.W_OK)
+        out.append({
+            "name": loc.name,
+            "path": loc.path,
+            "free_bytes": free_bytes,
+            "total_bytes": total_bytes,
+            "writable": writable,
+            "is_default": loc.name == _config.storage.default,
+        })
+    return {"locations": out}
+
+
+def _parse_strict_bool(raw: str, *, field: str) -> bool:
+    s = raw.lower()
+    if s in ("true", "1"):
+        return True
+    if s in ("false", "0"):
+        return False
+    raise HTTPException(
+        status_code=422,
+        detail=f"{field} must be true/false/1/0, got {raw!r}",
+    )
+
+
+@app.get("/manager/catalog", tags=["manager"])
+async def list_catalog(include_cache_only: str = Query("false")):
+    """List catalog rows. Default-excludes synthetic cache-only rows."""
+    include = _parse_strict_bool(include_cache_only, field="include_cache_only")
+    if _catalog is None:
+        return {"models": []}
+    rows = _catalog.list_models()
+    if not include:
+        rows = [r for r in rows if not is_cache_only_alias(r.alias)]
+    return {"models": [r.to_api_dict() for r in rows]}
 
 
 @app.post("/manager/load", tags=["manager"])
