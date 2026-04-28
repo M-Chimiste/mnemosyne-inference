@@ -13,6 +13,7 @@ import contextlib
 import dataclasses
 import httpx
 import re
+import secrets
 import shutil
 import signal
 import subprocess
@@ -29,8 +30,10 @@ from typing import Awaitable, Callable, Optional, TypeVar
 from huggingface_hub import snapshot_download, HfApi
 from huggingface_hub.utils import RepositoryNotFoundError, GatedRepoError
 
-from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request
+from fastapi.openapi.docs import get_redoc_html, get_swagger_ui_html
+from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 import uvicorn
 
 import config as config_mod
@@ -40,12 +43,13 @@ from profiles import ResolvedProfile, resolve_profile
 from runtime import RuntimeState, build_vllm_argv, build_vllm_env, derive_tp_size
 
 # ──────────────────────────────────────────────
-# Configuration (set via docker-compose environment)
+# Configuration
 # ──────────────────────────────────────────────
+# Inner vLLM listens on container-loopback only. Default moved 8001 → 8002 in
+# Phase 3 because the admin app now binds 8001 in the same network namespace.
+# `_check_inner_port_clash` in main() catches user overrides that re-collide.
 VLLM_INNER_HOST = os.getenv("VLLM_INNER_HOST", "127.0.0.1")
-VLLM_INNER_PORT = int(os.getenv("VLLM_INNER_PORT", "8001"))
-MANAGER_HOST    = os.getenv("MANAGER_HOST", "0.0.0.0")
-MANAGER_PORT    = int(os.getenv("MANAGER_PORT", "8000"))
+VLLM_INNER_PORT = int(os.getenv("VLLM_INNER_PORT", "8002"))
 DEFAULT_TP      = int(os.getenv("VLLM_DEFAULT_TP", "2"))
 DEFAULT_GPU_MEM = float(os.getenv("VLLM_GPU_MEM_UTIL", "0.90"))
 STARTUP_TIMEOUT = int(os.getenv("VLLM_STARTUP_TIMEOUT", "600"))
@@ -59,6 +63,44 @@ logging.basicConfig(
 logger = logging.getLogger("vllm-manager")
 
 T = TypeVar("T")
+
+# ──────────────────────────────────────────────
+# Auth (Phase 3 §5.10)
+# ──────────────────────────────────────────────
+# Admin: HTTP Basic, username "admin", password from ADMIN_PASSWORD env. If
+#   ADMIN_PASSWORD is unset, the admin port is forced to loopback by
+#   _resolve_admin_bind, so any reachable request is from inside the container —
+#   we accept without creds in that mode (no password to compare against).
+# Inference: optional bearer; auth disabled when INFERENCE_API_KEY is unset.
+_basic = HTTPBasic(auto_error=False)
+
+
+def require_admin_basic(
+    creds: HTTPBasicCredentials | None = Depends(_basic),
+) -> str:
+    expected = os.environ.get("ADMIN_PASSWORD")
+    if not expected:
+        # Loopback-only mode (fail-safe bind). Anyone reaching here is inside
+        # the container's network namespace; allow.
+        return "admin"
+    if creds is None:
+        raise HTTPException(401, headers={"WWW-Authenticate": "Basic"})
+    user_ok = secrets.compare_digest(creds.username, "admin")
+    pw_ok = secrets.compare_digest(creds.password, expected)
+    if not (user_ok and pw_ok):
+        raise HTTPException(401, headers={"WWW-Authenticate": "Basic"})
+    return creds.username
+
+
+async def require_inference_bearer(request: Request) -> None:
+    expected = os.environ.get("INFERENCE_API_KEY")
+    if not expected:
+        return
+    auth = request.headers.get("authorization", "")
+    if not auth.startswith("Bearer "):
+        raise HTTPException(401)
+    if not secrets.compare_digest(auth[len("Bearer "):], expected):
+        raise HTTPException(401)
 
 # ──────────────────────────────────────────────
 # Global state
@@ -463,10 +505,33 @@ async def _reload_config() -> ReloadResult:
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def manager_lifespan(
+    cfg: Config | None = None,
+    *,
+    install_signals: bool = True,
+    spawn_background: bool = True,
+):
+    """Process-level startup/teardown for the manager.
+
+    Phase 3: extracted from FastAPI's app lifespan so the same coroutine can
+    drive both production (under asyncio.gather of two uvicorn servers) and
+    tests (under a private event loop).
+
+    Args:
+      cfg: pre-loaded config, or None to load from MNEMOSYNE_* paths. The
+        production path passes cfg from main() so port resolution can happen
+        before async startup.
+      install_signals: if False, skip _install_sighup_handler. Test fixtures
+        pass False so SIGHUP isn't attached to a loop that's about to close.
+      spawn_background: if False, don't spawn _eviction_task / _flush_task.
+        Tests pass False because TestClient serves on a different loop and
+        the tasks would never run.
+    """
     global _config, _catalog, _runtime, _eviction_task, _flush_task
-    load_env()
-    _config = load_config()
+    if cfg is None:
+        load_env()
+        cfg = load_config()
+    _config = cfg
     _catalog = open_catalog()
     _runtime = RuntimeState()
     _legacy_alias_warned.clear()
@@ -479,33 +544,31 @@ async def lifespan(app: FastAPI):
         "Catalog ready: sync=%s reconcile=%s",
         asdict(sync), asdict(rec),
     )
-    logger.info(
-        "Phase 1: server.{inference,admin}_{port,bind} parsed but not bound. "
-        "Listening via legacy MANAGER_HOST/MANAGER_PORT. "
-        "config.server: inference_port=%d admin_port=%d",
-        _config.server.inference_port, _config.server.admin_port,
-    )
-    _install_sighup_handler()
+    if install_signals:
+        _install_sighup_handler()
 
-    if _config.server.idle_unload_seconds is not None:
-        _eviction_task = asyncio.create_task(_eviction_loop(), name="eviction")
+    if spawn_background:
+        if _config.server.idle_unload_seconds is not None:
+            _eviction_task = asyncio.create_task(_eviction_loop(), name="eviction")
+        else:
+            _eviction_task = None
+            logger.info("Idle eviction disabled (idle_unload_seconds=null)")
+        _flush_task = asyncio.create_task(_flush_loop(), name="usage-flush")
     else:
         _eviction_task = None
-        logger.info("Idle eviction disabled (idle_unload_seconds=null)")
-    _flush_task = asyncio.create_task(_flush_loop(), name="usage-flush")
+        _flush_task = None
 
     logger.info(
         f"\n"
-        f"  ┌─────────────────────────────────────────────┐\n"
-        f"  │         vLLM Manager Ready                  │\n"
-        f"  │                                             │\n"
-        f"  │  OpenAI API : :<port>/v1                    │\n"
-        f"  │  Manager    : :<port>/manager               │\n"
-        f"  │  Docs       : :<port>/docs                  │\n"
-        f"  │                                             │\n"
-        f"  │  No model loaded. POST /manager/load first. │\n"
-        f"  └─────────────────────────────────────────────┘\n"
-        .replace("<port>", str(MANAGER_PORT))
+        f"  ┌─────────────────────────────────────────────────────┐\n"
+        f"  │         Mnemosyne Inference (Phase 3) Ready         │\n"
+        f"  │                                                     │\n"
+        f"  │  Inference :{cfg.server.inference_port:<5} (LAN)    /v1/* + /health     │\n"
+        f"  │  Admin     :{cfg.server.admin_port:<5}        /manager/* + /docs   │\n"
+        f"  │  vLLM inner: 127.0.0.1:{VLLM_INNER_PORT:<5}                          │\n"
+        f"  │                                                     │\n"
+        f"  │  No model loaded. POST /manager/load first.         │\n"
+        f"  └─────────────────────────────────────────────────────┘\n"
     )
     try:
         yield
@@ -531,19 +594,42 @@ async def lifespan(app: FastAPI):
         _config = None
 
 
-app = FastAPI(
-    title="vLLM Manager",
-    version="1.0.0",
-    description="Dynamic vLLM model loader with OpenAI-compatible proxy",
-    lifespan=lifespan,
-)
+
+
+# ──────────────────────────────────────────────
+# Routers (Phase 3 §5.10)
+# ──────────────────────────────────────────────
+# Routers are populated by the @router.<verb>(...) decorators below. The two
+# FastAPI apps that include them are constructed at the BOTTOM of this file —
+# include_router() snapshots the route table at call time, so decorators
+# registered after include_router() run are silently ignored.
+health_router = APIRouter()
+inference_router = APIRouter()
+admin_router = APIRouter()
+docs_router = APIRouter()
+
+
+@docs_router.get("/openapi.json", include_in_schema=False)
+async def _admin_openapi():
+    # Forward-reference admin_app — resolved at call time, after construction.
+    return admin_app.openapi()
+
+
+@docs_router.get("/docs", include_in_schema=False)
+async def _admin_docs():
+    return get_swagger_ui_html(openapi_url="/openapi.json", title="Mnemosyne Admin")
+
+
+@docs_router.get("/redoc", include_in_schema=False)
+async def _admin_redoc():
+    return get_redoc_html(openapi_url="/openapi.json", title="Mnemosyne Admin")
 
 
 # ──────────────────────────────────────────────
 # Manager control endpoints
 # ──────────────────────────────────────────────
 
-@app.get("/manager/status", tags=["manager"])
+@admin_router.get("/manager/status", tags=["manager"])
 async def status():
     """Current state of the manager and loaded model.
 
@@ -589,7 +675,7 @@ async def status():
     }
 
 
-@app.post("/manager/reload", tags=["manager"])
+@admin_router.post("/manager/reload", tags=["manager"])
 async def reload_endpoint():
     """Reread config.yaml, re-sync the catalog. Resident vLLM model is
     untouched. Soft-fails with 400 on bad config (existing config remains
@@ -602,7 +688,7 @@ async def reload_endpoint():
     return result.to_dict()
 
 
-@app.get("/manager/profiles", tags=["manager"])
+@admin_router.get("/manager/profiles", tags=["manager"])
 async def list_profiles():
     """List config-defined aliases. Reflects YAML state, not the catalog."""
     if _config is None:
@@ -623,7 +709,7 @@ async def list_profiles():
     }
 
 
-@app.get("/manager/storage", tags=["manager"])
+@admin_router.get("/manager/storage", tags=["manager"])
 async def list_storage():
     """List configured storage locations with current free space."""
     if _config is None:
@@ -662,7 +748,7 @@ def _parse_strict_bool(raw: str, *, field: str) -> bool:
     )
 
 
-@app.get("/manager/catalog", tags=["manager"])
+@admin_router.get("/manager/catalog", tags=["manager"])
 async def list_catalog(include_cache_only: str = Query("false")):
     """List catalog rows. Default-excludes synthetic cache-only rows."""
     include = _parse_strict_bool(include_cache_only, field="include_cache_only")
@@ -674,7 +760,7 @@ async def list_catalog(include_cache_only: str = Query("false")):
     return {"models": [r.to_api_dict() for r in rows]}
 
 
-@app.post("/manager/load", tags=["manager"])
+@admin_router.post("/manager/load", tags=["manager"])
 async def load_model(request: Request):
     """
     Load a model — Phase 2 alias-aware shim over `ensure_loaded`.
@@ -726,7 +812,7 @@ async def load_model(request: Request):
     return {"status": "loaded", "alias": profile.alias, "model": profile.model}
 
 
-@app.post("/manager/unload", tags=["manager"])
+@admin_router.post("/manager/unload", tags=["manager"])
 async def unload_model():
     """Unload the current model and free all GPU memory."""
     deadline = time.monotonic() + (
@@ -746,7 +832,7 @@ async def unload_model():
         _swap_lock.release()
 
 
-@app.get("/manager/models", tags=["manager"])
+@admin_router.get("/manager/models", tags=["manager"])
 async def list_cached_models():
     """List models already downloaded in the HuggingFace cache volume."""
     hub_cache = os.path.join(HF_HOME, "hub")
@@ -823,7 +909,7 @@ def _run_download(model_id: str, revision: str, ignore_patterns: list[str], hf_t
         logger.error(f"Download failed for {model_id}: {e}")
 
 
-@app.post("/manager/download", tags=["downloads"])
+@admin_router.post("/manager/download", tags=["downloads"])
 async def download_model(request: Request):
     """
     Download a model from HuggingFace Hub into the cache volume.
@@ -888,7 +974,7 @@ async def download_model(request: Request):
     }
 
 
-@app.get("/manager/download/{model_id:path}", tags=["downloads"])
+@admin_router.get("/manager/download/{model_id:path}", tags=["downloads"])
 async def download_status(model_id: str):
     """
     Check the status of a download.
@@ -909,13 +995,13 @@ async def download_status(model_id: str):
     return result
 
 
-@app.get("/manager/downloads", tags=["downloads"])
+@admin_router.get("/manager/downloads", tags=["downloads"])
 async def list_downloads():
     """List all download records (active, complete, and failed)."""
     return {"downloads": list(_downloads.values())}
 
 
-@app.delete("/manager/download/{model_id:path}", tags=["downloads"])
+@admin_router.delete("/manager/download/{model_id:path}", tags=["downloads"])
 async def clear_download_record(model_id: str):
     """
     Remove a download status record (does not delete the cached files).
@@ -929,7 +1015,7 @@ async def clear_download_record(model_id: str):
     return {"cleared": model_id}
 
 
-@app.get("/health", tags=["manager"])
+@health_router.get("/health", tags=["manager"])
 async def health():
     """Health check — always returns 200 from the manager itself."""
     return {
@@ -968,9 +1054,11 @@ async def _open_upstream(
     """Open a streaming request against the inner vLLM. Returns the client
     (kept open for the lifetime of the response) and the response object.
     Caller is responsible for closing the client when finished."""
+    # Phase 3: strip auth headers so admin Basic creds and the inference
+    # bearer token don't leak into vLLM's request logs.
     headers = {
         k: v for k, v in request.headers.items()
-        if k.lower() not in ("host", "content-length")
+        if k.lower() not in ("host", "content-length", "authorization", "cookie")
     }
     client = httpx.AsyncClient(timeout=None)
     try:
@@ -1101,7 +1189,12 @@ async def _proxy(request: Request, path: str, body: bytes):
                     await client.aclose()
 
 
-@app.api_route("/v1/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"], tags=["openai"])
+@inference_router.api_route(
+    "/v1/{path:path}",
+    methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    tags=["openai"],
+    include_in_schema=False,
+)
 async def openai_proxy(path: str, request: Request):
     """
     Proxy all OpenAI-compatible requests to the inner vLLM server.
@@ -1118,13 +1211,13 @@ async def openai_proxy(path: str, request: Request):
 # Alias management (optional quality-of-life)
 # ──────────────────────────────────────────────
 
-@app.get("/manager/aliases", tags=["manager"])
+@admin_router.get("/manager/aliases", tags=["manager"])
 async def get_aliases():
     """List current model string aliases."""
     return {"aliases": MODEL_ALIASES}
 
 
-@app.post("/manager/aliases", tags=["manager"])
+@admin_router.post("/manager/aliases", tags=["manager"])
 async def set_alias(request: Request):
     """
     Add or update a model alias.
@@ -1144,7 +1237,7 @@ async def set_alias(request: Request):
     return {"alias": alias, "model": model}
 
 
-@app.delete("/manager/aliases/{alias}", tags=["manager"])
+@admin_router.delete("/manager/aliases/{alias}", tags=["manager"])
 async def delete_alias(alias: str):
     """Remove a model alias."""
     if alias not in MODEL_ALIASES:
@@ -1154,13 +1247,153 @@ async def delete_alias(alias: str):
 
 
 # ──────────────────────────────────────────────
-# Entry point
+# App construction (Phase 3 §5.10)
+# ──────────────────────────────────────────────
+# MUST run after every @<router>.<verb>(...) decorator above, because
+# FastAPI.include_router() copies routes by value at call time. Routes
+# registered on a router *after* include_router is called are silently
+# ignored.
+
+inference_app = FastAPI(
+    title="Mnemosyne Inference",
+    version="1.0.0",
+    docs_url=None, redoc_url=None, openapi_url=None,
+)
+inference_app.include_router(health_router)
+inference_app.include_router(
+    inference_router,
+    dependencies=[Depends(require_inference_bearer)],
+)
+
+admin_app = FastAPI(
+    title="Mnemosyne Admin",
+    version="1.0.0",
+    description="Admin plane: /manager/*, /docs, /v1/* superset.",
+    # Disable FastAPI's defaults; we re-serve them via docs_router behind
+    # require_admin_basic so the schema is not LAN-readable when ADMIN_PASSWORD
+    # is set.
+    docs_url=None, redoc_url=None, openapi_url=None,
+)
+admin_app.include_router(health_router)
+admin_app.include_router(
+    admin_router,
+    dependencies=[Depends(require_admin_basic)],
+)
+admin_app.include_router(
+    inference_router,
+    dependencies=[Depends(require_admin_basic)],
+)
+admin_app.include_router(
+    docs_router,
+    dependencies=[Depends(require_admin_basic)],
+)
+
+# Back-compat alias for tests and any importer using `from vllm_manager
+# import app`. Admin is the superset, so this is the safe default.
+app = admin_app
+
+
+# ──────────────────────────────────────────────
+# Entry point (Phase 3 §5.10)
 # ──────────────────────────────────────────────
 
-if __name__ == "__main__":
-    uvicorn.run(
-        "vllm_manager:app",
-        host=MANAGER_HOST,
-        port=MANAGER_PORT,
+class _ManagedServer(uvicorn.Server):
+    """uvicorn.Server with signal-handler installation suppressed.
+
+    We install one handler at the gather level so a single SIGTERM sets
+    `should_exit` on both server instances atomically.
+
+    Modern uvicorn (≥0.30) wraps `serve()` in `with self.capture_signals():`.
+    Older versions called `self.install_signal_handlers()` directly. Override
+    both so this works regardless of the installed uvicorn version.
+    """
+    @contextlib.contextmanager
+    def capture_signals(self):
+        yield
+
+    def install_signal_handlers(self) -> None:  # legacy uvicorn
+        return
+
+
+def _resolve_admin_bind(cfg_bind: str) -> str:
+    """If ADMIN_PASSWORD is unset, force admin to loopback (PRD §5.10
+    fail-safe). Note: in Docker, container loopback is not reachable through
+    `-p 8001:8001` — the bridge forwards to container 0.0.0.0 only. So this
+    mode means admin is only reachable via `docker exec`.
+    """
+    if not os.environ.get("ADMIN_PASSWORD") and cfg_bind != "127.0.0.1":
+        logger.warning(
+            "ADMIN_PASSWORD unset; forcing admin bind from %s to 127.0.0.1 "
+            "(fail-safe). Admin port will be unreachable from outside the "
+            "container — set ADMIN_PASSWORD in /config/.env for LAN admin.",
+            cfg_bind,
+        )
+        return "127.0.0.1"
+    return cfg_bind
+
+
+def _check_inner_port_clash(cfg: Config) -> None:
+    """Reject configs where VLLM_INNER_PORT collides with either external
+    port. Inner vLLM and the admin app share the container's network
+    namespace, so 0.0.0.0:8001 (admin) and 127.0.0.1:8001 (inner) cannot
+    coexist."""
+    inner = int(os.environ.get("VLLM_INNER_PORT", "8002"))
+    if inner in (cfg.server.inference_port, cfg.server.admin_port):
+        raise SystemExit(
+            f"VLLM_INNER_PORT={inner} collides with "
+            f"server.inference_port={cfg.server.inference_port} or "
+            f"server.admin_port={cfg.server.admin_port}. "
+            f"Pick an unused port (default 8002)."
+        )
+
+
+async def _serve_both(cfg: Config) -> None:
+    inf_cfg = uvicorn.Config(
+        inference_app,
+        host=cfg.server.inference_bind,
+        port=cfg.server.inference_port,
         log_level="info",
+        lifespan="off",
     )
+    adm_cfg = uvicorn.Config(
+        admin_app,
+        host=_resolve_admin_bind(cfg.server.admin_bind),
+        port=cfg.server.admin_port,
+        log_level="info",
+        lifespan="off",
+    )
+    inf_server = _ManagedServer(inf_cfg)
+    adm_server = _ManagedServer(adm_cfg)
+
+    loop = asyncio.get_running_loop()
+    def _shutdown():
+        inf_server.should_exit = True
+        adm_server.should_exit = True
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        with contextlib.suppress(NotImplementedError):
+            loop.add_signal_handler(sig, _shutdown)
+
+    async with manager_lifespan(cfg):
+        # If one server fails (bind error, etc.) we want the other to wind
+        # down too, not be torn from under itself by gather() raising. Wait
+        # for FIRST_EXCEPTION, signal both, then drain.
+        inf_task = asyncio.create_task(inf_server.serve(), name="inference-uvicorn")
+        adm_task = asyncio.create_task(adm_server.serve(), name="admin-uvicorn")
+        await asyncio.wait(
+            {inf_task, adm_task}, return_when=asyncio.FIRST_EXCEPTION
+        )
+        _shutdown()
+        results = await asyncio.gather(inf_task, adm_task, return_exceptions=True)
+        for name, result in zip(("inference", "admin"), results):
+            if isinstance(result, BaseException):
+                logger.error("%s uvicorn exited with error: %r", name, result)
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
+
+
+if __name__ == "__main__":
+    load_env()
+    cfg_at_boot = load_config()
+    _check_inner_port_clash(cfg_at_boot)
+    asyncio.run(_serve_both(cfg_at_boot))

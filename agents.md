@@ -11,7 +11,7 @@ This repository contains **Mnemosyne Inference**, a containerized vLLM manager f
 - `project_docs/implementation_plan.md` is the phased implementation plan derived from the PRD.
 - `CLAUDE.md` contains Claude-specific repository guidance. Keep it in sync with this file when architecture or common commands change.
 
-`docker-compose.yml` is intentionally outside this repo. The CLI expects it under `$VLLM_COMPOSE_DIR`, defaulting to `~/vllm-manager`. If a change affects ports, env vars, volumes, container names, or mounts, call out the required external compose changes.
+The live `docker-compose.yml` is intentionally machine-specific and may live outside this repo. The CLI expects it under `$VLLM_COMPOSE_DIR`, defaulting to `~/vllm-manager`. Use `docker-compose.example.yml` as the maintained template. If a change affects ports, env vars, volumes, container names, or mounts, call out the required external compose changes.
 
 ## Current Architecture
 

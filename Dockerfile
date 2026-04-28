@@ -56,14 +56,14 @@ RUN pip install --no-cache-dir \
 
 # ── App ────────────────────────────────────────────────────────────
 WORKDIR /app
-COPY vllm_manager.py config.py catalog.py profiles.py ./
+COPY vllm_manager.py config.py catalog.py profiles.py runtime.py ./
 
 # HuggingFace cache lives in a volume (models persist across restarts)
 ENV HF_HOME=/hf-cache
 ENV TRANSFORMERS_CACHE=/hf-cache
 
-# Manager listens on 8000 (LAN-facing)
-# vLLM inner server on 8001 (loopback inside container)
-EXPOSE 8000
+# Manager: inference :8000, admin :8001 (LAN-gated by ADMIN_PASSWORD).
+# vLLM inner server: 127.0.0.1:8002 inside container.
+EXPOSE 8000 8001
 
 ENTRYPOINT ["python", "vllm_manager.py"]

@@ -17,8 +17,20 @@
 #   vllm-ctl shell                  # open a shell inside the container
 # ──────────────────────────────────────────────────────────────────
 
-MANAGER_URL="${VLLM_MANAGER_URL:-http://localhost:8000}"
 COMPOSE_DIR="${VLLM_COMPOSE_DIR:-$HOME/vllm-manager}"
+ADMIN_URL="${VLLM_ADMIN_URL:-http://localhost:8001}"
+INFERENCE_URL="${VLLM_INFERENCE_URL:-${VLLM_MANAGER_URL:-http://localhost:8000}}"
+
+load_admin_password() {
+  [[ -n "${ADMIN_PASSWORD:-}" ]] && return
+  local env_file="${COMPOSE_DIR}/.env"
+  [[ -r "$env_file" ]] || return
+  ADMIN_PASSWORD="$(grep -E '^ADMIN_PASSWORD=' "$env_file" \
+    | head -1 | cut -d= -f2- \
+    | sed -e 's/^["'"'"']//' -e 's/["'"'"']$//')"
+  export ADMIN_PASSWORD
+}
+load_admin_password
 
 red()    { printf '\033[31m%s\033[0m\n' "$*"; }
 green()  { printf '\033[32m%s\033[0m\n' "$*"; }
@@ -30,8 +42,11 @@ compose() { docker compose -f "${COMPOSE_DIR}/docker-compose.yml" "$@"; }
 api() {
   local method="$1"; shift
   local path="$1";   shift
-  curl -sf -X "$method" "${MANAGER_URL}${path}" \
-    -H "Content-Type: application/json" "$@"
+  local auth_args=()
+  [[ -n "${ADMIN_PASSWORD:-}" ]] && auth_args=(-u "admin:${ADMIN_PASSWORD}")
+  curl -sf -X "$method" "${ADMIN_URL}${path}" \
+    -H "Content-Type: application/json" \
+    "${auth_args[@]}" "$@"
 }
 
 # ── commands ───────────────────────────────────────────────────────
@@ -49,10 +64,16 @@ cmd_start() {
   # Wait briefly for the manager to come up
   for i in {1..15}; do
     sleep 1
-    if curl -sf "${MANAGER_URL}/health" &>/dev/null; then
-      green "✓ Manager is up at ${MANAGER_URL}"
+    if curl -sf "${INFERENCE_URL}/health" &>/dev/null; then
+      green "✓ Inference is up at ${INFERENCE_URL}"
       echo ""
-      cmd_status
+      if [[ -n "${ADMIN_PASSWORD:-}" ]]; then
+        cmd_status
+      else
+        yellow "Admin port is loopback-only (ADMIN_PASSWORD unset)."
+        yellow "Use: docker exec vllm-manager curl http://127.0.0.1:8001/manager/status"
+        yellow "Or set ADMIN_PASSWORD in ${COMPOSE_DIR}/.env for host-side admin commands."
+      fi
       return
     fi
   done
@@ -85,7 +106,7 @@ cmd_status() {
   bold "── Manager Status ────────────────────────────────────────"
   local result
   result=$(api GET /manager/status 2>/dev/null) || {
-    yellow "  Manager not reachable at ${MANAGER_URL}"
+    yellow "  Admin not reachable at ${ADMIN_URL}"
     yellow "  Start with: vllm-ctl start"
     return
   }
@@ -186,10 +207,8 @@ print(json.dumps({
   echo ""
 
   local result
-  result=$(curl -sf -X POST "${MANAGER_URL}/manager/load" \
-    -H "Content-Type: application/json" \
-    -d "$payload") || {
-    red "Failed to reach manager at ${MANAGER_URL}"
+  result=$(api POST /manager/load -d "$payload") || {
+    red "Failed to reach admin at ${ADMIN_URL}"
     red "Is it running? Try: vllm-ctl start"
     exit 1
   }
@@ -225,18 +244,8 @@ else:
 cmd_reload() {
   echo ""
   green "Reloading config ..."
-  local result http_code
-  result=$(curl -s -o /tmp/vllm-ctl-reload.$$ -w "%{http_code}" \
-    -X POST "${MANAGER_URL}/manager/reload" \
-    -H "Content-Type: application/json")
-  http_code="$result"
-  result=$(cat /tmp/vllm-ctl-reload.$$ 2>/dev/null); rm -f /tmp/vllm-ctl-reload.$$
-
-  if [[ "$http_code" != "200" ]]; then
-    red "  ✗ Reload failed (HTTP $http_code)"
-    echo "$result" | python3 -c "import sys,json; d=json.load(sys.stdin); print('   ', d.get('detail','unknown'))" 2>/dev/null || echo "   $result"
-    exit 1
-  fi
+  local result
+  result=$(api POST /manager/reload) || { red "  ✗ Reload failed or admin not reachable"; exit 1; }
   echo "$result" | python3 -c "
 import sys, json
 d = json.load(sys.stdin)
@@ -347,8 +356,11 @@ print(json.dumps({
   bold "Model:  ${model}"
   bold "Prompt: ${prompt}"
   echo "──────────────────────────────────────────────────────────"
-  curl -sf -X POST "${MANAGER_URL}/v1/chat/completions" \
+  local auth_args=()
+  [[ -n "${INFERENCE_API_KEY:-}" ]] && auth_args=(-H "Authorization: Bearer ${INFERENCE_API_KEY}")
+  curl -sf -X POST "${INFERENCE_URL}/v1/chat/completions" \
     -H "Content-Type: application/json" \
+    "${auth_args[@]}" \
     -d "$payload" \
     | python3 -c "
 import sys,json
@@ -397,9 +409,7 @@ print(json.dumps(d))
   echo ""
   green "Queuing download: ${model}"
   local result
-  result=$(curl -sf -X POST "${MANAGER_URL}/manager/download" \
-    -H "Content-Type: application/json" \
-    -d "$payload") || { red "Manager not reachable"; exit 1; }
+  result=$(api POST /manager/download -d "$payload") || { red "Admin not reachable"; exit 1; }
 
   local poll_path status
   poll_path=$(echo "$result" | python3 -c "import sys,json; print(json.load(sys.stdin).get('poll',''))")
@@ -526,7 +536,8 @@ cmd_help() {
 
 $(bold "vllm-ctl") — Containerized vLLM Manager
 Compose dir: ${COMPOSE_DIR}
-Manager URL: ${MANAGER_URL}
+Admin URL: ${ADMIN_URL}
+Inference URL: ${INFERENCE_URL}
 
 $(bold "Container:")
   build                   Build the Docker image
@@ -571,8 +582,12 @@ $(bold "Examples:")
   vllm-ctl stop
 
 $(bold "Environment:")
-  VLLM_MANAGER_URL     Override URL (default: http://localhost:8000)
+  VLLM_ADMIN_URL       Override admin URL (default: http://localhost:8001)
+  VLLM_INFERENCE_URL   Override inference URL (default: http://localhost:8000)
+  VLLM_MANAGER_URL     Legacy inference URL fallback (default: http://localhost:8000)
   VLLM_COMPOSE_DIR     Path to docker-compose.yml dir (default: ~/vllm-manager)
+  ADMIN_PASSWORD       Admin Basic password; auto-loaded from ${COMPOSE_DIR}/.env
+  INFERENCE_API_KEY    Optional bearer token for /v1/* chat requests
 
 $(bold "HF token (for gated models):")
   Add HUGGING_FACE_HUB_TOKEN to docker-compose.yml environment, or:

@@ -1,0 +1,62 @@
+# Mnemosyne Inference — example Docker Compose file.
+#
+# The live compose file is conventionally stored outside this repo at
+# ~/vllm-manager/docker-compose.yml because it contains workstation-specific
+# bind mounts. `vllm-ctl` reads $VLLM_COMPOSE_DIR, defaulting to ~/vllm-manager.
+#
+# If this file lives outside the repo, set MNEMOSYNE_REPO_DIR to this checkout
+# so Compose can find the Dockerfile.
+
+services:
+  vllm-manager:
+    container_name: vllm-manager
+    image: mnemosyne-inference:latest
+    build:
+      context: ${MNEMOSYNE_REPO_DIR:-.}
+      dockerfile: Dockerfile
+
+    restart: unless-stopped
+    ipc: host
+    gpus: all
+
+    env_file:
+      - .env
+    environment:
+      HF_HOME: /hf-cache
+      TRANSFORMERS_CACHE: /hf-cache
+      MNEMOSYNE_CONFIG_PATH: /config/config.yaml
+      MNEMOSYNE_ENV_PATH: /config/.env
+      MNEMOSYNE_DB_PATH: /state/mnemosyne.db
+      # Optional: keep unset unless you need to move the inner vLLM listener.
+      # VLLM_INNER_PORT: "8002"
+
+    ports:
+      # Inference plane: /v1/* + /health. Open by default unless
+      # INFERENCE_API_KEY is set in .env.
+      - "8000:8000"
+      # Admin plane: /manager/* + /docs + admin /v1/*. Requires
+      # ADMIN_PASSWORD in .env to bind beyond container loopback.
+      # To restrict admin to the Docker host only, use:
+      # - "127.0.0.1:8001:8001"
+      - "8001:8001"
+
+    volumes:
+      - ./config.yaml:/config/config.yaml:ro
+      - ./.env:/config/.env:ro
+      - ./state:/state
+      - hf-cache:/hf-cache
+
+      # Optional storage locations matching config.yaml.example.
+      # Replace the left-hand paths with real host drives/directories.
+      # - /mnt/nvme/mnemosyne/hf-cache:/storage/nvme/hf-cache
+      # - /mnt/raid/mnemosyne/hf-cache:/storage/raid/hf-cache
+
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+volumes:
+  hf-cache:

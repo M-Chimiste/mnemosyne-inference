@@ -46,6 +46,15 @@ class Server(BaseModel):
     startup_timeout_seconds: int = 600
     swap_queue_timeout_seconds: int = 300
 
+    @model_validator(mode="after")
+    def _ports_distinct(self) -> "Server":
+        if self.inference_port == self.admin_port:
+            raise ValueError(
+                f"server.inference_port and server.admin_port must differ "
+                f"(both = {self.inference_port})"
+            )
+        return self
+
 
 class StorageLocation(BaseModel):
     model_config = ConfigDict(extra="forbid")

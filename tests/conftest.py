@@ -14,6 +14,7 @@ exercise the swap queue, eviction, and proxy without launching a real
 vLLM subprocess. See plans/phase_2.md §8.6.
 """
 import asyncio
+import contextlib
 import sys
 import time
 from pathlib import Path
@@ -73,6 +74,13 @@ def tmp_paths(tmp_path, monkeypatch):
     return tmp_path
 
 
+@pytest.fixture(autouse=True)
+def _plane_auth_env(monkeypatch):
+    """Exercise admin Basic by default and keep inference auth opt-in."""
+    monkeypatch.setenv("ADMIN_PASSWORD", "test-pw")
+    monkeypatch.delenv("INFERENCE_API_KEY", raising=False)
+
+
 @pytest.fixture
 def tmp_config(tmp_paths):
     """Write a minimal valid YAML — empty models, single tmp storage location."""
@@ -110,12 +118,53 @@ def _reset_globals():
     vllm_manager._swap_lock = asyncio.Lock()
 
 
+@contextlib.contextmanager
+def _running_lifespan():
+    """Drive manager_lifespan() around TestClient without FastAPI lifespan.
+
+    Phase 3 serves two apps with lifespan disabled, so tests need process
+    setup/teardown explicitly. Background tasks and signal handlers are off
+    because TestClient runs requests on its own event loop.
+    """
+    loop = asyncio.new_event_loop()
+    cm = vllm_manager.manager_lifespan(
+        install_signals=False,
+        spawn_background=False,
+    )
+    loop.run_until_complete(cm.__aenter__())
+    try:
+        yield
+    finally:
+        loop.run_until_complete(cm.__aexit__(None, None, None))
+        loop.close()
+
+
 @pytest.fixture
 def client(tmp_config):
     """TestClient with all module globals reset and a minimal valid config."""
     _reset_globals()
-    with TestClient(vllm_manager.app) as c:
-        yield c
+    with _running_lifespan():
+        with TestClient(vllm_manager.app) as c:
+            c.auth = ("admin", "test-pw")
+            yield c
+
+
+@pytest.fixture
+def admin_client_no_auth(tmp_config):
+    """Admin TestClient without default Basic credentials."""
+    _reset_globals()
+    with _running_lifespan():
+        with TestClient(vllm_manager.app) as c:
+            yield c
+
+
+@pytest.fixture
+def inference_client(tmp_config):
+    """Inference-plane TestClient; exposes only /health and /v1/*."""
+    _reset_globals()
+    with _running_lifespan():
+        with TestClient(vllm_manager.inference_app) as c:
+            yield c
 
 
 @pytest.fixture
@@ -190,5 +239,7 @@ def rich_client(rich_config, stub_vllm):
     """TestClient backed by RICH_CONFIG_YAML with subprocess launches stubbed.
     Yields (client, stub) so tests can drive both."""
     _reset_globals()
-    with TestClient(vllm_manager.app) as c:
-        yield c, stub_vllm
+    with _running_lifespan():
+        with TestClient(vllm_manager.app) as c:
+            c.auth = ("admin", "test-pw")
+            yield c, stub_vllm
