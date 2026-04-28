@@ -30,6 +30,7 @@ class ResolvedProfile:
     storage_name: str
     storage_path: str
     extra_args: tuple[str, ...]
+    revision: str = "main"
 
 
 def resolve_profile(
@@ -74,6 +75,7 @@ def resolve_profile(
             storage_name=storage_name,
             storage_path=storage_path,
             extra_args=tuple(config_profile.extra_args),
+            revision=config_profile.revision,
         )
 
     if catalog is not None:
@@ -86,6 +88,15 @@ def resolve_profile(
                 )
             gpus = json.loads(row.gpus)
             extra_args = tuple(json.loads(row.extra_args)) if row.extra_args else ()
+            # Prefer the resolved snapshot SHA when set so the resident vLLM
+            # pins to the exact downloaded weights even if a moving ref like
+            # 'main' has advanced on the Hub. Falls back to the symbolic
+            # revision (default "main") for rows that have not been installed.
+            revision = (
+                row.resolved_sha
+                if row.resolved_sha
+                else (row.revision or "main")
+            )
             return ResolvedProfile(
                 alias=row.alias,
                 model=row.hf_model_id,
@@ -101,6 +112,7 @@ def resolve_profile(
                 storage_name=row.storage_location,
                 storage_path=storage_locations[row.storage_location],
                 extra_args=extra_args,
+                revision=revision,
             )
 
     raise KeyError(alias)

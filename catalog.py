@@ -9,7 +9,10 @@ import hashlib
 import json
 import logging
 import os
+import re
 import sqlite3
+import threading
+import time
 from dataclasses import dataclass
 from typing import Optional
 
@@ -75,6 +78,71 @@ def _has_weights(snapshot_dir: str) -> bool:
     return False
 
 
+_HEX_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+def _snapshot_for_revision(cache_dir: str, revision: Optional[str]) -> Optional[str]:
+    """Resolve a revision to its on-disk snapshot directory.
+
+    Order:
+      1. Path-safety guard. Reject revisions containing '..', leading '/',
+         or anything that, after normalization + join, escapes
+         <cache_dir>/refs/. Defensive against attacker-controlled revisions.
+      2. Direct snapshot SHA. If revision matches /^[0-9a-f]{40}$/ and
+         <repo>/snapshots/<revision>/ exists with weights, return it. HF
+         cache stores commit SHAs as snapshot dirs without a refs entry.
+      3. Branch/tag ref resolution. Read <repo>/refs/<revision>, look up
+         the SHA, and return <repo>/snapshots/<sha>/ if it exists with
+         weights.
+    Returns None if no valid snapshot found.
+    """
+    if not revision:
+        return None
+    if ".." in revision or revision.startswith("/") or revision.startswith("\\"):
+        return None
+    refs_root = os.path.realpath(os.path.join(cache_dir, "refs"))
+
+    # 2. Direct SHA path
+    if _HEX_SHA_RE.match(revision):
+        snap_dir = os.path.join(cache_dir, "snapshots", revision)
+        if os.path.isdir(snap_dir) and _has_weights(snap_dir):
+            return snap_dir
+        # fall through to refs lookup
+
+    # 3. Refs-based lookup
+    refs_path = os.path.join(cache_dir, "refs", revision)
+    try:
+        # Path-safety check: ensure refs_path resolves under refs_root.
+        normalized = os.path.realpath(refs_path)
+        if not (
+            normalized == refs_root
+            or normalized.startswith(refs_root + os.sep)
+        ):
+            return None
+    except OSError:
+        return None
+    try:
+        with open(refs_path, "r") as f:
+            sha = f.read().strip()
+    except OSError:
+        return None
+    if not sha:
+        return None
+    snap_dir = os.path.join(cache_dir, "snapshots", sha)
+    if os.path.isdir(snap_dir) and _has_weights(snap_dir):
+        return snap_dir
+    return None
+
+
+def _snapshot_sha(snapshot_path: str) -> Optional[str]:
+    """Extract the snapshot SHA from a path of the form
+    .../snapshots/<sha>/. Returns None if it doesn't match."""
+    base = os.path.basename(os.path.normpath(snapshot_path))
+    if _HEX_SHA_RE.match(base):
+        return base
+    return None
+
+
 @dataclass(frozen=True)
 class CatalogRow:
     alias: str
@@ -91,6 +159,8 @@ class CatalogRow:
     last_used_at: Optional[int]
     request_count: int
     extra_args: str     # JSON
+    revision: str = "main"
+    resolved_sha: Optional[str] = None
 
     def to_api_dict(self) -> dict:
         return {
@@ -108,6 +178,8 @@ class CatalogRow:
             "last_used_at": self.last_used_at,
             "request_count": self.request_count,
             "extra_args": json.loads(self.extra_args) if self.extra_args else [],
+            "revision": self.revision,
+            "resolved_sha": self.resolved_sha,
         }
 
 
@@ -145,6 +217,7 @@ class Catalog:
         self._conn = conn
         self._conn.row_factory = sqlite3.Row
         self._closed = False
+        self._lock = threading.RLock()
         try:
             self._conn.execute("PRAGMA journal_mode=WAL")
         except sqlite3.OperationalError:
@@ -152,6 +225,7 @@ class Catalog:
             pass
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._bootstrap()
+        self._migrate_revision_column()
 
     def close(self) -> None:
         if self._closed:
@@ -163,7 +237,7 @@ class Catalog:
         self._closed = True
 
     def _bootstrap(self) -> None:
-        with self._conn:
+        with self._lock, self._conn:
             self._conn.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS schema_version (
@@ -183,7 +257,9 @@ class Catalog:
                   installed_at       INTEGER,
                   last_used_at       INTEGER,
                   request_count      INTEGER DEFAULT 0,
-                  extra_args         TEXT
+                  extra_args         TEXT,
+                  revision           TEXT NOT NULL DEFAULT 'main',
+                  resolved_sha       TEXT
                 );
                 CREATE TABLE IF NOT EXISTS downloads (
                   id                 INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -198,6 +274,7 @@ class Catalog:
                 );
                 CREATE INDEX IF NOT EXISTS idx_downloads_alias  ON downloads(alias);
                 CREATE INDEX IF NOT EXISTS idx_models_last_used ON models(last_used_at);
+                CREATE INDEX IF NOT EXISTS idx_models_hf_id     ON models(hf_model_id);
                 """
             )
             existing = self._conn.execute("SELECT version FROM schema_version").fetchone()
@@ -206,6 +283,23 @@ class Catalog:
                     "INSERT INTO schema_version(version) VALUES (?)", (SCHEMA_VERSION,)
                 )
             # Future: elif existing["version"] < SCHEMA_VERSION: run migrations.
+
+    def _migrate_revision_column(self) -> None:
+        """Additive ALTER for legacy DBs predating Phase 4. On a fresh DB,
+        _bootstrap creates these columns directly and both branches no-op."""
+        with self._lock, self._conn:
+            cols = {
+                row["name"]
+                for row in self._conn.execute("PRAGMA table_info('models')")
+            }
+            if "revision" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE models ADD COLUMN revision TEXT NOT NULL DEFAULT 'main'"
+                )
+            if "resolved_sha" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE models ADD COLUMN resolved_sha TEXT"
+                )
 
     # ── sync ──────────────────────────────────────────────────────────
 
@@ -221,7 +315,7 @@ class Catalog:
         `request_count` on existing rows — reconcile_cache handles
         status/cache_path; Phase 4 writes the rest.
         """
-        with self._conn:
+        with self._lock, self._conn:
             return self._sync_from_config_uncommitted(models, default_storage)
 
     def apply_config(
@@ -235,7 +329,7 @@ class Catalog:
         Used by startup/reload so a failure in either step rolls back all DB
         writes and keeps catalog state aligned with the still-loaded config.
         """
-        with self._conn:
+        with self._lock, self._conn:
             sync = self._sync_from_config_uncommitted(models, default_storage)
             rec = self._reconcile_cache_uncommitted(storage_paths)
             return sync, rec
@@ -267,7 +361,8 @@ class Catalog:
             extra_json = json.dumps(m.extra_args)
 
             row = self._conn.execute(
-                "SELECT source FROM models WHERE alias=?", (m.alias,)
+                "SELECT source, hf_model_id, storage_location, revision "
+                "FROM models WHERE alias=?", (m.alias,)
             ).fetchone()
 
             if row is None:
@@ -276,11 +371,13 @@ class Catalog:
                     INSERT INTO models (
                       alias, hf_model_id, source, quantization, gpus,
                       max_model_len, storage_location, cache_path, size_bytes,
-                      status, installed_at, last_used_at, request_count, extra_args
-                    ) VALUES (?, ?, 'config', ?, ?, ?, ?, NULL, NULL, 'partial', NULL, NULL, 0, ?)
+                      status, installed_at, last_used_at, request_count,
+                      extra_args, revision
+                    ) VALUES (?, ?, 'config', ?, ?, ?, ?, NULL, NULL,
+                              'partial', NULL, NULL, 0, ?, ?)
                     """,
                     (m.alias, m.model, m.quantization, gpus_json,
-                     m.max_model_len, storage_loc, extra_json),
+                     m.max_model_len, storage_loc, extra_json, m.revision),
                 )
                 added += 1
             else:
@@ -290,8 +387,19 @@ class Catalog:
                         m.alias,
                     )
                     ui_overwritten += 1
+                clears_cached_snapshot = (
+                    row["source"] == "ui_install"
+                    or row["hf_model_id"] != m.model
+                    or row["storage_location"] != storage_loc
+                    or row["revision"] != m.revision
+                )
+                cache_reset_sql = (
+                    "cache_path = NULL, status = 'partial', resolved_sha = NULL,"
+                    if clears_cached_snapshot
+                    else ""
+                )
                 self._conn.execute(
-                    """
+                    f"""
                     UPDATE models SET
                       hf_model_id      = ?,
                       source           = 'config',
@@ -299,11 +407,13 @@ class Catalog:
                       gpus             = ?,
                       max_model_len    = ?,
                       storage_location = ?,
-                      extra_args       = ?
+                      {cache_reset_sql}
+                      extra_args       = ?,
+                      revision         = ?
                     WHERE alias = ?
                     """,
                     (m.model, m.quantization, gpus_json, m.max_model_len,
-                     storage_loc, extra_json, m.alias),
+                     storage_loc, extra_json, m.revision, m.alias),
                 )
                 updated += 1
 
@@ -324,7 +434,7 @@ class Catalog:
     def reconcile_cache(self, storage_paths: dict[str, str]) -> ReconcileResult:
         """Walk each row's expected on-disk cache. Writes ONLY status and
         cache_path — preserves all durable metadata."""
-        with self._conn:
+        with self._lock, self._conn:
             return self._reconcile_cache_uncommitted(storage_paths)
 
     def _reconcile_cache_uncommitted(self, storage_paths: dict[str, str]) -> ReconcileResult:
@@ -333,14 +443,21 @@ class Catalog:
         loc_missing = 0
         rows = list(
             self._conn.execute(
-                "SELECT alias, hf_model_id, storage_location FROM models"
+                "SELECT alias, hf_model_id, storage_location, status, revision "
+                "FROM models"
             )
         )
         for row in rows:
+            # Skip hard-failed installs — don't promote on a half-finished
+            # snapshot dir; user-driven retry only.
+            if row["status"] == "error":
+                continue
+
             loc_path = storage_paths.get(row["storage_location"])
             if loc_path is None:
                 self._conn.execute(
-                    "UPDATE models SET cache_path=NULL, status='partial' WHERE alias=?",
+                    "UPDATE models SET cache_path=NULL, status='partial', "
+                    "resolved_sha=NULL WHERE alias=?",
                     (row["alias"],),
                 )
                 loc_missing += 1
@@ -348,16 +465,27 @@ class Catalog:
                 continue
 
             cache_dir = os.path.join(loc_path, "hub", _hf_dir_name(row["hf_model_id"]))
-            snap = _newest_snapshot(cache_dir)
-            if snap and _has_weights(snap):
+            revision = row["revision"] if "revision" in row.keys() else None
+            snap = _snapshot_for_revision(cache_dir, revision)
+            if snap is None:
+                # Fall back to newest-mtime for legacy rows with no revision
+                # set (shouldn't happen post-migration, but defensive).
+                if not revision:
+                    snap_fallback = _newest_snapshot(cache_dir)
+                    if snap_fallback and _has_weights(snap_fallback):
+                        snap = snap_fallback
+            if snap:
+                sha = _snapshot_sha(snap)
                 self._conn.execute(
-                    "UPDATE models SET cache_path=?, status='installed' WHERE alias=?",
-                    (snap, row["alias"]),
+                    "UPDATE models SET cache_path=?, status='installed', "
+                    "resolved_sha=? WHERE alias=?",
+                    (snap, sha, row["alias"]),
                 )
                 installed += 1
             else:
                 self._conn.execute(
-                    "UPDATE models SET cache_path=NULL, status='partial' WHERE alias=?",
+                    "UPDATE models SET cache_path=NULL, status='partial', "
+                    "resolved_sha=NULL WHERE alias=?",
                     (row["alias"],),
                 )
                 partial += 1
@@ -366,16 +494,100 @@ class Catalog:
     # ── reads ─────────────────────────────────────────────────────────
 
     def list_models(self) -> list[CatalogRow]:
-        rows = self._conn.execute("SELECT * FROM models ORDER BY alias").fetchall()
+        with self._lock:
+            rows = self._conn.execute("SELECT * FROM models ORDER BY alias").fetchall()
         return [self._to_catalog_row(r) for r in rows]
 
     def get_model(self, alias: str) -> Optional[CatalogRow]:
-        row = self._conn.execute("SELECT * FROM models WHERE alias=?", (alias,)).fetchone()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM models WHERE alias=?", (alias,)
+            ).fetchone()
         return self._to_catalog_row(row) if row else None
 
     def list_downloads(self) -> list[DownloadRow]:
-        rows = self._conn.execute("SELECT * FROM downloads ORDER BY id").fetchall()
+        with self._lock:
+            rows = self._conn.execute("SELECT * FROM downloads ORDER BY id").fetchall()
         return [self._to_download_row(r) for r in rows]
+
+    def get_download(self, alias: str) -> Optional[DownloadRow]:
+        """Return the most recent download row for an alias, or None."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM downloads WHERE alias=? ORDER BY id DESC LIMIT 1",
+                (alias,),
+            ).fetchone()
+        return self._to_download_row(row) if row else None
+
+    def lookup_by_hf_id(self, hf_model_id: str) -> list[CatalogRow]:
+        """Return all rows with the given HF model id, ui_install rows first."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM models WHERE hf_model_id=? "
+                "ORDER BY (source='ui_install') DESC, alias",
+                (hf_model_id,),
+            ).fetchall()
+        return [self._to_catalog_row(r) for r in rows]
+
+    def find_active_for(
+        self, storage_location: str, hf_model_id: str
+    ) -> Optional[str]:
+        """Return the alias of any active download (queued or downloading)
+        on the same (storage_location, hf_model_id) pair, or None.
+
+        Revision is intentionally excluded from the tuple — HF stores all
+        revisions of a repo under one shared cache dir; concurrent workers
+        on different revisions corrupt each other's refs/blobs/.incomplete.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT m.alias FROM models m "
+                "JOIN downloads d ON d.alias=m.alias "
+                "WHERE m.storage_location=? AND m.hf_model_id=? "
+                "AND d.status IN ('queued','downloading') "
+                "LIMIT 1",
+                (storage_location, hf_model_id),
+            ).fetchone()
+        return row["alias"] if row else None
+
+    def find_active_by_hf_id(self, hf_model_id: str) -> Optional[str]:
+        """Like find_active_for but storage-agnostic; used by legacy
+        DELETE /manager/cache/{model_id} to refuse if any matching alias
+        has an active download."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT m.alias FROM models m "
+                "JOIN downloads d ON d.alias=m.alias "
+                "WHERE m.hf_model_id=? "
+                "AND d.status IN ('queued','downloading') "
+                "LIMIT 1",
+                (hf_model_id,),
+            ).fetchone()
+        return row["alias"] if row else None
+
+    def find_repo_siblings(
+        self,
+        storage_location: str,
+        hf_model_id: str,
+        exclude_alias: Optional[str] = None,
+    ) -> list[CatalogRow]:
+        """Return all alias rows that share (storage_location, hf_model_id)
+        — i.e. point at the same on-disk repo cache dir. Used by cache
+        deletes to mark every sibling 'partial' since the wipe nukes them
+        all together."""
+        with self._lock:
+            if exclude_alias is None:
+                rows = self._conn.execute(
+                    "SELECT * FROM models WHERE storage_location=? AND hf_model_id=?",
+                    (storage_location, hf_model_id),
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    "SELECT * FROM models WHERE storage_location=? "
+                    "AND hf_model_id=? AND alias!=?",
+                    (storage_location, hf_model_id, exclude_alias),
+                ).fetchall()
+        return [self._to_catalog_row(r) for r in rows]
 
     # ── usage flush ───────────────────────────────────────────────────
 
@@ -388,7 +600,7 @@ class Catalog:
         call."""
         if delta <= 0 or last_used_at is None:
             return
-        with self._conn:
+        with self._lock, self._conn:
             self._conn.execute(
                 "UPDATE models SET last_used_at=?, request_count = request_count + ? "
                 "WHERE alias=?",
@@ -396,8 +608,215 @@ class Catalog:
             )
 
     def schema_version(self) -> int:
-        row = self._conn.execute("SELECT version FROM schema_version").fetchone()
+        with self._lock:
+            row = self._conn.execute("SELECT version FROM schema_version").fetchone()
         return int(row["version"]) if row else -1
+
+    # ── install / download transitions (Phase 4 §3b) ──────────────────
+
+    def start_install_tx(
+        self,
+        *,
+        alias: str,
+        hf_model_id: str,
+        source: str = "ui_install",
+        revision: str = "main",
+        quantization: Optional[str] = None,
+        gpus: list | str = "all",
+        max_model_len: Optional[int] = None,
+        storage_location: str,
+        extra_args: Optional[list[str]] = None,
+        total_bytes_hint: Optional[int] = None,
+    ) -> int:
+        """Atomically: insert/upsert the models row at status='queued' and
+        insert a new downloads row at status='queued'. Returns the new
+        downloads.id. Clears any stale resolved_sha pin on retry."""
+        gpus_json = json.dumps(gpus)
+        extra_json = json.dumps(extra_args or [])
+        now = int(time.time())
+        with self._lock, self._conn:
+            existing = self._conn.execute(
+                "SELECT alias FROM models WHERE alias=?", (alias,)
+            ).fetchone()
+            if existing is None:
+                self._conn.execute(
+                    """
+                    INSERT INTO models (
+                      alias, hf_model_id, source, quantization, gpus,
+                      max_model_len, storage_location, cache_path, size_bytes,
+                      status, installed_at, last_used_at, request_count,
+                      extra_args, revision, resolved_sha
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL,
+                              'queued', NULL, NULL, 0, ?, ?, NULL)
+                    """,
+                    (alias, hf_model_id, source, quantization, gpus_json,
+                     max_model_len, storage_location, extra_json, revision),
+                )
+            else:
+                self._conn.execute(
+                    """
+                    UPDATE models SET
+                      hf_model_id      = ?,
+                      source           = ?,
+                      quantization     = ?,
+                      gpus             = ?,
+                      max_model_len    = ?,
+                      storage_location = ?,
+                      cache_path       = NULL,
+                      status           = 'queued',
+                      extra_args       = ?,
+                      revision         = ?,
+                      resolved_sha     = NULL
+                    WHERE alias = ?
+                    """,
+                    (hf_model_id, source, quantization, gpus_json,
+                     max_model_len, storage_location, extra_json, revision,
+                     alias),
+                )
+            cursor = self._conn.execute(
+                "INSERT INTO downloads (alias, pid, status, started_at, "
+                "bytes_downloaded, total_bytes) VALUES (?, NULL, 'queued', ?, 0, ?)",
+                (alias, now, total_bytes_hint),
+            )
+            return cursor.lastrowid
+
+    def mark_downloading(
+        self, alias: str, *, pid: Optional[int], total_bytes: Optional[int]
+    ) -> None:
+        """Worker emitted 'start'. Update the active downloads row."""
+        now = int(time.time())
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE downloads SET status='downloading', pid=?, "
+                "total_bytes=COALESCE(?, total_bytes), started_at=? "
+                "WHERE alias=? AND status IN ('queued','downloading')",
+                (pid, total_bytes, now, alias),
+            )
+
+    def mark_progress(self, alias: str, bytes_downloaded: int) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE downloads SET bytes_downloaded=? "
+                "WHERE alias=? AND status IN ('queued','downloading')",
+                (bytes_downloaded, alias),
+            )
+
+    def mark_complete(
+        self,
+        alias: str,
+        *,
+        cache_path: str,
+        size_bytes: Optional[int],
+        resolved_sha: Optional[str],
+    ) -> None:
+        """Worker exited 0 with a complete event. Atomic: models→installed,
+        downloads→complete, resolved_sha pinned to the snapshot's actual SHA."""
+        now = int(time.time())
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE models SET status='installed', cache_path=?, "
+                "size_bytes=?, installed_at=?, resolved_sha=? WHERE alias=?",
+                (cache_path, size_bytes, now, resolved_sha, alias),
+            )
+            self._conn.execute(
+                "UPDATE downloads SET status='complete', finished_at=? "
+                "WHERE alias=? AND status IN ('queued','downloading')",
+                (now, alias),
+            )
+
+    def mark_error(self, alias: str, message: str) -> None:
+        """Hard worker failure → models='error', downloads='error'.
+        Distinguishes 'broken — investigate' from 'resumable'."""
+        now = int(time.time())
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE models SET status='error', resolved_sha=NULL WHERE alias=?",
+                (alias,),
+            )
+            self._conn.execute(
+                "UPDATE downloads SET status='error', error=?, finished_at=? "
+                "WHERE alias=? AND status IN ('queued','downloading')",
+                (message, now, alias),
+            )
+
+    def mark_cancelled(self, alias: str) -> None:
+        """User-cancelled (SIGTERM) → models='partial', downloads='cancelled'.
+        Resumable; clears stale resolved_sha pin."""
+        now = int(time.time())
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE models SET status='partial', resolved_sha=NULL WHERE alias=?",
+                (alias,),
+            )
+            self._conn.execute(
+                "UPDATE downloads SET status='cancelled', finished_at=? "
+                "WHERE alias=? AND status IN ('queued','downloading')",
+                (now, alias),
+            )
+
+    def mark_orphan_interrupted(self, alias: str) -> None:
+        """Manager restart mid-download → models='partial', downloads='error'
+        with explanatory message. Subsequent reconcile may promote back
+        to 'installed' if the snapshot is actually complete on disk."""
+        now = int(time.time())
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE models SET status='partial', resolved_sha=NULL WHERE alias=?",
+                (alias,),
+            )
+            self._conn.execute(
+                "UPDATE downloads SET status='error', "
+                "error='interrupted by manager restart', finished_at=? "
+                "WHERE alias=? AND status IN ('queued','downloading')",
+                (now, alias),
+            )
+
+    def mark_partial(self, alias: str) -> None:
+        """Cache-only delete on an aliased row → row stays, status flips.
+        Clears cache_path and resolved_sha."""
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE models SET status='partial', cache_path=NULL, "
+                "resolved_sha=NULL WHERE alias=?",
+                (alias,),
+            )
+
+    def delete_install_row(self, alias: str) -> int:
+        """Full removal — models row + cascading downloads. Returns rows
+        affected. Used by full-removal endpoint and synthetic cache-only
+        delete paths."""
+        with self._lock, self._conn:
+            cursor = self._conn.execute(
+                "DELETE FROM models WHERE alias=? AND source='ui_install'",
+                (alias,),
+            )
+            return cursor.rowcount
+
+    def recover_orphan_downloads(self) -> int:
+        """Find downloads rows in queued/downloading state at startup and
+        mark them interrupted. Returns the count. Called BEFORE
+        apply_config() so reconcile may then promote any whose snapshot
+        is actually complete on disk."""
+        with self._lock, self._conn:
+            rows = self._conn.execute(
+                "SELECT alias FROM downloads WHERE status IN ('queued','downloading')"
+            ).fetchall()
+            count = 0
+            now = int(time.time())
+            for r in rows:
+                alias = r["alias"]
+                self._conn.execute(
+                    "UPDATE models SET status='partial', resolved_sha=NULL WHERE alias=?",
+                    (alias,),
+                )
+                self._conn.execute(
+                    "UPDATE downloads SET status='error', "
+                    "error='interrupted by manager restart', finished_at=? "
+                    "WHERE alias=? AND status IN ('queued','downloading')",
+                    (now, alias),
+                )
+                count += 1
+            return count
 
     # ── test/internal helpers ─────────────────────────────────────────
 
@@ -418,24 +837,54 @@ class Catalog:
         last_used_at: Optional[int] = None,
         request_count: int = 0,
         extra_args: str = "[]",
+        revision: str = "main",
+        resolved_sha: Optional[str] = None,
     ) -> None:
         """Direct insert bypassing config validation. Used by Phase 4 for
         ui_install rows and by tests for synthetic-alias rows."""
-        with self._conn:
+        with self._lock, self._conn:
             self._conn.execute(
                 """
                 INSERT OR REPLACE INTO models (
                   alias, hf_model_id, source, quantization, gpus,
                   max_model_len, storage_location, cache_path, size_bytes,
-                  status, installed_at, last_used_at, request_count, extra_args
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  status, installed_at, last_used_at, request_count,
+                  extra_args, revision, resolved_sha
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (alias, hf_model_id, source, quantization, gpus,
                  max_model_len, storage_location, cache_path, size_bytes,
-                 status, installed_at, last_used_at, request_count, extra_args),
+                 status, installed_at, last_used_at, request_count,
+                 extra_args, revision, resolved_sha),
             )
 
+    def _raw_insert_download(
+        self,
+        *,
+        alias: str,
+        status: str,
+        started_at: int,
+        finished_at: Optional[int] = None,
+        bytes_downloaded: int = 0,
+        total_bytes: Optional[int] = None,
+        error: Optional[str] = None,
+        pid: Optional[int] = None,
+    ) -> int:
+        """Test/fixture helper for seeding downloads rows."""
+        with self._lock, self._conn:
+            cursor = self._conn.execute(
+                "INSERT INTO downloads (alias, pid, status, started_at, "
+                "finished_at, bytes_downloaded, total_bytes, error) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (alias, pid, status, started_at, finished_at,
+                 bytes_downloaded, total_bytes, error),
+            )
+            return cursor.lastrowid
+
     def _to_catalog_row(self, row) -> CatalogRow:
+        # SQLite Row supports keys() — older rows from the migration may
+        # have None for new columns. Use .get-style fallbacks.
+        keys = set(row.keys())
         return CatalogRow(
             alias=row["alias"],
             hf_model_id=row["hf_model_id"],
@@ -451,6 +900,8 @@ class Catalog:
             last_used_at=row["last_used_at"],
             request_count=row["request_count"] or 0,
             extra_args=row["extra_args"] or "[]",
+            revision=(row["revision"] if "revision" in keys and row["revision"] else "main"),
+            resolved_sha=(row["resolved_sha"] if "resolved_sha" in keys else None),
         )
 
     def _to_download_row(self, row) -> DownloadRow:

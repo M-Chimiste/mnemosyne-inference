@@ -27,18 +27,25 @@ from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
 from typing import Awaitable, Callable, Optional, TypeVar
 
-from huggingface_hub import snapshot_download, HfApi
-from huggingface_hub.utils import RepositoryNotFoundError, GatedRepoError
-
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.openapi.docs import get_redoc_html, get_swagger_ui_html
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from pydantic import BaseModel, Field
 import uvicorn
 
 import config as config_mod
-from catalog import Catalog, ReconcileResult, SyncResult, is_cache_only_alias, open_catalog
-from config import Config, ConfigError, load_config, load_env
+import downloader
+from catalog import (
+    Catalog,
+    ReconcileResult,
+    SyncResult,
+    is_cache_only_alias,
+    open_catalog,
+    synthetic_alias,
+)
+from config import Config, ConfigError, GpuPlan, load_config, load_env
+from downloader import ConflictError, repo_cache_dir
 from profiles import ResolvedProfile, resolve_profile
 from runtime import RuntimeState, build_vllm_argv, build_vllm_env, derive_tp_size
 
@@ -115,10 +122,6 @@ _load_error:     Optional[BaseException]    = None
 _eviction_task:  Optional[asyncio.Task]     = None
 _flush_task:     Optional[asyncio.Task]     = None
 _legacy_alias_warned: set[str]              = set()
-
-# Download state — keyed by model_id
-# Each entry: {status, started_at, finished_at, error, path}
-_downloads: dict[str, dict] = {}
 
 # Phase 1 globals — populated by lifespan, reset by tests/conftest.py::client.
 _config: Optional[Config] = None
@@ -398,6 +401,7 @@ def _synthesize_profile(model_id: str) -> ResolvedProfile:
         storage_name=storage_name,
         storage_path=storage_path,
         extra_args=(),
+        revision="main",
     )
 
 
@@ -412,9 +416,17 @@ def _resolve_request_model(requested: str) -> ResolvedProfile:
     # Tier 1 — config alias
     if any(m.alias == requested for m in _config.models):
         return resolve_profile(requested, _config, _catalog)
-    # Tier 2 — catalog ui_install row
+    # Tier 2 — catalog ui_install row (must be fully installed)
     row = _catalog.get_model(requested)
     if row is not None and row.source == "ui_install":
+        if row.status != "installed":
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"alias '{requested}' is not ready (status='{row.status}'); "
+                    "complete the install before routing requests to it"
+                ),
+            )
         return resolve_profile(requested, _config, _catalog)
     # Tier 3 — legacy MODEL_ALIASES dict
     if requested in MODEL_ALIASES:
@@ -535,6 +547,17 @@ async def manager_lifespan(
     _catalog = open_catalog()
     _runtime = RuntimeState()
     _legacy_alias_warned.clear()
+    # Recover any in-flight downloads from a prior run BEFORE apply_config —
+    # reconcile inside apply_config may then promote any whose snapshot is
+    # actually complete on disk back to 'installed'. Reverse order would
+    # let reconcile promote first, then recovery would clobber back.
+    recovered = downloader.reap_orphans_on_startup(_catalog)
+    if recovered:
+        logger.warning(
+            "Recovered %d interrupted download(s) from previous run — "
+            "marked partial; user can retry from UI/CLI.",
+            recovered,
+        )
     sync, rec = _catalog.apply_config(
         _config.models,
         _config.storage.default,
@@ -583,6 +606,14 @@ async def manager_lifespan(
                     await t
         _eviction_task = None
         _flush_task = None
+        # SIGTERM all in-flight installs so we exit cleanly. Worker's
+        # prctl(PDEATHSIG) is belt-and-suspenders on Linux; this is the
+        # primary cleanup path.
+        for alias in list(downloader._active.keys()):
+            try:
+                downloader.cancel_install(alias)
+            except Exception as e:
+                logger.warning("cancel_install(%s) during shutdown: %s", alias, e)
         # Final flush before _kill_vllm wipes _runtime — belt-and-suspenders
         # in case _kill_vllm's internal flush ever moves.
         _flush_usage_best_effort("lifespan shutdown")
@@ -865,55 +896,396 @@ async def list_cached_models():
 
 
 # ──────────────────────────────────────────────
-# HuggingFace Hub download endpoints
+# Install / download endpoints (Phase 4)
 # ──────────────────────────────────────────────
 
-def _run_download(model_id: str, revision: str, ignore_patterns: list[str], hf_token: Optional[str]):
-    """
-    Blocking download — runs in a background thread so it doesn't
-    tie up the async event loop. Updates _downloads[model_id] in place.
-    """
-    _downloads[model_id]["status"]     = "downloading"
-    _downloads[model_id]["started_at"] = time.time()
 
+_LEGACY_DEFAULT_IGNORE = [
+    "*.pt", "*.bin", "*.msgpack",
+    "flax_model*", "tf_model*", "rust_model*",
+]
+
+
+class InstallRequest(BaseModel):
+    alias: str
+    model: str
+    revision: str = "main"
+    quantization: Optional[str] = None
+    gpus: GpuPlan = "all"
+    max_model_len: Optional[int] = None
+    storage: Optional[str] = None
+    extra_args: list[str] = Field(default_factory=list)
+    size_estimate_gb: Optional[float] = None
+    ignore_patterns: Optional[list[str]] = None
+
+
+def _resolve_storage(name: Optional[str]) -> tuple[str, str]:
+    """Return (storage_name, storage_path). 400 on missing/unwritable."""
+    if _config is None:
+        raise HTTPException(503, "config not loaded")
+    target = name if name is not None else _config.storage.default
+    for loc in _config.storage.locations:
+        if loc.name == target:
+            if not os.path.isdir(loc.path):
+                raise HTTPException(400, f"storage path '{loc.path}' does not exist")
+            if not os.access(loc.path, os.W_OK):
+                raise HTTPException(400, f"storage path '{loc.path}' is not writable")
+            return loc.name, loc.path
+    raise HTTPException(400, f"unknown storage location '{target}'")
+
+
+def _free_space_check(storage_path: str, size_estimate_gb: Optional[float], model_id: str) -> None:
+    if size_estimate_gb is None:
+        logger.warning(
+            "install for '%s': size_estimate_gb not provided — skipping free-space check",
+            model_id,
+        )
+        return
     try:
-        path = snapshot_download(
-            repo_id=model_id,
-            revision=revision or None,
-            ignore_patterns=ignore_patterns or None,
-            cache_dir=os.path.join(HF_HOME, "hub"),
-            token=hf_token or os.getenv("HUGGING_FACE_HUB_TOKEN") or None,
-            local_files_only=False,
+        usage = shutil.disk_usage(storage_path)
+    except OSError as e:
+        logger.warning("disk_usage failed on '%s': %s", storage_path, e)
+        return
+    needed = size_estimate_gb * 1.1 * 1e9
+    if usage.free < needed:
+        raise HTTPException(
+            400,
+            f"insufficient free space at '{storage_path}': "
+            f"have {usage.free / 1e9:.1f} GB, need ~{needed / 1e9:.1f} GB",
         )
-        _downloads[model_id]["status"]      = "complete"
-        _downloads[model_id]["path"]        = path
-        _downloads[model_id]["finished_at"] = time.time()
-        logger.info(f"✓ Download complete: {model_id} → {path}")
 
-    except RepositoryNotFoundError:
-        _downloads[model_id]["status"] = "error"
-        _downloads[model_id]["error"]  = f"Repository '{model_id}' not found on HF Hub"
-        logger.error(_downloads[model_id]["error"])
 
-    except GatedRepoError:
-        _downloads[model_id]["status"] = "error"
-        _downloads[model_id]["error"]  = (
-            f"'{model_id}' is a gated model. "
-            "Set HUGGING_FACE_HUB_TOKEN in docker-compose.yml and accept the model license on huggingface.co"
+def _gpus_to_json(gpus: GpuPlan) -> list:
+    """Normalize a GpuPlan to a JSON-serializable list shape that
+    catalog.start_install_tx accepts."""
+    if gpus == "all":
+        return "all"
+    return list(gpus)
+
+
+async def _install_internal(
+    request: InstallRequest,
+    *,
+    hf_token_override: Optional[str] = None,
+    allow_cache_only_alias: bool = False,
+) -> dict:
+    """Body of POST /manager/install, factored out so the legacy shim can
+    reuse it without going through HTTP."""
+    if _config is None or _catalog is None:
+        raise HTTPException(503, "manager not initialized")
+
+    alias = request.alias
+    model_id = request.model
+
+    # Validate alias shape (defense in depth — Pydantic does most). Synthetic
+    # cache aliases are internal to the legacy /manager/download shim.
+    if is_cache_only_alias(alias):
+        if not allow_cache_only_alias:
+            raise HTTPException(
+                400,
+                f"alias '{alias}' uses reserved synthetic cache namespace",
+            )
+    elif not config_mod._ALIAS_RE.match(alias):
+        raise HTTPException(400, f"alias '{alias}' has invalid shape")
+
+    # 1. Refuse if alias is in config.yaml — config wins.
+    if any(m.alias == alias for m in _config.models):
+        raise HTTPException(409, f"alias '{alias}' is defined in config.yaml; config wins")
+    # 2. Refuse if alias is currently resident.
+    if _runtime.resident_alias == alias:
+        raise HTTPException(409, f"alias '{alias}' is currently loaded; unload first")
+    # 3. Refuse if there is an active install for this alias.
+    if downloader.is_active(alias):
+        raise HTTPException(409, f"alias '{alias}' has an install in progress")
+
+    storage_name, storage_path = _resolve_storage(request.storage)
+
+    # 4. Refuse if (storage, hf_model_id) already has an active install.
+    other = _catalog.find_active_for(storage_name, model_id)
+    if other and other != alias:
+        raise HTTPException(
+            409,
+            {
+                "message": f"another install is in progress for '{model_id}' on storage '{storage_name}'",
+                "conflict_alias": other,
+            },
         )
-        logger.error(_downloads[model_id]["error"])
 
+    _free_space_check(storage_path, request.size_estimate_gb, model_id)
+
+    gpus_for_catalog = _gpus_to_json(request.gpus)
+
+    _catalog.start_install_tx(
+        alias=alias,
+        hf_model_id=model_id,
+        source="ui_install",
+        revision=request.revision,
+        quantization=request.quantization,
+        gpus=gpus_for_catalog,
+        max_model_len=request.max_model_len,
+        storage_location=storage_name,
+        extra_args=list(request.extra_args),
+    )
+
+    hf_token = hf_token_override
+    if hf_token is None:
+        hf_token = os.environ.get("HUGGING_FACE_HUB_TOKEN") or None
+
+    cache_dir = os.path.join(storage_path, "hub")
+    try:
+        downloader.start_install(
+            alias=alias,
+            model_id=model_id,
+            revision=request.revision,
+            cache_dir=cache_dir,
+            ignore_patterns=request.ignore_patterns,
+            hf_token=hf_token,
+            catalog=_catalog,
+            storage_location=storage_name,
+        )
+    except ConflictError as e:
+        # Race: another worker came in between our checks and the spawn.
+        # Roll back the catalog row we just inserted to avoid a stuck
+        # 'queued' state.
+        _catalog.mark_error(alias, "race with concurrent install")
+        raise HTTPException(
+            409,
+            {"message": "concurrent install conflict", "conflict_alias": e.conflict_alias},
+        )
     except Exception as e:
-        _downloads[model_id]["status"] = "error"
-        _downloads[model_id]["error"]  = str(e)
-        logger.error(f"Download failed for {model_id}: {e}")
+        _catalog.mark_error(alias, f"failed to spawn worker: {e}")
+        raise HTTPException(500, f"failed to spawn worker: {e}")
 
+    return {
+        "alias": alias,
+        "status": "queued",
+        "poll": f"/manager/install/{alias}",
+    }
+
+
+@admin_router.post("/manager/install", status_code=202, tags=["installs"])
+async def install_model(request: InstallRequest):
+    """Install a model: queue a download, run it in a killable subprocess,
+    and add an aliased catalog row.
+
+    On 202: poll `/manager/install/{alias}` for status. The catalog row
+    starts at status='queued'; on completion it transitions to 'installed'.
+    """
+    return await _install_internal(request)
+
+
+@admin_router.post("/manager/install/{alias}/cancel", tags=["installs"])
+async def cancel_install_route(alias: str):
+    if not downloader.is_active(alias):
+        raise HTTPException(404, f"no active install for alias '{alias}'")
+    downloader.cancel_install(alias)
+    return {"alias": alias, "status": "cancelling"}
+
+
+def _wipe_cache_or_error(cache_dir: str) -> bool:
+    if _config is None:
+        raise HTTPException(503, "manager not initialized")
+    try:
+        return downloader.force_wipe_cache(
+            cache_dir,
+            allowed_roots=[loc.path for loc in _config.storage.locations],
+        )
+    except downloader.CacheWipeError as e:
+        raise HTTPException(400, str(e)) from e
+
+
+@admin_router.post("/manager/install/{alias}/retry", status_code=202, tags=["installs"])
+async def retry_install_route(alias: str, force: bool = False):
+    if _config is None or _catalog is None:
+        raise HTTPException(503, "manager not initialized")
+    row = _catalog.get_model(alias)
+    if row is None or row.source != "ui_install":
+        raise HTTPException(404, f"no installable row for alias '{alias}'")
+    if downloader.is_active(alias):
+        raise HTTPException(409, f"alias '{alias}' already has an active install")
+    other = _catalog.find_active_for(row.storage_location, row.hf_model_id)
+    if other and other != alias:
+        raise HTTPException(
+            409,
+            {"message": "concurrent install conflict", "conflict_alias": other},
+        )
+
+    _, storage_path = _resolve_storage(row.storage_location)
+    if force:
+        _wipe_cache_or_error(repo_cache_dir(storage_path, row.hf_model_id))
+
+    extra_args = json.loads(row.extra_args) if row.extra_args else []
+    gpus = json.loads(row.gpus)
+    return await _install_internal(
+        InstallRequest(
+            alias=alias,
+            model=row.hf_model_id,
+            revision=row.revision,
+            quantization=row.quantization,
+            gpus=gpus,
+            max_model_len=row.max_model_len,
+            storage=row.storage_location,
+            extra_args=extra_args,
+        ),
+    )
+
+
+def _install_status_payload(alias: str) -> dict:
+    """Compose the API shape for an install-status query."""
+    if _catalog is None:
+        raise HTTPException(503, "manager not initialized")
+    row = _catalog.get_model(alias)
+    if row is None:
+        raise HTTPException(404, f"no install row for alias '{alias}'")
+    download = _catalog.get_download(alias)
+    payload = row.to_api_dict()
+    payload["alias"] = alias
+    if download is not None:
+        payload["download"] = {
+            "status": download.status,
+            "started_at": download.started_at,
+            "finished_at": download.finished_at,
+            "bytes_downloaded": download.bytes_downloaded,
+            "total_bytes": download.total_bytes,
+            "error": download.error,
+            "pid": download.pid,
+        }
+        if download.started_at:
+            end = download.finished_at or int(time.time())
+            payload["download"]["elapsed_seconds"] = round(end - download.started_at, 1)
+    payload["active"] = downloader.is_active(alias)
+    return payload
+
+
+@admin_router.get("/manager/install/{alias}", tags=["installs"])
+async def install_status_route(alias: str):
+    return _install_status_payload(alias)
+
+
+def _check_aliased_delete_safety(row, exclude_alias: Optional[str] = None) -> None:
+    """Refuse deletes when any sibling is resident or has an active install."""
+    if _catalog is None:
+        raise HTTPException(503, "manager not initialized")
+    siblings = _catalog.find_repo_siblings(
+        row.storage_location, row.hf_model_id, exclude_alias=None,
+    )
+    for s in siblings:
+        if _runtime.resident_alias == s.alias:
+            raise HTTPException(
+                409,
+                f"alias '{s.alias}' is currently loaded; unload first",
+            )
+        if downloader.is_active(s.alias):
+            raise HTTPException(
+                409,
+                f"alias '{s.alias}' has an active install; cancel first",
+            )
+
+
+@admin_router.delete("/manager/install/{alias}/cache", tags=["installs"])
+async def delete_install_cache(alias: str):
+    """Wipe the on-disk cache for the alias's repo cache dir; mark every
+    sibling 'partial'. Row stays. Used by the UI's 'remove from disk' action."""
+    if _config is None or _catalog is None:
+        raise HTTPException(503, "manager not initialized")
+    row = _catalog.get_model(alias)
+    if row is None or row.source != "ui_install":
+        raise HTTPException(404, f"no installable row for alias '{alias}'")
+    _check_aliased_delete_safety(row)
+
+    _, storage_path = _resolve_storage(row.storage_location)
+    cache_dir = repo_cache_dir(storage_path, row.hf_model_id)
+    _wipe_cache_or_error(cache_dir)
+    # Mark every sibling 'partial' — the wipe nuked their cache too.
+    siblings = _catalog.find_repo_siblings(row.storage_location, row.hf_model_id)
+    for s in siblings:
+        _catalog.mark_partial(s.alias)
+    return {"alias": alias, "status": "partial", "siblings_marked": [s.alias for s in siblings]}
+
+
+@admin_router.delete("/manager/install/{alias}", tags=["installs"])
+async def delete_install_full(alias: str):
+    """Wipe the on-disk cache AND remove the catalog row entirely.
+    Sibling rows are NOT removed; they get marked 'partial'."""
+    if _config is None or _catalog is None:
+        raise HTTPException(503, "manager not initialized")
+    row = _catalog.get_model(alias)
+    if row is None or row.source != "ui_install":
+        raise HTTPException(404, f"no installable row for alias '{alias}'")
+    _check_aliased_delete_safety(row)
+
+    _, storage_path = _resolve_storage(row.storage_location)
+    cache_dir = repo_cache_dir(storage_path, row.hf_model_id)
+    _wipe_cache_or_error(cache_dir)
+    siblings = _catalog.find_repo_siblings(
+        row.storage_location, row.hf_model_id, exclude_alias=alias,
+    )
+    _catalog.delete_install_row(alias)
+    for s in siblings:
+        _catalog.mark_partial(s.alias)
+    return {"alias": alias, "status": "removed"}
+
+
+@admin_router.delete("/manager/cache/{model_id:path}", tags=["installs"])
+async def delete_cache_legacy(model_id: str):
+    """Legacy by-HF-id cache delete. Wipes the repo cache dir on every
+    storage location it appears, marks aliased rows 'partial', deletes
+    synthetic cache-only rows.
+    """
+    if _config is None or _catalog is None:
+        raise HTTPException(503, "manager not initialized")
+    rows = _catalog.lookup_by_hf_id(model_id)
+    if not rows:
+        raise HTTPException(404, f"no catalog rows for HF id '{model_id}'")
+
+    # Refuse if any matched alias (or any sibling) is resident/active.
+    for r in rows:
+        if _runtime.resident_alias == r.alias:
+            raise HTTPException(409, f"alias '{r.alias}' is currently loaded; unload first")
+    other = _catalog.find_active_by_hf_id(model_id)
+    if other:
+        raise HTTPException(
+            409,
+            {"message": "active download in progress", "conflict_alias": other},
+        )
+
+    # Resolve every storage location before wiping anything so catalog and disk
+    # cannot be partially mutated if one row references a bad location.
+    storage_paths: dict[str, str] = {}
+    for r in rows:
+        if r.storage_location not in storage_paths:
+            _, storage_path = _resolve_storage(r.storage_location)
+            storage_paths[r.storage_location] = storage_path
+
+    # Group by storage_location and wipe each repo dir once.
+    wiped_locations: set[str] = set()
+    for storage_location, storage_path in storage_paths.items():
+        cache_dir = repo_cache_dir(storage_path, model_id)
+        _wipe_cache_or_error(cache_dir)
+        wiped_locations.add(storage_location)
+
+    removed: list[str] = []
+    marked_partial: list[str] = []
+    for r in rows:
+        if is_cache_only_alias(r.alias):
+            _catalog.delete_install_row(r.alias)
+            removed.append(r.alias)
+        else:
+            _catalog.mark_partial(r.alias)
+            marked_partial.append(r.alias)
+    return {
+        "model": model_id,
+        "wiped": sorted(wiped_locations),
+        "removed_rows": removed,
+        "marked_partial": marked_partial,
+    }
+
+
+# ── Legacy /manager/download* shim (Phase 4 §4c) ─────────────────────
 
 @admin_router.post("/manager/download", tags=["downloads"])
 async def download_model(request: Request):
-    """
-    Download a model from HuggingFace Hub into the cache volume.
-    Runs in the background — returns immediately and tracks progress.
+    """Legacy v0 endpoint preserved for back-compat. Body shape:
 
     ```json
     {
@@ -924,94 +1296,151 @@ async def download_model(request: Request):
     }
     ```
 
-    Only `model` is required. Use `ignore_patterns` to skip non-safetensor
-    formats and cut download size (e.g. `["*.pt", "*.bin"]`).
-    `hf_token` overrides the container environment variable for this request.
-
-    Poll `/manager/download/{model}` to track progress.
+    Internally creates a synthetic-alias `ui_install` row keyed on the
+    model id and runs through the same subprocess pipeline as
+    /manager/install. `hf_token` is threaded into the subprocess env only;
+    the manager's os.environ is not mutated.
     """
     body = await request.json()
     model_id = body.get("model")
     if not model_id:
         raise HTTPException(status_code=400, detail="'model' field required")
 
-    existing = _downloads.get(model_id, {})
-    if existing.get("status") == "downloading":
+    alias = synthetic_alias(model_id)
+    revision = body.get("revision") or "main"
+    hf_token = body.get("hf_token")
+    if "ignore_patterns" in body:
+        ignore = body.get("ignore_patterns")
+    else:
+        # v0 default: skip non-safetensor formats.
+        ignore = list(_LEGACY_DEFAULT_IGNORE)
+
+    # If the same synthetic alias is already running, return the v0
+    # 'already_downloading' shape rather than 409.
+    if downloader.is_active(alias):
         return {
-            "status":  "already_downloading",
-            "model":   model_id,
-            "poll":    f"/manager/download/{model_id.replace('/', '%2F')}",
+            "status": "already_downloading",
+            "model": model_id,
+            "poll": f"/manager/download/{model_id.replace('/', '%2F')}",
         }
 
-    revision        = body.get("revision", "main")
-    ignore_patterns = body.get("ignore_patterns", ["*.pt", "*.bin", "*.msgpack", "flax_model*", "tf_model*", "rust_model*"])
-    hf_token        = body.get("hf_token")
+    try:
+        await _install_internal(
+            InstallRequest(
+                alias=alias,
+                model=model_id,
+                revision=revision,
+                gpus="all",
+                ignore_patterns=ignore,
+            ),
+            hf_token_override=hf_token,
+            allow_cache_only_alias=True,
+        )
+    except HTTPException as e:
+        # Surface as v0-shaped failure (no started_at / poll).
+        raise
 
-    # Seed the status entry before the thread starts
-    _downloads[model_id] = {
-        "model":       model_id,
-        "status":      "queued",
-        "revision":    revision,
-        "started_at":  None,
-        "finished_at": None,
-        "path":        None,
-        "error":       None,
-    }
-
-    thread = threading.Thread(
-        target=_run_download,
-        args=(model_id, revision, ignore_patterns, hf_token),
-        daemon=True,
-        name=f"download-{model_id}",
-    )
-    thread.start()
-
-    logger.info(f"Download started (background): {model_id}")
     return {
-        "status":  "started",
-        "model":   model_id,
-        "poll":    f"/manager/download/{model_id.replace('/', '%2F')}",
+        "status": "started",
+        "model": model_id,
+        "poll": f"/manager/download/{model_id.replace('/', '%2F')}",
     }
+
+
+def _legacy_download_payload(alias: str, model_id: str) -> dict:
+    """v0-shaped status object built from the catalog. Returned shape
+    matches Phase 0: {model, status, started_at, finished_at, path, error,
+    revision, elapsed_seconds?}."""
+    if _catalog is None:
+        raise HTTPException(503, "manager not initialized")
+    row = _catalog.get_model(alias)
+    if row is None:
+        raise HTTPException(404, f"No download record for '{model_id}'")
+    download = _catalog.get_download(alias)
+    out: dict = {
+        "model": model_id,
+        "status": _legacy_status(row.status, download.status if download else None),
+        "started_at": download.started_at if download else None,
+        "finished_at": download.finished_at if download else None,
+        "path": row.cache_path,
+        "error": download.error if download else None,
+        "revision": row.revision,
+    }
+    if download and download.started_at:
+        end = download.finished_at or int(time.time())
+        out["elapsed_seconds"] = round(end - download.started_at, 1)
+    return out
+
+
+def _legacy_status(model_status: str, download_status: Optional[str]) -> str:
+    """Map (models.status, downloads.status) → v0 enum
+    {queued, downloading, complete, error}."""
+    if model_status == "installed":
+        return "complete"
+    if model_status == "error":
+        return "error"
+    if download_status == "downloading":
+        return "downloading"
+    if download_status == "complete":
+        return "complete"
+    if download_status == "error":
+        return "error"
+    if download_status == "cancelled":
+        return "error"
+    return "queued"
 
 
 @admin_router.get("/manager/download/{model_id:path}", tags=["downloads"])
 async def download_status(model_id: str):
-    """
-    Check the status of a download.
-
-    Status values: queued | downloading | complete | error
-    """
-    entry = _downloads.get(model_id)
-    if not entry:
-        raise HTTPException(status_code=404, detail=f"No download record for '{model_id}'")
-
-    result = dict(entry)
-
-    # Add human-readable elapsed / duration
-    if entry.get("started_at"):
-        end = entry.get("finished_at") or time.time()
-        result["elapsed_seconds"] = round(end - entry["started_at"], 1)
-
-    return result
+    """Legacy by-HF-id download status. Resolves via the synthetic alias
+    so config or ui_install rows for the same HF id don't shadow it."""
+    alias = synthetic_alias(model_id)
+    return _legacy_download_payload(alias, model_id)
 
 
 @admin_router.get("/manager/downloads", tags=["downloads"])
 async def list_downloads():
-    """List all download records (active, complete, and failed)."""
-    return {"downloads": list(_downloads.values())}
+    """List every catalog row that has an associated download (any status).
+    Returns v0-shaped records for back-compat."""
+    if _catalog is None:
+        return {"downloads": []}
+    out = []
+    for r in _catalog.list_models():
+        download = _catalog.get_download(r.alias)
+        if download is None:
+            continue
+        record = {
+            "model": r.hf_model_id,
+            "alias": r.alias,
+            "status": _legacy_status(r.status, download.status),
+            "started_at": download.started_at,
+            "finished_at": download.finished_at,
+            "path": r.cache_path,
+            "error": download.error,
+            "revision": r.revision,
+        }
+        if download.started_at:
+            end = download.finished_at or int(time.time())
+            record["elapsed_seconds"] = round(end - download.started_at, 1)
+        out.append(record)
+    return {"downloads": out}
 
 
 @admin_router.delete("/manager/download/{model_id:path}", tags=["downloads"])
 async def clear_download_record(model_id: str):
-    """
-    Remove a download status record (does not delete the cached files).
-    Useful for clearing errors before retrying.
-    """
-    if model_id not in _downloads:
-        raise HTTPException(status_code=404, detail=f"No record for '{model_id}'")
-    if _downloads[model_id].get("status") == "downloading":
-        raise HTTPException(status_code=409, detail="Download is in progress — cannot clear an active download")
-    _downloads.pop(model_id)
+    """Legacy clear-record. Removes the synthetic-alias row only — does
+    not delete cached files. Refuses while a download is active."""
+    if _catalog is None:
+        raise HTTPException(503, "manager not initialized")
+    alias = synthetic_alias(model_id)
+    row = _catalog.get_model(alias)
+    if row is None:
+        raise HTTPException(404, f"No record for '{model_id}'")
+    if downloader.is_active(alias):
+        raise HTTPException(
+            409, "Download is in progress — cannot clear an active download"
+        )
+    _catalog.delete_install_row(alias)
     return {"cleared": model_id}
 
 

@@ -96,10 +96,12 @@ def _reset_globals():
 
     # Phase 0 globals (Phase 2 retired the {current_model, _loading,
     # _current_tp, _current_gpu_mem, model_load_time, loading_lock} set —
-    # they live on _runtime now).
+    # they live on _runtime now). Phase 4 retired _downloads.
     vllm_manager.vllm_process = None
-    vllm_manager._downloads = {}
     vllm_manager.MODEL_ALIASES = {}
+    # Phase 4 — reset live download handles.
+    import downloader
+    downloader._active.clear()
     # Phase 1 globals
     if vllm_manager._catalog is not None:
         vllm_manager._catalog.close()
@@ -243,3 +245,56 @@ def rich_client(rich_config, stub_vllm):
         with TestClient(vllm_manager.app) as c:
             c.auth = ("admin", "test-pw")
             yield c, stub_vllm
+
+
+class StubDownloader:
+    """In-process replacement for downloader.start_install. Captures the
+    last call's args, optionally flips catalog state directly so the
+    /v1/* test paths can transition through queued → installed without
+    spawning a real subprocess."""
+
+    def __init__(self):
+        self.calls: list = []
+        self.auto_complete: bool = False
+        self.fail_with_error: str | None = None
+
+    def __call__(self, *, alias, model_id, revision, cache_dir, ignore_patterns,
+                 hf_token, catalog, storage_location):
+        self.calls.append({
+            "alias": alias,
+            "model_id": model_id,
+            "revision": revision,
+            "cache_dir": cache_dir,
+            "ignore_patterns": ignore_patterns,
+            "hf_token": hf_token,
+            "storage_location": storage_location,
+        })
+
+        class Handle:
+            pass
+        h = Handle()
+        h.alias = alias
+
+        if self.fail_with_error:
+            catalog.mark_error(alias, self.fail_with_error)
+        elif self.auto_complete:
+            # Pretend the worker finished cleanly. Caller-controlled cache
+            # path; sha derived from a fake constant.
+            sha = "b" * 40
+            catalog.mark_complete(
+                alias,
+                cache_path=f"{cache_dir}/models--placeholder/snapshots/{sha}",
+                size_bytes=0,
+                resolved_sha=sha,
+            )
+        return h
+
+
+@pytest.fixture
+def stub_downloader(monkeypatch):
+    """Replace downloader.start_install with a sync stub that records
+    invocation args. Yields the StubDownloader so tests can inspect
+    captured calls and toggle auto_complete / fail_with_error."""
+    stub = StubDownloader()
+    monkeypatch.setattr(vllm_manager.downloader, "start_install", stub)
+    yield stub

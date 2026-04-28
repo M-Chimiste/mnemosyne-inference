@@ -73,6 +73,8 @@ def build_vllm_argv(
         argv += ["--quantization", profile.quantization]
     if profile.max_model_len is not None:
         argv += ["--max-model-len", str(profile.max_model_len)]
+    if profile.revision and profile.revision != "main":
+        argv += ["--revision", profile.revision]
     argv += list(profile.extra_args)
     return argv
 

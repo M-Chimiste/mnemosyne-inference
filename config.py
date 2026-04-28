@@ -105,6 +105,7 @@ class ModelProfile(BaseModel):
     max_model_len: int | None = None
     storage: str | None = None
     extra_args: list[str] = Field(default_factory=list)
+    revision: str = "main"
 
     @field_validator("alias")
     @classmethod

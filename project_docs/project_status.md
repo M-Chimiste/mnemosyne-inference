@@ -4,13 +4,20 @@
 
 ## Current state
 
-**Active milestone:** M2 — Safe Admin Boundary  
-**Active phase:** Phase 3 next.
+**Active milestone:** M3 — Operational catalog
+**Active phase:** Phase 5 next.
 
-M1 is implemented: the manager now has the config/catalog/profile substrate
-from Phase 1 and the profile-driven runtime lifecycle from Phase 2. The
-runtime still uses one FastAPI app and the legacy single listener; inference
-and admin plane separation remains Phase 3.
+M3 is implemented: `/manager/install` is end-to-end functional with
+killable subprocess downloads, restart-recoverable state, multi-drive
+storage routing, and a catalog-backed legacy `/manager/download` shim.
+The post-implementation Phase 4 review fixes have also landed: async
+install routes now return `202 Accepted`, public install rejects reserved
+synthetic cache aliases, stale `resolved_sha` pins are cleared on every
+invalidation path, worker error details are preserved, and cache deletion
+fails closed when a wipe cannot be safely completed. The catalog is now the
+single source of truth for "what is on disk, where, and in what state."
+HF search + vLLM compatibility filter (Phase 5) and the admin UI (Phase 6)
+are next.
 
 ## Phase status
 
@@ -19,9 +26,9 @@ and admin plane separation remains Phase 3.
 | 0 — Foundation & safety rails | Examples, test harness, vLLM pin | ✅ Done; download baseline fixed (2026-04-28) |
 | 1 — Config, profiles, storage, catalog core | Declarative YAML config + SQLite catalog + profile resolver | ✅ Done (2026-04-28) |
 | 2 — Runtime lifecycle, lazy load, queue, idle eviction | Profile-driven `_start_vllm`, swap queue, idle eviction | ✅ Done (2026-04-28) |
-| 3 — Plane separation & auth | Two FastAPI apps (inference :8000, admin :8001), HTTP Basic | ⏭ Next |
-| 4 — Install, download, cache, multi-drive | `/manager/install` + cancellable subprocess downloads | ⏳ Pending |
-| 5 — HF search & vLLM compatibility filter | `GET /manager/hf/search`, runtime registry introspection | ⏳ Pending |
+| 3 — Plane separation & auth | Two FastAPI apps (inference :8000, admin :8001), HTTP Basic | ✅ Done (2026-04-28) |
+| 4 — Install, download, cache, multi-drive | `/manager/install` + cancellable subprocess downloads | ✅ Done; review fixes landed (2026-04-28) |
+| 5 — HF search & vLLM compatibility filter | `GET /manager/hf/search`, runtime registry introspection | ⏭ Next |
 | 6 — Admin UI | React + Vite SPA on the admin port | ⏳ Pending |
 | 7 — Packaging, compose, docs | Multi-stage Dockerfile, compose mounts, ops docs | ⏳ Pending |
 | 8 — Verification & hardening | PRD acceptance scenarios | ⏳ Pending |
@@ -43,7 +50,7 @@ and admin plane separation remains Phase 3.
 - `profiles.py` resolves config/catalog aliases into `ResolvedProfile`.
 - Manager endpoints now expose reload, configured profiles, storage locations,
   and catalog rows.
-- Archived plan: [plans/phase_1_plan.md](plans/phase_1_plan.md).
+- Archived plan: [plans/phase_1.md](plans/phase_1.md).
 
 **Phase 2**
 
@@ -63,39 +70,133 @@ and admin plane separation remains Phase 3.
 - `vllm-ctl status` prints the new fields when present.
 - Archived plan: [plans/phase_2.md](plans/phase_2.md).
 
+**Phase 3**
+
+- Split inference (`:8000`) and admin (`:8001`) FastAPI apps; admin is a
+  superset that includes `/v1/*` for back-compat plus `/manager/*` and
+  `/docs`/`/openapi.json`/`/redoc`.
+- HTTP Basic auth on admin (`admin:$ADMIN_PASSWORD`); fail-safe bind to
+  `127.0.0.1` inside the container when `ADMIN_PASSWORD` is unset.
+- Optional bearer auth on inference (`INFERENCE_API_KEY`); admin Basic and
+  inference Bearer headers are stripped before proxying to the inner vLLM.
+- Inner vLLM moved from loopback `:8001` → `:8002` so the admin app and inner
+  server don't collide in the container's network namespace; startup checks
+  reject overrides that re-collide.
+- Single SIGTERM handler at the asyncio gather level shuts down both
+  uvicorn instances atomically.
+- Archived plan: [plans/phase_3.md](plans/phase_3.md).
+
+**Phase 4**
+
+- `POST /manager/install` accepts a fully-typed install request (alias,
+  HF model, revision, quantization, GPU plan, `max_model_len`, storage,
+  `extra_args`) and persists `models` + `downloads` rows in one
+  transaction, then spawns a killable subprocess download. It now returns
+  `202 Accepted` for queued async work.
+- New `download_worker.py` (subprocess) wraps `huggingface_hub.snapshot_download`,
+  emits line-delimited JSON progress on stdout, exits 130 on SIGTERM, and
+  links its lifetime to the manager via `prctl(PR_SET_PDEATHSIG)` on Linux.
+- New `downloader.py` (manager-side) owns the live subprocess registry,
+  parses worker stdout in a daemon thread, and writes catalog state through
+  `mark_*` methods. HF token is threaded explicitly into a per-subprocess
+  env dict — `os.environ` is never mutated.
+- Catalog gains a `threading.RLock`, `revision TEXT NOT NULL DEFAULT 'main'`
+  + `resolved_sha TEXT` columns (with additive ALTERs for legacy DBs), and
+  9 transition methods (`start_install_tx`, `mark_downloading`,
+  `mark_progress`, `mark_complete`, `mark_error`, `mark_cancelled`,
+  `mark_orphan_interrupted`, `mark_partial`, `delete_install_row`) plus
+  `find_active_for` (revision-agnostic), `find_active_by_hf_id`,
+  `find_repo_siblings`, `lookup_by_hf_id`, and `recover_orphan_downloads`.
+- Reconcile resolves snapshots per-revision via `<repo>/refs/<revision>` (or
+  the direct `snapshots/<sha>/` path for 40-hex commit SHAs), refuses
+  `..`/absolute paths, and skips `status='error'` rows so a hard-failed
+  install isn't silently promoted by a half-finished snapshot.
+- Resident vLLM is pinned to the exact downloaded snapshot: `mark_complete`
+  records `resolved_sha`, and `resolve_profile` prefers it over the symbolic
+  revision when emitting `--revision`. Every invalidation path clears stale
+  SHA pins, including start/retry, error, cancel, orphan recovery, partial
+  transitions, config-sync cache invalidation, and reconcile downgrades.
+- Restart recovery: lifespan calls `reap_orphans_on_startup` **before**
+  `apply_config` so reconcile may promote any whose snapshot landed cleanly
+  before the crash; lifespan teardown SIGTERMs all in-flight installs.
+- Cache delete has two flavors with sibling-aware cleanup:
+  `DELETE /manager/install/{alias}/cache` (wipe disk + mark every sibling
+  `partial`) and `DELETE /manager/install/{alias}` (wipe + remove this row);
+  `DELETE /manager/cache/{model_id:path}` is the legacy by-HF-id form.
+  All paths are gated on residency + active-download checks; wipes refuse
+  paths outside `storage.locations[].path` and fail closed without mutating
+  catalog rows when a wipe is refused or fails.
+- `_resolve_request_model` gates `ui_install` rows on `status='installed'`
+  so queued/partial/error installs return a 409 instead of falling through
+  to raw-HF passthrough or launching vLLM with incomplete weights.
+- Public `/manager/install` rejects reserved synthetic cache aliases
+  (`__cache__:` / `__cache__/`). Only the legacy `/manager/download` shim may
+  create synthetic cache rows internally.
+- Worker-emitted error messages are preserved in the catalog instead of
+  being collapsed to a generic subprocess exit code.
+- Legacy `POST /manager/download` is now a catalog-backed shim that
+  preserves the v0 body shape (including the default `ignore_patterns`
+  list), creates a synthetic-alias `ui_install` row, and runs through the
+  same subprocess pipeline. Status route resolves by exact synthetic alias
+  so config/UI rows for the same HF id don't shadow it. Per-request
+  `hf_token` is threaded into the worker env without polluting
+  `os.environ`. The in-memory `_downloads` dict is retired.
+- `vllm-ctl` adds `install`, `install-cancel`, `install-retry`,
+  `install-status`, and `cache-delete` commands; `download` and
+  `download-status` continue to work through the catalog-backed shim.
+- Archived plan: [plans/phase_4.md](plans/phase_4.md).
+
 ## Verification
 
 Latest host verification on macOS, no CUDA required:
 
-- `python -m pytest -q` → `133 passed`
-- `python -m py_compile vllm_manager.py runtime.py config.py catalog.py profiles.py`
+- `uv run pytest -q` → `210 passed` (145 prior + 65 new/extended across
+  `test_install.py`, `test_install_recovery.py`, `test_cache_delete.py`,
+  `test_download_legacy.py`, `test_downloader.py`, plus catalog and
+  runtime extensions, including the Phase 4 review-fix regressions).
+- `python -m py_compile vllm_manager.py runtime.py config.py catalog.py profiles.py downloader.py download_worker.py`
 - `bash -n vllm-ctl`
 
 Workstation/GPU smoke validation is still outstanding:
 
 - Rebuild/start the container.
-- Load a configured alias and confirm argv/env behavior in logs.
-- Swap through `/v1/chat/completions`.
-- Run same-target concurrent request smoke.
-- Confirm idle eviction and catalog usage increments.
+- Install a small model end-to-end (`vllm-ctl install qwen-coder-1_5b ...`)
+  and watch progress through `install-status`.
+- Install to a non-default storage location and confirm the cache lands on
+  the right drive.
+- Cancel a long install mid-flight, then `install-retry` (default and
+  `--force`) to confirm resumable / wipe semantics.
+- Restart the container during a download and confirm `partial` →
+  `install-retry` recovery.
+- Cache-delete (`--alias` cache-only, `--alias --remove-row`, and legacy
+  by-HF-id) with the existing safety gates.
+- Plane-separation regression: `POST /manager/install` is 404 on `:8000`,
+  reachable on `:8001` behind Basic auth.
+- Confirm `HUGGING_FACE_HUB_TOKEN` from the legacy `/manager/download` body
+  does not appear in `docker exec vllm-manager env`.
 
 ## Open follow-ups
 
-- **Phase 3 security boundary.** Split inference/admin listeners before adding
-  more mutating admin routes.
-- **Inner/admin port collision.** The inner vLLM server still defaults to
-  loopback `8001`, which conflicts with the future `admin_port=8001`; Phase 3
-  must move or isolate that binding.
 - **External `docker-compose.yml`.** Lives outside the repo at
-  `~/vllm-manager/`. Phase 7 documents final mounts and exposed ports.
-- **vLLM pin staleness.** Refresh the pinned nightly before the next workstation
-  rebuild if the nightly index has moved.
+  `~/vllm-manager/`. Phase 4 expects each `storage.locations[].path` from
+  `config.yaml` to be bind-mounted; the example file gets a multi-drive
+  comment block update. Phase 7 documents the final canonical layout.
+- **Phase 5 search.** `GET /manager/hf/search` and the runtime vLLM-compat
+  registry introspection are next; Phase 5 also auto-populates
+  `size_estimate_gb` so UI installs always have the free-space pre-check.
+- **vLLM pin staleness.** Refresh the pinned nightly before the next
+  workstation rebuild if the nightly index has moved.
+- **Free-space pre-check absent on manual installs.** `vllm-ctl install`
+  warns when `--size-gb` is not supplied; UI flow (Phase 6) will set it
+  from search results so the warning fires only on hand-crafted curl/CLI.
 
 ## Quick links
 
 - [PRD](PRD.md) — product requirements and decision log.
 - [Implementation plan](implementation_plan.md) — phase breakdown and milestones.
 - [Phase 0 plan](plans/phase_0.md)
-- [Phase 1 plan](plans/phase_1_plan.md)
+- [Phase 1 plan](plans/phase_1.md)
 - [Phase 2 plan](plans/phase_2.md)
+- [Phase 3 plan](plans/phase_3.md)
+- [Phase 4 plan](plans/phase_4.md)
 - [Smoke checks](smoke_checks.md)

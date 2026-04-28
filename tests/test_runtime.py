@@ -104,6 +104,24 @@ def test_argv_extra_args_appended_verbatim_last():
     assert argv[-2:] == ["--limit-mm-per-prompt", "image=4"]
 
 
+def test_argv_revision_omitted_when_main():
+    argv = build_vllm_argv(_profile(), host="h", port=1, tp_size=1)
+    assert "--revision" not in argv
+
+
+def test_argv_revision_emitted_when_set():
+    p = ResolvedProfile(
+        alias="x", model="org/x", gpus="all",
+        quantization=None, max_model_len=None,
+        gpu_memory_utilization=0.9, trust_remote_code=False,
+        storage_name="d", storage_path="/d", extra_args=(),
+        revision="dev",
+    )
+    argv = build_vllm_argv(p, host="h", port=1, tp_size=1)
+    idx = argv.index("--revision")
+    assert argv[idx + 1] == "dev"
+
+
 def test_argv_extra_args_can_override_our_flags():
     # User restating --gpu-memory-utilization 0.5 after our 0.9 — vLLM takes
     # the last occurrence. We emit the user's value LAST so it wins.

@@ -56,7 +56,8 @@ RUN pip install --no-cache-dir \
 
 # ── App ────────────────────────────────────────────────────────────
 WORKDIR /app
-COPY vllm_manager.py config.py catalog.py profiles.py runtime.py ./
+COPY vllm_manager.py config.py catalog.py profiles.py runtime.py \
+     downloader.py download_worker.py ./
 
 # HuggingFace cache lives in a volume (models persist across restarts)
 ENV HF_HOME=/hf-cache

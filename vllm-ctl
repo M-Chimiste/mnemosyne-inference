@@ -531,6 +531,189 @@ else:
   echo ""
 }
 
+cmd_install() {
+  local alias="$1"; shift
+  local model="$1"; shift
+
+  if [[ -z "$alias" || -z "$model" ]]; then
+    red "Usage: vllm-ctl install <alias> <model> [--revision REF] [--quant X] \\"
+    red "         [--gpus all|0,1] [--max-len N] [--storage NAME] [--size-gb F] \\"
+    red "         [-- vllm extra args...]"
+    exit 1
+  fi
+
+  local revision="main"
+  local quant=""
+  local gpus="all"
+  local max_len=""
+  local storage=""
+  local size_gb=""
+  local extra_args=()
+  local pass_through=false
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --revision) revision="$2"; shift 2 ;;
+      --quant)    quant="$2";    shift 2 ;;
+      --gpus)     gpus="$2";     shift 2 ;;
+      --max-len)  max_len="$2";  shift 2 ;;
+      --storage)  storage="$2";  shift 2 ;;
+      --size-gb)  size_gb="$2";  shift 2 ;;
+      --)         pass_through=true; shift ;;
+      *)
+        if $pass_through; then extra_args+=("$1"); fi
+        shift ;;
+    esac
+  done
+
+  local extra_json
+  extra_json=$(printf '%s\n' "${extra_args[@]}" | python3 -c "
+import sys, json
+lines = [l.strip() for l in sys.stdin if l.strip()]
+print(json.dumps(lines))
+")
+
+  local payload
+  payload=$(python3 -c "
+import json
+gpus_raw = '${gpus}'
+if gpus_raw == 'all':
+    gpus = 'all'
+else:
+    gpus = [int(x) for x in gpus_raw.split(',') if x.strip()]
+d = {
+  'alias':    '${alias}',
+  'model':    '${model}',
+  'revision': '${revision}',
+  'gpus':     gpus,
+  'extra_args': ${extra_json},
+}
+if '${quant}':   d['quantization']      = '${quant}'
+if '${max_len}': d['max_model_len']     = int('${max_len}')
+if '${storage}': d['storage']           = '${storage}'
+if '${size_gb}': d['size_estimate_gb']  = float('${size_gb}')
+print(json.dumps(d))
+")
+
+  echo ""
+  green "Queuing install: ${alias} ← ${model}"
+  echo  "  revision=${revision}  gpus=${gpus}"
+  [[ -n "$quant" ]]   && echo "  quantization=${quant}"
+  [[ -n "$max_len" ]] && echo "  max_model_len=${max_len}"
+  [[ -n "$storage" ]] && echo "  storage=${storage}"
+  [[ -n "$size_gb" ]] && echo "  size_estimate_gb=${size_gb}"
+  echo ""
+
+  local result
+  result=$(api POST /manager/install -d "$payload") || {
+    red "  ✗ Install request failed (admin not reachable or 4xx)."
+    exit 1
+  }
+  echo "$result" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+print(f\"  Status: {d.get('status','?')}\")
+print(f\"  Poll:   vllm-ctl install-status {d.get('alias','?')}\")
+"
+  echo ""
+}
+
+cmd_install_cancel() {
+  local alias="$1"
+  [[ -z "$alias" ]] && { red "Usage: vllm-ctl install-cancel <alias>"; exit 1; }
+  api POST "/manager/install/${alias}/cancel" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+print(f\"  Status: {d.get('status','?')} ({d.get('alias','')})\")
+"
+}
+
+cmd_install_retry() {
+  local alias="$1"; shift
+  [[ -z "$alias" ]] && { red "Usage: vllm-ctl install-retry <alias> [--force]"; exit 1; }
+  local force=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --force) force="?force=true"; shift ;;
+      *) shift ;;
+    esac
+  done
+  api POST "/manager/install/${alias}/retry${force}" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+print(f\"  Status: {d.get('status','?')} ({d.get('alias','')})\")
+"
+}
+
+cmd_install_status() {
+  local alias="$1"
+  if [[ -z "$alias" ]]; then
+    api GET /manager/catalog | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+rows = d.get('models', [])
+if not rows:
+    print('  (catalog empty)')
+else:
+    for r in rows:
+        print(f\"  {r['alias']:24}  {r['hf_model_id']:50}  status={r['status']}  revision={r.get('revision','main')}\")
+"
+    return
+  fi
+  api GET "/manager/install/${alias}" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+status = d.get('status','?')
+print(f\"  Alias:   {d.get('alias')}\")
+print(f\"  Model:   {d.get('hf_model_id')}\")
+print(f\"  Status:  {status}\")
+print(f\"  Revision:    {d.get('revision','main')}\")
+print(f\"  Storage:     {d.get('storage_location')}\")
+print(f\"  Cache path:  {d.get('cache_path') or '-'}\")
+dl = d.get('download') or {}
+if dl:
+    bd = dl.get('bytes_downloaded') or 0
+    tb = dl.get('total_bytes') or 0
+    pct = (bd / tb * 100) if tb else None
+    print(f\"  Download:    {dl.get('status','?')}  {bd}/{tb or '?'} bytes\" + (f' ({pct:.1f}%)' if pct is not None else ''))
+    if dl.get('error'):
+        print(f\"  Error:       {dl['error']}\")
+    if 'elapsed_seconds' in dl:
+        print(f\"  Elapsed:     {dl['elapsed_seconds']:.1f}s\")
+"
+}
+
+cmd_cache_delete() {
+  local alias=""
+  local remove_row=false
+  local model_id=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --alias) alias="$2"; shift 2 ;;
+      --remove-row) remove_row=true; shift ;;
+      *) model_id="$1"; shift ;;
+    esac
+  done
+  if [[ -n "$alias" ]]; then
+    if $remove_row; then
+      api DELETE "/manager/install/${alias}"
+    else
+      api DELETE "/manager/install/${alias}/cache"
+    fi
+    echo ""
+    return
+  fi
+  if [[ -z "$model_id" ]]; then
+    red "Usage: vllm-ctl cache-delete <model-id>"
+    red "       vllm-ctl cache-delete --alias <alias> [--remove-row]"
+    exit 1
+  fi
+  local encoded
+  encoded=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${model_id}', safe=''))")
+  api DELETE "/manager/cache/${encoded}"
+  echo ""
+}
+
 cmd_help() {
   cat <<EOF
 
@@ -561,7 +744,23 @@ $(bold "Config:")
   reload                  Reread config.yaml without restarting the container
   storage                 List storage locations with free space
 
-$(bold "Downloads:")
+$(bold "Installs (Phase 4):")
+  install <alias> <model> [opts]  Install a model under a stable alias
+    --revision <ref>              Branch/tag/commit SHA (default: main)
+    --quant <q>                   Quantization (awq, fp8, ...)
+    --gpus all|0,1                GPU plan (default: all)
+    --max-len N                   Override max_model_len
+    --storage <name>              Storage location name (default: storage.default)
+    --size-gb F                   Size estimate (drives free-space pre-check)
+    -- <vllm extra args>          Extra args appended verbatim
+  install-cancel <alias>          SIGTERM the worker (resumable)
+  install-retry <alias> [--force] Re-spawn the worker; --force wipes cache
+  install-status [alias]          Show one row or list all
+  cache-delete <model-id>         Legacy by-HF-id cache delete
+  cache-delete --alias <alias> [--remove-row]
+                                  Cache-only or full removal of an aliased install
+
+$(bold "Downloads (legacy v0 shim — preserved):")
   download <model> [opts]     Download a model from HuggingFace Hub
     --revision <ref>            Branch/tag/commit (default: main)
     --token hf_...              HF token for this request (overrides env)
@@ -612,6 +811,11 @@ case "${1:-help}" in
   download) shift; cmd_download "$@" ;;
   download-status) shift; cmd_download_status "$@" ;;
   downloads) cmd_downloads ;;
+  install)         shift; cmd_install "$@" ;;
+  install-cancel)  shift; cmd_install_cancel "$@" ;;
+  install-retry)   shift; cmd_install_retry "$@" ;;
+  install-status)  shift; cmd_install_status "$@" ;;
+  cache-delete)    shift; cmd_cache_delete "$@" ;;
   logs)    shift; cmd_logs "$@" ;;
   chat)    shift; cmd_chat "$@" ;;
   shell)   cmd_shell ;;

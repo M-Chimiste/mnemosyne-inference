@@ -242,6 +242,7 @@ def test_catalog_row_shape(client, tmp_paths):
         "alias", "hf_model_id", "source", "quantization", "gpus",
         "max_model_len", "storage_location", "cache_path", "size_bytes",
         "status", "installed_at", "last_used_at", "request_count", "extra_args",
+        "revision", "resolved_sha",
     }
     assert row["alias"] == "qw"
     assert row["hf_model_id"] == "org/qw"
@@ -250,3 +251,5 @@ def test_catalog_row_shape(client, tmp_paths):
     assert row["request_count"] == 0
     assert row["extra_args"] == []
     assert row["gpus"] == "all"
+    assert row["revision"] == "main"
+    assert row["resolved_sha"] is None

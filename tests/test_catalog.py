@@ -22,14 +22,30 @@ def _profiles(*specs) -> list[ModelProfile]:
     return [ModelProfile.model_validate(s) for s in specs]
 
 
-def _make_cache(storage_root, hf_id: str, *, with_weights: bool = True) -> str:
-    """Build a fake HF cache dir under <storage_root>/hub/models--<...>/snapshots/<rev>/."""
+def _make_cache(
+    storage_root,
+    hf_id: str,
+    *,
+    with_weights: bool = True,
+    revision: str = "main",
+    sha: str = "a" * 40,
+) -> str:
+    """Build a fake HF cache dir under <storage_root>/hub/models--<...>/snapshots/<sha>/.
+
+    Also writes refs/<revision> pointing at the snapshot SHA so reconcile's
+    revision-aware resolver finds it.
+    """
     safe = "models--" + hf_id.replace("/", "--")
-    snap = os.path.join(storage_root, "hub", safe, "snapshots", "abc123")
+    repo = os.path.join(storage_root, "hub", safe)
+    snap = os.path.join(repo, "snapshots", sha)
     os.makedirs(snap, exist_ok=True)
     if with_weights:
         with open(os.path.join(snap, "model.safetensors"), "wb") as f:
             f.write(b"\x00")
+    refs_dir = os.path.join(repo, "refs")
+    os.makedirs(refs_dir, exist_ok=True)
+    with open(os.path.join(refs_dir, revision), "w") as f:
+        f.write(sha)
     return snap
 
 
@@ -133,6 +149,8 @@ def test_sync_config_wins_on_ui_install_collision(cat):
         source="ui_install",
         gpus='"all"',
         storage_location="tmp",
+        cache_path="/cached/path",
+        resolved_sha="a" * 40,
         last_used_at=999,
         request_count=5,
     )
@@ -144,9 +162,35 @@ def test_sync_config_wins_on_ui_install_collision(cat):
     row = cat.get_model("dup")
     assert row.source == "config"
     assert row.hf_model_id == "real/model"
-    # Durable metadata is preserved even on the source flip.
+    assert row.status == "partial"
+    assert row.cache_path is None
+    assert row.resolved_sha is None
+    # Usage metadata is preserved even on the source flip.
     assert row.last_used_at == 999
     assert row.request_count == 5
+
+
+def test_sync_config_change_clears_cached_snapshot(cat):
+    cat.sync_from_config(
+        _profiles({"alias": "qw", "model": "org/qw", "revision": "main"}),
+        default_storage="tmp",
+    )
+    cat._conn.execute(
+        "UPDATE models SET status='installed', cache_path=?, resolved_sha=? "
+        "WHERE alias='qw'",
+        ("/cached/path", "b" * 40),
+    )
+    cat._conn.commit()
+
+    cat.sync_from_config(
+        _profiles({"alias": "qw", "model": "org/qw", "revision": "dev"}),
+        default_storage="tmp",
+    )
+    row = cat.get_model("qw")
+    assert row.revision == "dev"
+    assert row.status == "partial"
+    assert row.cache_path is None
+    assert row.resolved_sha is None
 
 
 def test_sync_preserves_durable_metadata(cat):
@@ -324,3 +368,213 @@ def test_synthetic_alias_validation_rejected_by_pydantic():
     for bad in ("__cache__:abcd1234", "__cache__/legacy"):
         with pytest.raises(ValidationError):
             ModelProfile.model_validate({"alias": bad, "model": "org/m"})
+
+
+# ── Phase 4: revision + resolved_sha plumbing ────────────────────────
+
+
+def test_fresh_db_has_revision_and_resolved_sha_columns(cat):
+    cols = {row["name"] for row in cat._conn.execute("PRAGMA table_info('models')")}
+    assert "revision" in cols
+    assert "resolved_sha" in cols
+
+
+def test_sync_persists_revision(cat):
+    cat.sync_from_config(
+        _profiles({"alias": "qw", "model": "org/qw", "revision": "dev"}),
+        default_storage="tmp",
+    )
+    row = cat.get_model("qw")
+    assert row.revision == "dev"
+
+
+def test_sync_updates_revision_on_yaml_edit(cat):
+    cat.sync_from_config(
+        _profiles({"alias": "qw", "model": "org/qw", "revision": "main"}),
+        default_storage="tmp",
+    )
+    cat.sync_from_config(
+        _profiles({"alias": "qw", "model": "org/qw", "revision": "v2"}),
+        default_storage="tmp",
+    )
+    assert cat.get_model("qw").revision == "v2"
+
+
+# ── Phase 4: install transitions ─────────────────────────────────────
+
+
+def _seed_queued(cat, alias="qw", model="org/qw"):
+    return cat.start_install_tx(
+        alias=alias,
+        hf_model_id=model,
+        revision="main",
+        gpus="all",
+        storage_location="tmp",
+    )
+
+
+def test_start_install_tx_creates_both_rows(cat):
+    download_id = _seed_queued(cat)
+    row = cat.get_model("qw")
+    assert row is not None
+    assert row.source == "ui_install"
+    assert row.status == "queued"
+    assert row.resolved_sha is None
+    assert isinstance(download_id, int) and download_id > 0
+    download = cat.get_download("qw")
+    assert download.status == "queued"
+
+
+def test_mark_downloading_keeps_models_queued(cat):
+    _seed_queued(cat)
+    cat.mark_downloading("qw", pid=42, total_bytes=1234)
+    row = cat.get_model("qw")
+    assert row.status == "queued"  # models row stays queued
+    download = cat.get_download("qw")
+    assert download.status == "downloading"
+    assert download.pid == 42
+    assert download.total_bytes == 1234
+
+
+def test_mark_complete_records_resolved_sha(cat):
+    _seed_queued(cat)
+    cat.mark_complete(
+        "qw", cache_path="/path/snap/abc", size_bytes=99, resolved_sha="d" * 40,
+    )
+    row = cat.get_model("qw")
+    assert row.status == "installed"
+    assert row.resolved_sha == "d" * 40
+    assert row.cache_path == "/path/snap/abc"
+
+
+def test_mark_error_clears_resolved_sha(cat):
+    _seed_queued(cat)
+    cat.mark_complete("qw", cache_path="/p", size_bytes=1, resolved_sha="e" * 40)
+    cat.mark_error("qw", "bang")
+    row = cat.get_model("qw")
+    assert row.status == "error"
+    assert row.resolved_sha is None
+
+
+def test_mark_cancelled_keeps_partial(cat):
+    _seed_queued(cat)
+    cat.mark_downloading("qw", pid=99, total_bytes=None)
+    cat.mark_cancelled("qw")
+    row = cat.get_model("qw")
+    assert row.status == "partial"
+    assert row.resolved_sha is None
+
+
+def test_mark_partial_clears_cache_path(cat):
+    _seed_queued(cat)
+    cat.mark_complete("qw", cache_path="/p", size_bytes=1, resolved_sha="f" * 40)
+    cat.mark_partial("qw")
+    row = cat.get_model("qw")
+    assert row.status == "partial"
+    assert row.cache_path is None
+    assert row.resolved_sha is None
+
+
+def test_delete_install_row_cascades(cat):
+    _seed_queued(cat)
+    n = cat.delete_install_row("qw")
+    assert n == 1
+    assert cat.get_model("qw") is None
+    assert cat.get_download("qw") is None  # CASCADE
+
+
+def test_find_active_for_revision_agnostic(cat):
+    """v4: dedup uses (storage, hf_id) only — revision excluded."""
+    _seed_queued(cat, alias="alpha", model="Qwen/X")
+    cat.mark_downloading("alpha", pid=99, total_bytes=None)
+    other = cat.find_active_for("tmp", "Qwen/X")
+    assert other == "alpha"
+    # Storage isolation:
+    assert cat.find_active_for("other", "Qwen/X") is None
+
+
+def test_find_active_by_hf_id(cat):
+    _seed_queued(cat, alias="alpha", model="Qwen/Z")
+    cat.mark_downloading("alpha", pid=99, total_bytes=None)
+    assert cat.find_active_by_hf_id("Qwen/Z") == "alpha"
+    cat.mark_complete("alpha", cache_path="/p", size_bytes=1, resolved_sha=None)
+    assert cat.find_active_by_hf_id("Qwen/Z") is None
+
+
+def test_recover_orphan_downloads(cat):
+    _seed_queued(cat, alias="alpha")
+    cat.mark_downloading("alpha", pid=42, total_bytes=None)
+    n = cat.recover_orphan_downloads()
+    assert n == 1
+    row = cat.get_model("alpha")
+    assert row.status == "partial"
+    download = cat.get_download("alpha")
+    assert download.status == "error"
+
+
+def test_start_install_tx_clears_stale_resolved_sha(cat):
+    """Reinstall after a previous successful install must clear the SHA pin
+    so the resident vLLM doesn't latch onto stale weights."""
+    _seed_queued(cat)
+    cat.mark_complete("qw", cache_path="/p", size_bytes=1, resolved_sha="a" * 40)
+    cat.start_install_tx(
+        alias="qw",
+        hf_model_id="org/qw",
+        revision="main",
+        gpus="all",
+        storage_location="tmp",
+    )
+    row = cat.get_model("qw")
+    assert row.resolved_sha is None
+
+
+def test_lookup_by_hf_id_orders_ui_install_first(cat):
+    cat.sync_from_config(_profiles({"alias": "config-row", "model": "Qwen/Y"}), default_storage="tmp")
+    cat._raw_insert_model(
+        alias="ui-row", hf_model_id="Qwen/Y", source="ui_install",
+        gpus='"all"', storage_location="tmp",
+    )
+    rows = cat.lookup_by_hf_id("Qwen/Y")
+    assert len(rows) == 2
+    assert rows[0].alias == "ui-row"
+
+
+def test_legacy_db_migration_adds_revision(tmp_path):
+    """A pre-Phase-4 DB without revision/resolved_sha columns gets
+    migrated by _migrate_revision_column on open."""
+    import sqlite3
+    db = str(tmp_path / "legacy.db")
+    conn = sqlite3.connect(db)
+    conn.executescript("""
+        CREATE TABLE schema_version (version INTEGER PRIMARY KEY);
+        CREATE TABLE models (
+          alias TEXT PRIMARY KEY, hf_model_id TEXT NOT NULL,
+          source TEXT NOT NULL, quantization TEXT, gpus TEXT NOT NULL,
+          max_model_len INTEGER, storage_location TEXT NOT NULL,
+          cache_path TEXT, size_bytes INTEGER, status TEXT NOT NULL,
+          installed_at INTEGER, last_used_at INTEGER, request_count INTEGER DEFAULT 0,
+          extra_args TEXT
+        );
+        CREATE TABLE downloads (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          alias TEXT NOT NULL REFERENCES models(alias) ON DELETE CASCADE,
+          pid INTEGER, status TEXT NOT NULL, started_at INTEGER NOT NULL,
+          finished_at INTEGER, bytes_downloaded INTEGER DEFAULT 0,
+          total_bytes INTEGER, error TEXT
+        );
+        INSERT INTO models (alias, hf_model_id, source, gpus, storage_location, status)
+        VALUES ('legacy', 'org/legacy', 'config', '"all"', 'tmp', 'partial');
+    """)
+    conn.commit()
+    conn.close()
+
+    cat = open_catalog(db)
+    try:
+        cols = {row["name"] for row in cat._conn.execute("PRAGMA table_info('models')")}
+        assert "revision" in cols
+        assert "resolved_sha" in cols
+        row = cat.get_model("legacy")
+        assert row.revision == "main"  # default backfill
+        assert row.resolved_sha is None
+    finally:
+        cat.close()

@@ -91,17 +91,22 @@ def test_downloads_empty_initially(client):
 
 
 def test_download_enqueue_returns_current_contract(client, monkeypatch):
-    class FakeThread:
-        def __init__(self, target, args, daemon, name):
-            self.target = target
-            self.args = args
-            self.daemon = daemon
-            self.name = name
+    """Phase 4: legacy /manager/download is now catalog-backed.
 
-        def start(self):
-            return None
+    Spawning is stubbed so we don't actually run the worker subprocess;
+    the route still creates a synthetic-alias row at status='queued'.
+    """
+    captured: dict = {}
 
-    monkeypatch.setattr(vllm_manager.threading, "Thread", FakeThread)
+    def fake_start_install(**kwargs):
+        captured.update(kwargs)
+        # Don't spawn a real worker — leave the catalog row at queued
+        # so the assertions below see it.
+        class H:
+            alias = kwargs["alias"]
+        return H()
+
+    monkeypatch.setattr(vllm_manager.downloader, "start_install", fake_start_install)
 
     model_id = "hf-internal-testing/tiny-random-gpt2"
     r = client.post("/manager/download", json={"model": model_id})
@@ -113,8 +118,17 @@ def test_download_enqueue_returns_current_contract(client, monkeypatch):
         "poll": "/manager/download/hf-internal-testing%2Ftiny-random-gpt2",
     }
 
-    assert vllm_manager._downloads[model_id]["status"] == "queued"
-    assert vllm_manager._downloads[model_id]["started_at"] is None
-    assert vllm_manager._downloads[model_id]["finished_at"] is None
-    assert vllm_manager._downloads[model_id]["path"] is None
-    assert vllm_manager._downloads[model_id]["error"] is None
+    from catalog import synthetic_alias
+    alias = synthetic_alias(model_id)
+    row = vllm_manager._catalog.get_model(alias)
+    assert row is not None
+    assert row.hf_model_id == model_id
+    assert row.source == "ui_install"
+    assert row.status == "queued"
+    assert row.revision == "main"
+
+    # The legacy default ignore_patterns must be passed to the worker.
+    assert captured["ignore_patterns"] == [
+        "*.pt", "*.bin", "*.msgpack",
+        "flax_model*", "tf_model*", "rust_model*",
+    ]
