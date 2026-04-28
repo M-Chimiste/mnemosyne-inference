@@ -22,7 +22,8 @@ def test_status_no_model_loaded(client):
     r = client.get("/manager/status")
     assert r.status_code == 200
     body = r.json()
-    assert set(body.keys()) == {
+    # Phase 0/1 keys must still be present (plan §8.5: subset, not exact).
+    phase_0_keys = {
         "loaded_model",
         "loading",
         "vllm_pid",
@@ -32,13 +33,16 @@ def test_status_no_model_loaded(client):
         "gpu_mem_util",
         "inner_endpoint",
     }
+    assert phase_0_keys.issubset(body.keys())
     assert body["loaded_model"] is None
     assert body["loading"] is False
     assert body["vllm_pid"] is None
     assert body["loaded_at"] is None
     assert body["loaded_at_human"] is None
-    assert body["tp_size"] == vllm_manager.DEFAULT_TP
-    assert body["gpu_mem_util"] == vllm_manager.DEFAULT_GPU_MEM
+    # Phase 2: tp_size and gpu_mem_util reflect the resident profile, so they
+    # are None when nothing is loaded (Phase 0 returned the env-driven defaults).
+    assert body["tp_size"] is None
+    assert body["gpu_mem_util"] is None
 
 
 def test_aliases_crud_roundtrip(client):
@@ -67,13 +71,17 @@ def test_aliases_post_rejects_missing_fields(client):
     assert r.status_code == 400
 
 
-def test_resolve_model_known_alias(client):
+def test_resolve_request_model_legacy_alias_dict(client):
+    """Phase 2 tier 3: legacy MODEL_ALIASES still resolves (with WARN logged)."""
     vllm_manager.MODEL_ALIASES["coder"] = "Qwen/Qwen2.5-Coder-7B-Instruct"
-    assert vllm_manager._resolve_model("coder") == "Qwen/Qwen2.5-Coder-7B-Instruct"
+    profile = vllm_manager._resolve_request_model("coder")
+    assert profile.model == "Qwen/Qwen2.5-Coder-7B-Instruct"
 
 
-def test_resolve_model_passthrough(client):
-    assert vllm_manager._resolve_model("org/some-model") == "org/some-model"
+def test_resolve_request_model_raw_passthrough(client):
+    """Phase 2 tier 4: org/repo form synthesizes a profile."""
+    profile = vllm_manager._resolve_request_model("org/some-model")
+    assert profile.model == "org/some-model"
 
 
 def test_downloads_empty_initially(client):

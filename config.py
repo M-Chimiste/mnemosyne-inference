@@ -157,7 +157,7 @@ class ConfigDiagnostics:
     storage_warnings: list[str] = field(default_factory=list)
 
 
-def _gpu_indices_or_none() -> list[int] | None:
+def gpu_indices_or_none() -> list[int] | None:
     """Return visible GPU indices via `nvidia-smi -L`, or None if probe fails."""
     try:
         proc = subprocess.run(
@@ -180,7 +180,7 @@ def _validate_runtime(cfg: Config) -> ConfigDiagnostics:
     """Hard-fail on missing GPU indices when the probe succeeds. Soft-warn on
     storage path issues (PRD §5.12 — drives can be temporarily unmounted)."""
     diag = ConfigDiagnostics()
-    gpus = _gpu_indices_or_none()
+    gpus = gpu_indices_or_none()
     if gpus is None:
         diag.gpu_warnings.append(
             "nvidia-smi unavailable; skipping GPU index validation"

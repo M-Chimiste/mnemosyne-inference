@@ -377,6 +377,24 @@ class Catalog:
         rows = self._conn.execute("SELECT * FROM downloads ORDER BY id").fetchall()
         return [self._to_download_row(r) for r in rows]
 
+    # ── usage flush ───────────────────────────────────────────────────
+
+    def bump_usage(self, alias: str, last_used_at: Optional[float], delta: int) -> None:
+        """Buffered usage flush from the runtime hot path. Single UPDATE.
+
+        No-op when nothing to flush, or when the alias doesn't have a row
+        (raw-id passthrough — UPDATE silently matches zero rows). Caller
+        is responsible for zeroing its in-memory delta after a successful
+        call."""
+        if delta <= 0 or last_used_at is None:
+            return
+        with self._conn:
+            self._conn.execute(
+                "UPDATE models SET last_used_at=?, request_count = request_count + ? "
+                "WHERE alias=?",
+                (int(last_used_at), delta, alias),
+            )
+
     def schema_version(self) -> int:
         row = self._conn.execute("SELECT version FROM schema_version").fetchone()
         return int(row["version"]) if row else -1

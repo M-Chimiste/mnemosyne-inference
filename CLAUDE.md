@@ -4,9 +4,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Repository scope
 
-Three files do all the work:
+Core runtime files:
 
 - [vllm_manager.py](vllm_manager.py) — FastAPI service that supervises a vLLM subprocess and proxies an OpenAI-compatible API to it.
+- [config.py](config.py), [catalog.py](catalog.py), [profiles.py](profiles.py), [runtime.py](runtime.py) — YAML/env loading, SQLite catalog, profile resolution, and pure vLLM argv/env builders.
 - [Dockerfile](Dockerfile) — CUDA 12.8 / Python 3.11 image that bakes in PyTorch (cu128), vLLM nightly (Blackwell sm_100 kernels), FastAPI/uvicorn/httpx/huggingface_hub. There is no `requirements.txt` or `pyproject.toml`; dependencies live only in the Dockerfile.
 - [vllm-ctl](vllm-ctl) — Bash CLI that wraps `docker compose` + the manager HTTP API.
 
@@ -16,9 +17,9 @@ Three files do all the work:
 
 **Two HTTP servers, one container.** The manager (FastAPI, port 8000, LAN-facing) runs as the entrypoint. It launches `vllm.entrypoints.openai.api_server` as a child `subprocess.Popen` on port 8001 (loopback). The manager proxies `/v1/*` requests to the inner vLLM and exposes `/manager/*` control endpoints (load, unload, status, models, download, aliases) plus `/health` and `/docs`.
 
-**One model at a time.** `_start_vllm` always calls `_kill_vllm` first — switching models is destroy + relaunch, not hot-swap. Global state (`current_model`, `vllm_process`, `_current_tp`, `_current_gpu_mem`, `_loading`) is module-level; `loading_lock` (asyncio) serializes load/unload.
+**One model at a time.** `_start_vllm(profile)` always calls `_kill_vllm` first — switching models is destroy + relaunch, not hot-swap. Live model state is held in `_runtime` (`RuntimeState`), with `vllm_process` kept separately. `_swap_lock` serializes load/unload transitions, while `_loading_target` + `_load_event` let same-target requests piggyback on one load.
 
-**Auto-swap on `/v1/*` proxy.** `_proxy` peeks at the JSON body's `model` field; if it differs from `current_model`, `_maybe_swap` triggers a load before forwarding. This is the implicit path most clients hit — they don't have to call `/manager/load` explicitly. Aliases (`MODEL_ALIASES`, populated via `/manager/aliases`) are resolved here too. Streaming responses (`text/event-stream`) are passed through with `StreamingResponse`; non-streaming bodies are read fully and re-emitted as JSON.
+**Auto-swap on `/v1/*` proxy.** `_proxy` peeks at the JSON body's `model` field, resolves it through config aliases, catalog `ui_install` rows, legacy `MODEL_ALIASES`, then gated raw `org/repo` or absolute path fallback. `ensure_loaded` queues swaps with a deadline instead of returning 409 during another load. Streaming responses (`text/event-stream`) are passed through with `StreamingResponse`; non-streaming bodies are read fully and re-emitted as JSON.
 
 **Downloads run in an OS thread, not asyncio.** `snapshot_download` from `huggingface_hub` is blocking, so `/manager/download` spawns a `threading.Thread` and tracks state in the module-level `_downloads` dict. Endpoints read this dict directly. Status values: `queued | downloading | complete | error`. There is no persistence — `_downloads` is lost on container restart.
 
@@ -52,11 +53,11 @@ curl -X POST http://localhost:8000/manager/load -d '{"model":"...","tp":2}'
 # Auto-generated FastAPI docs: http://localhost:8000/docs
 ```
 
-There is no test suite, no linter config, and no formatter config in this repo. Don't invent commands for them.
+Run `python -m pytest -q` for the committed test suite. Use `python -m py_compile vllm_manager.py runtime.py config.py catalog.py profiles.py` and `bash -n vllm-ctl` for lightweight syntax checks.
 
 ## Conventions worth noticing
 
-- Config is environment-only (`VLLM_INNER_PORT`, `VLLM_DEFAULT_TP`, `VLLM_GPU_MEM_UTIL`, `VLLM_STARTUP_TIMEOUT`, `HF_HOME`, `HUGGING_FACE_HUB_TOKEN`). Set these in the external compose file, not in code.
+- Runtime profiles come from YAML config + SQLite catalog resolution. Legacy env vars still provide fallback process defaults and outer/inner port settings.
 - The vLLM subprocess inherits stdout/stderr from the manager — its logs interleave directly with manager logs.
-- `--trust-remote-code` and `--disable-log-requests` are hardcoded into the vLLM launch command in `_start_vllm`.
+- `--disable-log-requests` is always passed. `--trust-remote-code` is passed only when the resolved profile enables it. `extra_args` stays the escape hatch and is appended last.
 - The container name is hardcoded to `vllm-manager` in `vllm-ctl` (`docker inspect`, `docker exec`). The compose file must use that service/container name.

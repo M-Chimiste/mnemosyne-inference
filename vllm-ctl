@@ -90,22 +90,49 @@ cmd_status() {
     return
   }
 
-  local model loading
-  model=$(echo "$result"   | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('loaded_model') or 'none')")
-  loading=$(echo "$result" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('loading', False))")
-  tp=$(echo "$result"      | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('tp_size', '?'))")
-  loaded_at=$(echo "$result" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('loaded_at_human') or '-')")
+  echo "$result" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+GREEN, YELLOW, RESET = '\033[32m', '\033[33m', '\033[0m'
 
-  if [[ "$loading" == "True" ]]; then
-    yellow "  Status:  Loading model ..."
-  elif [[ "$model" == "none" ]]; then
-    yellow "  Status:  No model loaded"
-  else
-    green  "  Status:  Ready"
-    echo   "  Model:   ${model}"
-    echo   "  TP size: ${tp}"
-    echo   "  Loaded:  ${loaded_at}"
-  fi
+model     = d.get('loaded_model') or 'none'
+loading   = d.get('loading', False)
+swap_to   = d.get('swap_target')
+alias     = d.get('alias')
+gpus      = d.get('gpus')
+quant     = d.get('quantization') or '-'
+mml       = d.get('max_model_len')
+storage   = d.get('storage_location') or '-'
+tp        = d.get('tp_size')
+gpu_mem   = d.get('gpu_mem_util')
+loaded_at = d.get('loaded_at_human') or '-'
+idle      = d.get('idle_seconds')
+evict_in  = d.get('seconds_until_eviction')
+inflight  = d.get('inflight_requests', 0)
+
+if loading:
+    target = swap_to or '?'
+    print(f'{YELLOW}  Status:  Loading {target} ...{RESET}')
+elif model == 'none':
+    print(f'{YELLOW}  Status:  No model loaded{RESET}')
+else:
+    gpus_str = '[' + ','.join(str(x) for x in gpus) + ']' if isinstance(gpus, list) else str(gpus or '?')
+    print(f'{GREEN}  Status:  Ready{RESET}')
+    if alias:
+        print(f'  Alias:   {alias}')
+    print(f'  Model:   {model}')
+    print(f'  GPUs:    {gpus_str}   tp={tp}   gpu_mem={gpu_mem}')
+    if quant != '-' or mml is not None:
+        mml_s = str(mml) if mml is not None else '-'
+        print(f'  Quant:   {quant}   max_model_len={mml_s}')
+    print(f'  Storage: {storage}')
+    print(f'  Loaded:  {loaded_at}')
+    if idle is not None:
+        if evict_in is not None:
+            print(f'  Idle:    {idle:.0f}s   evict in {evict_in:.0f}s   inflight={inflight}')
+        else:
+            print(f'  Idle:    {idle:.0f}s   evict disabled   inflight={inflight}')
+"
   echo ""
 }
 

@@ -1,8 +1,7 @@
 """Mnemosyne Inference — pure profile resolver.
 
-Merges config + catalog + defaults into a runtime ResolvedProfile. Phase 1
-ships the resolver unwired; Phase 2 will pass its return value into
-_start_vllm. See project_docs/phase_1_plan.md §4.5.
+Merges config + catalog + defaults into a runtime ResolvedProfile.
+See project_docs/plans/phase_1_plan.md §4.5.
 
 Lives here (not in config.py) to keep the dep graph one-way:
   config.py → (nothing)

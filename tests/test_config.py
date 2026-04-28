@@ -50,7 +50,7 @@ def _no_real_nvidia_smi(monkeypatch):
     """Default to 'no GPUs visible, probe failed' so list-gpu validators
     don't reach for real hardware. Individual tests override this."""
     import config as config_mod
-    monkeypatch.setattr(config_mod, "_gpu_indices_or_none", lambda: None)
+    monkeypatch.setattr(config_mod, "gpu_indices_or_none", lambda: None)
 
 
 # ── parsing ──────────────────────────────────────────────────────────
@@ -256,7 +256,7 @@ def test_gpus_empty_list_rejected(tmp_path):
 
 def test_gpu_index_missing_hard_fails(tmp_path, monkeypatch):
     import config as config_mod
-    monkeypatch.setattr(config_mod, "_gpu_indices_or_none", lambda: [0])
+    monkeypatch.setattr(config_mod, "gpu_indices_or_none", lambda: [0])
     p = _write(tmp_path / "config.yaml", f"""\
         storage:
           default: tmp
@@ -274,7 +274,7 @@ def test_gpu_index_missing_hard_fails(tmp_path, monkeypatch):
 
 def test_gpu_probe_unavailable_does_not_fail(tmp_path, monkeypatch):
     import config as config_mod
-    monkeypatch.setattr(config_mod, "_gpu_indices_or_none", lambda: None)
+    monkeypatch.setattr(config_mod, "gpu_indices_or_none", lambda: None)
     p = _write(tmp_path / "config.yaml", f"""\
         storage:
           default: tmp

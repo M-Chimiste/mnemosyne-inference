@@ -9,7 +9,10 @@ on demand and swapping when requested. Exposes:
 """
 
 import asyncio
+import contextlib
+import dataclasses
 import httpx
+import re
 import shutil
 import signal
 import subprocess
@@ -21,7 +24,7 @@ import time
 import threading
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
-from typing import Optional, AsyncIterator
+from typing import Awaitable, Callable, Optional, TypeVar
 
 from huggingface_hub import snapshot_download, HfApi
 from huggingface_hub.utils import RepositoryNotFoundError, GatedRepoError
@@ -30,8 +33,11 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 import uvicorn
 
+import config as config_mod
 from catalog import Catalog, ReconcileResult, SyncResult, is_cache_only_alias, open_catalog
 from config import Config, ConfigError, load_config, load_env
+from profiles import ResolvedProfile, resolve_profile
+from runtime import RuntimeState, build_vllm_argv, build_vllm_env, derive_tp_size
 
 # ──────────────────────────────────────────────
 # Configuration (set via docker-compose environment)
@@ -52,16 +58,21 @@ logging.basicConfig(
 )
 logger = logging.getLogger("vllm-manager")
 
+T = TypeVar("T")
+
 # ──────────────────────────────────────────────
 # Global state
 # ──────────────────────────────────────────────
-current_model:   Optional[str]              = None
+# Phase 2: vLLM subprocess + runtime view + swap queue.
 vllm_process:    Optional[subprocess.Popen] = None
-model_load_time: Optional[float]            = None
-loading_lock                                = asyncio.Lock()
-_loading:        bool                       = False
-_current_tp:     int                        = DEFAULT_TP
-_current_gpu_mem: float                     = DEFAULT_GPU_MEM
+_runtime:        RuntimeState               = RuntimeState()
+_swap_lock                                  = asyncio.Lock()
+_loading_target: Optional[str]              = None
+_load_event:     Optional[asyncio.Event]    = None
+_load_error:     Optional[BaseException]    = None
+_eviction_task:  Optional[asyncio.Task]     = None
+_flush_task:     Optional[asyncio.Task]     = None
+_legacy_alias_warned: set[str]              = set()
 
 # Download state — keyed by model_id
 # Each entry: {status, started_at, finished_at, error, path}
@@ -94,7 +105,11 @@ async def _wait_for_vllm(timeout: int = STARTUP_TIMEOUT) -> bool:
 
 
 def _kill_vllm():
-    global vllm_process, current_model, model_load_time
+    """Stop the resident vLLM subprocess (idempotent) and reset runtime state.
+    Flushes buffered usage to the catalog before clearing the resident alias
+    so the just-evicted model's last activity makes it to disk."""
+    global vllm_process
+    _flush_usage_best_effort("vLLM teardown")
     if vllm_process and vllm_process.poll() is None:
         logger.info(f"Stopping vLLM (pid={vllm_process.pid}) ...")
         vllm_process.terminate()
@@ -105,43 +120,289 @@ def _kill_vllm():
             vllm_process.kill()
             vllm_process.wait()
         logger.info("vLLM stopped.")
-    vllm_process    = None
-    current_model   = None
-    model_load_time = None
+    vllm_process = None
+    _runtime.resident_alias = None
+    _runtime.resident_profile = None
+    _runtime.resident_tp_size = None
+    _runtime.model_load_time = None
+    _runtime.last_used_at = None
+    # If the best-effort flush failed, drop the buffered count rather than
+    # risking attribution to the next resident profile.
+    _runtime.request_count_delta = 0
 
 
-async def _start_vllm(model_id: str, tp: int, gpu_mem: float, extra_args: list[str]) -> None:
-    global vllm_process, current_model, model_load_time, _loading, _current_tp, _current_gpu_mem
+async def _start_vllm(profile: ResolvedProfile) -> None:
+    """Launch vLLM for `profile`. Cleans up half-launched subprocesses on any
+    failure, including asyncio.CancelledError from a deadline-induced wait_for
+    (called inside ensure_loaded). See plans/phase_2.md §5.2."""
+    global vllm_process
 
     _kill_vllm()
-    _loading = True
+    visible = config_mod.gpu_indices_or_none()
+    tp_size = derive_tp_size(profile, visible_gpus=visible, default_tp=DEFAULT_TP)
+    if profile.gpus == "all" and not visible:
+        logger.warning(
+            "gpus='all' but nvidia-smi probe returned no GPUs; falling back to "
+            "DEFAULT_TP=%d. Production CUDA hosts should never hit this path.",
+            DEFAULT_TP,
+        )
 
-    cmd = [
-        sys.executable, "-m", "vllm.entrypoints.openai.api_server",
-        "--model",                  model_id,
-        "--host",                   VLLM_INNER_HOST,
-        "--port",                   str(VLLM_INNER_PORT),
-        "--tensor-parallel-size",   str(tp),
-        "--gpu-memory-utilization", str(gpu_mem),
-        "--trust-remote-code",
-        "--disable-log-requests",
-    ] + extra_args
+    argv = build_vllm_argv(profile, host=VLLM_INNER_HOST, port=VLLM_INNER_PORT, tp_size=tp_size)
+    env = build_vllm_env(profile, base_env=os.environ)
+    logger.info("Launching vLLM (alias=%s tp=%d): %s", profile.alias, tp_size, " ".join(argv))
+    vllm_process = subprocess.Popen(argv, env=env, stdout=sys.stdout, stderr=sys.stderr)
 
-    logger.info(f"Launching vLLM: {' '.join(cmd)}")
-    vllm_process = subprocess.Popen(cmd, stdout=sys.stdout, stderr=sys.stderr)
-
-    ready = await _wait_for_vllm()
-    _loading = False
-
-    if not ready:
+    try:
+        if not await _wait_for_vllm():
+            raise RuntimeError(f"vLLM failed to become ready for alias '{profile.alias}'")
+    except (Exception, asyncio.CancelledError):
+        # Includes wait_for-induced CancelledError when ensure_loaded times out.
+        # Always clean up the half-launched subprocess.
         _kill_vllm()
-        raise RuntimeError(f"vLLM failed to become ready for model '{model_id}'")
+        raise
 
-    current_model    = model_id
-    model_load_time  = time.time()
-    _current_tp      = tp
-    _current_gpu_mem = gpu_mem
-    logger.info(f"✓ Model '{model_id}' ready (tp={tp}, gpu_mem={gpu_mem})")
+    _runtime.resident_alias = profile.alias
+    _runtime.resident_profile = profile
+    _runtime.resident_tp_size = tp_size
+    now = time.time()
+    _runtime.model_load_time = now
+    _runtime.last_used_at = now
+    logger.info(
+        "✓ Loaded alias='%s' model='%s' tp=%d gpu_mem=%.2f",
+        profile.alias, profile.model, tp_size, profile.gpu_memory_utilization,
+    )
+
+
+# ──────────────────────────────────────────────
+# Swap queue + deadline helpers (Phase 2 §5.3)
+# ──────────────────────────────────────────────
+
+async def _run_until(
+    awaitable_factory: Callable[[], Awaitable[T]],
+    deadline: float,
+) -> T:
+    """Wrap any awaitable in a deadline-relative timeout. Raises
+    asyncio.TimeoutError if the deadline is past or the coro doesn't finish
+    in time. Used by ensure_loaded so a single arrival-time deadline gates
+    every await in the swap path — including _start_vllm itself.
+
+    The factory shape avoids creating an unawaited coroutine when the deadline
+    is already expired.
+    """
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise asyncio.TimeoutError()
+    coro = awaitable_factory()
+    return await asyncio.wait_for(coro, timeout=remaining)
+
+
+async def ensure_loaded(profile: ResolvedProfile, deadline: float) -> None:
+    """Block until vLLM is serving `profile.alias`. Raises HTTPException(504)
+    on deadline expiry, HTTPException(503) on vLLM load failure.
+
+    Concurrency model (LMStudio-style): single _swap_lock for cross-target
+    transitions; per-target asyncio.Event for piggyback so multiple requests
+    for the same loading target wait on one load. See plans/phase_2.md §5.3.
+    """
+    global _loading_target, _load_event, _load_error
+    target = profile.alias
+    while True:
+        if _runtime.resident_alias == target and _loading_target is None:
+            return  # warm path
+        if _loading_target == target:  # piggyback an in-flight load
+            try:
+                await _run_until(_load_event.wait, deadline)
+            except asyncio.TimeoutError:
+                raise HTTPException(504, f"swap queue timeout waiting for '{target}'")
+            if _load_error is not None:
+                raise HTTPException(503, f"vLLM load failed: {_load_error}")
+            continue  # re-check resident
+        try:
+            await _run_until(_swap_lock.acquire, deadline)
+        except asyncio.TimeoutError:
+            raise HTTPException(504, f"swap queue timeout acquiring lock for '{target}'")
+        try:
+            if _runtime.resident_alias == target:  # raced
+                return
+            _loading_target = target
+            _load_event = asyncio.Event()
+            _load_error = None
+            try:
+                await _run_until(lambda: _start_vllm(profile), deadline)
+            except asyncio.TimeoutError:
+                # _start_vllm cleans up the half-launched subprocess in its
+                # own except block. Surface as 504.
+                raise HTTPException(504, f"vLLM load did not complete in time for '{target}'")
+            except asyncio.CancelledError:
+                # Caller cancelled. Don't stash _load_error — piggybackers
+                # will re-check resident, see no model loaded, and retry
+                # against their own deadline.
+                raise
+            except HTTPException:
+                raise
+            except Exception as e:
+                _load_error = e
+                raise HTTPException(503, f"vLLM load failed: {e}")
+            finally:
+                _loading_target = None
+                _load_event.set()
+        finally:
+            _swap_lock.release()
+        # loop falls through to warm-path check
+
+
+# ──────────────────────────────────────────────
+# Usage buffer flush (Phase 2 §5.7)
+# ──────────────────────────────────────────────
+
+def _flush_usage() -> None:
+    """Sync. Single UPDATE per call. Safe from any context — no-op if there's
+    nothing to flush. Called from _flush_loop, _kill_vllm, and lifespan exit."""
+    if _catalog is None:
+        return
+    alias = _runtime.resident_alias
+    delta = _runtime.request_count_delta
+    if alias is None or delta == 0:
+        return
+    _catalog.bump_usage(alias, _runtime.last_used_at, delta)
+    _runtime.request_count_delta = 0
+
+
+def _flush_usage_best_effort(context: str) -> None:
+    """Flush usage without letting catalog/SQLite failures block teardown."""
+    try:
+        _flush_usage()
+    except Exception as e:
+        logger.warning("Usage flush failed during %s: %s", context, e)
+
+
+async def _flush_loop() -> None:
+    """Background task: flush every 30s while the manager is up."""
+    while True:
+        await asyncio.sleep(30)
+        try:
+            _flush_usage()
+        except Exception as e:
+            logger.warning("Usage flush failed: %s", e)
+
+
+# ──────────────────────────────────────────────
+# Idle eviction loop (Phase 2 §5.6)
+# ──────────────────────────────────────────────
+
+async def _eviction_loop() -> None:
+    """Periodically unload the resident model when it's been idle past the
+    configured threshold. Returns immediately if eviction is disabled
+    (idle_unload_seconds=null)."""
+    if _config is None or _config.server.idle_unload_seconds is None:
+        return
+    threshold = _config.server.idle_unload_seconds
+    period = max(5, min(threshold // 4, 30))
+    logger.info("Idle eviction enabled (threshold=%ds, period=%ds)", threshold, period)
+    while True:
+        await asyncio.sleep(period)
+        async with _swap_lock:
+            if _runtime.resident_alias is None:
+                continue
+            if _runtime.inflight > 0:
+                continue
+            if _runtime.last_used_at is None:
+                continue
+            idle = time.time() - _runtime.last_used_at
+            if idle > threshold:
+                logger.info(
+                    "Idle eviction: '%s' idle %ds (threshold %ds)",
+                    _runtime.resident_alias, int(idle), threshold,
+                )
+                _kill_vllm()
+
+
+# ──────────────────────────────────────────────
+# Request-model resolver (Phase 2 §5.5)
+# ──────────────────────────────────────────────
+
+# org/repo form — exactly one '/', conservative chars on both halves.
+_RAW_HF_ID_RE = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$")
+
+
+def _warn_legacy_alias_once(alias: str) -> None:
+    if alias in _legacy_alias_warned:
+        return
+    _legacy_alias_warned.add(alias)
+    logger.warning(
+        "Legacy MODEL_ALIASES used for '%s'; prefer config.yaml or "
+        "/manager/install (Phase 4)", alias,
+    )
+
+
+def _synthesize_profile(model_id: str) -> ResolvedProfile:
+    """Build an inline ResolvedProfile for a raw HF id or a legacy alias.
+    Uses defaults from the loaded config; storage falls back to storage.default.
+    """
+    if _config is None:
+        raise RuntimeError("config not loaded")
+    storage_name = _config.storage.default
+    storage_path = next(
+        l.path for l in _config.storage.locations if l.name == storage_name
+    )
+    return ResolvedProfile(
+        alias=model_id,  # synthetic — only used for log lines and status
+        model=model_id,
+        gpus="all",
+        quantization=None,
+        max_model_len=_config.defaults.max_model_len,
+        gpu_memory_utilization=_config.defaults.gpu_memory_utilization,
+        trust_remote_code=_config.defaults.trust_remote_code,
+        storage_name=storage_name,
+        storage_path=storage_path,
+        extra_args=(),
+    )
+
+
+def _resolve_request_model(requested: str) -> ResolvedProfile:
+    """Four-tier lookup: config alias → catalog ui_install row → legacy
+    MODEL_ALIASES dict → raw HF id passthrough (gated by _RAW_HF_ID_RE or
+    absolute existing path). Anything else raises KeyError, which the caller
+    translates to 404. See plans/phase_2.md §5.5."""
+    if _config is None or _catalog is None:
+        raise RuntimeError("manager not initialized")
+
+    # Tier 1 — config alias
+    if any(m.alias == requested for m in _config.models):
+        return resolve_profile(requested, _config, _catalog)
+    # Tier 2 — catalog ui_install row
+    row = _catalog.get_model(requested)
+    if row is not None and row.source == "ui_install":
+        return resolve_profile(requested, _config, _catalog)
+    # Tier 3 — legacy MODEL_ALIASES dict
+    if requested in MODEL_ALIASES:
+        _warn_legacy_alias_once(requested)
+        return _synthesize_profile(MODEL_ALIASES[requested])
+    # Tier 4 — raw HF id or absolute path
+    if _RAW_HF_ID_RE.match(requested) or (
+        requested.startswith("/") and os.path.isdir(requested)
+    ):
+        logger.info("Resolving '%s' as raw model id (no alias match)", requested)
+        return _synthesize_profile(requested)
+    raise KeyError(requested)
+
+
+def _apply_legacy_overrides(
+    profile: ResolvedProfile,
+    legacy: dict,
+) -> ResolvedProfile:
+    """Honor legacy {tp, gpu_mem, extra_args} on top of a synthesized raw-id
+    profile so `vllm-ctl load <raw-id> --gpu-mem 0.85` keeps working. Aliased
+    profiles are NOT overridden — see /manager/load shim."""
+    updates = {}
+    if "gpu_mem" in legacy:
+        updates["gpu_memory_utilization"] = float(legacy["gpu_mem"])
+    if "tp" in legacy:
+        n = int(legacy["tp"])
+        updates["gpus"] = list(range(n))
+    if "extra_args" in legacy:
+        updates["extra_args"] = tuple(legacy["extra_args"])
+    return dataclasses.replace(profile, **updates)
 
 
 # ──────────────────────────────────────────────
@@ -203,10 +464,12 @@ async def _reload_config() -> ReloadResult:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _config, _catalog
+    global _config, _catalog, _runtime, _eviction_task, _flush_task
     load_env()
     _config = load_config()
     _catalog = open_catalog()
+    _runtime = RuntimeState()
+    _legacy_alias_warned.clear()
     sync, rec = _catalog.apply_config(
         _config.models,
         _config.storage.default,
@@ -224,6 +487,13 @@ async def lifespan(app: FastAPI):
     )
     _install_sighup_handler()
 
+    if _config.server.idle_unload_seconds is not None:
+        _eviction_task = asyncio.create_task(_eviction_loop(), name="eviction")
+    else:
+        _eviction_task = None
+        logger.info("Idle eviction disabled (idle_unload_seconds=null)")
+    _flush_task = asyncio.create_task(_flush_loop(), name="usage-flush")
+
     logger.info(
         f"\n"
         f"  ┌─────────────────────────────────────────────┐\n"
@@ -237,13 +507,28 @@ async def lifespan(app: FastAPI):
         f"  └─────────────────────────────────────────────┘\n"
         .replace("<port>", str(MANAGER_PORT))
     )
-    yield
-    logger.info("Shutting down — stopping vLLM ...")
-    _kill_vllm()
-    if _catalog is not None:
-        _catalog.close()
-        _catalog = None
-    _config = None
+    try:
+        yield
+    finally:
+        # Cancel infinite tasks first so they don't fight teardown.
+        for t in (_eviction_task, _flush_task):
+            if t is not None and not t.done():
+                t.cancel()
+        for t in (_eviction_task, _flush_task):
+            if t is not None:
+                with contextlib.suppress(asyncio.CancelledError):
+                    await t
+        _eviction_task = None
+        _flush_task = None
+        # Final flush before _kill_vllm wipes _runtime — belt-and-suspenders
+        # in case _kill_vllm's internal flush ever moves.
+        _flush_usage_best_effort("lifespan shutdown")
+        logger.info("Shutting down — stopping vLLM ...")
+        _kill_vllm()
+        if _catalog is not None:
+            _catalog.close()
+            _catalog = None
+        _config = None
 
 
 app = FastAPI(
@@ -260,16 +545,47 @@ app = FastAPI(
 
 @app.get("/manager/status", tags=["manager"])
 async def status():
-    """Current state of the manager and loaded model."""
+    """Current state of the manager and loaded model.
+
+    Phase 0/1 keys (loaded_model, loading, vllm_pid, loaded_at,
+    loaded_at_human, tp_size, gpu_mem_util, inner_endpoint) are preserved.
+    Phase 2 adds resident-profile detail and idle-eviction countdown."""
+    profile = _runtime.resident_profile
+    loaded_model = profile.model if profile else None
+    load_time = _runtime.model_load_time
+
+    last_used = _runtime.last_used_at
+    idle_seconds = (time.time() - last_used) if last_used else None
+    threshold = _config.server.idle_unload_seconds if _config else None
+    seconds_until_eviction = (
+        max(0, threshold - idle_seconds)
+        if threshold is not None and idle_seconds is not None
+        else None
+    )
+
     return {
-        "loaded_model":   current_model,
-        "loading":        _loading,
+        # Phase 0/1 keys
+        "loaded_model":   loaded_model,
+        "loading":        _loading_target is not None,
         "vllm_pid":       vllm_process.pid if vllm_process else None,
-        "loaded_at":      model_load_time,
-        "loaded_at_human": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(model_load_time)) if model_load_time else None,
-        "tp_size":        _current_tp,
-        "gpu_mem_util":   _current_gpu_mem,
+        "loaded_at":      load_time,
+        "loaded_at_human": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(load_time)) if load_time else None,
+        "tp_size":        _runtime.resident_tp_size,
+        "gpu_mem_util":   profile.gpu_memory_utilization if profile else None,
         "inner_endpoint": f"http://{VLLM_INNER_HOST}:{VLLM_INNER_PORT}",
+        # Phase 2 additions
+        "alias":            profile.alias if profile else None,
+        "gpus":             profile.gpus if profile else None,
+        "quantization":     profile.quantization if profile else None,
+        "max_model_len":    profile.max_model_len if profile else None,
+        "storage_location": profile.storage_name if profile else None,
+        "last_used_at":     last_used,
+        "idle_seconds":     round(idle_seconds, 1) if idle_seconds is not None else None,
+        "seconds_until_eviction": (
+            round(seconds_until_eviction, 1) if seconds_until_eviction is not None else None
+        ),
+        "inflight_requests": _runtime.inflight,
+        "swap_target":       _loading_target,
     }
 
 
@@ -361,48 +677,73 @@ async def list_catalog(include_cache_only: str = Query("false")):
 @app.post("/manager/load", tags=["manager"])
 async def load_model(request: Request):
     """
-    Load a model. Unloads any currently loaded model first.
+    Load a model — Phase 2 alias-aware shim over `ensure_loaded`.
 
-    ```json
-    {
-      "model": "Qwen/Qwen2.5-72B-Instruct-AWQ",
-      "tp": 2,
-      "gpu_mem": 0.90,
-      "extra_args": ["--max-model-len", "32768"]
-    }
-    ```
-    Only `model` is required. `tp` and `gpu_mem` default to the values
-    set in docker-compose.yml environment variables.
+    Aliased payload (config alias, ui_install row, or legacy MODEL_ALIASES key):
+        {"model": "qwen-72b-awq"}
+    Legacy raw-id payload (Phase 0 compatibility):
+        {"model": "Qwen/Qwen2.5-7B-Instruct", "tp": 1, "gpu_mem": 0.85,
+         "extra_args": ["--max-model-len", "32768"]}
+
+    For aliases, the resolved profile is authoritative — tp/gpu_mem/extra_args
+    on the payload are ignored with a warning (PRD §5.1: config wins).
+    For raw IDs, the legacy params override the synthesized profile defaults.
     """
-    if _loading:
-        raise HTTPException(status_code=409, detail="Already loading a model. Wait or unload first.")
-
     body = await request.json()
-    model_id = body.get("model")
-    if not model_id:
+    requested = body.get("model")
+    if not requested:
         raise HTTPException(status_code=400, detail="'model' field required")
 
-    tp      = int(body.get("tp", DEFAULT_TP))
-    gpu_mem = float(body.get("gpu_mem", DEFAULT_GPU_MEM))
-    extra   = body.get("extra_args", [])
+    try:
+        profile = _resolve_request_model(requested)
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"Unknown alias '{requested}'")
 
-    async with loading_lock:
-        try:
-            await _start_vllm(model_id, tp, gpu_mem, extra)
-        except RuntimeError as e:
-            raise HTTPException(status_code=500, detail=str(e))
+    is_aliased = (
+        any(m.alias == requested for m in (_config.models if _config else []))
+        or (
+            _catalog is not None
+            and (row := _catalog.get_model(requested)) is not None
+            and row.source == "ui_install"
+        )
+        or requested in MODEL_ALIASES
+    )
+    legacy_params = {
+        k: body[k] for k in ("tp", "gpu_mem", "extra_args") if k in body
+    }
+    if is_aliased and legacy_params:
+        logger.warning(
+            "Ignoring %s — profile '%s' wins (PRD §5.1)",
+            sorted(legacy_params), profile.alias,
+        )
+    elif not is_aliased and legacy_params:
+        profile = _apply_legacy_overrides(profile, legacy_params)
 
-    return {"status": "loaded", "model": current_model, "tp": _current_tp}
+    deadline = time.monotonic() + (
+        _config.server.swap_queue_timeout_seconds if _config else 300
+    )
+    await ensure_loaded(profile, deadline)
+    return {"status": "loaded", "alias": profile.alias, "model": profile.model}
 
 
 @app.post("/manager/unload", tags=["manager"])
 async def unload_model():
     """Unload the current model and free all GPU memory."""
-    if not current_model:
-        return {"status": "nothing to unload"}
-    was = current_model
-    _kill_vllm()
-    return {"status": "unloaded", "was": was}
+    deadline = time.monotonic() + (
+        _config.server.swap_queue_timeout_seconds if _config else 300
+    )
+    try:
+        await _run_until(_swap_lock.acquire, deadline)
+    except asyncio.TimeoutError:
+        raise HTTPException(504, "timeout waiting for active model load to finish")
+    try:
+        if _runtime.resident_alias is None:
+            return {"status": "nothing to unload"}
+        was = _runtime.resident_alias
+        _kill_vllm()
+        return {"status": "unloaded", "was": was}
+    finally:
+        _swap_lock.release()
 
 
 @app.get("/manager/models", tags=["manager"])
@@ -593,8 +934,8 @@ async def health():
     """Health check — always returns 200 from the manager itself."""
     return {
         "status": "ok",
-        "model_loaded": current_model is not None,
-        "loading": _loading,
+        "model_loaded": _runtime.resident_alias is not None,
+        "loading": _loading_target is not None,
     }
 
 
@@ -604,84 +945,35 @@ async def health():
 
 VLLM_BASE = f"http://{VLLM_INNER_HOST}:{VLLM_INNER_PORT}"
 
-# Model string aliases — map shorthand names to full HF model IDs.
-# Add your own here or POST to /manager/aliases to add at runtime.
+# Legacy in-memory aliases (deprecated; tier 3 in _resolve_request_model).
+# Kept for /manager/aliases CRUD compatibility — Phase 3/4 retire it.
 MODEL_ALIASES: dict[str, str] = {}
 
 
-def _resolve_model(name: str) -> str:
-    """Resolve a model alias to its full ID, or return as-is."""
-    return MODEL_ALIASES.get(name, name)
+def _peek_model_field(body: bytes) -> Optional[str]:
+    """Extract the `model` field from a JSON body, or None on any failure."""
+    if not body:
+        return None
+    try:
+        payload = json.loads(body)
+    except Exception:
+        return None
+    val = payload.get("model")
+    return val if isinstance(val, str) else None
 
 
-async def _maybe_swap(requested_model: str) -> None:
-    """
-    If requested_model differs from the currently loaded model, swap to it.
-    Uses the same tp/gpu_mem as the current session, or defaults if nothing
-    is loaded yet. Blocks until the new model is ready.
-    """
-    resolved = _resolve_model(requested_model)
-
-    if resolved == current_model:
-        return  # already loaded, nothing to do
-
-    if _loading:
-        # Another swap is already in progress — wait for it, then check again
-        while _loading:
-            await asyncio.sleep(1)
-        if current_model == resolved:
-            return
-        raise HTTPException(
-            status_code=409,
-            detail=f"A different model ('{current_model}') just finished loading. Retry your request."
-        )
-
-    logger.info(f"Auto-swap: '{current_model}' → '{resolved}'")
-    async with loading_lock:
-        # Re-check inside the lock in case another request beat us here
-        if current_model == resolved:
-            return
-        try:
-            await _start_vllm(resolved, _current_tp, _current_gpu_mem, [])
-        except RuntimeError as e:
-            raise HTTPException(status_code=500, detail=str(e))
-
-
-async def _stream_vllm(response: httpx.Response) -> AsyncIterator[bytes]:
-    async for chunk in response.aiter_bytes():
-        yield chunk
-
-
-async def _proxy(request: Request, path: str, body: bytes):
-    """
-    Forward a request to the inner vLLM server.
-    If the request body contains a 'model' field that differs from the
-    currently loaded model, swap to it first (auto-swap).
-    """
-    # ── Auto-swap on model mismatch ────────────────────────────────
-    requested_model: Optional[str] = None
-    if body:
-        try:
-            payload = json.loads(body)
-            requested_model = payload.get("model")
-        except Exception:
-            pass
-
-    if requested_model:
-        await _maybe_swap(requested_model)
-    elif not current_model:
-        raise HTTPException(
-            status_code=503,
-            detail="No model loaded and no 'model' field in request. POST /manager/load first."
-        )
-
-    # ── Proxy to inner vLLM ────────────────────────────────────────
+async def _open_upstream(
+    request: Request, path: str, body: bytes
+) -> tuple[httpx.AsyncClient, httpx.Response]:
+    """Open a streaming request against the inner vLLM. Returns the client
+    (kept open for the lifetime of the response) and the response object.
+    Caller is responsible for closing the client when finished."""
     headers = {
         k: v for k, v in request.headers.items()
         if k.lower() not in ("host", "content-length")
     }
-
-    async with httpx.AsyncClient(timeout=None) as client:
+    client = httpx.AsyncClient(timeout=None)
+    try:
         req = client.build_request(
             method=request.method,
             url=f"{VLLM_BASE}/{path}",
@@ -690,24 +982,123 @@ async def _proxy(request: Request, path: str, body: bytes):
             params=dict(request.query_params),
         )
         response = await client.send(req, stream=True)
+        return client, response
+    except BaseException:
+        await client.aclose()
+        raise
 
+
+async def _wrap_stream(client: httpx.AsyncClient, response: httpx.Response):
+    """Stream upstream chunks and own the inflight + usage accounting for
+    this request. Reaching here means upstream returned headers, so usage
+    IS counted — even on client disconnect mid-stream (model performed work).
+    See plans/phase_2.md §5.4."""
+    try:
+        async for chunk in response.aiter_bytes():
+            yield chunk
+    finally:
+        _runtime.inflight -= 1
+        _runtime.last_used_at = time.time()
+        _runtime.request_count_delta += 1
+        with contextlib.suppress(Exception):
+            await response.aclose()
+        with contextlib.suppress(Exception):
+            await client.aclose()
+
+
+async def _proxy(request: Request, path: str, body: bytes):
+    """
+    Forward a request to the inner vLLM server.
+
+    Phase 2 semantics (plans/phase_2.md §5.4):
+      - The request body's `model` field is resolved through the four-tier
+        lookup (config → ui_install → MODEL_ALIASES → raw passthrough).
+        Unknown values raise 404. Org/repo and absolute paths fall through
+        to tier 4.
+      - Swap queueing via ensure_loaded — multiple requests for the same
+        loading target piggyback on one load.
+      - Inflight counter incremented under _swap_lock with a resident-alias
+        re-check, closing the eviction TOCTOU window.
+      - Usage (last_used_at, request_count_delta) bumps only on a SUCCESSFUL
+        proxied request — pre-stream upstream errors don't count.
+      - Single deadline computed at arrival, gates lock-wait, event-wait,
+        and _start_vllm itself.
+    """
+    requested = _peek_model_field(body)
+    if requested is None and _runtime.resident_alias is None:
+        raise HTTPException(
+            status_code=503,
+            detail="No model loaded and no 'model' field in request. POST /manager/load first.",
+        )
+
+    profile: Optional[ResolvedProfile] = None
+    if requested is not None:
+        try:
+            profile = _resolve_request_model(requested)
+        except KeyError:
+            raise HTTPException(status_code=404, detail=f"Unknown alias '{requested}'")
+
+    deadline = time.monotonic() + (
+        _config.server.swap_queue_timeout_seconds if _config else 300
+    )
+
+    # Loop with one deadline, one lock-release path. continue triggers
+    # a retry of ensure_loaded if eviction or another swap raced us.
+    while True:
+        if profile is not None:
+            await ensure_loaded(profile, deadline)
+
+        try:
+            await _run_until(_swap_lock.acquire, deadline)
+        except asyncio.TimeoutError:
+            raise HTTPException(504, "swap queue timeout acquiring inflight lock")
+        try:
+            if profile is not None and _runtime.resident_alias != profile.alias:
+                continue  # finally releases; loop reruns
+            if profile is None and _runtime.resident_alias is None:
+                raise HTTPException(503, "Model evicted before request started")
+            _runtime.inflight += 1
+            break
+        finally:
+            _swap_lock.release()
+
+    is_streaming = False
+    upstream_ok = False
+    client: Optional[httpx.AsyncClient] = None
+    response: Optional[httpx.Response] = None
+    try:
+        client, response = await _open_upstream(request, f"{path}", body)
+        upstream_ok = True
         if "text/event-stream" in response.headers.get("content-type", ""):
+            is_streaming = True
+            # Ownership transfers to _wrap_stream — its finally handles
+            # inflight + usage accounting.
+            wrapped_client, wrapped_response = client, response
+            client, response = None, None  # don't close in this finally
             return StreamingResponse(
-                _stream_vllm(response),
-                status_code=response.status_code,
-                headers=dict(response.headers),
+                _wrap_stream(wrapped_client, wrapped_response),
+                status_code=wrapped_response.status_code,
+                headers=dict(wrapped_response.headers),
                 media_type="text/event-stream",
             )
-        else:
-            content = await response.aread()
-            try:
-                body_json = json.loads(content)
-            except Exception:
-                body_json = {"raw": content.decode(errors="replace")}
-            return JSONResponse(
-                content=body_json,
-                status_code=response.status_code,
-            )
+        content = await response.aread()
+        try:
+            body_json = json.loads(content)
+        except Exception:
+            body_json = {"raw": content.decode(errors="replace")}
+        return JSONResponse(content=body_json, status_code=response.status_code)
+    finally:
+        if not is_streaming:
+            _runtime.inflight -= 1
+            if upstream_ok:
+                _runtime.last_used_at = time.time()
+                _runtime.request_count_delta += 1
+            if response is not None:
+                with contextlib.suppress(Exception):
+                    await response.aclose()
+            if client is not None:
+                with contextlib.suppress(Exception):
+                    await client.aclose()
 
 
 @app.api_route("/v1/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"], tags=["openai"])
