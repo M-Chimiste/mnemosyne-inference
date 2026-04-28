@@ -1,0 +1,17 @@
+# Mnemosyne Inference — dev/test dependencies.
+#
+# Install on the dev host (no CUDA needed): `pip install -r requirements-dev.txt`.
+# Runtime deps for the container itself live in the Dockerfile.
+#
+# fastapi/httpx/huggingface_hub/uvicorn are needed because vllm_manager.py
+# imports them at module load — pytest collection fails without them.
+# vllm itself is NOT listed: nothing in vllm_manager.py imports it (it's
+# launched as a subprocess), so tests run on macOS/Linux without GPUs.
+
+pytest
+pytest-asyncio
+httpx
+fastapi
+huggingface_hub
+uvicorn
+pyyaml

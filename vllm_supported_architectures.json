@@ -1,0 +1,6 @@
+{
+  "vllm_version": null,
+  "generated_at": null,
+  "architectures": [],
+  "_note": "Placeholder — populated by scripts/refresh_arch_list.py (Phase 5). Until then, hf_search.py compatibility checks fall back to runtime introspection only."
+}

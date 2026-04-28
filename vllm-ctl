@@ -1,0 +1,500 @@
+#!/usr/bin/env bash
+# ──────────────────────────────────────────────────────────────────
+# vllm-ctl — Control tool for the containerized vLLM Manager
+#
+# Usage:
+#   vllm-ctl build                  # build the Docker image
+#   vllm-ctl start                  # start container (docker compose up -d)
+#   vllm-ctl stop                   # stop container  (docker compose down)
+#   vllm-ctl restart                # restart container
+#   vllm-ctl status                 # service + loaded model status
+#   vllm-ctl load <model>           # load a model
+#   vllm-ctl load <model> --tp 1    # load with 1 GPU only
+#   vllm-ctl unload                 # unload model, free VRAM
+#   vllm-ctl models                 # list locally cached models
+#   vllm-ctl logs [-f]              # show container logs
+#   vllm-ctl chat <prompt>          # quick one-shot chat
+#   vllm-ctl shell                  # open a shell inside the container
+# ──────────────────────────────────────────────────────────────────
+
+MANAGER_URL="${VLLM_MANAGER_URL:-http://localhost:8000}"
+COMPOSE_DIR="${VLLM_COMPOSE_DIR:-$HOME/vllm-manager}"
+
+red()    { printf '\033[31m%s\033[0m\n' "$*"; }
+green()  { printf '\033[32m%s\033[0m\n' "$*"; }
+yellow() { printf '\033[33m%s\033[0m\n' "$*"; }
+bold()   { printf '\033[1m%s\033[0m\n' "$*"; }
+
+compose() { docker compose -f "${COMPOSE_DIR}/docker-compose.yml" "$@"; }
+
+api() {
+  local method="$1"; shift
+  local path="$1";   shift
+  curl -sf -X "$method" "${MANAGER_URL}${path}" \
+    -H "Content-Type: application/json" "$@"
+}
+
+# ── commands ───────────────────────────────────────────────────────
+
+cmd_build() {
+  green "Building vLLM Manager image (this takes a few minutes first time) ..."
+  compose build
+  green "✓ Image built."
+}
+
+cmd_start() {
+  green "Starting vLLM Manager container ..."
+  compose up -d
+  echo ""
+  # Wait briefly for the manager to come up
+  for i in {1..15}; do
+    sleep 1
+    if curl -sf "${MANAGER_URL}/health" &>/dev/null; then
+      green "✓ Manager is up at ${MANAGER_URL}"
+      echo ""
+      cmd_status
+      return
+    fi
+  done
+  yellow "Manager started but not responding yet — check: vllm-ctl logs"
+}
+
+cmd_stop() {
+  yellow "Stopping vLLM Manager (unloads model and frees VRAM) ..."
+  compose down
+  green "✓ Stopped."
+}
+
+cmd_restart() {
+  compose restart vllm-manager
+  green "✓ Restarted."
+}
+
+cmd_status() {
+  echo ""
+  bold "── Container Status ──────────────────────────────────────"
+  local state
+  state=$(docker inspect --format='{{.State.Status}}' vllm-manager 2>/dev/null || echo "not found")
+  case "$state" in
+    running) green  "  Container: running" ;;
+    exited)  yellow "  Container: stopped (exited)" ;;
+    *)       red    "  Container: ${state}" ;;
+  esac
+
+  echo ""
+  bold "── Manager Status ────────────────────────────────────────"
+  local result
+  result=$(api GET /manager/status 2>/dev/null) || {
+    yellow "  Manager not reachable at ${MANAGER_URL}"
+    yellow "  Start with: vllm-ctl start"
+    return
+  }
+
+  local model loading
+  model=$(echo "$result"   | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('loaded_model') or 'none')")
+  loading=$(echo "$result" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('loading', False))")
+  tp=$(echo "$result"      | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('tp_size', '?'))")
+  loaded_at=$(echo "$result" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('loaded_at_human') or '-')")
+
+  if [[ "$loading" == "True" ]]; then
+    yellow "  Status:  Loading model ..."
+  elif [[ "$model" == "none" ]]; then
+    yellow "  Status:  No model loaded"
+  else
+    green  "  Status:  Ready"
+    echo   "  Model:   ${model}"
+    echo   "  TP size: ${tp}"
+    echo   "  Loaded:  ${loaded_at}"
+  fi
+  echo ""
+}
+
+cmd_load() {
+  local model="$1"; shift
+
+  if [[ -z "$model" ]]; then
+    red "Usage: vllm-ctl load <model-id> [--tp N] [--gpu-mem 0.90] [-- <extra vllm args...>]"
+    exit 1
+  fi
+
+  local tp=2
+  local gpu_mem=0.90
+  local extra_args=()
+  local pass_through=false
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --tp)      tp="$2";      shift 2 ;;
+      --gpu-mem) gpu_mem="$2"; shift 2 ;;
+      --)        pass_through=true; shift ;;
+      *)
+        if $pass_through; then extra_args+=("$1"); fi
+        shift ;;
+    esac
+  done
+
+  local extra_json
+  extra_json=$(printf '%s\n' "${extra_args[@]}" | python3 -c "
+import sys, json
+lines = [l.strip() for l in sys.stdin if l.strip()]
+print(json.dumps(lines))
+")
+
+  local payload
+  payload=$(python3 -c "
+import json
+print(json.dumps({
+  'model':     '${model}',
+  'tp':        ${tp},
+  'gpu_mem':   ${gpu_mem},
+  'extra_args': ${extra_json},
+}))
+")
+
+  echo ""
+  green "Loading: ${model}"
+  echo  "  tp=${tp}  gpu_mem=${gpu_mem}"
+  [[ ${#extra_args[@]} -gt 0 ]] && echo "  extra: ${extra_args[*]}"
+  yellow "  Large models can take several minutes to load ..."
+  echo ""
+
+  local result
+  result=$(curl -sf -X POST "${MANAGER_URL}/manager/load" \
+    -H "Content-Type: application/json" \
+    -d "$payload") || {
+    red "Failed to reach manager at ${MANAGER_URL}"
+    red "Is it running? Try: vllm-ctl start"
+    exit 1
+  }
+
+  echo "$result" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+if d.get('status') == 'loaded':
+    print(f\"  ✓ {d['model']} loaded (tp={d.get('tp','?')})\")
+else:
+    print(json.dumps(d, indent=2))
+"
+  echo ""
+}
+
+cmd_unload() {
+  echo ""
+  yellow "Unloading model and freeing VRAM ..."
+  local result
+  result=$(api POST /manager/unload) || { red "Manager not reachable"; exit 1; }
+  echo "$result" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+was = d.get('was', '')
+if was:
+    print(f'  ✓ Unloaded: {was}')
+else:
+    print(f'  {d.get(\"status\",\"done\")}')
+"
+  echo ""
+}
+
+cmd_models() {
+  echo ""
+  bold "── Cached Models (HF volume) ─────────────────────────────"
+  local result
+  result=$(api GET /manager/models) || { red "Manager not reachable"; exit 1; }
+  echo "$result" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+models = d.get('cached_models', [])
+if not models:
+    print('  (no models cached yet)')
+else:
+    for m in models:
+        size = f\"{m['size_gb']} GB\" if m.get('size_gb') else '?'
+        print(f\"  • {m['model']}  [{size}]\")
+print(f\"\nCache: {d.get('hf_cache')}\")
+"
+  echo ""
+}
+
+cmd_logs() {
+  if [[ "$1" == "-f" ]]; then
+    compose logs -f vllm-manager
+  else
+    compose logs --tail=100 vllm-manager
+  fi
+}
+
+cmd_chat() {
+  local prompt="$*"
+  [[ -z "$prompt" ]] && { red "Usage: vllm-ctl chat <prompt>"; exit 1; }
+
+  local model
+  model=$(api GET /manager/status | python3 -c "
+import sys,json; d=json.load(sys.stdin)
+m=d.get('loaded_model')
+print(m if m else '')
+") || { red "Manager not reachable"; exit 1; }
+
+  [[ -z "$model" ]] && { red "No model loaded. Use: vllm-ctl load <model>"; exit 1; }
+
+  local payload
+  payload=$(python3 -c "
+import json
+print(json.dumps({
+  'model': '${model}',
+  'messages': [{'role': 'user', 'content': '''${prompt}'''}],
+  'stream': False
+}))
+")
+
+  echo ""
+  bold "Model:  ${model}"
+  bold "Prompt: ${prompt}"
+  echo "──────────────────────────────────────────────────────────"
+  curl -sf -X POST "${MANAGER_URL}/v1/chat/completions" \
+    -H "Content-Type: application/json" \
+    -d "$payload" \
+    | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+print(d['choices'][0]['message']['content'])
+"
+  echo ""
+}
+
+cmd_shell() {
+  docker exec -it vllm-manager /bin/bash
+}
+
+cmd_download() {
+  local model="$1"; shift
+
+  if [[ -z "$model" ]]; then
+    red "Usage: vllm-ctl download <model-id> [--revision main] [--token hf_...]"
+    exit 1
+  fi
+
+  local revision="main"
+  local hf_token=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --revision) revision="$2"; shift 2 ;;
+      --token)    hf_token="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+
+  local payload
+  payload=$(python3 -c "
+import json
+d = {
+  'model': '${model}',
+  'revision': '${revision}',
+  'ignore_patterns': ['*.pt', '*.bin', '*.msgpack', 'flax_model*', 'tf_model*', 'rust_model*'],
+}
+if '${hf_token}':
+    d['hf_token'] = '${hf_token}'
+print(json.dumps(d))
+")
+
+  echo ""
+  green "Queuing download: ${model}"
+  local result
+  result=$(curl -sf -X POST "${MANAGER_URL}/manager/download" \
+    -H "Content-Type: application/json" \
+    -d "$payload") || { red "Manager not reachable"; exit 1; }
+
+  local poll_path status
+  poll_path=$(echo "$result" | python3 -c "import sys,json; print(json.load(sys.stdin).get('poll',''))")
+  status=$(echo "$result"    | python3 -c "import sys,json; print(json.load(sys.stdin).get('status',''))")
+
+  if [[ "$status" == "already_downloading" ]]; then
+    yellow "  Already downloading — polling for progress ..."
+  else
+    green  "  Download started in background."
+  fi
+
+  echo   "  Poll: vllm-ctl download-status ${model}"
+  echo ""
+
+  # Optionally follow progress
+  read -rp "  Follow progress? [Y/n] " follow
+  if [[ "${follow,,}" != "n" ]]; then
+    cmd_download_follow "$model"
+  fi
+}
+
+cmd_download_status() {
+  local model="$1"
+  [[ -z "$model" ]] && { red "Usage: vllm-ctl download-status <model-id>"; exit 1; }
+
+  local encoded
+  encoded=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${model}', safe=''))")
+
+  local result
+  result=$(api GET "/manager/download/${encoded}") || { red "Manager not reachable or no record for '${model}'"; exit 1; }
+
+  echo "$result" | python3 -c "
+import sys, json, time
+d = json.load(sys.stdin)
+status = d.get('status','?')
+colors = {'complete': '\033[32m', 'error': '\033[31m', 'downloading': '\033[33m', 'queued': '\033[33m'}
+reset = '\033[0m'
+color = colors.get(status, '')
+print(f\"  Model:   {d.get('model')}\")
+print(f\"  Status:  {color}{status}{reset}\")
+if d.get('elapsed_seconds'):
+    elapsed = d['elapsed_seconds']
+    print(f\"  Elapsed: {int(elapsed//60)}m {int(elapsed%60)}s\")
+if d.get('path'):
+    print(f\"  Path:    {d['path']}\")
+if d.get('error'):
+    print(f\"  Error:   {d['error']}\")
+"
+}
+
+cmd_download_follow() {
+  local model="${1:-}"
+  if [[ -z "$model" ]]; then
+    # Show all active downloads
+    api GET /manager/downloads | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+active = [x for x in d['downloads'] if x['status'] in ('queued','downloading')]
+if not active:
+    print('  No active downloads.')
+else:
+    for m in active:
+        print(f\"  {m['model']}: {m['status']}\")
+"
+    return
+  fi
+
+  echo ""
+  yellow "  Following download: ${model} (Ctrl+C to stop following, download continues)"
+  echo ""
+  local encoded
+  encoded=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${model}', safe=''))")
+
+  while true; do
+    local result
+    result=$(api GET "/manager/download/${encoded}" 2>/dev/null) || break
+    local status
+    status=$(echo "$result" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status','?'))")
+    local elapsed
+    elapsed=$(echo "$result" | python3 -c "import sys,json; d=json.load(sys.stdin); e=d.get('elapsed_seconds',0); print(f'{int(e//60)}m{int(e%60)}s')")
+
+    printf "\r  [%s]  status=%-12s  elapsed=%s  " "$(date +%H:%M:%S)" "$status" "$elapsed"
+
+    if [[ "$status" == "complete" ]]; then
+      echo ""
+      green "  ✓ Download complete."
+      break
+    elif [[ "$status" == "error" ]]; then
+      echo ""
+      red "  ✗ Download failed:"
+      echo "$result" | python3 -c "import sys,json; print('   ', json.load(sys.stdin).get('error','unknown error'))"
+      break
+    fi
+    sleep 5
+  done
+  echo ""
+}
+
+cmd_downloads() {
+  echo ""
+  bold "── All Downloads ─────────────────────────────────────────"
+  api GET /manager/downloads | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+items = d.get('downloads', [])
+if not items:
+    print('  (no download records)')
+else:
+    for m in items:
+        status = m.get('status','?')
+        colors = {'complete': '\033[32m', 'error': '\033[31m', 'downloading': '\033[33m', 'queued': '\033[33m'}
+        c, r = colors.get(status,''), '\033[0m'
+        elapsed = ''
+        if m.get('elapsed_seconds'):
+            e = m['elapsed_seconds']
+            elapsed = f\" ({int(e//60)}m{int(e%60)}s)\"
+        print(f\"  {c}{status:12}{r}  {m['model']}{elapsed}\")
+"
+  echo ""
+}
+
+cmd_help() {
+  cat <<EOF
+
+$(bold "vllm-ctl") — Containerized vLLM Manager
+Compose dir: ${COMPOSE_DIR}
+Manager URL: ${MANAGER_URL}
+
+$(bold "Container:")
+  build                   Build the Docker image
+  start                   Start container (docker compose up -d)
+  stop                    Stop container + unload model
+  restart                 Restart container
+  logs [-f]               Show container logs (-f to follow)
+  shell                   Open bash shell inside container
+
+$(bold "Model control:")
+  status                  Show container + loaded model info
+  load <model> [opts]     Load a model (swaps out any current model)
+    --tp N                  Tensor parallel size (default: 2)
+    --gpu-mem 0.90          GPU memory fraction
+    -- <vllm args>          Extra args passed to vllm server
+  unload                  Unload current model, free all VRAM
+  models                  List models in local HF cache volume
+
+$(bold "Downloads:")
+  download <model> [opts]     Download a model from HuggingFace Hub
+    --revision <ref>            Branch/tag/commit (default: main)
+    --token hf_...              HF token for this request (overrides env)
+  download-status <model>     Check status of a specific download
+  downloads                   List all download records
+
+$(bold "Testing:")
+  chat <prompt>           Quick one-shot chat with loaded model
+
+$(bold "Examples:")
+  vllm-ctl build
+  vllm-ctl start
+  vllm-ctl load Qwen/Qwen2.5-72B-Instruct-AWQ
+  vllm-ctl load Qwen/Qwen3-8B --tp 1
+  vllm-ctl load Qwen/Qwen2.5-72B-Instruct-AWQ -- --max-model-len 32768
+  vllm-ctl chat "What is your context length?"
+  vllm-ctl unload
+  vllm-ctl stop
+
+$(bold "Environment:")
+  VLLM_MANAGER_URL     Override URL (default: http://localhost:8000)
+  VLLM_COMPOSE_DIR     Path to docker-compose.yml dir (default: ~/vllm-manager)
+
+$(bold "HF token (for gated models):")
+  Add HUGGING_FACE_HUB_TOKEN to docker-compose.yml environment, or:
+  echo 'HUGGING_FACE_HUB_TOKEN=hf_...' >> ${COMPOSE_DIR}/.env
+
+EOF
+}
+
+# ── dispatch ───────────────────────────────────────────────────────
+case "${1:-help}" in
+  build)   cmd_build ;;
+  start)   cmd_start ;;
+  stop)    cmd_stop ;;
+  restart) cmd_restart ;;
+  status)  cmd_status ;;
+  load)    shift; cmd_load "$@" ;;
+  unload)  cmd_unload ;;
+  models)  cmd_models ;;
+  download) shift; cmd_download "$@" ;;
+  download-status) shift; cmd_download_status "$@" ;;
+  downloads) cmd_downloads ;;
+  logs)    shift; cmd_logs "$@" ;;
+  chat)    shift; cmd_chat "$@" ;;
+  shell)   cmd_shell ;;
+  help|--help|-h) cmd_help ;;
+  *) red "Unknown command: $1"; cmd_help; exit 1 ;;
+esac
