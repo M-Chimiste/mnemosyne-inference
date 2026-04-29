@@ -57,11 +57,20 @@ RUN pip install --no-cache-dir \
 # ── App ────────────────────────────────────────────────────────────
 WORKDIR /app
 COPY vllm_manager.py config.py catalog.py profiles.py runtime.py \
-     downloader.py download_worker.py ./
+     downloader.py download_worker.py hf_search.py \
+     vllm_supported_architectures.json ./
+COPY scripts/ ./scripts/
 
 # HuggingFace cache lives in a volume (models persist across restarts)
 ENV HF_HOME=/hf-cache
 ENV TRANSFORMERS_CACHE=/hf-cache
+
+# Phase 5 — sensible defaults for huggingface_hub HTTP timeouts on
+# hf_hub_download (covers /manager/hf/search per-row config.json fetches).
+# These are read by huggingface_hub itself; list_models / model_info use
+# the underlying requests session's default timeout.
+ENV HF_HUB_ETAG_TIMEOUT=10
+ENV HF_HUB_DOWNLOAD_TIMEOUT=30
 
 # Manager: inference :8000, admin :8001 (LAN-gated by ADMIN_PASSWORD).
 # vLLM inner server: 127.0.0.1:8002 inside container.

@@ -4,20 +4,18 @@
 
 ## Current state
 
-**Active milestone:** M3 — Operational catalog
-**Active phase:** Phase 5 next.
+**Active milestone:** M4 — Discovery + UI
+**Active phase:** Phase 5 snapshot gate; Phase 6 next after that.
 
 M3 is implemented: `/manager/install` is end-to-end functional with
 killable subprocess downloads, restart-recoverable state, multi-drive
 storage routing, and a catalog-backed legacy `/manager/download` shim.
-The post-implementation Phase 4 review fixes have also landed: async
-install routes now return `202 Accepted`, public install rejects reserved
-synthetic cache aliases, stale `resolved_sha` pins are cleared on every
-invalidation path, worker error details are preserved, and cache deletion
-fails closed when a wipe cannot be safely completed. The catalog is now the
-single source of truth for "what is on disk, where, and in what state."
-HF search + vLLM compatibility filter (Phase 5) and the admin UI (Phase 6)
-are next.
+Phase 5 code has landed: `GET /manager/hf/search` returns vLLM-compatibility-
+flagged results sourced from runtime registry introspection (with a bundled
+JSON snapshot fallback), and `/manager/status` reports `vllm_arch_count` /
+`vllm_arch_source` so operators can see when the fallback is active. Phase 5
+is not marked complete until the bundled architecture snapshot is regenerated
+inside the pinned vLLM container and committed. The admin UI (Phase 6) follows.
 
 ## Phase status
 
@@ -28,7 +26,7 @@ are next.
 | 2 — Runtime lifecycle, lazy load, queue, idle eviction | Profile-driven `_start_vllm`, swap queue, idle eviction | ✅ Done (2026-04-28) |
 | 3 — Plane separation & auth | Two FastAPI apps (inference :8000, admin :8001), HTTP Basic | ✅ Done (2026-04-28) |
 | 4 — Install, download, cache, multi-drive | `/manager/install` + cancellable subprocess downloads | ✅ Done; review fixes landed (2026-04-28) |
-| 5 — HF search & vLLM compatibility filter | `GET /manager/hf/search`, runtime registry introspection | ⏭ Next |
+| 5 — HF search & vLLM compatibility filter | `GET /manager/hf/search`, runtime registry introspection | ⚠️ Code landed; generated snapshot pending |
 | 6 — Admin UI | React + Vite SPA on the admin port | ⏳ Pending |
 | 7 — Packaging, compose, docs | Multi-stage Dockerfile, compose mounts, ops docs | ⏳ Pending |
 | 8 — Verification & hardening | PRD acceptance scenarios | ⏳ Pending |
@@ -146,16 +144,54 @@ are next.
   `download-status` continue to work through the catalog-backed shim.
 - Archived plan: [plans/phase_4.md](plans/phase_4.md).
 
+**Phase 5**
+
+- New `hf_search.py` wraps `HfApi.list_models` with a `filter="transformers"`
+  + `pipeline_tag` pre-filter, fetches each candidate's `config.json`,
+  and decides vLLM compatibility against the loaded architecture set.
+  Per-row failures stay row-level (gated/missing/error reasons surface in
+  `compat_reason`), endpoint-level auth/timeout failures map to 502/504.
+- Architecture set sourced primarily by introspecting
+  `vllm.model_executor.models.registry.ModelRegistry.get_supported_archs()`
+  during `manager_lifespan` startup; falls back to the bundled
+  `vllm_supported_architectures.json` snapshot when the import path moves
+  on a vLLM bump, and to an empty set as a last resort (search still
+  returns rows, all flagged `vllm registry unavailable`).
+- `scripts/refresh_arch_list.py` regenerates the bundled snapshot from a
+  live vLLM install (`docker exec vllm-manager python scripts/refresh_arch_list.py`);
+  exits non-zero if vLLM cannot be imported or the registry API has shifted.
+- New admin route `GET /manager/hf/search?q=...&limit=...&filter_compat=...&include_vision=...`
+  returns the pinned envelope `{query, limit, include_vision,
+  vllm_arch_source, vllm_arch_count, results}`. Each result row carries
+  `model_id, architectures, is_compatible, compat_reason, size_estimate_gb,
+  downloads, likes, last_modified, tags, pipeline_tag`. `include_vision`
+  defaults `false` per PRD §5.9 but exposes a flag the UI can flip on for
+  vision-LLM searches (Qwen-VL, Llava, etc.).
+- Bounded daemon search workers cap `huggingface_hub` thread pile-up without
+  blocking process exit; outer `asyncio.wait_for(timeout=30)` raises 504 on
+  the response side. Lifespan teardown cancels queued search jobs.
+- Config lookups are cached by `(repo_id, sha_or_last_modified)` with a
+  10-minute TTL for unversioned rows, and `hf_hub_download` is pinned to the
+  Hub sha when available.
+- The Dockerfile sets `HF_HUB_ETAG_TIMEOUT` and `HF_HUB_DOWNLOAD_TIMEOUT`
+  defaults that cover the per-row `hf_hub_download` HTTP path; `model_info`
+  gets an explicit 15s timeout.
+- Size estimate reuses the proven siblings approach from
+  `download_worker._safetensor_total`; failures yield
+  `size_estimate_gb: null` without flipping `is_compatible`.
+- `/manager/status` gains `vllm_arch_count` and `vllm_arch_source` so
+  operators can see when the bundled fallback is active.
+- Archived plan: [plans/phase_5.md](plans/phase_5.md).
+
 ## Verification
 
 Latest host verification on macOS, no CUDA required:
 
-- `uv run pytest -q` → `210 passed` (145 prior + 65 new/extended across
-  `test_install.py`, `test_install_recovery.py`, `test_cache_delete.py`,
-  `test_download_legacy.py`, `test_downloader.py`, plus catalog and
-  runtime extensions, including the Phase 4 review-fix regressions).
-- `python -m py_compile vllm_manager.py runtime.py config.py catalog.py profiles.py downloader.py download_worker.py`
+- `python -m pytest -q` → `238 passed` (233 prior + 5 new Phase 5
+  review-fix regressions).
+- `python -m py_compile vllm_manager.py runtime.py config.py catalog.py profiles.py downloader.py download_worker.py hf_search.py scripts/refresh_arch_list.py`
 - `bash -n vllm-ctl`
+- `python scripts/refresh_arch_list.py --help` (does not require vLLM import)
 
 Workstation/GPU smoke validation is still outstanding:
 
@@ -181,11 +217,15 @@ Workstation/GPU smoke validation is still outstanding:
   `~/vllm-manager/`. Phase 4 expects each `storage.locations[].path` from
   `config.yaml` to be bind-mounted; the example file gets a multi-drive
   comment block update. Phase 7 documents the final canonical layout.
-- **Phase 5 search.** `GET /manager/hf/search` and the runtime vLLM-compat
-  registry introspection are next; Phase 5 also auto-populates
-  `size_estimate_gb` so UI installs always have the free-space pre-check.
+- **Phase 5 bundled architecture snapshot.** The committed
+  `vllm_supported_architectures.json` is a temporary fallback. This host
+  cannot import vLLM, so after the next workstation rebuild run
+  `docker exec vllm-manager python scripts/refresh_arch_list.py` once and
+  commit the regenerated file so the fallback exactly matches the pinned
+  vLLM nightly.
 - **vLLM pin staleness.** Refresh the pinned nightly before the next
-  workstation rebuild if the nightly index has moved.
+  workstation rebuild if the nightly index has moved. After bumping vLLM,
+  rerun `scripts/refresh_arch_list.py` to keep the bundled fallback aligned.
 - **Free-space pre-check absent on manual installs.** `vllm-ctl install`
   warns when `--size-gb` is not supplied; UI flow (Phase 6) will set it
   from search results so the warning fires only on hand-crafted curl/CLI.
@@ -199,4 +239,5 @@ Workstation/GPU smoke validation is still outstanding:
 - [Phase 2 plan](plans/phase_2.md)
 - [Phase 3 plan](plans/phase_3.md)
 - [Phase 4 plan](plans/phase_4.md)
+- [Phase 5 plan](plans/phase_5.md)
 - [Smoke checks](smoke_checks.md)
