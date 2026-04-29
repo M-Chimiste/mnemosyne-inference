@@ -1,4 +1,15 @@
 # ──────────────────────────────────────────────────────────────────
+# UI build stage
+# ──────────────────────────────────────────────────────────────────
+FROM node:22-alpine AS ui-builder
+
+WORKDIR /ui
+COPY ui/package*.json ./
+RUN npm ci
+COPY ui/ ./
+RUN npm run build
+
+# ──────────────────────────────────────────────────────────────────
 # vLLM Manager — Mnemosyne Inference Container
 #
 # Base: CUDA 12.8 devel (forward-compatible with your CUDA 13.2 driver)
@@ -60,6 +71,7 @@ COPY vllm_manager.py config.py catalog.py profiles.py runtime.py \
      downloader.py download_worker.py hf_search.py \
      vllm_supported_architectures.json ./
 COPY scripts/ ./scripts/
+COPY --from=ui-builder /ui/dist /app/static
 
 # HuggingFace cache lives in a volume (models persist across restarts)
 ENV HF_HOME=/hf-cache

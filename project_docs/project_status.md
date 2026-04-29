@@ -1,11 +1,11 @@
 # Mnemosyne Inference — Project Status
 
-**Last updated:** 2026-04-28
+**Last updated:** 2026-04-29
 
 ## Current state
 
 **Active milestone:** M4 — Discovery + UI
-**Active phase:** Phase 5 snapshot gate; Phase 6 next after that.
+**Active phase:** Phase 5 snapshot gate; Phase 7 packaging/docs next.
 
 M3 is implemented: `/manager/install` is end-to-end functional with
 killable subprocess downloads, restart-recoverable state, multi-drive
@@ -13,9 +13,12 @@ storage routing, and a catalog-backed legacy `/manager/download` shim.
 Phase 5 code has landed: `GET /manager/hf/search` returns vLLM-compatibility-
 flagged results sourced from runtime registry introspection (with a bundled
 JSON snapshot fallback), and `/manager/status` reports `vllm_arch_count` /
-`vllm_arch_source` so operators can see when the fallback is active. Phase 5
-is not marked complete until the bundled architecture snapshot is regenerated
-inside the pinned vLLM container and committed. The admin UI (Phase 6) follows.
+`vllm_arch_source` so operators can see when the fallback is active. Phase 6
+code has landed: the admin port now serves a React/Vite SPA, exposes live
+best-effort GPU telemetry via `/manager/gpu`, and keeps `/ui/*` off the
+inference plane. Phase 5 is still not marked complete until the bundled
+architecture snapshot is regenerated inside the pinned vLLM container and
+committed.
 
 ## Phase status
 
@@ -27,7 +30,7 @@ inside the pinned vLLM container and committed. The admin UI (Phase 6) follows.
 | 3 — Plane separation & auth | Two FastAPI apps (inference :8000, admin :8001), HTTP Basic | ✅ Done (2026-04-28) |
 | 4 — Install, download, cache, multi-drive | `/manager/install` + cancellable subprocess downloads | ✅ Done; review fixes landed (2026-04-28) |
 | 5 — HF search & vLLM compatibility filter | `GET /manager/hf/search`, runtime registry introspection | ⚠️ Code landed; generated snapshot pending |
-| 6 — Admin UI | React + Vite SPA on the admin port | ⏳ Pending |
+| 6 — Admin UI | React + Vite SPA on the admin port | ✅ Done; host verification complete (2026-04-29) |
 | 7 — Packaging, compose, docs | Multi-stage Dockerfile, compose mounts, ops docs | ⏳ Pending |
 | 8 — Verification & hardening | PRD acceptance scenarios | ⏳ Pending |
 
@@ -183,15 +186,50 @@ inside the pinned vLLM container and committed. The admin UI (Phase 6) follows.
   operators can see when the bundled fallback is active.
 - Archived plan: [plans/phase_5.md](plans/phase_5.md).
 
+**Phase 6**
+
+- New React/Vite/TypeScript/Tailwind admin UI under `ui/`, with TanStack
+  Query data hooks, react-router routes, lucide icon buttons, and dense
+  operational views for Dashboard, Catalog, HuggingFace Search, and Downloads.
+- Dockerfile now builds the UI in a Node 22 stage and copies `ui/dist` into
+  `/app/static` in the CUDA runtime image. `.dockerignore` keeps local
+  `node_modules`, build output, caches, and git metadata out of the build
+  context.
+- `vllm_manager.py` registers a dedicated admin-only `ui_router` before app
+  construction. `GET /` redirects to `/ui/`; `/ui` and `/ui/` serve
+  `index.html`; `/ui/{full_path:path}` serves contained assets or falls back
+  to the SPA for internal routes. Static root resolution happens per request
+  from `MNEMOSYNE_UI_DIR` or `/app/static`, and traversal attempts return 404.
+- New read-only `GET /manager/gpu` endpoint parses `nvidia-smi` output into
+  `{available, gpus}` for live dashboard telemetry. Missing/failing
+  `nvidia-smi` returns `available:false` instead of erroring, so macOS and
+  no-GPU dev hosts remain usable.
+- Dashboard shows live GPU metrics when available, GPU plan/utilization cap
+  from `/manager/status`, and the resident alias's persisted catalog request
+  count without presenting it as a recent traffic metric.
+- Catalog UI derives cache-only rows from reserved alias prefixes
+  (`__cache__:` / `__cache__/`) and mirrors backend action rules: cache-only
+  rows hide Load and offer Create alias; config rows delete cache by HF ID;
+  non-cache UI installs use alias-scoped cache deletion; removable UI/synthetic
+  rows use `DELETE /manager/install/{alias}`.
+- Search keeps incompatible HF rows visible with `compat_reason`, disables
+  Install for them, and carries `size_estimate_gb` into `POST /manager/install`
+  when present.
+- Downloads view polls `/manager/downloads` plus selected
+  `/manager/install/{alias}` detail and exposes cancel/retry/clear actions.
+- Archived plan: [plans/phase_6.md](plans/phase_6.md).
+
 ## Verification
 
 Latest host verification on macOS, no CUDA required:
 
-- `python -m pytest -q` → `238 passed` (233 prior + 5 new Phase 5
-  review-fix regressions).
+- `python -m pytest -q` → `247 passed`.
+- `cd ui && npm run build` → Vite production build succeeded.
+- `cd ui && npm test` → `9 passed`.
 - `python -m py_compile vllm_manager.py runtime.py config.py catalog.py profiles.py downloader.py download_worker.py hf_search.py scripts/refresh_arch_list.py`
 - `bash -n vllm-ctl`
 - `python scripts/refresh_arch_list.py --help` (does not require vLLM import)
+- `git diff --check`
 
 Workstation/GPU smoke validation is still outstanding:
 
@@ -210,6 +248,9 @@ Workstation/GPU smoke validation is still outstanding:
   reachable on `:8001` behind Basic auth.
 - Confirm `HUGGING_FACE_HUB_TOKEN` from the legacy `/manager/download` body
   does not appear in `docker exec vllm-manager env`.
+- Phase 6 container UI smoke: authenticated admin `/ui/` returns 200,
+  unauthenticated admin `/ui/` returns 401, inference `/ui/` returns 404, and
+  refreshing `/ui/catalog` serves the SPA.
 
 ## Open follow-ups
 
@@ -227,8 +268,9 @@ Workstation/GPU smoke validation is still outstanding:
   workstation rebuild if the nightly index has moved. After bumping vLLM,
   rerun `scripts/refresh_arch_list.py` to keep the bundled fallback aligned.
 - **Free-space pre-check absent on manual installs.** `vllm-ctl install`
-  warns when `--size-gb` is not supplied; UI flow (Phase 6) will set it
-  from search results so the warning fires only on hand-crafted curl/CLI.
+  warns when `--size-gb` is not supplied; the Phase 6 UI sets it from search
+  results when available, so the warning should primarily appear on
+  hand-crafted curl/CLI calls or search rows without a size estimate.
 
 ## Quick links
 
@@ -240,4 +282,5 @@ Workstation/GPU smoke validation is still outstanding:
 - [Phase 3 plan](plans/phase_3.md)
 - [Phase 4 plan](plans/phase_4.md)
 - [Phase 5 plan](plans/phase_5.md)
+- [Phase 6 plan](plans/phase_6.md)
 - [Smoke checks](smoke_checks.md)

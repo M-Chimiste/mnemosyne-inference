@@ -30,7 +30,7 @@ from typing import Awaitable, Callable, Optional, TypeVar
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.openapi.docs import get_redoc_html, get_swagger_ui_html
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel, Field
 import uvicorn
@@ -648,6 +648,7 @@ health_router = APIRouter()
 inference_router = APIRouter()
 admin_router = APIRouter()
 docs_router = APIRouter()
+ui_router = APIRouter()
 
 
 @docs_router.get("/openapi.json", include_in_schema=False)
@@ -778,6 +779,58 @@ async def list_storage():
             "is_default": loc.name == _config.storage.default,
         })
     return {"locations": out}
+
+
+def _parse_gpu_query(stdout: str) -> list[dict]:
+    """Parse nvidia-smi CSV output for the read-only dashboard GPU endpoint."""
+    gpus = []
+    for line in stdout.splitlines():
+        if not line.strip():
+            continue
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 5:
+            continue
+        name = ",".join(parts[1:-3]).strip()
+        try:
+            gpus.append({
+                "index": int(parts[0]),
+                "name": name,
+                "memory_used_mb": int(parts[-3]),
+                "memory_total_mb": int(parts[-2]),
+                "utilization_pct": int(parts[-1]),
+            })
+        except ValueError:
+            logger.warning("Skipping unparsable nvidia-smi row: %r", line)
+    return gpus
+
+
+@admin_router.get("/manager/gpu", tags=["manager"])
+async def gpu_status():
+    """Best-effort read-only GPU visibility for the admin dashboard.
+
+    Development hosts often lack nvidia-smi; fail closed to an empty response
+    instead of making the dashboard error.
+    """
+    cmd = [
+        "nvidia-smi",
+        "--query-gpu=index,name,memory.used,memory.total,utilization.gpu",
+        "--format=csv,noheader,nounits",
+    ]
+    try:
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return {"available": False, "gpus": []}
+    if result.returncode != 0:
+        return {"available": False, "gpus": []}
+    gpus = _parse_gpu_query(result.stdout)
+    return {"available": bool(gpus), "gpus": gpus}
 
 
 @admin_router.get("/manager/hf/search", tags=["manager"])
@@ -1715,6 +1768,43 @@ async def delete_alias(alias: str):
 
 
 # ──────────────────────────────────────────────
+# Admin UI static serving (Phase 6)
+# ──────────────────────────────────────────────
+
+def _ui_static_root() -> Path:
+    return Path(os.environ.get("MNEMOSYNE_UI_DIR", "/app/static")).resolve()
+
+
+def _ui_index_or_404(root: Path) -> FileResponse:
+    index = root / "index.html"
+    if not root.is_dir() or not index.is_file():
+        raise HTTPException(404, "admin UI build not found")
+    return FileResponse(index)
+
+
+@ui_router.get("/", include_in_schema=False)
+async def _admin_root():
+    return RedirectResponse("/ui/", status_code=307)
+
+
+@ui_router.get("/ui", include_in_schema=False)
+@ui_router.get("/ui/", include_in_schema=False)
+async def _ui_index():
+    return _ui_index_or_404(_ui_static_root())
+
+
+@ui_router.get("/ui/{full_path:path}", include_in_schema=False)
+async def _ui_spa(full_path: str):
+    root = _ui_static_root()
+    candidate = (root / full_path).resolve()
+    if candidate != root and root not in candidate.parents:
+        raise HTTPException(404, "invalid UI asset path")
+    if candidate.is_file():
+        return FileResponse(candidate)
+    return _ui_index_or_404(root)
+
+
+# ──────────────────────────────────────────────
 # App construction (Phase 3 §5.10)
 # ──────────────────────────────────────────────
 # MUST run after every @<router>.<verb>(...) decorator above, because
@@ -1753,6 +1843,10 @@ admin_app.include_router(
 )
 admin_app.include_router(
     docs_router,
+    dependencies=[Depends(require_admin_basic)],
+)
+admin_app.include_router(
+    ui_router,
     dependencies=[Depends(require_admin_basic)],
 )
 

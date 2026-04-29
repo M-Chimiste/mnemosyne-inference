@@ -216,3 +216,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Mnemosyne admin UI
+ui/node_modules/
+ui/dist/
+ui/coverage/
+!ui/src/lib/
+!ui/src/lib/**
