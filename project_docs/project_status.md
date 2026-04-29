@@ -4,8 +4,8 @@
 
 ## Current state
 
-**Active milestone:** M4 — Discovery + UI
-**Active phase:** Phase 5 snapshot gate; Phase 7 packaging/docs next.
+**Active milestone:** M5 — Workstation-ready release
+**Active phase:** Phase 8 verification/hardening; Phase 5 snapshot gate remains open.
 
 M3 is implemented: `/manager/install` is end-to-end functional with
 killable subprocess downloads, restart-recoverable state, multi-drive
@@ -16,9 +16,10 @@ JSON snapshot fallback), and `/manager/status` reports `vllm_arch_count` /
 `vllm_arch_source` so operators can see when the fallback is active. Phase 6
 code has landed: the admin port now serves a React/Vite SPA, exposes live
 best-effort GPU telemetry via `/manager/gpu`, and keeps `/ui/*` off the
-inference plane. Phase 5 is still not marked complete until the bundled
-architecture snapshot is regenerated inside the pinned vLLM container and
-committed.
+inference plane. Phase 7 docs/CLI packaging work has landed with a top-level
+README, executable `vllm-ctl`, and corrected admin auth examples. Phase 5 is
+still not marked complete until the bundled architecture snapshot is
+regenerated inside the pinned vLLM container and committed.
 
 ## Phase status
 
@@ -31,7 +32,7 @@ committed.
 | 4 — Install, download, cache, multi-drive | `/manager/install` + cancellable subprocess downloads | ✅ Done; review fixes landed (2026-04-28) |
 | 5 — HF search & vLLM compatibility filter | `GET /manager/hf/search`, runtime registry introspection | ⚠️ Code landed; generated snapshot pending |
 | 6 — Admin UI | React + Vite SPA on the admin port | ✅ Done; host verification complete (2026-04-29) |
-| 7 — Packaging, compose, docs | Multi-stage Dockerfile, compose mounts, ops docs | ⏳ Pending |
+| 7 — Packaging, compose, docs | Multi-stage Dockerfile, compose mounts, ops docs | ✅ Docs/CLI landed; CUDA quickstart smoke pending |
 | 8 — Verification & hardening | PRD acceptance scenarios | ⏳ Pending |
 
 ## What has landed
@@ -219,6 +220,24 @@ committed.
   `/manager/install/{alias}` detail and exposes cancel/retry/clear actions.
 - Archived plan: [plans/phase_6.md](plans/phase_6.md).
 
+**Phase 7**
+
+- Added top-level [README](../README.md) covering quickstart, config reload,
+  multi-drive storage, gated HF tokens, partial-download recovery,
+  architecture-list refresh, LAN exposure, common CLI operations, and
+  troubleshooting.
+- `vllm-ctl` help/env handling now reflects the two-plane world:
+  `VLLM_ADMIN_URL` defaults to `:8001`, legacy `VLLM_MANAGER_URL` is an admin
+  fallback, and `VLLM_INFERENCE_URL` steers `/v1/*` chat requests.
+- `vllm-ctl` is executable in git (`100755`) so README quickstart commands and
+  PATH/symlink usage work without `bash vllm-ctl`.
+- README raw admin `curl` examples load `ADMIN_PASSWORD` from
+  `~/vllm-manager/.env`, preserving `.env` as the container secret source while
+  making copy-paste API examples authenticate correctly.
+- README terminology now matches the shipped UI navigation (`Search`, not
+  `Discover`).
+- Archived plan: [plans/phase_7.md](plans/phase_7.md).
+
 ## Verification
 
 Latest host verification on macOS, no CUDA required:
@@ -228,6 +247,8 @@ Latest host verification on macOS, no CUDA required:
 - `cd ui && npm test` → `9 passed`.
 - `python -m py_compile vllm_manager.py runtime.py config.py catalog.py profiles.py downloader.py download_worker.py hf_search.py scripts/refresh_arch_list.py`
 - `bash -n vllm-ctl`
+- `./vllm-ctl help`
+- `git ls-files -s vllm-ctl` → `100755`
 - `python scripts/refresh_arch_list.py --help` (does not require vLLM import)
 - `git diff --check`
 
@@ -251,6 +272,9 @@ Workstation/GPU smoke validation is still outstanding:
 - Phase 6 container UI smoke: authenticated admin `/ui/` returns 200,
   unauthenticated admin `/ui/` returns 401, inference `/ui/` returns 404, and
   refreshing `/ui/catalog` serves the SPA.
+- Phase 7 CUDA quickstart smoke: copy examples into a clean compose dir,
+  set `ADMIN_PASSWORD`, build/start on the workstation, confirm `/health`,
+  authenticated `/manager/status`, and authenticated `/ui/`.
 
 ## Open follow-ups
 

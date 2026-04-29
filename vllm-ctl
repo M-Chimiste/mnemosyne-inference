@@ -2,24 +2,22 @@
 # ──────────────────────────────────────────────────────────────────
 # vllm-ctl — Control tool for the containerized vLLM Manager
 #
-# Usage:
-#   vllm-ctl build                  # build the Docker image
-#   vllm-ctl start                  # start container (docker compose up -d)
-#   vllm-ctl stop                   # stop container  (docker compose down)
-#   vllm-ctl restart                # restart container
-#   vllm-ctl status                 # service + loaded model status
-#   vllm-ctl load <model>           # load a model
-#   vllm-ctl load <model> --tp 1    # load with 1 GPU only
-#   vllm-ctl unload                 # unload model, free VRAM
-#   vllm-ctl models                 # list locally cached models
-#   vllm-ctl logs [-f]              # show container logs
-#   vllm-ctl chat <prompt>          # quick one-shot chat
-#   vllm-ctl shell                  # open a shell inside the container
+# Usage (see `vllm-ctl help` for the full list):
+#   Container:  build, start, stop, restart, logs [-f], shell
+#   Model:      status, load <model> [opts], unload, list, models
+#   Config:     reload, storage
+#   Installs:   install, install-cancel, install-retry, install-status,
+#               cache-delete
+#   Downloads:  download, download-status, downloads
+#   Testing:    chat <prompt>
 # ──────────────────────────────────────────────────────────────────
 
 COMPOSE_DIR="${VLLM_COMPOSE_DIR:-$HOME/vllm-manager}"
-ADMIN_URL="${VLLM_ADMIN_URL:-http://localhost:8001}"
-INFERENCE_URL="${VLLM_INFERENCE_URL:-${VLLM_MANAGER_URL:-http://localhost:8000}}"
+# VLLM_MANAGER_URL is the legacy variable from the single-plane prototype; it
+# now serves as a backward-compatible fallback for the admin URL only.
+# /v1/* is steered by VLLM_INFERENCE_URL (default :8000).
+ADMIN_URL="${VLLM_ADMIN_URL:-${VLLM_MANAGER_URL:-http://localhost:8001}}"
+INFERENCE_URL="${VLLM_INFERENCE_URL:-http://localhost:8000}"
 
 load_admin_password() {
   [[ -n "${ADMIN_PASSWORD:-}" ]] && return
@@ -783,14 +781,14 @@ $(bold "Examples:")
 $(bold "Environment:")
   VLLM_ADMIN_URL       Override admin URL (default: http://localhost:8001)
   VLLM_INFERENCE_URL   Override inference URL (default: http://localhost:8000)
-  VLLM_MANAGER_URL     Legacy inference URL fallback (default: http://localhost:8000)
+  VLLM_MANAGER_URL     Legacy admin URL fallback when VLLM_ADMIN_URL is unset
   VLLM_COMPOSE_DIR     Path to docker-compose.yml dir (default: ~/vllm-manager)
   ADMIN_PASSWORD       Admin Basic password; auto-loaded from ${COMPOSE_DIR}/.env
   INFERENCE_API_KEY    Optional bearer token for /v1/* chat requests
 
 $(bold "HF token (for gated models):")
-  Add HUGGING_FACE_HUB_TOKEN to docker-compose.yml environment, or:
-  echo 'HUGGING_FACE_HUB_TOKEN=hf_...' >> ${COMPOSE_DIR}/.env
+  Add HUGGING_FACE_HUB_TOKEN=hf_... to ${COMPOSE_DIR}/.env, then
+  vllm-ctl restart (env is read once at process start; no live reload).
 
 EOF
 }
