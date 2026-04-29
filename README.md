@@ -359,6 +359,36 @@ curl -u admin:"$ADMIN_PASSWORD" -X POST \
 - **`docker compose build` cannot find the Dockerfile.** `MNEMOSYNE_REPO_DIR`
   is unset (or wrong). Export it to the absolute path of your checkout.
 
+## Known v1 limitations
+
+These are deliberate v1 scope cuts. The canonical decision log is
+[project_docs/PRD.md §8](project_docs/PRD.md); this list is the operator-facing
+summary so you don't go looking for features that aren't here.
+
+- **No multi-model concurrent serving.** One vLLM at a time. To switch, send
+  a request with the new alias — `_proxy` queues the swap and returns once
+  the new model is loaded.
+- **No chat playground in the UI.** The admin UI covers catalog, install,
+  search, and dashboard surfaces. Use the OpenAI-compatible `/v1/*` endpoint
+  from your IDE / `curl` / a separate client for actual conversations.
+- **No Prometheus `/metrics` endpoint.** `/manager/status` plus the UI
+  dashboard are the operational surface. `/manager/gpu` exposes live GPU
+  telemetry parsed from `nvidia-smi`.
+- **No startup pre-warm.** The first `/v1/*` request after container start
+  triggers the lazy load; expect the usual vLLM warmup latency on that call.
+- **No automatic quantization-variant discovery on install.** You pick the
+  exact HF repo (e.g. `Qwen/Qwen2.5-72B-Instruct-AWQ` vs the FP16 base) at
+  install time. The HF Search view surfaces compatibility flags but does not
+  auto-substitute quantized variants.
+- **No vLLM auto-restart on crash.** If the inner vLLM dies under a request,
+  the manager fails open with a `503` and the next `/v1/*` request triggers a
+  fresh load (PRD §5.3). No supervisor loop tries to keep the previous model
+  resident.
+- **No runtime hard-fail when `gpus='all'` finds no GPUs.** The manager logs
+  a warning and falls back to `VLLM_DEFAULT_TP`. On a real CUDA host this
+  only happens if the nvidia-container-toolkit is misconfigured — fix the
+  toolkit setup rather than expecting a hard error from the manager.
+
 ## More
 
 - [agents.md](agents.md) — guidance for AI coding assistants and external

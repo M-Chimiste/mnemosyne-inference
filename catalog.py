@@ -27,6 +27,10 @@ _RESERVED_PREFIX_COLON = "__cache__:"
 _RESERVED_PREFIX_SLASH = "__cache__/"
 
 
+class CatalogCorruptionError(Exception):
+    """PRAGMA quick_check returned anything other than 'ok'."""
+
+
 def synthetic_alias(hf_model_id: str) -> str:
     """Deterministic, URL-safe synthetic alias for cache-only catalog entries.
 
@@ -224,8 +228,26 @@ class Catalog:
             # In-memory DBs don't support WAL; fall back silently.
             pass
         self._conn.execute("PRAGMA foreign_keys=ON")
+        self._quick_check()
         self._bootstrap()
         self._migrate_revision_column()
+        self._wal_checkpoint_best_effort()
+
+    def _quick_check(self) -> None:
+        """Raise CatalogCorruptionError unless quick_check returns exactly
+        one row with the literal string 'ok'."""
+        rows = self._conn.execute("PRAGMA quick_check").fetchall()
+        if len(rows) != 1 or rows[0][0] != "ok":
+            detail = "; ".join(str(r[0]) for r in rows) or "no rows"
+            raise CatalogCorruptionError(f"PRAGMA quick_check failed: {detail}")
+
+    def _wal_checkpoint_best_effort(self) -> None:
+        """Bound WAL growth across restarts. In-memory DBs don't support
+        the checkpoint; ignore those failures."""
+        try:
+            self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+        except sqlite3.OperationalError:
+            pass
 
     def close(self) -> None:
         if self._closed:
@@ -918,12 +940,52 @@ class Catalog:
         )
 
 
+def _quarantine_corrupt_db(db_path: str) -> list[str]:
+    """Rename `<db>` and any sibling `-wal`/`-shm` files to `*.corrupt-<ts>`.
+    Returns the list of quarantine paths actually created."""
+    stamp = time.strftime("%Y%m%d%H%M%S")
+    quarantined: list[str] = []
+    for suffix in ("", "-wal", "-shm"):
+        src = db_path + suffix
+        if not os.path.exists(src):
+            continue
+        dst = f"{db_path}.corrupt-{stamp}{suffix}"
+        try:
+            os.rename(src, dst)
+            quarantined.append(dst)
+        except OSError as e:
+            logger.warning("could not quarantine %s: %s", src, e)
+    return quarantined
+
+
 def open_catalog(path: str | None = None) -> Catalog:
-    """Open or create the SQLite catalog. Path resolved at call time."""
+    """Open or create the SQLite catalog. Path resolved at call time.
+
+    If the on-disk DB is corrupt (PRAGMA quick_check fails, or open/bootstrap
+    raises sqlite3.DatabaseError / OperationalError), quarantine the files to
+    `<db>.corrupt-<timestamp>` and open a fresh DB at the original path.
+    Startup apply_config + reconcile then repopulate config rows and recover
+    installed/partial state from storage.
+    """
     db_path = path or os.environ.get("MNEMOSYNE_DB_PATH", DEFAULT_DB_PATH)
     if db_path != ":memory:":
         parent = os.path.dirname(db_path)
         if parent:
             os.makedirs(parent, exist_ok=True)
     conn = sqlite3.connect(db_path, check_same_thread=False)
-    return Catalog(conn)
+    try:
+        return Catalog(conn)
+    except (CatalogCorruptionError, sqlite3.DatabaseError, sqlite3.OperationalError) as e:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        if db_path == ":memory:":
+            raise
+        quarantined = _quarantine_corrupt_db(db_path)
+        logger.error(
+            "catalog corruption detected at %s (%s: %s); quarantined to %s",
+            db_path, type(e).__name__, e, quarantined or "<nothing>",
+        )
+        fresh = sqlite3.connect(db_path, check_same_thread=False)
+        return Catalog(fresh)

@@ -187,7 +187,20 @@ def _reader_loop(handle: DownloadHandle, catalog: Catalog) -> None:
                     # preserve the worker's useful diagnostic.
                     message = event.get("message")
                     if message:
-                        worker_error = str(message)
+                        category = event.get("category")
+                        if category == "auth":
+                            worker_error = (
+                                "HuggingFace authentication failed (gated or "
+                                "private repo) — set HUGGING_FACE_HUB_TOKEN in "
+                                f"/config/.env and restart. raw: {message}"
+                            )
+                        elif category == "not_found":
+                            worker_error = (
+                                f"HuggingFace repo not found — check the model "
+                                f"id and revision. raw: {message}"
+                            )
+                        else:
+                            worker_error = str(message)
             except Exception as e:
                 logger.warning("download[%s]: catalog write failed: %s", alias, e)
     except Exception as e:

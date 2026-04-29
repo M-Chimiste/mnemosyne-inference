@@ -33,7 +33,7 @@ regenerated inside the pinned vLLM container and committed.
 | 5 — HF search & vLLM compatibility filter | `GET /manager/hf/search`, runtime registry introspection | ⚠️ Code landed; generated snapshot pending |
 | 6 — Admin UI | React + Vite SPA on the admin port | ✅ Done; host verification complete (2026-04-29) |
 | 7 — Packaging, compose, docs | Multi-stage Dockerfile, compose mounts, ops docs | ✅ Docs/CLI landed; CUDA quickstart smoke pending |
-| 8 — Verification & hardening | PRD acceptance scenarios | ⏳ Pending |
+| 8 — Verification & hardening | PRD acceptance scenarios | ⚠️ Code/docs landed; workstation acceptance pending |
 
 ## What has landed
 
@@ -238,14 +238,39 @@ regenerated inside the pinned vLLM container and committed.
   `Discover`).
 - Archived plan: [plans/phase_7.md](plans/phase_7.md).
 
+**Phase 8**
+
+- New `logsetup.py` installs a JSON formatter on the root logger; controlled
+  by `MNEMOSYNE_LOG_FORMAT={json|text}` (default JSON). One-line JSON objects
+  per record carry `ts`/`level`/`logger`/`msg`, fold `extra=` fields, and
+  render `exc_info` tracebacks. No call sites changed.
+- vLLM startup-failure error text now reports the inner subprocess exit code
+  and points operators at container logs for vLLM stderr.
+- Download worker tags HF errors as `auth` / `not_found`; the manager rewrites
+  the catalog message to `"set HUGGING_FACE_HUB_TOKEN in /config/.env and
+  restart"` (preserving the raw cause) for gated/private repos.
+- `catalog.open_catalog` now runs `PRAGMA quick_check` + a passive WAL
+  checkpoint at open time. Corrupt DBs are quarantined to `*.corrupt-<ts>`
+  and a fresh DB is opened at the original path; startup `apply_config` +
+  reconcile then repopulate config rows and recover storage state.
+- New tests: multimodal proxy passthrough, JSON log formatter shape + text
+  fallback, SQLite corruption quarantine.
+- Docs: README "Known v1 limitations" section, smoke checks Section 8
+  (vision-model multimodal smoke), and a new
+  [phase_8_acceptance.md](phase_8_acceptance.md) acceptance log mapping each
+  PRD §7 criterion to its test reference and smoke section.
+- Workstation acceptance pass remains pending (CUDA host required); Phase 8
+  flips ✅ once `phase_8_acceptance.md` is filled in on the workstation.
+- Archived plan: [plans/phase_8.md](plans/phase_8.md).
+
 ## Verification
 
 Latest host verification on macOS, no CUDA required:
 
-- `python -m pytest -q` → `247 passed`.
+- `python -m pytest -q` → `253 passed`.
 - `cd ui && npm run build` → Vite production build succeeded.
 - `cd ui && npm test` → `9 passed`.
-- `python -m py_compile vllm_manager.py runtime.py config.py catalog.py profiles.py downloader.py download_worker.py hf_search.py scripts/refresh_arch_list.py`
+- `python -m py_compile vllm_manager.py runtime.py config.py catalog.py profiles.py downloader.py download_worker.py hf_search.py logsetup.py scripts/refresh_arch_list.py`
 - `bash -n vllm-ctl`
 - `./vllm-ctl help`
 - `git ls-files -s vllm-ctl` → `100755`
@@ -307,4 +332,7 @@ Workstation/GPU smoke validation is still outstanding:
 - [Phase 4 plan](plans/phase_4.md)
 - [Phase 5 plan](plans/phase_5.md)
 - [Phase 6 plan](plans/phase_6.md)
+- [Phase 7 plan](plans/phase_7.md)
+- [Phase 8 plan](plans/phase_8.md)
+- [Phase 8 acceptance log](phase_8_acceptance.md)
 - [Smoke checks](smoke_checks.md)

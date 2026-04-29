@@ -38,6 +38,7 @@ import uvicorn
 import config as config_mod
 import downloader
 import hf_search
+import logsetup
 from catalog import (
     Catalog,
     ReconcileResult,
@@ -64,11 +65,7 @@ DEFAULT_GPU_MEM = float(os.getenv("VLLM_GPU_MEM_UTIL", "0.90"))
 STARTUP_TIMEOUT = int(os.getenv("VLLM_STARTUP_TIMEOUT", "600"))
 HF_HOME         = os.getenv("HF_HOME", "/hf-cache")
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
+logsetup.configure_logging(level=logging.INFO)
 logger = logging.getLogger("vllm-manager")
 
 T = TypeVar("T")
@@ -201,7 +198,12 @@ async def _start_vllm(profile: ResolvedProfile) -> None:
 
     try:
         if not await _wait_for_vllm():
-            raise RuntimeError(f"vLLM failed to become ready for alias '{profile.alias}'")
+            exit_code = vllm_process.poll() if vllm_process else None
+            raise RuntimeError(
+                f"vLLM failed to become ready for alias '{profile.alias}' "
+                f"(exit_code={exit_code}; see container logs for vLLM stderr — "
+                f"common causes: OOM, invalid quantization, missing weights)"
+            )
     except (Exception, asyncio.CancelledError):
         # Includes wait_for-induced CancelledError when ensure_loaded times out.
         # Always clean up the half-launched subprocess.

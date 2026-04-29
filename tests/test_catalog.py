@@ -578,3 +578,59 @@ def test_legacy_db_migration_adds_revision(tmp_path):
         assert row.resolved_sha is None
     finally:
         cat.close()
+
+
+# ── Phase 8 D4: corruption guard ─────────────────────────────────────
+
+
+def test_corrupt_db_is_quarantined_and_replaced(tmp_path, caplog):
+    """Phase 8 D4: open_catalog must quarantine a corrupt DB and return a
+    fresh, working Catalog at the original path. Accept either quick_check
+    failure or bootstrap/open failure as the trigger."""
+    import glob
+    import os
+
+    db = str(tmp_path / "mnemosyne.db")
+
+    # Seed a real catalog so a sibling -wal/-shm may exist, then close it.
+    seeded = open_catalog(db)
+    seeded._raw_insert_model(
+        alias="seed", hf_model_id="org/seed", storage_location="tmp",
+    )
+    seeded.close()
+
+    # Smash the file: write garbage over it. Either quick_check rejects it
+    # or bootstrap fails on the executescript — both are caught and
+    # quarantined. Wipe sidecar files so the corrupt main file is what
+    # SQLite looks at.
+    for suffix in ("-wal", "-shm"):
+        sidecar = db + suffix
+        if os.path.exists(sidecar):
+            os.remove(sidecar)
+    with open(db, "wb") as f:
+        f.write(b"this is not a sqlite database, just garbage\n" * 1000)
+
+    caplog.set_level("ERROR", logger="vllm-manager.catalog")
+    cat = open_catalog(db)
+    try:
+        # Fresh DB at original path is usable.
+        cat._raw_insert_model(
+            alias="post-recovery",
+            hf_model_id="org/post-recovery",
+            storage_location="tmp",
+        )
+        assert cat.get_model("post-recovery") is not None
+        # Old install rows did NOT survive — fresh DB.
+        assert cat.get_model("seed") is None
+    finally:
+        cat.close()
+
+    # A quarantine file exists.
+    quarantined = glob.glob(db + ".corrupt-*")
+    assert quarantined, f"expected *.corrupt-* sibling next to {db}"
+
+    # ERROR log mentions the quarantine.
+    assert any(
+        "catalog corruption" in rec.getMessage().lower()
+        for rec in caplog.records
+    )

@@ -185,6 +185,24 @@ def _safetensor_total(model_id: str, revision: str, token: Optional[str]) -> Opt
         return None
 
 
+def _classify_error(exc: BaseException) -> Optional[str]:
+    """Tag the error category so the parent can rewrite the message.
+
+    Returns "auth" for gated/private repos that need HUGGING_FACE_HUB_TOKEN,
+    "not_found" for missing repos, or None if we can't classify.
+    """
+    type_name = type(exc).__name__
+    if type_name in ("GatedRepoError",):
+        return "auth"
+    status = getattr(exc, "response", None)
+    code = getattr(status, "status_code", None) if status is not None else None
+    if code in (401, 403):
+        return "auth"
+    if type_name == "RepositoryNotFoundError" or code == 404:
+        return "not_found"
+    return None
+
+
 def _resolved_sha_from_path(cache_path: str) -> Optional[str]:
     """The HF cache layout is .../snapshots/<sha>/. Pull the SHA from the
     final path component."""
@@ -243,7 +261,11 @@ def _run(args: dict) -> int:
             tqdm_class=_ProgressTqdm,
         )
     except Exception as e:
-        _emit({"event": "error", "message": f"{type(e).__name__}: {e}"})
+        _emit({
+            "event": "error",
+            "message": f"{type(e).__name__}: {e}",
+            "category": _classify_error(e),
+        })
         return 1
 
     size = _dir_size(path)

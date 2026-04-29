@@ -68,7 +68,7 @@ RUN pip install --no-cache-dir \
 # ── App ────────────────────────────────────────────────────────────
 WORKDIR /app
 COPY vllm_manager.py config.py catalog.py profiles.py runtime.py \
-     downloader.py download_worker.py hf_search.py \
+     downloader.py download_worker.py hf_search.py logsetup.py \
      vllm_supported_architectures.json ./
 COPY scripts/ ./scripts/
 COPY --from=ui-builder /ui/dist /app/static
