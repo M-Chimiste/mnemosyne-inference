@@ -814,6 +814,42 @@ class Catalog:
             )
             return cursor.rowcount
 
+    def update_launch_settings(
+        self,
+        *,
+        alias: str,
+        quantization: Optional[str],
+        gpus: list | str,
+        max_model_len: Optional[int],
+        extra_args: Optional[list[str]],
+    ) -> Optional[CatalogRow]:
+        """Update launch-time settings for an existing ui_install row.
+
+        This leaves model identity, revision, storage, cache path, status, and
+        resolved_sha untouched. The new settings take effect the next time the
+        alias is loaded.
+        """
+        gpus_json = json.dumps(gpus)
+        extra_json = json.dumps(extra_args or [])
+        with self._lock, self._conn:
+            existing = self._conn.execute(
+                "SELECT source FROM models WHERE alias=?", (alias,)
+            ).fetchone()
+            if existing is None or existing["source"] != "ui_install":
+                return None
+            self._conn.execute(
+                """
+                UPDATE models SET
+                  quantization  = ?,
+                  gpus          = ?,
+                  max_model_len = ?,
+                  extra_args    = ?
+                WHERE alias = ? AND source = 'ui_install'
+                """,
+                (quantization, gpus_json, max_model_len, extra_json, alias),
+            )
+            return self.get_model(alias)
+
     def recover_orphan_downloads(self) -> int:
         """Find downloads rows in queued/downloading state at startup and
         mark them interrupted. Returns the count. Called BEFORE

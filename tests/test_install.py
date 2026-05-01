@@ -70,6 +70,49 @@ def test_install_resolved_sha_recorded_on_complete(client, stub_downloader):
     assert body["resolved_sha"] == "b" * 40
 
 
+def test_update_install_launch_settings(client):
+    import vllm_manager
+    cat = vllm_manager._catalog
+    cat._raw_insert_model(
+        alias="qw",
+        hf_model_id="Qwen/Qwen3.6-27B",
+        source="ui_install",
+        gpus='"all"',
+        max_model_len=8192,
+        storage_location="tmp",
+        status="installed",
+        cache_path="/tmp/snapshots/" + ("a" * 40),
+        resolved_sha="a" * 40,
+        extra_args='["--old"]',
+    )
+
+    r = client.patch("/manager/install/qw", json={
+        "quantization": None,
+        "gpus": [0],
+        "max_model_len": 262144,
+        "extra_args": ["--reasoning-parser", "qwen3"],
+    })
+
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["hf_model_id"] == "Qwen/Qwen3.6-27B"
+    assert body["status"] == "installed"
+    assert body["resolved_sha"] == "a" * 40
+    assert body["gpus"] == [0]
+    assert body["max_model_len"] == 262144
+    assert body["extra_args"] == ["--reasoning-parser", "qwen3"]
+
+
+def test_update_install_refuses_config_alias(rich_client):
+    client, _stub = rich_client
+    r = client.patch("/manager/install/a-model", json={
+        "gpus": "all",
+        "max_model_len": 262144,
+        "extra_args": [],
+    })
+    assert r.status_code == 409
+
+
 # ── conflicts ───────────────────────────────────────────────────────
 
 

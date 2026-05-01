@@ -124,3 +124,10 @@ export interface InstallRequest {
   size_estimate_gb?: number | null;
   ignore_patterns?: string[] | null;
 }
+
+export interface CatalogUpdateRequest {
+  quantization?: string | null;
+  gpus: GpuPlan;
+  max_model_len?: number | null;
+  extra_args: string[];
+}

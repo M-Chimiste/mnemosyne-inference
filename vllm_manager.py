@@ -1013,6 +1013,13 @@ class InstallRequest(BaseModel):
     ignore_patterns: Optional[list[str]] = None
 
 
+class CatalogUpdateRequest(BaseModel):
+    quantization: Optional[str] = None
+    gpus: GpuPlan = "all"
+    max_model_len: Optional[int] = None
+    extra_args: list[str] = Field(default_factory=list)
+
+
 def _resolve_storage(name: Optional[str]) -> tuple[str, str]:
     """Return (storage_name, storage_path). 400 on missing/unwritable."""
     if _config is None:
@@ -1254,6 +1261,39 @@ def _install_status_payload(alias: str) -> dict:
 @admin_router.get("/manager/install/{alias}", tags=["installs"])
 async def install_status_route(alias: str):
     return _install_status_payload(alias)
+
+
+@admin_router.patch("/manager/install/{alias}", tags=["installs"])
+async def update_install_route(alias: str, request: CatalogUpdateRequest):
+    if _catalog is None:
+        raise HTTPException(503, "manager not initialized")
+    row = _catalog.get_model(alias)
+    if row is None:
+        raise HTTPException(404, f"no install row for alias '{alias}'")
+    if row.source != "ui_install":
+        raise HTTPException(409, f"alias '{alias}' is defined in config.yaml; config wins")
+    if is_cache_only_alias(alias):
+        raise HTTPException(409, f"alias '{alias}' is cache-only; create an alias first")
+    if downloader.is_active(alias):
+        raise HTTPException(409, f"alias '{alias}' has an install in progress")
+    if request.max_model_len is not None and request.max_model_len < 1:
+        raise HTTPException(400, "max_model_len must be a positive integer or null")
+    if isinstance(request.gpus, list):
+        if not request.gpus:
+            raise HTTPException(400, "gpus list must not be empty")
+        if any((not isinstance(idx, int)) or isinstance(idx, bool) or idx < 0 for idx in request.gpus):
+            raise HTTPException(400, "gpus must be 'all' or a list of non-negative integers")
+
+    updated = _catalog.update_launch_settings(
+        alias=alias,
+        quantization=request.quantization,
+        gpus=_gpus_to_json(request.gpus),
+        max_model_len=request.max_model_len,
+        extra_args=list(request.extra_args),
+    )
+    if updated is None:
+        raise HTTPException(404, f"no editable install row for alias '{alias}'")
+    return updated.to_api_dict()
 
 
 def _check_aliased_delete_safety(row, exclude_alias: Optional[str] = None) -> None:

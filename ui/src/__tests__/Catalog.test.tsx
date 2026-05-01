@@ -1,4 +1,4 @@
-import { screen } from "@testing-library/react";
+import { screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import Catalog from "../views/Catalog";
@@ -92,6 +92,9 @@ describe("Catalog", () => {
     expect(screen.getByRole("button", { name: "Delete cache for cfg" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Delete cache for ui" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Delete cache for __cache__:abc" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Edit ui" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Edit cfg" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Edit __cache__:abc" })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Remove ui" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Remove __cache__:abc" })).toBeInTheDocument();
   });
@@ -105,5 +108,28 @@ describe("Catalog", () => {
 
     expect(screen.getByText("Create Alias")).toBeInTheDocument();
     expect(screen.getByDisplayValue("cacheonly")).toBeInTheDocument();
+  });
+
+  it("edits launch settings for UI-installed rows", async () => {
+    const fetchMock = installCatalogFetch();
+    vi.stubGlobal("fetch", fetchMock);
+    const user = userEvent.setup();
+    renderWithClient(<Catalog />);
+
+    await user.click(await screen.findByRole("button", { name: "Edit ui" }));
+    expect(screen.getByText("Edit Install")).toBeInTheDocument();
+
+    await user.type(screen.getByLabelText("Max Context"), "262144");
+    await user.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/manager/install/ui",
+        expect.objectContaining({
+          method: "PATCH",
+          body: expect.stringContaining("\"max_model_len\":262144")
+        })
+      );
+    });
   });
 });
