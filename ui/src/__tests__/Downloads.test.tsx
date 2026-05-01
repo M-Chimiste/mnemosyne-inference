@@ -18,6 +18,8 @@ function installDownloadsFetch() {
           path: "/models/hub/foo",
           error: null,
           revision: "main",
+          bytes_downloaded: 50_000_000,
+          total_bytes: 100_000_000,
           elapsed_seconds: 5
         }]
       }));

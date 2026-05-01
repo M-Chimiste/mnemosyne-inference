@@ -1,4 +1,5 @@
-import { useQuery } from "@tanstack/react-query";
+import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
+import type { InfiniteData } from "@tanstack/react-query";
 import { api } from "./client";
 import type {
   CatalogRow,
@@ -50,7 +51,7 @@ export function useDownloads() {
     queryFn: () => api<{ downloads: DownloadEntry[] }>("/manager/downloads"),
     refetchInterval: (query) => {
       const data = query.state.data as { downloads: DownloadEntry[] } | undefined;
-      const active = data?.downloads.some((d) => d.status === "queued" || d.status === "downloading");
+      const active = data?.downloads.some((d) => d.status === "queued" || d.status === "pending" || d.status === "downloading");
       return active ? 2000 : 10000;
     }
   });
@@ -69,14 +70,25 @@ export function useHfSearch(params: {
   q: string;
   includeVision: boolean;
   filterCompat: boolean;
+  pageSize: number;
   enabled: boolean;
 }) {
-  return useQuery({
-    queryKey: ["hf-search", params.q, params.includeVision, params.filterCompat],
-    enabled: params.enabled && params.q.trim().length > 0,
-    queryFn: () => {
+  return useInfiniteQuery<
+    HfSearchEnvelope,
+    Error,
+    InfiniteData<HfSearchEnvelope>,
+    [string, string, boolean, boolean, number],
+    number
+  >({
+    queryKey: ["hf-search", params.q, params.includeVision, params.filterCompat, params.pageSize],
+    enabled: params.enabled,
+    initialPageParam: 1,
+    getNextPageParam: (lastPage) => lastPage.next_page ?? undefined,
+    queryFn: ({ pageParam }) => {
       const qs = new URLSearchParams({
         q: params.q.trim(),
+        page: String(pageParam),
+        limit: String(params.pageSize),
         include_vision: String(params.includeVision),
         filter_compat: String(params.filterCompat)
       });

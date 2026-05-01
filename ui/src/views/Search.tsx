@@ -1,5 +1,5 @@
-import { FormEvent, useState } from "react";
-import { Download, Search as SearchIcon, ShieldAlert } from "lucide-react";
+import { FormEvent, UIEvent, useState } from "react";
+import { ChevronDown, Download, Search as SearchIcon, ShieldAlert } from "lucide-react";
 import type { HfSearchResult, InstallRequest } from "../api/types";
 import { useHfSearch, useStorage } from "../api/queries";
 import { useInstallStart } from "../api/mutations";
@@ -12,8 +12,9 @@ export default function Search() {
   const [query, setQuery] = useState("");
   const [includeVision, setIncludeVision] = useState(false);
   const [filterCompat, setFilterCompat] = useState(false);
+  const [pageSize, setPageSize] = useState(20);
   const [target, setTarget] = useState<HfSearchResult | null>(null);
-  const search = useHfSearch({ q: query, includeVision, filterCompat, enabled: Boolean(query) });
+  const search = useHfSearch({ q: query, includeVision, filterCompat, pageSize, enabled: true });
   const storage = useStorage();
   const install = useInstallStart();
 
@@ -26,7 +27,19 @@ export default function Search() {
     install.mutate(body, { onSuccess: () => setTarget(null) });
   }
 
-  const results = search.data?.results ?? [];
+  function maybeLoadMore(e: UIEvent<HTMLDivElement>) {
+    const el = e.currentTarget;
+    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 96;
+    if (nearBottom && search.hasNextPage && !search.isFetchingNextPage) {
+      search.fetchNextPage();
+    }
+  }
+
+  const pages = search.data?.pages ?? [];
+  const results = pages.flatMap((page) => page.results);
+  const firstPage = pages[0];
+  const lastPage = pages[pages.length - 1];
+  const isTopModels = query.length === 0;
 
   return (
     <div className="space-y-5">
@@ -35,7 +48,7 @@ export default function Search() {
           <h1 className="text-lg font-semibold">HuggingFace Search</h1>
           <p className="text-sm text-stone-600">vLLM compatibility is checked from the pinned architecture snapshot.</p>
         </div>
-        <form className="flex flex-col gap-3 p-4 md:flex-row md:items-end" onSubmit={submit}>
+        <form className="flex flex-col gap-3 p-4 lg:flex-row lg:items-end" onSubmit={submit}>
           <label className="flex-1 text-sm font-medium">
             Query
             <input
@@ -44,6 +57,18 @@ export default function Search() {
               onChange={(e) => setText(e.target.value)}
               placeholder="qwen instruct awq"
             />
+          </label>
+          <label className="text-sm font-medium">
+            Page size
+            <select
+              className="focus-ring mt-1 w-full border border-line bg-white px-2 py-1.5 lg:w-24"
+              value={pageSize}
+              onChange={(e) => setPageSize(Number(e.target.value))}
+            >
+              <option value={10}>10</option>
+              <option value={20}>20</option>
+              <option value={50}>50</option>
+            </select>
           </label>
           <label className="inline-flex items-center gap-2 text-sm">
             <input type="checkbox" checked={includeVision} onChange={(e) => setIncludeVision(e.target.checked)} />
@@ -58,14 +83,17 @@ export default function Search() {
           </button>
         </form>
         {search.error && <ErrorBox error={search.error} />}
-        {search.data && (
-          <div className="border-t border-line px-4 py-2 text-xs text-stone-600">
-            {search.data.results.length} results · {search.data.vllm_arch_count} architectures · {search.data.vllm_arch_source}
+        {firstPage && (
+          <div className="flex flex-col gap-1 border-t border-line px-4 py-2 text-xs text-stone-600 md:flex-row md:items-center md:justify-between">
+            <span>
+              {isTopModels ? "Top HuggingFace models" : `Search: ${query}`} · Showing {results.length} results · page {lastPage?.page ?? 1} · {firstPage.vllm_arch_count} architectures · {firstPage.vllm_arch_source}
+            </span>
+            {search.isFetching && !search.isFetchingNextPage && <span>Refreshing...</span>}
           </div>
         )}
-        <div className="overflow-x-auto">
+        <div className="max-h-[65vh] overflow-auto border-t border-line" onScroll={maybeLoadMore}>
           <table className="min-w-full text-left text-sm">
-            <thead className="border-y border-line bg-stone-50 text-xs uppercase text-stone-500">
+            <thead className="sticky top-0 z-10 border-y border-line bg-stone-50 text-xs uppercase text-stone-500">
               <tr>
                 <th className="px-3 py-2">Model</th>
                 <th className="px-3 py-2">Compatibility</th>
@@ -76,6 +104,9 @@ export default function Search() {
               </tr>
             </thead>
             <tbody>
+              {search.isFetching && results.length === 0 && (
+                <tr><td className="px-3 py-6 text-center text-stone-600" colSpan={6}>Loading models...</td></tr>
+              )}
               {results.map((row) => (
                 <tr key={row.model_id} className="border-b border-line last:border-0">
                   <td className="max-w-sm break-all px-3 py-2 font-medium">{row.model_id}</td>
@@ -109,15 +140,28 @@ export default function Search() {
                   </td>
                 </tr>
               ))}
-              {query && !search.isFetching && results.length === 0 && (
+              {!search.isFetching && results.length === 0 && (
                 <tr><td className="px-3 py-6 text-center text-stone-600" colSpan={6}>No search results.</td></tr>
-              )}
-              {!query && (
-                <tr><td className="px-3 py-6 text-center text-stone-600" colSpan={6}>Enter a query to search HuggingFace.</td></tr>
               )}
             </tbody>
           </table>
         </div>
+        {results.length > 0 && (
+          <div className="flex items-center justify-center border-t border-line p-3">
+            {search.hasNextPage ? (
+              <button
+                className="focus-ring inline-flex items-center gap-2 border border-line bg-white px-3 py-1.5 text-sm hover:bg-stone-100 disabled:cursor-wait disabled:opacity-70"
+                onClick={() => search.fetchNextPage()}
+                disabled={search.isFetchingNextPage}
+              >
+                <ChevronDown className="h-4 w-4" aria-hidden />
+                {search.isFetchingNextPage ? "Loading..." : "Load more"}
+              </button>
+            ) : (
+              <span className="text-xs text-stone-600">End of results</span>
+            )}
+          </div>
+        )}
       </section>
 
       {target && (

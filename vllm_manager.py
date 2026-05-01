@@ -197,7 +197,12 @@ async def _start_vllm(profile: ResolvedProfile) -> None:
     vllm_process = subprocess.Popen(argv, env=env, stdout=sys.stdout, stderr=sys.stderr)
 
     try:
-        if not await _wait_for_vllm():
+        startup_timeout = (
+            _config.server.startup_timeout_seconds
+            if _config is not None
+            else STARTUP_TIMEOUT
+        )
+        if not await _wait_for_vllm(timeout=startup_timeout):
             exit_code = vllm_process.poll() if vllm_process else None
             raise RuntimeError(
                 f"vLLM failed to become ready for alias '{profile.alias}' "
@@ -409,34 +414,119 @@ def _synthesize_profile(model_id: str) -> ResolvedProfile:
     )
 
 
+def _config_alias_for(requested: str) -> Optional[str]:
+    if _config is None:
+        return None
+    for m in _config.models:
+        if m.alias == requested:
+            return m.alias
+    folded = requested.casefold()
+    for m in _config.models:
+        if m.alias.casefold() == folded:
+            return m.alias
+    return None
+
+
+def _legacy_alias_for(requested: str) -> Optional[str]:
+    if requested in MODEL_ALIASES:
+        return requested
+    folded = requested.casefold()
+    for alias in MODEL_ALIASES:
+        if alias.casefold() == folded:
+            return alias
+    return None
+
+
+def _ui_install_row_for_alias(requested: str):
+    if _catalog is None:
+        return None
+    row = _catalog.get_model(requested)
+    if row is None:
+        row = _catalog.get_model_case_insensitive(requested)
+    if row is not None and row.source == "ui_install":
+        return row
+    return None
+
+
+def _ui_install_rows_for_hf_id(requested: str):
+    if _catalog is None:
+        return []
+    return [
+        row for row in _catalog.lookup_by_hf_id_case_insensitive(requested)
+        if row.source == "ui_install"
+    ]
+
+
+def _request_is_aliased(requested: str, profile: ResolvedProfile) -> bool:
+    """Whether a load request resolved to a managed alias/profile.
+
+    Raw HF passthrough synthesizes alias == requested. Managed aliases may be
+    addressed case-insensitively or by HF id, but still resolve to a canonical
+    alias and should ignore legacy tp/gpu_mem/extra_args overrides.
+    """
+    return (
+        _config_alias_for(requested) is not None
+        or _ui_install_row_for_alias(requested) is not None
+        or _legacy_alias_for(requested) is not None
+        or profile.alias != requested
+    )
+
+
 def _resolve_request_model(requested: str) -> ResolvedProfile:
-    """Four-tier lookup: config alias → catalog ui_install row → legacy
-    MODEL_ALIASES dict → raw HF id passthrough (gated by _RAW_HF_ID_RE or
-    absolute existing path). Anything else raises KeyError, which the caller
-    translates to 404. See plans/phase_2.md §5.5."""
+    """Five-tier lookup: config alias → catalog ui_install alias → legacy
+    MODEL_ALIASES dict → installed catalog HF id → raw HF id passthrough
+    (gated by _RAW_HF_ID_RE or absolute existing path). Anything else raises
+    KeyError, which the caller translates to 404. See plans/phase_2.md §5.5."""
     if _config is None or _catalog is None:
         raise RuntimeError("manager not initialized")
 
     # Tier 1 — config alias
-    if any(m.alias == requested for m in _config.models):
-        return resolve_profile(requested, _config, _catalog)
+    config_alias = _config_alias_for(requested)
+    if config_alias is not None:
+        return resolve_profile(config_alias, _config, _catalog)
     # Tier 2 — catalog ui_install row (must be fully installed)
-    row = _catalog.get_model(requested)
-    if row is not None and row.source == "ui_install":
+    row = _ui_install_row_for_alias(requested)
+    if row is not None:
         if row.status != "installed":
             raise HTTPException(
                 status_code=409,
                 detail=(
-                    f"alias '{requested}' is not ready (status='{row.status}'); "
+                    f"alias '{row.alias}' is not ready (status='{row.status}'); "
                     "complete the install before routing requests to it"
                 ),
             )
-        return resolve_profile(requested, _config, _catalog)
+        return resolve_profile(row.alias, _config, _catalog)
     # Tier 3 — legacy MODEL_ALIASES dict
-    if requested in MODEL_ALIASES:
-        _warn_legacy_alias_once(requested)
-        return _synthesize_profile(MODEL_ALIASES[requested])
-    # Tier 4 — raw HF id or absolute path
+    legacy_alias = _legacy_alias_for(requested)
+    if legacy_alias is not None:
+        _warn_legacy_alias_once(legacy_alias)
+        return _synthesize_profile(MODEL_ALIASES[legacy_alias])
+
+    is_hf_id = _RAW_HF_ID_RE.match(requested) is not None
+    # Tier 4 — an installed catalog row can also be addressed by HF id. This
+    # keeps OpenAI-compatible clients that send the provider model id on the
+    # saved alias profile instead of launching an unsafe raw profile.
+    if is_hf_id:
+        rows = _ui_install_rows_for_hf_id(requested)
+        for hf_row in rows:
+            if hf_row.status == "installed":
+                logger.info(
+                    "Resolving HF model id '%s' via installed alias '%s'",
+                    requested,
+                    hf_row.alias,
+                )
+                return resolve_profile(hf_row.alias, _config, _catalog)
+        for hf_row in rows:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"model '{requested}' is installed as alias "
+                    f"'{hf_row.alias}' but is not ready "
+                    f"(status='{hf_row.status}')"
+                ),
+            )
+
+    # Tier 5 — raw HF id or absolute path
     if _RAW_HF_ID_RE.match(requested) or (
         requested.startswith("/") and os.path.isdir(requested)
     ):
@@ -837,8 +927,9 @@ async def gpu_status():
 
 @admin_router.get("/manager/hf/search", tags=["manager"])
 async def hf_search_route(
-    q: str = Query(..., min_length=1, description="Search query"),
+    q: str = Query("", description="Search query; blank returns top models by downloads"),
     limit: int = Query(20, ge=1, le=50),
+    page: int = Query(1, ge=1, le=20),
     filter_compat: bool = Query(False),
     include_vision: bool = Query(False),
 ):
@@ -854,6 +945,7 @@ async def hf_search_route(
         return await hf_search.run_search(
             q=q,
             limit=limit,
+            page=page,
             include_vision=include_vision,
             filter_compat=filter_compat,
         )
@@ -910,15 +1002,7 @@ async def load_model(request: Request):
     except KeyError:
         raise HTTPException(status_code=404, detail=f"Unknown alias '{requested}'")
 
-    is_aliased = (
-        any(m.alias == requested for m in (_config.models if _config else []))
-        or (
-            _catalog is not None
-            and (row := _catalog.get_model(requested)) is not None
-            and row.source == "ui_install"
-        )
-        or requested in MODEL_ALIASES
-    )
+    is_aliased = _request_is_aliased(requested, profile)
     legacy_params = {
         k: body[k] for k in ("tp", "gpu_mem", "extra_args") if k in body
     }
@@ -1011,6 +1095,13 @@ class InstallRequest(BaseModel):
     extra_args: list[str] = Field(default_factory=list)
     size_estimate_gb: Optional[float] = None
     ignore_patterns: Optional[list[str]] = None
+
+
+class CatalogUpdateRequest(BaseModel):
+    quantization: Optional[str] = None
+    gpus: GpuPlan = "all"
+    max_model_len: Optional[int] = None
+    extra_args: list[str] = Field(default_factory=list)
 
 
 def _resolve_storage(name: Optional[str]) -> tuple[str, str]:
@@ -1254,6 +1345,39 @@ def _install_status_payload(alias: str) -> dict:
 @admin_router.get("/manager/install/{alias}", tags=["installs"])
 async def install_status_route(alias: str):
     return _install_status_payload(alias)
+
+
+@admin_router.patch("/manager/install/{alias}", tags=["installs"])
+async def update_install_route(alias: str, request: CatalogUpdateRequest):
+    if _catalog is None:
+        raise HTTPException(503, "manager not initialized")
+    row = _catalog.get_model(alias)
+    if row is None:
+        raise HTTPException(404, f"no install row for alias '{alias}'")
+    if row.source != "ui_install":
+        raise HTTPException(409, f"alias '{alias}' is defined in config.yaml; config wins")
+    if is_cache_only_alias(alias):
+        raise HTTPException(409, f"alias '{alias}' is cache-only; create an alias first")
+    if downloader.is_active(alias):
+        raise HTTPException(409, f"alias '{alias}' has an install in progress")
+    if request.max_model_len is not None and request.max_model_len < 1:
+        raise HTTPException(400, "max_model_len must be a positive integer or null")
+    if isinstance(request.gpus, list):
+        if not request.gpus:
+            raise HTTPException(400, "gpus list must not be empty")
+        if any((not isinstance(idx, int)) or isinstance(idx, bool) or idx < 0 for idx in request.gpus):
+            raise HTTPException(400, "gpus must be 'all' or a list of non-negative integers")
+
+    updated = _catalog.update_launch_settings(
+        alias=alias,
+        quantization=request.quantization,
+        gpus=_gpus_to_json(request.gpus),
+        max_model_len=request.max_model_len,
+        extra_args=list(request.extra_args),
+    )
+    if updated is None:
+        raise HTTPException(404, f"no editable install row for alias '{alias}'")
+    return updated.to_api_dict()
 
 
 def _check_aliased_delete_safety(row, exclude_alias: Optional[str] = None) -> None:
@@ -1512,6 +1636,8 @@ async def list_downloads():
             "path": r.cache_path,
             "error": download.error,
             "revision": r.revision,
+            "bytes_downloaded": download.bytes_downloaded,
+            "total_bytes": download.total_bytes,
         }
         if download.started_at:
             end = download.finished_at or int(time.time())
@@ -1571,6 +1697,27 @@ def _peek_model_field(body: bytes) -> Optional[str]:
     return val if isinstance(val, str) else None
 
 
+def _canonicalize_model_field(body: bytes, profile: Optional[ResolvedProfile]) -> bytes:
+    """Rewrite request JSON to the vLLM served model name after resolution.
+
+    The manager accepts aliases and case-insensitive HF ids, but vLLM's OpenAI
+    server validates the literal `model` field against its served name. Keep the
+    public lookup flexible while sending the canonical HF id upstream.
+    """
+    if profile is None or not body:
+        return body
+    try:
+        payload = json.loads(body)
+    except Exception:
+        return body
+    if not isinstance(payload, dict) or not isinstance(payload.get("model"), str):
+        return body
+    if payload["model"] == profile.model:
+        return body
+    payload["model"] = profile.model
+    return json.dumps(payload, separators=(",", ":")).encode("utf-8")
+
+
 async def _open_upstream(
     request: Request, path: str, body: bytes
 ) -> tuple[httpx.AsyncClient, httpx.Response]:
@@ -1622,8 +1769,8 @@ async def _proxy(request: Request, path: str, body: bytes):
     Forward a request to the inner vLLM server.
 
     Phase 2 semantics (plans/phase_2.md §5.4):
-      - The request body's `model` field is resolved through the four-tier
-        lookup (config → ui_install → MODEL_ALIASES → raw passthrough).
+      - The request body's `model` field is resolved through the managed
+        lookup (config → ui_install → MODEL_ALIASES → installed HF id → raw).
         Unknown values raise 404. Org/repo and absolute paths fall through
         to tier 4.
       - Swap queueing via ensure_loaded — multiple requests for the same
@@ -1677,8 +1824,9 @@ async def _proxy(request: Request, path: str, body: bytes):
     upstream_ok = False
     client: Optional[httpx.AsyncClient] = None
     response: Optional[httpx.Response] = None
+    upstream_body = _canonicalize_model_field(body, profile)
     try:
-        client, response = await _open_upstream(request, f"{path}", body)
+        client, response = await _open_upstream(request, f"{path}", upstream_body)
         upstream_ok = True
         if "text/event-stream" in response.headers.get("content-type", ""):
             is_streaming = True

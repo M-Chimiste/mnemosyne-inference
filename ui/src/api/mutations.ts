@@ -1,6 +1,6 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { api, jsonBody } from "./client";
-import type { InstallRequest } from "./types";
+import type { CatalogUpdateRequest, InstallRequest } from "./types";
 
 function invalidateManager(qc: ReturnType<typeof useQueryClient>) {
   qc.invalidateQueries({ queryKey: ["status"] });
@@ -38,6 +38,18 @@ export function useInstallStart() {
   return useMutation({
     mutationFn: (body: InstallRequest) =>
       api("/manager/install", { method: "POST", ...jsonBody(body) }),
+    onSuccess: () => invalidateManager(qc)
+  });
+}
+
+export function useUpdateCatalogRow() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ alias, body }: { alias: string; body: CatalogUpdateRequest }) =>
+      api(`/manager/install/${encodeURIComponent(alias)}`, {
+        method: "PATCH",
+        ...jsonBody(body)
+      }),
     onSuccess: () => invalidateManager(qc)
   });
 }

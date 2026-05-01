@@ -65,7 +65,7 @@ def build_vllm_argv(
         "--port", str(port),
         "--tensor-parallel-size", str(tp_size),
         "--gpu-memory-utilization", str(profile.gpu_memory_utilization),
-        "--disable-log-requests",
+        "--no-enable-log-requests",
     ]
     if profile.trust_remote_code:
         argv.append("--trust-remote-code")

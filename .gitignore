@@ -223,3 +223,7 @@ ui/dist/
 ui/coverage/
 !ui/src/lib/
 !ui/src/lib/**
+
+# Local functional-test runtime state and Codex scratch files
+.functional-test/
+.codex

@@ -469,15 +469,16 @@ def _list_one(
     `filter="transformers"` rather than the deprecated `library=` kwarg so
     the code survives `huggingface_hub` 1.x.
     """
-    return list(api.list_models(
-        search=q,
-        filter="transformers",
-        pipeline_tag=pipeline_tag,
-        limit=limit,
-        sort="downloads",
-        direction=-1,
-        token=token,
-    ))
+    kwargs = {
+        "filter": "transformers",
+        "pipeline_tag": pipeline_tag,
+        "limit": limit,
+        "sort": "downloads",
+        "token": token,
+    }
+    if q:
+        kwargs["search"] = q
+    return list(api.list_models(**kwargs))
 
 
 def _merge_by_id(a: list, b: list) -> list:
@@ -564,17 +565,21 @@ def _row_for_model(
 def _do_search_sync(
     q: str,
     limit: int,
+    page: int,
     include_vision: bool,
     filter_compat: bool,
 ) -> dict:
     """Sync search body. Runs on the bounded executor."""
     token = os.environ.get("HUGGING_FACE_HUB_TOKEN") or None
     cache_dir = os.environ.get("HF_HOME") or None
+    start = (page - 1) * limit
+    end = start + limit
+    fetch_limit = end + 1
 
     try:
-        rows = _list_one(_api, q, "text-generation", limit, token)
+        rows = _list_one(_api, q, "text-generation", fetch_limit, token)
         if include_vision:
-            vision = _list_one(_api, q, "image-text-to-text", limit, token)
+            vision = _list_one(_api, q, "image-text-to-text", fetch_limit, token)
             rows = _merge_by_id(rows, vision)
     except HfHubHTTPError as e:
         status = getattr(getattr(e, "response", None), "status_code", None)
@@ -589,17 +594,26 @@ def _do_search_sync(
     except Exception as e:  # noqa: BLE001
         raise HFSearchError(502, f"hub list_models failed: {type(e).__name__}: {e}")
 
-    # Truncate after merge so include_vision doesn't shrink the result count.
-    rows = rows[:limit]
-
     out_rows: list[dict] = []
     dropped_incompat = 0
-    for m in rows:
-        row = _row_for_model(m, token=token, cache_dir=cache_dir)
-        if filter_compat and not row["is_compatible"]:
-            dropped_incompat += 1
-            continue
-        out_rows.append(row)
+
+    if filter_compat:
+        for m in rows:
+            row = _row_for_model(m, token=token, cache_dir=cache_dir)
+            if not row["is_compatible"]:
+                dropped_incompat += 1
+                continue
+            out_rows.append(row)
+            if len(out_rows) > end:
+                break
+        page_rows = out_rows[start:end]
+        has_next = len(out_rows) > end
+    else:
+        page_models = rows[start:fetch_limit]
+        for m in page_models:
+            out_rows.append(_row_for_model(m, token=token, cache_dir=cache_dir))
+        page_rows = out_rows[:limit]
+        has_next = len(out_rows) > limit
 
     if filter_compat and dropped_incompat:
         logger.info(
@@ -610,11 +624,25 @@ def _do_search_sync(
     return {
         "query": q,
         "limit": limit,
+        "page": page,
+        "page_size": limit,
+        "has_next": has_next,
+        "next_page": page + 1 if has_next else None,
         "include_vision": include_vision,
         "vllm_arch_source": _arch_source,
         "vllm_arch_count": len(_supported_archs),
-        "results": out_rows,
+        "results": page_rows,
     }
+
+
+def _legacy_do_search_sync(
+    q: str,
+    limit: int,
+    include_vision: bool,
+    filter_compat: bool,
+) -> dict:
+    """Compatibility wrapper for older direct tests/imports."""
+    return _do_search_sync(q, limit, 1, include_vision, filter_compat)
 
 
 async def run_search(
@@ -622,17 +650,18 @@ async def run_search(
     limit: int,
     include_vision: bool,
     filter_compat: bool,
+    page: int = 1,
 ) -> dict:
     """Async wrapper around _do_search_sync. Caps end-to-end at 30s; on
     timeout, raises HFSearchError(504). The worker thread keeps running —
     the bounded pool prevents pile-up."""
-    if not q or not q.strip():
-        raise HFSearchError(400, "query 'q' is required")
+    q = (q or "").strip()
     limit = max(1, min(int(limit), 50))
+    page = max(1, min(int(page), 20))
     pool = _get_search_pool()
     future = pool.submit(
         _do_search_sync,
-        q.strip(), limit, bool(include_vision), bool(filter_compat),
+        q, limit, page, bool(include_vision), bool(filter_compat),
     )
     try:
         return await asyncio.wait_for(

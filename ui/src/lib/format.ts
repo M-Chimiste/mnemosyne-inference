@@ -27,7 +27,7 @@ export function relativeFromSeconds(seconds: number | null | undefined): string 
 
 export function formatGpuPlan(gpus: GpuPlan | null | undefined): string {
   if (!gpus) return "—";
-  if (gpus === "all") return "all GPUs";
+  if (gpus === "all") return "all visible GPUs";
   return `GPU ${gpus.join(",")}`;
 }
 

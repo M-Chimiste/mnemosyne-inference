@@ -78,6 +78,10 @@ export interface HfSearchResult {
 export interface HfSearchEnvelope {
   query: string;
   limit: number;
+  page: number;
+  page_size: number;
+  has_next: boolean;
+  next_page: number | null;
   include_vision: boolean;
   vllm_arch_source: string;
   vllm_arch_count: number;
@@ -109,6 +113,8 @@ export interface DownloadEntry {
   path: string | null;
   error: string | null;
   revision: string;
+  bytes_downloaded: number;
+  total_bytes: number | null;
   elapsed_seconds?: number;
 }
 
@@ -123,4 +129,11 @@ export interface InstallRequest {
   extra_args: string[];
   size_estimate_gb?: number | null;
   ignore_patterns?: string[] | null;
+}
+
+export interface CatalogUpdateRequest {
+  quantization?: string | null;
+  gpus: GpuPlan;
+  max_model_len?: number | null;
+  extra_args: string[];
 }

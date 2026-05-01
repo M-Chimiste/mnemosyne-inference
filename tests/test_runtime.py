@@ -59,7 +59,7 @@ def test_argv_mandatory_flags_present():
     assert argv[argv.index("--tensor-parallel-size") + 1] == "2"
     assert "--gpu-memory-utilization" in argv
     assert argv[argv.index("--gpu-memory-utilization") + 1] == "0.9"
-    assert "--disable-log-requests" in argv
+    assert "--no-enable-log-requests" in argv
 
 
 def test_argv_trust_remote_code_when_true():

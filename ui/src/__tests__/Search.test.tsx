@@ -16,6 +16,10 @@ function installSearchFetch() {
       return Promise.resolve(jsonResponse({
         query: "qwen",
         limit: 20,
+        page: 1,
+        page_size: 20,
+        has_next: false,
+        next_page: null,
         include_vision: true,
         vllm_arch_source: "snapshot",
         vllm_arch_count: 12,
@@ -67,7 +71,7 @@ describe("Search", () => {
 
     expect(await screen.findByText("Org/Good")).toBeInTheDocument();
     expect(fetchMock).toHaveBeenCalledWith(
-      "/manager/hf/search?q=qwen&include_vision=true&filter_compat=false",
+      "/manager/hf/search?q=qwen&page=1&limit=20&include_vision=true&filter_compat=false",
       expect.objectContaining({ credentials: "include" })
     );
     expect(screen.getByRole("button", { name: "Install Org/Bad" })).toBeDisabled();

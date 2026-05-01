@@ -108,6 +108,7 @@ class _ProgressTqdm:
     HF passes one instance per file. We aggregate via a module-level
     counter under a lock."""
     _total_lock = threading.Lock()
+    _lock = _total_lock
     _total_downloaded = 0
     _total_size: Optional[int] = None
 
@@ -147,6 +148,15 @@ class _ProgressTqdm:
 
     def refresh(self) -> None:
         pass
+
+    @classmethod
+    def get_lock(cls):
+        return cls._lock
+
+    @classmethod
+    def set_lock(cls, lock) -> None:
+        cls._lock = lock
+        cls._total_lock = lock
 
     def __enter__(self):
         return self

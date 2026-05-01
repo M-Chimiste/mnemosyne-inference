@@ -1,6 +1,7 @@
 const palette: Record<string, string> = {
   installed: "border-pine/40 bg-pine/10 text-pine",
   downloading: "border-amber/40 bg-amber/10 text-amber",
+  pending: "border-amber/40 bg-amber/10 text-amber",
   queued: "border-amber/40 bg-amber/10 text-amber",
   partial: "border-stone-400 bg-stone-100 text-stone-700",
   error: "border-brick/40 bg-brick/10 text-brick",

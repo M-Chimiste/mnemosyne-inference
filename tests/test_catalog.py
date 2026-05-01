@@ -539,6 +539,21 @@ def test_lookup_by_hf_id_orders_ui_install_first(cat):
     assert rows[0].alias == "ui-row"
 
 
+def test_case_insensitive_model_lookups_preserve_canonical_rows(cat):
+    cat._raw_insert_model(
+        alias="Qwen-Alias",
+        hf_model_id="Qwen/Qwen3.6-27B",
+        source="ui_install",
+        gpus='"all"',
+        storage_location="tmp",
+    )
+    by_alias = cat.get_model_case_insensitive("qwen-alias")
+    assert by_alias.alias == "Qwen-Alias"
+    by_hf_id = cat.lookup_by_hf_id_case_insensitive("qwen/qwen3.6-27b")
+    assert len(by_hf_id) == 1
+    assert by_hf_id[0].hf_model_id == "Qwen/Qwen3.6-27B"
+
+
 def test_legacy_db_migration_adds_revision(tmp_path):
     """A pre-Phase-4 DB without revision/resolved_sha columns gets
     migrated by _migrate_revision_column on open."""

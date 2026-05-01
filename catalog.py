@@ -527,6 +527,21 @@ class Catalog:
             ).fetchone()
         return self._to_catalog_row(row) if row else None
 
+    def get_model_case_insensitive(self, alias: str) -> Optional[CatalogRow]:
+        """Return a row by alias, falling back to ASCII case-insensitive match.
+
+        Exact-case matches win. HuggingFace ids and our generated aliases are
+        ASCII, so SQLite NOCASE is sufficient and avoids changing stored casing.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM models WHERE alias=? COLLATE NOCASE "
+                "ORDER BY CASE WHEN alias=? THEN 0 ELSE 1 END, alias "
+                "LIMIT 1",
+                (alias, alias),
+            ).fetchone()
+        return self._to_catalog_row(row) if row else None
+
     def list_downloads(self) -> list[DownloadRow]:
         with self._lock:
             rows = self._conn.execute("SELECT * FROM downloads ORDER BY id").fetchall()
@@ -548,6 +563,21 @@ class Catalog:
                 "SELECT * FROM models WHERE hf_model_id=? "
                 "ORDER BY (source='ui_install') DESC, alias",
                 (hf_model_id,),
+            ).fetchall()
+        return [self._to_catalog_row(r) for r in rows]
+
+    def lookup_by_hf_id_case_insensitive(self, hf_model_id: str) -> list[CatalogRow]:
+        """Return rows for an HF model id without requiring exact casing.
+
+        Exact-case matches sort first, then ui_install rows, preserving the
+        existing preference used by lookup_by_hf_id.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM models WHERE hf_model_id=? COLLATE NOCASE "
+                "ORDER BY CASE WHEN hf_model_id=? THEN 0 ELSE 1 END, "
+                "(source='ui_install') DESC, alias",
+                (hf_model_id, hf_model_id),
             ).fetchall()
         return [self._to_catalog_row(r) for r in rows]
 
@@ -813,6 +843,42 @@ class Catalog:
                 (alias,),
             )
             return cursor.rowcount
+
+    def update_launch_settings(
+        self,
+        *,
+        alias: str,
+        quantization: Optional[str],
+        gpus: list | str,
+        max_model_len: Optional[int],
+        extra_args: Optional[list[str]],
+    ) -> Optional[CatalogRow]:
+        """Update launch-time settings for an existing ui_install row.
+
+        This leaves model identity, revision, storage, cache path, status, and
+        resolved_sha untouched. The new settings take effect the next time the
+        alias is loaded.
+        """
+        gpus_json = json.dumps(gpus)
+        extra_json = json.dumps(extra_args or [])
+        with self._lock, self._conn:
+            existing = self._conn.execute(
+                "SELECT source FROM models WHERE alias=?", (alias,)
+            ).fetchone()
+            if existing is None or existing["source"] != "ui_install":
+                return None
+            self._conn.execute(
+                """
+                UPDATE models SET
+                  quantization  = ?,
+                  gpus          = ?,
+                  max_model_len = ?,
+                  extra_args    = ?
+                WHERE alias = ? AND source = 'ui_install'
+                """,
+                (quantization, gpus_json, max_model_len, extra_json, alias),
+            )
+            return self.get_model(alias)
 
     def recover_orphan_downloads(self) -> int:
         """Find downloads rows in queued/downloading state at startup and

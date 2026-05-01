@@ -63,6 +63,10 @@ def test_compatible_row(client, monkeypatch):
     body = r.json()
     assert body["query"] == "qwen2.5"
     assert body["limit"] == 20
+    assert body["page"] == 1
+    assert body["page_size"] == 20
+    assert body["has_next"] is False
+    assert body["next_page"] is None
     assert body["include_vision"] is False
     assert body["vllm_arch_source"] == "vllm-registry"
     assert body["vllm_arch_count"] == len(SUPPORTED)
@@ -74,6 +78,8 @@ def test_compatible_row(client, monkeypatch):
     assert row["compat_reason"] is None
     assert row["downloads"] == 12345
     assert row["likes"] == 50
+    assert api.list_calls[0]["sort"] == "downloads"
+    assert "direction" not in api.list_calls[0]
 
 
 def test_incompatible_row_unsupported_architecture(client, monkeypatch):
@@ -194,12 +200,18 @@ def test_include_vision_default_false_makes_one_call(client, monkeypatch):
     assert api.list_calls[0]["pipeline_tag"] == "text-generation"
 
 
-def test_empty_query_returns_400(client):
-    # Empty string is rejected by FastAPI's min_length=1 validation as 422.
-    # Pass a whitespace-only string to exercise our own 400 path.
+def test_empty_query_returns_top_models(client, monkeypatch):
+    api = _build_response(
+        monkeypatch,
+        list_results={"text-generation": [FakeModelInfo("top/model")]},
+        configs={"top/model": {"architectures": ["LlamaForCausalLM"]}},
+    )
     r = client.get("/manager/hf/search?q=%20%20")
-    assert r.status_code == 400
-    assert "required" in r.json()["detail"]
+    assert r.status_code == 200
+    body = r.json()
+    assert body["query"] == ""
+    assert body["results"][0]["model_id"] == "top/model"
+    assert "search" not in api.list_calls[0]
 
 
 def test_response_envelope_shape(client, monkeypatch):
@@ -210,10 +222,30 @@ def test_response_envelope_shape(client, monkeypatch):
     )
     body = client.get("/manager/hf/search?q=x").json()
     expected_keys = {
-        "query", "limit", "include_vision",
+        "query", "limit", "page", "page_size", "has_next", "next_page", "include_vision",
         "vllm_arch_source", "vllm_arch_count", "results",
     }
     assert expected_keys.issubset(body.keys())
+
+
+def test_search_paginates_ranked_results(client, monkeypatch):
+    models = [
+        FakeModelInfo(f"org/model-{i:02d}", downloads=100 - i)
+        for i in range(25)
+    ]
+    _build_response(
+        monkeypatch,
+        list_results={"text-generation": models},
+        configs={m.id: {"architectures": ["LlamaForCausalLM"]} for m in models},
+    )
+    body = client.get("/manager/hf/search?q=org&page=2&limit=10").json()
+    assert body["page"] == 2
+    assert body["page_size"] == 10
+    assert body["has_next"] is True
+    assert body["next_page"] == 3
+    assert [row["model_id"] for row in body["results"]] == [
+        f"org/model-{i:02d}" for i in range(10, 20)
+    ]
 
 
 def test_size_estimate_from_siblings(client, monkeypatch):

@@ -5,6 +5,7 @@ mocked at the _open_upstream boundary so no real subprocess is spawned.
 """
 from __future__ import annotations
 
+import json
 import time
 from contextlib import asynccontextmanager
 from unittest import mock
@@ -111,6 +112,90 @@ def test_v1_resolves_ui_install_alias(rich_client, monkeypatch):
     assert stub.calls[0].model == "org/ui-installed-model"
 
 
+def test_v1_resolves_ui_install_alias_case_insensitive(rich_client, monkeypatch):
+    client, stub = rich_client
+    vllm_manager._catalog._raw_insert_model(
+        alias="ui-installed",
+        hf_model_id="org/ui-installed-model",
+        source="ui_install",
+        storage_location="tmp",
+    )
+    _patch_upstream(monkeypatch, _FakeResponse())
+    r = client.post(
+        "/v1/chat/completions",
+        json={"model": "UI-INSTALLED", "messages": []},
+    )
+    assert r.status_code == 200
+    assert stub.calls[0].alias == "ui-installed"
+    assert stub.calls[0].model == "org/ui-installed-model"
+
+
+def test_v1_resolves_installed_hf_id_via_ui_alias(rich_client, monkeypatch):
+    client, stub = rich_client
+    vllm_manager._catalog._raw_insert_model(
+        alias="qwen36-27b",
+        hf_model_id="Qwen/Qwen3.6-27B",
+        source="ui_install",
+        gpus='"all"',
+        storage_location="tmp",
+        extra_args='["--max-num-seqs", "512"]',
+    )
+    _patch_upstream(monkeypatch, _FakeResponse())
+    r = client.post(
+        "/v1/chat/completions",
+        json={"model": "qwen/qwen3.6-27b", "messages": []},
+    )
+    assert r.status_code == 200
+    assert stub.calls[0].alias == "qwen36-27b"
+    assert stub.calls[0].model == "Qwen/Qwen3.6-27B"
+    assert stub.calls[0].extra_args == ("--max-num-seqs", "512")
+    assert vllm_manager._runtime.resident_alias == "qwen36-27b"
+
+
+def test_v1_rewrites_case_insensitive_hf_id_to_served_model(rich_client, monkeypatch):
+    client, stub = rich_client
+    captured: dict[str, dict] = {}
+    vllm_manager._catalog._raw_insert_model(
+        alias="qwen36-27b",
+        hf_model_id="Qwen/Qwen3.6-27B",
+        source="ui_install",
+        gpus='"all"',
+        storage_location="tmp",
+    )
+
+    async def _open_upstream(_request, _path, body):
+        captured["body"] = json.loads(body)
+        return _FakeClient(), _FakeResponse()
+
+    monkeypatch.setattr(vllm_manager, "_open_upstream", _open_upstream)
+    r = client.post(
+        "/v1/chat/completions",
+        json={"model": "qwen/qwen3.6-27b", "messages": []},
+    )
+    assert r.status_code == 200
+    assert stub.calls[0].alias == "qwen36-27b"
+    assert captured["body"]["model"] == "Qwen/Qwen3.6-27B"
+
+
+def test_v1_installed_hf_id_not_ready_returns_409(rich_client, monkeypatch):
+    client, stub = rich_client
+    vllm_manager._catalog._raw_insert_model(
+        alias="qwen36-27b",
+        hf_model_id="Qwen/Qwen3.6-27B",
+        source="ui_install",
+        status="downloading",
+        storage_location="tmp",
+    )
+    _patch_upstream(monkeypatch, _FakeResponse())
+    r = client.post(
+        "/v1/chat/completions",
+        json={"model": "Qwen/Qwen3.6-27B", "messages": []},
+    )
+    assert r.status_code == 409
+    assert "not ready" in r.json()["detail"]
+    assert stub.calls == []
+
+
 # ── tier 3: legacy MODEL_ALIASES ──────────────────────────────────────
 
 
@@ -193,6 +278,28 @@ def test_load_raw_id_with_legacy_overrides(rich_client):
     assert profile.model == "Qwen/Qwen2.5-7B-Instruct"
     assert profile.gpu_memory_utilization == 0.85
     assert profile.gpus == [0]  # tp=1 → list(range(1))
+
+
+def test_load_installed_hf_id_ignores_legacy_overrides(rich_client):
+    client, stub = rich_client
+    vllm_manager._catalog._raw_insert_model(
+        alias="qwen36-27b",
+        hf_model_id="Qwen/Qwen3.6-27B",
+        source="ui_install",
+        gpus='"all"',
+        storage_location="tmp",
+        extra_args='["--max-num-seqs", "512"]',
+    )
+    r = client.post(
+        "/manager/load",
+        json={"model": "qwen/qwen3.6-27b", "tp": 1, "gpu_mem": 0.5},
+    )
+    assert r.status_code == 200
+    assert r.json()["alias"] == "qwen36-27b"
+    profile = stub.calls[0]
+    assert profile.alias == "qwen36-27b"
+    assert profile.gpu_memory_utilization == 0.85
+    assert profile.gpus == "all"
 
 
 def test_load_typoed_alias_returns_404(rich_client):

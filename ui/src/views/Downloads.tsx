@@ -8,11 +8,21 @@ import { StatusBadge } from "../components/StatusBadge";
 import { formatBytes, formatTime } from "../lib/format";
 
 function canCancel(status: string) {
-  return status === "queued" || status === "downloading";
+  return status === "queued" || status === "pending" || status === "downloading";
 }
 
 function canRetry(status: string) {
   return status === "error" || status === "cancelled" || status === "partial";
+}
+
+function progressTotal(status: string | undefined, bytes: number | null | undefined, total: number | null | undefined) {
+  if (total != null) return total;
+  if (status === "complete" && bytes != null && bytes > 0) return bytes;
+  return total;
+}
+
+function isActiveDownload(status: string | undefined) {
+  return status === "queued" || status === "pending" || status === "downloading";
 }
 
 export default function Downloads() {
@@ -42,6 +52,7 @@ export default function Downloads() {
                 <th className="px-3 py-2">Alias</th>
                 <th className="px-3 py-2">Model</th>
                 <th className="px-3 py-2">Status</th>
+                <th className="px-3 py-2">Progress</th>
                 <th className="px-3 py-2">Started</th>
                 <th className="px-3 py-2">Path</th>
                 <th className="px-3 py-2 text-right">Actions</th>
@@ -60,6 +71,13 @@ export default function Downloads() {
                   </td>
                   <td className="max-w-sm break-all px-3 py-2 text-stone-700">{row.model}</td>
                   <td className="px-3 py-2"><StatusBadge status={row.status} /></td>
+                  <td className="px-3 py-2">
+                    <ProgressBar
+                      bytes={row.bytes_downloaded}
+                      total={progressTotal(row.status, row.bytes_downloaded, row.total_bytes)}
+                      active={isActiveDownload(row.status)}
+                    />
+                  </td>
                   <td className="px-3 py-2">{formatTime(row.started_at)}</td>
                   <td className="max-w-xs truncate px-3 py-2 text-xs text-stone-600" title={row.path ?? ""}>{row.path ?? "—"}</td>
                   <td className="px-3 py-2">
@@ -98,7 +116,7 @@ export default function Downloads() {
                 </tr>
               ))}
               {rows.length === 0 && (
-                <tr><td className="px-3 py-6 text-center text-stone-600" colSpan={6}>No download records.</td></tr>
+                <tr><td className="px-3 py-6 text-center text-stone-600" colSpan={7}>No download records.</td></tr>
               )}
             </tbody>
           </table>
@@ -126,7 +144,15 @@ export default function Downloads() {
               <dt className="text-stone-500">Error</dt>
               <dd>{detail.data?.download?.error ?? "—"}</dd>
             </dl>
-            <ProgressBar bytes={detail.data?.download?.bytes_downloaded} total={detail.data?.download?.total_bytes} />
+            <ProgressBar
+              bytes={detail.data?.download?.bytes_downloaded}
+              total={progressTotal(
+                detail.data?.download?.status,
+                detail.data?.download?.bytes_downloaded,
+                detail.data?.download?.total_bytes
+              )}
+              active={isActiveDownload(detail.data?.download?.status)}
+            />
           </div>
         </section>
       )}

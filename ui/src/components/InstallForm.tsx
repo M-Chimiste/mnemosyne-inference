@@ -59,7 +59,7 @@ export function InstallForm({
         <label className="text-sm font-medium">
           GPU Plan
           <select className="focus-ring mt-1 w-full border border-line bg-white px-2 py-1.5" value={gpuMode} onChange={(e) => setGpuMode(e.target.value)}>
-            <option value="all">all GPUs</option>
+            <option value="all">all visible GPUs</option>
             <option value="0">GPU 0</option>
             <option value="1">GPU 1</option>
             <option value="custom">custom</option>
