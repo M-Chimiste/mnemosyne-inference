@@ -18,10 +18,10 @@ load if the requested model is not the resident one; concurrent callers for
 the same target piggyback on a single load.
 
 Hardware target: a CUDA 12.8+ host with a Blackwell-class NVIDIA GPU (RTX 50
-or workstation Blackwell). The image bakes in PyTorch cu128 and a pinned vLLM
-nightly with sm_100 kernels. Ampere/Hopper cards generally also work — see
-[Refreshing architecture support](#refreshing-architecture-support) if you
-need to bump or change the pinned vLLM build.
+or workstation Blackwell). The image bakes in PyTorch cu129 and a pinned vLLM
+stable release. Ampere/Hopper cards generally also work — see [Refreshing
+architecture support](#refreshing-architecture-support) if you need to bump or
+change the pinned vLLM build.
 
 Design context: [project_docs/PRD.md](project_docs/PRD.md) and
 [project_docs/implementation_plan.md](project_docs/implementation_plan.md).
@@ -245,9 +245,9 @@ families.
 
 The maintenance workflow:
 
-1. **Bump the pinned vLLM** in [Dockerfile](Dockerfile) line 56 (the comment
-   block above it lists the `pip index` / `wheels.vllm.ai` recipe for finding
-   a fresh tag). Update the `Last refreshed:` comment.
+1. **Bump the pinned vLLM** in [Dockerfile](Dockerfile) line 56 after checking
+   the upstream release notes and install guidance. Update the `Last
+   refreshed:` comment.
 2. **Rebuild and restart** so the new vLLM is loaded:
    ```bash
    vllm-ctl build && vllm-ctl restart

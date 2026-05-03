@@ -12,8 +12,8 @@ RUN npm run build
 # ──────────────────────────────────────────────────────────────────
 # vLLM Manager — Mnemosyne Inference Container
 #
-# Base: CUDA 13.0 devel (matches current vLLM nightlies for Blackwell).
-# The workstation driver reports CUDA 13.0, so the runtime and wheel agree.
+# Base: CUDA 13.0 devel. vLLM's release wheels bundle their CUDA runtime;
+# the workstation driver reports CUDA 13.0, which can run the cu129 wheels.
 # ──────────────────────────────────────────────────────────────────
 FROM nvidia/cuda:13.0.2-devel-ubuntu24.04
 
@@ -37,23 +37,19 @@ RUN python3 -m venv /opt/venv
 ENV PATH="/opt/venv/bin:${PATH}"
 
 # ── Python deps ────────────────────────────────────────────────────
-# PyTorch cu128 first (vLLM will use this rather than pulling its own)
+# PyTorch cu129 first (matches current vLLM release wheel guidance).
 RUN pip install --no-cache-dir \
       torch \
       torchvision \
       torchaudio \
-      --index-url https://download.pytorch.org/whl/cu128
+      --index-url https://download.pytorch.org/whl/cu129
 
-# vLLM nightly — has Blackwell sm_100 kernels.
-# Pinned so rebuilds are reproducible. To refresh, either:
-#   curl -s https://wheels.vllm.ai/nightly/vllm/ \
-#     | grep -oE 'vllm-[0-9.]+(rc[0-9]+)?\.dev[0-9]+\+g[0-9a-f]+' | sort -u
-# or run on a CUDA host:
-#   pip index versions vllm --pre --index-url https://wheels.vllm.ai/nightly
-# Last refreshed: 2026-04-30 (commit 3ca6ca210, Blackwell sm_100).
+# vLLM stable release pin. Refresh deliberately after checking upstream
+# release notes and regenerating vllm_supported_architectures.json.
+# Last refreshed: 2026-05-03 (v0.20.1).
 RUN pip install --no-cache-dir \
-      "vllm==0.20.1rc1.dev105+g3ca6ca210" \
-      --extra-index-url https://wheels.vllm.ai/nightly
+      "vllm==0.20.1" \
+      --extra-index-url https://download.pytorch.org/whl/cu129
 
 # Manager API deps
 RUN pip install --no-cache-dir \

@@ -8,7 +8,7 @@ Core runtime files:
 
 - [vllm_manager.py](vllm_manager.py) — FastAPI service that supervises a vLLM subprocess and proxies an OpenAI-compatible API to it.
 - [config.py](config.py), [catalog.py](catalog.py), [profiles.py](profiles.py), [runtime.py](runtime.py) — YAML/env loading, SQLite catalog, profile resolution, and pure vLLM argv/env builders.
-- [Dockerfile](Dockerfile) — CUDA 12.8 / Python 3.11 image that bakes in PyTorch (cu128), vLLM nightly (Blackwell sm_100 kernels), FastAPI/uvicorn/httpx/huggingface_hub. There is no `requirements.txt` or `pyproject.toml`; dependencies live only in the Dockerfile.
+- [Dockerfile](Dockerfile) — CUDA / Python image that bakes in PyTorch (cu129), a pinned stable vLLM release, FastAPI/uvicorn/httpx/huggingface_hub. There is no runtime `requirements.txt` or `pyproject.toml`; dependencies live only in the Dockerfile.
 - [vllm-ctl](vllm-ctl) — Bash CLI that wraps `docker compose` + the manager HTTP API.
 
 The live `docker-compose.yml` is expected to be machine-specific and may live outside this repo. `vllm-ctl` expects it at `$VLLM_COMPOSE_DIR` (default `~/vllm-manager`). Use [docker-compose.example.yml](docker-compose.example.yml) as the maintained template. When making changes that touch container config (env vars, volumes, ports), remember the live compose file may be outside the repo — flag this so the user can update it.

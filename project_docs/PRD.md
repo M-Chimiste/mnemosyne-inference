@@ -345,7 +345,7 @@ Minimal. Roughly:
 | `_proxy` | Queue requests during a swap (`asyncio.Event` per target alias). Update DB-backed `last_used_at`/`request_count` on success (buffered). |
 | New | Asyncio idle-eviction task in `lifespan`. |
 | `vllm-ctl` | Talks to admin port with HTTP Basic auth. `VLLM_ADMIN_URL` env var (alias for old `VLLM_MANAGER_URL`). |
-| Dockerfile | Multi-stage: Node 22 stage builds the React SPA, final CUDA stage copies `ui/dist/` to `/app/static/`. Add `pyyaml`, `pydantic`. Mount points for `/config` (config + .env), `/state` (SQLite), and one per storage location. **Pin vLLM** to a specific nightly version. |
+| Dockerfile | Multi-stage: Node 22 stage builds the React SPA, final CUDA stage copies `ui/dist/` to `/app/static/`. Add `pyyaml`, `pydantic`. Mount points for `/config` (config + .env), `/state` (SQLite), and one per storage location. **Pin vLLM** to a specific release version. |
 | New | `ui/` — React + Vite + TypeScript + Tailwind project. Own `package.json`, lockfile. |
 | New | `vllm_supported_architectures.json` — checked into the repo, regenerated on vLLM version bumps (see §10 Q3 for refresh strategy). |
 | New | `.env.example` documenting all secret variables. |
@@ -389,7 +389,7 @@ Python module split: `vllm_manager.py` (HTTP + subprocess + plane wiring), `conf
 - **`max_model_len`.** First-class profile field with a global default in `defaults:`. (2026-04-26)
 - **`dtype` field.** Dropped from schema. Does not affect quantization level. Override via `extra_args` if ever needed. (2026-04-26)
 - **`modality` field.** Dropped from schema. vLLM detects from the model itself; OpenAI-compatible image/audio passthrough works regardless. (2026-04-26)
-- **vLLM version pin.** Pin to a specific nightly tag in the Dockerfile. Upgrades are deliberate. (2026-04-26)
+- **vLLM version pin.** Pin to a specific release tag in the Dockerfile. Upgrades are deliberate. (Updated 2026-05-03)
 - **Cancellable downloads.** Yes — implemented via download subprocess + SIGTERM. HF cache state recovers via resumable `snapshot_download`; force-wipe option for corrupt state. (2026-04-26)
 - **Persistence.** SQLite at `/state/mnemosyne.db`. Tables: `models`, `downloads`. Survives container restart. (2026-04-26)
 - **HF gated-token UX.** Hard-fail at install time with a clear "set HUGGING_FACE_HUB_TOKEN in `.env` and restart" message. No per-install token field in the UI — secrets only in `.env`. (2026-04-26)

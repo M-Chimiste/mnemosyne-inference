@@ -312,10 +312,10 @@ Workstation/GPU smoke validation is still outstanding:
   cannot import vLLM, so after the next workstation rebuild run
   `docker exec vllm-manager python scripts/refresh_arch_list.py` once and
   commit the regenerated file so the fallback exactly matches the pinned
-  vLLM nightly.
-- **vLLM pin staleness.** Refresh the pinned nightly before the next
-  workstation rebuild if the nightly index has moved. After bumping vLLM,
-  rerun `scripts/refresh_arch_list.py` to keep the bundled fallback aligned.
+  vLLM release.
+- **vLLM pin staleness.** Refresh the pinned release deliberately after
+  checking upstream release notes. After bumping vLLM, rerun
+  `scripts/refresh_arch_list.py` to keep the bundled fallback aligned.
 - **Free-space pre-check absent on manual installs.** `vllm-ctl install`
   warns when `--size-gb` is not supplied; the Phase 6 UI sets it from search
   results when available, so the warning should primarily appear on

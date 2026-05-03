@@ -556,6 +556,15 @@ class Catalog:
             ).fetchone()
         return self._to_download_row(row) if row else None
 
+    def delete_downloads(self, alias: str) -> int:
+        """Delete download history rows for an alias without touching the model row."""
+        with self._lock, self._conn:
+            cursor = self._conn.execute(
+                "DELETE FROM downloads WHERE alias=?",
+                (alias,),
+            )
+            return cursor.rowcount
+
     def lookup_by_hf_id(self, hf_model_id: str) -> list[CatalogRow]:
         """Return all rows with the given HF model id, ui_install rows first."""
         with self._lock:

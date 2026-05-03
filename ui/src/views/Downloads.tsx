@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { RotateCcw, Square, Trash2 } from "lucide-react";
 import { useDownloads, useInstall } from "../api/queries";
-import { useInstallCancel, useInstallRetry, useLegacyDeleteDownload } from "../api/mutations";
+import { useClearInstallDownload, useInstallCancel, useInstallRetry } from "../api/mutations";
 import { ErrorBox } from "../components/ErrorBox";
 import { ProgressBar } from "../components/ProgressBar";
 import { StatusBadge } from "../components/StatusBadge";
@@ -29,7 +29,7 @@ export default function Downloads() {
   const downloads = useDownloads();
   const cancel = useInstallCancel();
   const retry = useInstallRetry();
-  const clear = useLegacyDeleteDownload();
+  const clear = useClearInstallDownload();
   const [selectedAlias, setSelectedAlias] = useState<string | null>(null);
   const detail = useInstall(selectedAlias);
   const rows = downloads.data?.downloads ?? [];
@@ -104,9 +104,9 @@ export default function Downloads() {
                       )}
                       <button
                         className="focus-ring inline-flex items-center gap-1 border border-brick bg-white px-2 py-1 text-xs text-brick hover:bg-brick/10"
-                        onClick={() => clear.mutate(row.model)}
+                        onClick={() => clear.mutate(row.alias)}
                         disabled={canCancel(row.status)}
-                        title="Clear legacy download record"
+                        title="Clear download record"
                         aria-label={`Clear record for ${row.model}`}
                       >
                         <Trash2 className="h-4 w-4" aria-hidden /> Clear

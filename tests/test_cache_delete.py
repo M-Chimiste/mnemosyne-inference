@@ -61,6 +61,22 @@ def test_delete_install_full_removes_row(install_client, tmp_paths):
     assert r2.status_code == 404
 
 
+def test_clear_install_download_keeps_installed_row(install_client):
+    import vllm_manager
+    _seed_install(install_client, "qw", "Qwen/Qwen2.5-7B")
+    r = install_client.delete("/manager/install/qw/download")
+    assert r.status_code == 200
+    assert r.json()["deleted_downloads"] == 1
+    assert install_client.get("/manager/install/qw").status_code == 200
+    assert vllm_manager._catalog.get_download("qw") is None
+
+
+def test_clear_install_download_refuses_active(install_client):
+    _seed_install(install_client, "qw", "Qwen/Qwen2.5-7B", complete=False)
+    r = install_client.delete("/manager/install/qw/download")
+    assert r.status_code == 409
+
+
 def test_delete_install_cache_resident_returns_409(install_client):
     import vllm_manager
     _seed_install(install_client, "qw", "Qwen/Qwen2.5-7B")

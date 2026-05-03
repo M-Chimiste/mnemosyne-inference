@@ -1,4 +1,4 @@
-import { FormEvent, UIEvent, useState } from "react";
+import { FormEvent, UIEvent, useEffect, useRef, useState } from "react";
 import { ChevronDown, Download, Search as SearchIcon, ShieldAlert } from "lucide-react";
 import type { HfSearchResult, InstallRequest } from "../api/types";
 import { useHfSearch, useStorage } from "../api/queries";
@@ -14,13 +14,26 @@ export default function Search() {
   const [filterCompat, setFilterCompat] = useState(false);
   const [pageSize, setPageSize] = useState(20);
   const [target, setTarget] = useState<HfSearchResult | null>(null);
+  const installPanelRef = useRef<HTMLElement | null>(null);
+  const installHeadingRef = useRef<HTMLHeadingElement | null>(null);
   const search = useHfSearch({ q: query, includeVision, filterCompat, pageSize, enabled: true });
   const storage = useStorage();
   const install = useInstallStart();
 
+  useEffect(() => {
+    if (!target) return;
+    installPanelRef.current?.scrollIntoView?.({ block: "start", behavior: "smooth" });
+    installHeadingRef.current?.focus();
+  }, [target]);
+
   function submit(e: FormEvent) {
     e.preventDefault();
     setQuery(text.trim());
+  }
+
+  function openInstall(row: HfSearchResult) {
+    install.reset();
+    setTarget(row);
   }
 
   function submitInstall(body: InstallRequest) {
@@ -130,7 +143,7 @@ export default function Search() {
                   <td className="px-3 py-2 text-right">
                     <button
                       className="focus-ring inline-flex items-center gap-1 border border-pine bg-pine px-2 py-1 text-xs text-white disabled:cursor-not-allowed disabled:border-line disabled:bg-stone-100 disabled:text-stone-500"
-                      onClick={() => setTarget(row)}
+                      onClick={() => openInstall(row)}
                       disabled={!row.is_compatible}
                       title={row.is_compatible ? "Install model" : "Incompatible models cannot be installed from search"}
                       aria-label={`Install ${row.model_id}`}
@@ -165,9 +178,9 @@ export default function Search() {
       </section>
 
       {target && (
-        <section className="border border-line bg-white">
+        <section ref={installPanelRef} className="border border-line bg-white">
           <div className="border-b border-line px-4 py-3">
-            <h2 className="text-base font-semibold">Install {target.model_id}</h2>
+            <h2 ref={installHeadingRef} tabIndex={-1} className="text-base font-semibold outline-none">Install {target.model_id}</h2>
           </div>
           <div className="p-4">
             <InstallForm

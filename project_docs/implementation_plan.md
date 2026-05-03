@@ -31,7 +31,7 @@
   - Unit tests for config validation and catalog CRUD.
   - FastAPI route tests for plane separation and auth.
   - Lightweight process lifecycle tests using mocks instead of real vLLM where possible.
-- Pin the vLLM nightly version in the Dockerfile rather than installing an unbounded `--pre`.
+- Pin the vLLM release version in the Dockerfile rather than installing an unbounded dependency.
 - Preserve current behavior with smoke tests around:
   - `/health`.
   - `/manager/status`.

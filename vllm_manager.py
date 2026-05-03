@@ -1347,6 +1347,31 @@ async def install_status_route(alias: str):
     return _install_status_payload(alias)
 
 
+@admin_router.delete("/manager/install/{alias}/download", tags=["installs"])
+async def clear_install_download(alias: str):
+    """Clear a completed/failed download record by alias without deleting
+    cached weights. Legacy synthetic rows are removed entirely to preserve the
+    v0 clear-record behavior."""
+    if _catalog is None:
+        raise HTTPException(503, "manager not initialized")
+    row = _catalog.get_model(alias)
+    if row is None or row.source != "ui_install":
+        raise HTTPException(404, f"no installable row for alias '{alias}'")
+    download = _catalog.get_download(alias)
+    if download is None:
+        raise HTTPException(404, f"no download record for alias '{alias}'")
+    if downloader.is_active(alias) or download.status in ("queued", "downloading"):
+        raise HTTPException(
+            409,
+            "Download is in progress — cannot clear an active download",
+        )
+    if is_cache_only_alias(alias):
+        _catalog.delete_install_row(alias)
+        return {"cleared": row.hf_model_id, "alias": alias, "removed_row": True}
+    deleted = _catalog.delete_downloads(alias)
+    return {"cleared": row.hf_model_id, "alias": alias, "deleted_downloads": deleted}
+
+
 @admin_router.patch("/manager/install/{alias}", tags=["installs"])
 async def update_install_route(alias: str, request: CatalogUpdateRequest):
     if _catalog is None:

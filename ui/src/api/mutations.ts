@@ -104,3 +104,12 @@ export function useLegacyDeleteDownload() {
     onSuccess: () => invalidateManager(qc)
   });
 }
+
+export function useClearInstallDownload() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (alias: string) =>
+      api(`/manager/install/${encodeURIComponent(alias)}/download`, { method: "DELETE" }),
+    onSuccess: () => invalidateManager(qc)
+  });
+}

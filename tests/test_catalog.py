@@ -483,6 +483,15 @@ def test_delete_install_row_cascades(cat):
     assert cat.get_download("qw") is None  # CASCADE
 
 
+def test_delete_downloads_keeps_install_row(cat):
+    _seed_queued(cat)
+    assert cat.get_download("qw") is not None
+    n = cat.delete_downloads("qw")
+    assert n == 1
+    assert cat.get_model("qw") is not None
+    assert cat.get_download("qw") is None
+
+
 def test_find_active_for_revision_agnostic(cat):
     """v4: dedup uses (storage, hf_id) only — revision excluded."""
     _seed_queued(cat, alias="alpha", model="Qwen/X")

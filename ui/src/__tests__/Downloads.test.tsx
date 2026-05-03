@@ -62,6 +62,33 @@ function installDownloadsFetch() {
   });
 }
 
+function completedDownloadsFetch() {
+  return vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+    const path = input.toString();
+    if (path === "/manager/downloads") {
+      return Promise.resolve(jsonResponse({
+        downloads: [{
+          model: "Org/Foo",
+          alias: "foo",
+          status: "complete",
+          started_at: 1700000000,
+          finished_at: 1700000100,
+          path: "/models/hub/foo",
+          error: null,
+          revision: "main",
+          bytes_downloaded: 100_000_000,
+          total_bytes: 100_000_000,
+          elapsed_seconds: 100
+        }]
+      }));
+    }
+    if (path === "/manager/install/foo/download" && init?.method === "DELETE") {
+      return Promise.resolve(jsonResponse({ alias: "foo", cleared: "Org/Foo", deleted_downloads: 1 }));
+    }
+    return Promise.resolve(new Response("missing mock", { status: 500 }));
+  });
+}
+
 describe("Downloads", () => {
   it("polls install detail and cancels active downloads", async () => {
     const fetchMock = installDownloadsFetch();
@@ -81,6 +108,22 @@ describe("Downloads", () => {
       expect(fetchMock).toHaveBeenCalledWith(
         "/manager/install/foo/cancel",
         expect.objectContaining({ method: "POST", credentials: "include" })
+      );
+    });
+  });
+
+  it("clears completed download records by alias", async () => {
+    const fetchMock = completedDownloadsFetch();
+    vi.stubGlobal("fetch", fetchMock);
+    const user = userEvent.setup();
+    renderWithClient(<Downloads />);
+
+    await user.click(await screen.findByRole("button", { name: "Clear record for Org/Foo" }));
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/manager/install/foo/download",
+        expect.objectContaining({ method: "DELETE", credentials: "include" })
       );
     });
   });
