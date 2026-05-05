@@ -169,6 +169,28 @@ _SEARCH_TIMEOUT_SECONDS = 30
 _MODEL_INFO_TIMEOUT_SECONDS = 15
 _WEIGHT_EXTENSIONS = (".safetensors", ".bin", ".gguf", ".pt")
 
+# Modalities the search exposes. The Hub uses pipeline_tag values to bucket
+# repos; these four cover the LLM-shaped surface vLLM can serve.
+_DEFAULT_PIPELINE_TAGS: tuple[str, ...] = (
+    "text-generation",
+    "image-text-to-text",
+    "audio-text-to-text",
+    "any-to-any",
+)
+_VALID_PIPELINE_TAGS: frozenset[str] = frozenset(_DEFAULT_PIPELINE_TAGS)
+
+# Maps the API-facing sort name to the `huggingface_hub` 1.x sort literal.
+# The library converts these snake_case names to the Hub API's camelCase
+# internally, and sorts descending by default — there's no public
+# `direction` kwarg in 1.x.
+_SORT_FIELDS: dict[str, str] = {
+    "trending":  "trending_score",
+    "downloads": "downloads",
+    "likes":     "likes",
+    "recent":    "last_modified",
+}
+_DEFAULT_SORT = "trending"
+
 
 # ── Architecture set loading ─────────────────────────────────────────
 
@@ -462,18 +484,24 @@ def _list_one(
     pipeline_tag: str,
     limit: int,
     token: Optional[str],
+    sort_field: str = "downloads",
 ) -> list:
     """Single `list_models` call for one pipeline_tag.
 
-    `pipeline_tag` is a single string on `huggingface_hub` 0.36.x. We use
-    `filter="transformers"` rather than the deprecated `library=` kwarg so
-    the code survives `huggingface_hub` 1.x.
+    We deliberately do NOT pass `filter="transformers"`: many newer/research
+    releases (e.g. poolside/Laguna-XS.2, nvidia Nemotron-3-Omni) skip the
+    `library:transformers` tag, and the Hub drops them before we get to
+    do our own architecture check.
+
+    `sort_field` uses the snake_case literals the library accepts in 1.x
+    (`trending_score`, `downloads`, `likes`, `last_modified`); the
+    library descends by default for these fields — `direction` is not a
+    public kwarg anymore.
     """
-    kwargs = {
-        "filter": "transformers",
+    kwargs: dict[str, Any] = {
         "pipeline_tag": pipeline_tag,
         "limit": limit,
-        "sort": "downloads",
+        "sort": sort_field,
         "token": token,
     }
     if q:
@@ -481,17 +509,65 @@ def _list_one(
     return list(api.list_models(**kwargs))
 
 
-def _merge_by_id(a: list, b: list) -> list:
-    """Merge two ModelInfo lists by `.id`, preserving the higher-ranked
-    (earlier) appearance. Sort by downloads desc."""
+def _lookup_exact_repo(
+    api: HfApi,
+    q: str,
+    token: Optional[str],
+) -> Optional[Any]:
+    """Direct `model_info` for queries that look like a complete `org/repo`.
+
+    Bypasses pipeline_tag pre-filters so a user who types the full ID
+    always finds their model — even if the repo lacks the `pipeline_tag`
+    or library tags that the broader `list_models` pre-filter requires.
+    Returns None on any failure (404, gated, network) so the caller can
+    fall back to the broader list_models result without surfacing errors
+    when q is just normal search text that happens to contain a slash.
+    """
+    if "/" not in q:
+        return None
+    repo_id = q.strip().strip("/")
+    parts = repo_id.split("/")
+    if len(parts) != 2 or not parts[0] or not parts[1]:
+        return None
+    try:
+        return api.model_info(
+            repo_id,
+            timeout=_MODEL_INFO_TIMEOUT_SECONDS,
+            token=token,
+        )
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _merge_by_id(*lists: list, sort_field: str = "downloads") -> list:
+    """Merge any number of ModelInfo lists by `.id`, preserving the
+    higher-ranked (earlier) appearance. Final order is by `sort_field`
+    (downloads/likes/trendingScore/lastModified) desc, with stable
+    fallbacks on missing values."""
     seen: dict[str, Any] = {}
-    for m in a:
-        seen[m.id] = m
-    for m in b:
-        if m.id not in seen:
-            seen[m.id] = m
+    for src in lists:
+        for m in src:
+            mid = getattr(m, "id", None)
+            if not mid or mid in seen:
+                continue
+            seen[mid] = m
     rows = list(seen.values())
-    rows.sort(key=lambda m: getattr(m, "downloads", 0) or 0, reverse=True)
+
+    if sort_field == "last_modified":
+        def key(m: Any) -> str:
+            v = getattr(m, "last_modified", None)
+            if v is None:
+                return ""
+            return v if isinstance(v, str) else str(v)
+        rows.sort(key=key, reverse=True)
+    elif sort_field in ("downloads", "likes"):
+        # ModelInfo exposes downloads / likes directly. trending_score is
+        # not surfaced as an attribute, so for trending we fall back to
+        # insertion order — list_models already returns them in Hub order.
+        rows.sort(
+            key=lambda m: getattr(m, sort_field, 0) or 0,
+            reverse=True,
+        )
     return rows
 
 
@@ -562,11 +638,37 @@ def _row_for_model(
     }
 
 
+def _resolve_pipeline_tags(
+    pipeline_tags: Optional[Iterable[str]],
+    include_vision: Optional[bool],
+) -> tuple[str, ...]:
+    """Resolve modality selection.
+
+    Precedence:
+      1. Explicit `pipeline_tags` (CSV from the route, list internally).
+      2. Legacy `include_vision`: True → text + vision; False → text only.
+      3. Neither: full default (text + vision + audio + omni).
+    """
+    if pipeline_tags is not None:
+        seen: list[str] = []
+        for t in pipeline_tags:
+            t = (t or "").strip()
+            if t and t in _VALID_PIPELINE_TAGS and t not in seen:
+                seen.append(t)
+        return tuple(seen) if seen else _DEFAULT_PIPELINE_TAGS
+    if include_vision is True:
+        return ("text-generation", "image-text-to-text")
+    if include_vision is False:
+        return ("text-generation",)
+    return _DEFAULT_PIPELINE_TAGS
+
+
 def _do_search_sync(
     q: str,
     limit: int,
     page: int,
-    include_vision: bool,
+    pipeline_tags: tuple[str, ...],
+    sort: str,
     filter_compat: bool,
 ) -> dict:
     """Sync search body. Runs on the bounded executor."""
@@ -576,11 +678,22 @@ def _do_search_sync(
     end = start + limit
     fetch_limit = end + 1
 
+    sort_field = _SORT_FIELDS.get(sort, _SORT_FIELDS[_DEFAULT_SORT])
+
     try:
-        rows = _list_one(_api, q, "text-generation", fetch_limit, token)
-        if include_vision:
-            vision = _list_one(_api, q, "image-text-to-text", fetch_limit, token)
-            rows = _merge_by_id(rows, vision)
+        per_tag: list[list] = []
+        for tag in pipeline_tags:
+            per_tag.append(_list_one(
+                _api, q, tag, fetch_limit, token,
+                sort_field=sort_field,
+            ))
+        rows = _merge_by_id(*per_tag, sort_field=sort_field)
+
+        # Pin an exact-ID match (org/repo) to the head — bypasses pre-filter
+        # quirks for newer/research repos with missing pipeline_tag tags.
+        exact = _lookup_exact_repo(_api, q, token) if q else None
+        if exact is not None and getattr(exact, "id", None):
+            rows = [exact] + [m for m in rows if getattr(m, "id", None) != exact.id]
     except HfHubHTTPError as e:
         status = getattr(getattr(e, "response", None), "status_code", None)
         if status in (401, 403):
@@ -628,7 +741,9 @@ def _do_search_sync(
         "page_size": limit,
         "has_next": has_next,
         "next_page": page + 1 if has_next else None,
-        "include_vision": include_vision,
+        "include_vision": "image-text-to-text" in pipeline_tags,
+        "pipeline_tags": list(pipeline_tags),
+        "sort": sort,
         "vllm_arch_source": _arch_source,
         "vllm_arch_count": len(_supported_archs),
         "results": page_rows,
@@ -642,26 +757,36 @@ def _legacy_do_search_sync(
     filter_compat: bool,
 ) -> dict:
     """Compatibility wrapper for older direct tests/imports."""
-    return _do_search_sync(q, limit, 1, include_vision, filter_compat)
+    tags = _resolve_pipeline_tags(None, include_vision)
+    return _do_search_sync(q, limit, 1, tags, _DEFAULT_SORT, filter_compat)
 
 
 async def run_search(
     q: str,
     limit: int,
-    include_vision: bool,
-    filter_compat: bool,
+    include_vision: Optional[bool] = None,
+    filter_compat: bool = False,
     page: int = 1,
+    pipeline_tags: Optional[Iterable[str]] = None,
+    sort: str = _DEFAULT_SORT,
 ) -> dict:
     """Async wrapper around _do_search_sync. Caps end-to-end at 30s; on
     timeout, raises HFSearchError(504). The worker thread keeps running —
-    the bounded pool prevents pile-up."""
+    the bounded pool prevents pile-up.
+
+    `include_vision` is the legacy bool toggle; `pipeline_tags` (when
+    provided) takes precedence. `sort` ∈ {trending, downloads, likes,
+    recent}; unknown values fall back to trending.
+    """
     q = (q or "").strip()
     limit = max(1, min(int(limit), 50))
     page = max(1, min(int(page), 20))
+    sort = sort if sort in _SORT_FIELDS else _DEFAULT_SORT
+    tags = _resolve_pipeline_tags(pipeline_tags, include_vision)
     pool = _get_search_pool()
     future = pool.submit(
         _do_search_sync,
-        q, limit, page, bool(include_vision), bool(filter_compat),
+        q, limit, page, tags, sort, bool(filter_compat),
     )
     try:
         return await asyncio.wait_for(

@@ -927,20 +927,35 @@ async def gpu_status():
 
 @admin_router.get("/manager/hf/search", tags=["manager"])
 async def hf_search_route(
-    q: str = Query("", description="Search query; blank returns top models by downloads"),
+    q: str = Query("", description="Search query; blank returns top models for the chosen sort"),
     limit: int = Query(20, ge=1, le=50),
     page: int = Query(1, ge=1, le=20),
     filter_compat: bool = Query(False),
-    include_vision: bool = Query(False),
+    sort: str = Query("trending", description="trending | downloads | likes | recent"),
+    pipeline_tags: Optional[str] = Query(
+        None,
+        description=(
+            "CSV of pipeline tags to include "
+            "(text-generation, image-text-to-text, audio-text-to-text, any-to-any). "
+            "Defaults to all four."
+        ),
+    ),
+    include_vision: Optional[bool] = Query(
+        None,
+        description="Legacy alias: true → text+vision, false → text only. Ignored when pipeline_tags is set.",
+    ),
 ):
-    """Search HuggingFace Hub for vLLM-compatible models. PRD §5.9.
+    """Search HuggingFace Hub for vLLM-compatible models.
 
     Returns both compatible and incompatible results (incompatible flagged
     with `compat_reason`). Pass `filter_compat=true` to drop incompatible
-    rows server-side. Pass `include_vision=true` to also surface
-    `image-text-to-text` models (Qwen-VL, Llava, etc.) — defaults to
-    `false` to match PRD §5.9 literally.
+    rows server-side. `sort` defaults to `trending` (matches huggingface.co's
+    homepage). `pipeline_tags` lets the caller restrict modalities; the
+    legacy `include_vision` flag is honored when `pipeline_tags` is omitted.
     """
+    tags_list: Optional[list[str]] = None
+    if pipeline_tags is not None:
+        tags_list = [t.strip() for t in pipeline_tags.split(",") if t.strip()]
     try:
         return await hf_search.run_search(
             q=q,
@@ -948,6 +963,8 @@ async def hf_search_route(
             page=page,
             include_vision=include_vision,
             filter_compat=filter_compat,
+            pipeline_tags=tags_list,
+            sort=sort,
         )
     except hf_search.HFSearchError as e:
         raise HTTPException(status_code=e.status_code, detail=e.detail)

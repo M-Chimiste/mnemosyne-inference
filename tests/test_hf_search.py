@@ -58,7 +58,7 @@ def test_compatible_row(client, monkeypatch):
         ]},
         configs={"Qwen/Qwen2.5-7B": {"architectures": ["Qwen2ForCausalLM"]}},
     )
-    r = client.get("/manager/hf/search?q=qwen2.5")
+    r = client.get("/manager/hf/search?q=qwen2.5&pipeline_tags=text-generation")
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["query"] == "qwen2.5"
@@ -68,6 +68,8 @@ def test_compatible_row(client, monkeypatch):
     assert body["has_next"] is False
     assert body["next_page"] is None
     assert body["include_vision"] is False
+    assert body["pipeline_tags"] == ["text-generation"]
+    assert body["sort"] == "trending"
     assert body["vllm_arch_source"] == "vllm-registry"
     assert body["vllm_arch_count"] == len(SUPPORTED)
     assert len(body["results"]) == 1
@@ -78,8 +80,86 @@ def test_compatible_row(client, monkeypatch):
     assert row["compat_reason"] is None
     assert row["downloads"] == 12345
     assert row["likes"] == 50
-    assert api.list_calls[0]["sort"] == "downloads"
+    # Default sort = trending; the library accepts the snake_case literal
+    # `trending_score` (huggingface_hub 1.x) and descends by default — we
+    # never pass a `direction` kwarg because 1.x removed it.
+    assert api.list_calls[0]["sort"] == "trending_score"
     assert "direction" not in api.list_calls[0]
+    # Pre-filter by `library:transformers` was dropped: it was hiding newer
+    # repos that simply don't carry the tag.
+    assert "filter" not in api.list_calls[0]
+
+
+def test_default_sort_is_trending_and_overridable(client, monkeypatch):
+    api = _build_response(
+        monkeypatch,
+        list_results={"text-generation": [FakeModelInfo("a/b")]},
+        configs={"a/b": {"architectures": ["LlamaForCausalLM"]}},
+    )
+    client.get("/manager/hf/search?q=&pipeline_tags=text-generation")
+    assert api.list_calls[-1]["sort"] == "trending_score"
+
+    client.get("/manager/hf/search?q=&pipeline_tags=text-generation&sort=downloads")
+    assert api.list_calls[-1]["sort"] == "downloads"
+
+    client.get("/manager/hf/search?q=&pipeline_tags=text-generation&sort=likes")
+    assert api.list_calls[-1]["sort"] == "likes"
+
+    client.get("/manager/hf/search?q=&pipeline_tags=text-generation&sort=recent")
+    assert api.list_calls[-1]["sort"] == "last_modified"
+
+
+def test_default_modalities_query_all_four(client, monkeypatch):
+    api = _build_response(
+        monkeypatch,
+        list_results={"text-generation": [FakeModelInfo("x/y")]},
+        configs={"x/y": {"architectures": ["LlamaForCausalLM"]}},
+    )
+    client.get("/manager/hf/search?q=anything")
+    pipeline_tags = [c.get("pipeline_tag") for c in api.list_calls]
+    assert pipeline_tags == [
+        "text-generation",
+        "image-text-to-text",
+        "audio-text-to-text",
+        "any-to-any",
+    ]
+
+
+def test_pipeline_tags_csv_filters_calls(client, monkeypatch):
+    api = _build_response(
+        monkeypatch,
+        list_results={"any-to-any": [FakeModelInfo("nv/Nemotron-Omni")]},
+        configs={"nv/Nemotron-Omni": {"architectures": ["LlamaForCausalLM"]}},
+    )
+    r = client.get(
+        "/manager/hf/search?q=nemotron&pipeline_tags=any-to-any,audio-text-to-text"
+    )
+    assert r.status_code == 200
+    pipeline_tags = [c.get("pipeline_tag") for c in api.list_calls]
+    assert pipeline_tags == ["any-to-any", "audio-text-to-text"]
+
+
+def test_exact_repo_id_lookup_pinned_to_head(client, monkeypatch):
+    """A query like `org/repo` triggers a direct model_info lookup, so newer
+    repos that don't carry a pipeline_tag still appear at the top."""
+    listed = FakeModelInfo("other/related", downloads=999_999)
+    exact = FakeModelInfo("poolside/Laguna-XS.2", downloads=12, pipeline_tag=None)
+    api = _build_response(
+        monkeypatch,
+        list_results={"text-generation": [listed]},
+        configs={
+            "poolside/Laguna-XS.2": {"architectures": ["LlamaForCausalLM"]},
+            "other/related": {"architectures": ["LlamaForCausalLM"]},
+        },
+        model_info_map={"poolside/Laguna-XS.2": exact},
+    )
+    body = client.get(
+        "/manager/hf/search?q=poolside/Laguna-XS.2&pipeline_tags=text-generation"
+    ).json()
+    ids = [row["model_id"] for row in body["results"]]
+    assert ids[0] == "poolside/Laguna-XS.2"
+    # The direct model_info lookup ran with the trimmed repo id.
+    assert any(c["repo_id"] == "poolside/Laguna-XS.2" for c in api.model_info_calls)
 
 
 def test_incompatible_row_unsupported_architecture(client, monkeypatch):
@@ -88,7 +168,7 @@ def test_incompatible_row_unsupported_architecture(client, monkeypatch):
         list_results={"text-generation": [FakeModelInfo("acme/SomeModel")]},
         configs={"acme/SomeModel": {"architectures": ["AcmeNewArchForCausalLM"]}},
     )
-    r = client.get("/manager/hf/search?q=acme")
+    r = client.get("/manager/hf/search?q=acme&pipeline_tags=text-generation")
     body = r.json()
     assert body["results"][0]["is_compatible"] is False
     assert body["results"][0]["compat_reason"] == "unsupported architecture: AcmeNewArchForCausalLM"
@@ -100,7 +180,7 @@ def test_missing_config_json_flagged_not_dropped(client, monkeypatch):
         list_results={"text-generation": [FakeModelInfo("x/y")]},
         configs={},  # no config — fake_download will raise EntryNotFoundError
     )
-    r = client.get("/manager/hf/search?q=x")
+    r = client.get("/manager/hf/search?q=x&pipeline_tags=text-generation")
     body = r.json()
     assert len(body["results"]) == 1
     assert body["results"][0]["is_compatible"] is False
@@ -113,7 +193,7 @@ def test_per_row_403_flagged_gated(client, monkeypatch):
         list_results={"text-generation": [FakeModelInfo("gated/repo")]},
         config_errors={"gated/repo": GatedRepoError("nope")},
     )
-    r = client.get("/manager/hf/search?q=gated")
+    r = client.get("/manager/hf/search?q=gated&pipeline_tags=text-generation")
     body = r.json()
     assert body["results"][0]["is_compatible"] is False
     assert body["results"][0]["compat_reason"] == "gated or unauthorized"
@@ -145,13 +225,16 @@ def test_filter_compat_drops_incompatible(client, monkeypatch):
             "bad/bad": {"architectures": ["UnsupportedArchForCausalLM"]},
         },
     )
-    r = client.get("/manager/hf/search?q=foo&filter_compat=true")
+    r = client.get(
+        "/manager/hf/search?q=foo&filter_compat=true&pipeline_tags=text-generation"
+    )
     body = r.json()
     ids = [row["model_id"] for row in body["results"]]
     assert ids == ["ok/ok"]
 
 
-def test_include_vision_makes_two_calls(client, monkeypatch):
+def test_include_vision_legacy_alias_true_makes_two_calls(client, monkeypatch):
+    """`include_vision=true` is honored when `pipeline_tags` is omitted."""
     api = _build_response(
         monkeypatch,
         list_results={
@@ -189,13 +272,14 @@ def test_include_vision_dedupes_by_id(client, monkeypatch):
     assert len(api.list_calls) == 2
 
 
-def test_include_vision_default_false_makes_one_call(client, monkeypatch):
+def test_include_vision_legacy_alias_false_makes_one_call(client, monkeypatch):
+    """`include_vision=false` is the legacy text-only path."""
     api = _build_response(
         monkeypatch,
         list_results={"text-generation": [FakeModelInfo("x/y")]},
         configs={"x/y": {"architectures": ["LlamaForCausalLM"]}},
     )
-    client.get("/manager/hf/search?q=x")
+    client.get("/manager/hf/search?q=x&include_vision=false")
     assert len(api.list_calls) == 1
     assert api.list_calls[0]["pipeline_tag"] == "text-generation"
 
@@ -206,7 +290,7 @@ def test_empty_query_returns_top_models(client, monkeypatch):
         list_results={"text-generation": [FakeModelInfo("top/model")]},
         configs={"top/model": {"architectures": ["LlamaForCausalLM"]}},
     )
-    r = client.get("/manager/hf/search?q=%20%20")
+    r = client.get("/manager/hf/search?q=%20%20&pipeline_tags=text-generation")
     assert r.status_code == 200
     body = r.json()
     assert body["query"] == ""
@@ -220,9 +304,10 @@ def test_response_envelope_shape(client, monkeypatch):
         list_results={"text-generation": [FakeModelInfo("x/y")]},
         configs={"x/y": {"architectures": ["LlamaForCausalLM"]}},
     )
-    body = client.get("/manager/hf/search?q=x").json()
+    body = client.get("/manager/hf/search?q=x&pipeline_tags=text-generation").json()
     expected_keys = {
-        "query", "limit", "page", "page_size", "has_next", "next_page", "include_vision",
+        "query", "limit", "page", "page_size", "has_next", "next_page",
+        "include_vision", "pipeline_tags", "sort",
         "vllm_arch_source", "vllm_arch_count", "results",
     }
     assert expected_keys.issubset(body.keys())
@@ -238,7 +323,9 @@ def test_search_paginates_ranked_results(client, monkeypatch):
         list_results={"text-generation": models},
         configs={m.id: {"architectures": ["LlamaForCausalLM"]} for m in models},
     )
-    body = client.get("/manager/hf/search?q=org&page=2&limit=10").json()
+    body = client.get(
+        "/manager/hf/search?q=org&page=2&limit=10&pipeline_tags=text-generation&sort=downloads"
+    ).json()
     assert body["page"] == 2
     assert body["page_size"] == 10
     assert body["has_next"] is True

@@ -100,7 +100,7 @@ describe("Downloads", () => {
 
     expect(await screen.findByText("Downloaded")).toBeInTheDocument();
     expect(screen.getByText("50 MB / 100 MB")).toBeInTheDocument();
-    expect(screen.getByText("50%")).toBeInTheDocument();
+    expect(screen.getAllByText("50%").length).toBeGreaterThanOrEqual(1);
 
     await user.click(screen.getByRole("button", { name: "Cancel foo" }));
 

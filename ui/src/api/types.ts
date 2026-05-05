@@ -75,6 +75,14 @@ export interface HfSearchResult {
   pipeline_tag: string | null;
 }
 
+export type HfSortOption = "trending" | "downloads" | "likes" | "recent";
+
+export type HfPipelineTag =
+  | "text-generation"
+  | "image-text-to-text"
+  | "audio-text-to-text"
+  | "any-to-any";
+
 export interface HfSearchEnvelope {
   query: string;
   limit: number;
@@ -83,6 +91,8 @@ export interface HfSearchEnvelope {
   has_next: boolean;
   next_page: number | null;
   include_vision: boolean;
+  pipeline_tags: HfPipelineTag[];
+  sort: HfSortOption;
   vllm_arch_source: string;
   vllm_arch_count: number;
   results: HfSearchResult[];

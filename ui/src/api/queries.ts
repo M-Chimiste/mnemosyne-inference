@@ -5,7 +5,9 @@ import type {
   CatalogRow,
   DownloadEntry,
   GpuStatus,
+  HfPipelineTag,
   HfSearchEnvelope,
+  HfSortOption,
   InstallStatus,
   ManagerStatus,
   StorageLocation
@@ -68,19 +70,21 @@ export function useInstall(alias: string | null) {
 
 export function useHfSearch(params: {
   q: string;
-  includeVision: boolean;
+  pipelineTags: HfPipelineTag[];
+  sort: HfSortOption;
   filterCompat: boolean;
   pageSize: number;
   enabled: boolean;
 }) {
+  const tagsKey = [...params.pipelineTags].sort().join(",");
   return useInfiniteQuery<
     HfSearchEnvelope,
     Error,
     InfiniteData<HfSearchEnvelope>,
-    [string, string, boolean, boolean, number],
+    [string, string, string, string, boolean, number],
     number
   >({
-    queryKey: ["hf-search", params.q, params.includeVision, params.filterCompat, params.pageSize],
+    queryKey: ["hf-search", params.q, tagsKey, params.sort, params.filterCompat, params.pageSize],
     enabled: params.enabled,
     initialPageParam: 1,
     getNextPageParam: (lastPage) => lastPage.next_page ?? undefined,
@@ -89,7 +93,8 @@ export function useHfSearch(params: {
         q: params.q.trim(),
         page: String(pageParam),
         limit: String(params.pageSize),
-        include_vision: String(params.includeVision),
+        sort: params.sort,
+        pipeline_tags: params.pipelineTags.join(","),
         filter_compat: String(params.filterCompat)
       });
       return api<HfSearchEnvelope>(`/manager/hf/search?${qs.toString()}`);
