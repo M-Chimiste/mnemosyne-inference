@@ -39,7 +39,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Built from a pinned tag against the same CUDA toolkit as vLLM.
 # Refresh deliberately after checking llama.cpp release notes (the binary
 # CLI flags occasionally change). Last refreshed: 2026-05-07.
-ARG LLAMA_CPP_TAG=b6500
+#
+# Architectures land in llama.cpp on a rolling basis; if a new model
+# (qwen35moe, nemotron_h_moe, gpt-oss, etc.) isn't recognized at load time
+# the symptom is `unknown model architecture: '<arch>'` from llama-server
+# stderr. Bump this tag to a release that contains the arch's PR. Override
+# at build time without editing the Dockerfile:
+#   docker build --build-arg LLAMA_CPP_TAG=b9100 ...
+# Latest tags: see https://github.com/ggerganov/llama.cpp/tags
+ARG LLAMA_CPP_TAG=b9060
 # Compute capabilities to compile kernels for. Docker builds have no GPU,
 # so `-arch=native` falls back to a default arch and the resulting binary
 # may not run on the deployment card. The default targets RTX PRO 6000
@@ -80,6 +88,9 @@ RUN set -eu \
       -DLLAMA_BUILD_EXAMPLES=OFF \
  && cmake --build /tmp/llama.cpp/build -j --target llama-server \
  && cp /tmp/llama.cpp/build/bin/llama-server /usr/local/bin/ \
+ && mkdir -p /usr/local/lib/llama.cpp \
+ && cp /tmp/llama.cpp/build/bin/*.so /usr/local/lib/llama.cpp/ \
+ && echo /usr/local/lib/llama.cpp > /etc/ld.so.conf.d/llama-cpp.conf \
  && rm -rf /tmp/llama.cpp \
  && rm -f "${STUB_DIR}/libcuda.so.1" \
  && rm -f /etc/ld.so.conf.d/zz-cuda-stubs.conf \

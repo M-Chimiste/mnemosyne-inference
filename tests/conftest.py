@@ -296,7 +296,25 @@ class StubDownloader:
 def stub_downloader(monkeypatch):
     """Replace downloader.start_install with a sync stub that records
     invocation args. Yields the StubDownloader so tests can inspect
-    captured calls and toggle auto_complete / fail_with_error."""
+    captured calls and toggle auto_complete / fail_with_error.
+
+    Also stubs `hf_search.fetch_repo_files` so /manager/install (which now
+    probes the repo before queueing) doesn't try to reach huggingface.co.
+    The default stub mimics a healthy vLLM-style repo. Tests that need
+    GGUF-aware probe results (e.g. `test_install.py`) override it again
+    with their own monkeypatch.setattr — last-write-wins.
+    """
+    import hf_search
+
+    def _default_probe(model_id, revision=None):
+        return {
+            "has_gguf": False,
+            "has_transformer_weights": True,
+            "recommended_backend": "vllm",
+            "gguf_candidates": [],
+        }
+
     stub = StubDownloader()
     monkeypatch.setattr(vllm_manager.downloader, "start_install", stub)
+    monkeypatch.setattr(hf_search, "fetch_repo_files", _default_probe)
     yield stub

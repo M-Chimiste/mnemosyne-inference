@@ -857,7 +857,13 @@ class Catalog:
         resolved_sha: Optional[str],
     ) -> None:
         """Worker exited 0 with a complete event. Atomic: models→installed,
-        downloads→complete, resolved_sha pinned to the snapshot's actual SHA."""
+        downloads→complete, resolved_sha pinned to the snapshot's actual SHA.
+
+        Also reconciles `bytes_downloaded` to the on-disk size and bumps
+        `total_bytes` to match — the worker's 1-Hz progress emitter can drop
+        the final sample, leaving the UI showing 93%-ish on a fully-complete
+        row. Trusting `size_bytes` here keeps the row honest after restart.
+        """
         now = int(time.time())
         with self._lock, self._conn:
             self._conn.execute(
@@ -865,11 +871,20 @@ class Catalog:
                 "size_bytes=?, installed_at=?, resolved_sha=? WHERE alias=?",
                 (cache_path, size_bytes, now, resolved_sha, alias),
             )
-            self._conn.execute(
-                "UPDATE downloads SET status='complete', finished_at=? "
-                "WHERE alias=? AND status IN ('queued','downloading')",
-                (now, alias),
-            )
+            if size_bytes is not None:
+                self._conn.execute(
+                    "UPDATE downloads SET status='complete', finished_at=?, "
+                    "bytes_downloaded=?, "
+                    "total_bytes=COALESCE(total_bytes, ?) "
+                    "WHERE alias=? AND status IN ('queued','downloading')",
+                    (now, size_bytes, size_bytes, alias),
+                )
+            else:
+                self._conn.execute(
+                    "UPDATE downloads SET status='complete', finished_at=? "
+                    "WHERE alias=? AND status IN ('queued','downloading')",
+                    (now, alias),
+                )
 
     def mark_error(self, alias: str, message: str) -> None:
         """Hard worker failure → models='error', downloads='error'.

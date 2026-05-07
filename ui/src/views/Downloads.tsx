@@ -1,7 +1,8 @@
-import { useState } from "react";
-import { RotateCcw, Square, Trash2 } from "lucide-react";
+import { useRef, useState } from "react";
+import { RefreshCw, RotateCcw, Square, Trash2 } from "lucide-react";
 import { useDownloads, useInstall } from "../api/queries";
 import { useClearInstallDownload, useInstallCancel, useInstallRetry } from "../api/mutations";
+import { ConfirmDialog, type ConfirmDialogHandle } from "../components/ConfirmDialog";
 import { ErrorBox } from "../components/ErrorBox";
 import { ProgressBar } from "../components/ProgressBar";
 import { StatusBadge } from "../components/StatusBadge";
@@ -11,8 +12,17 @@ function canCancel(status: string) {
   return status === "queued" || status === "pending" || status === "downloading";
 }
 
+// Errored / cancelled / partial: re-spawn the worker; HF will resume from
+// the cache and the missing files come down. Single-click, no confirm.
 function canRetry(status: string) {
   return status === "error" || status === "cancelled" || status === "partial";
+}
+
+// Completed installs can also be re-fetched (cache verification, suspected
+// corruption, refreshed tag). Routed through the same retry endpoint but
+// gated behind a confirm dialog because it's a no-op cost on a healthy row.
+function canRestart(status: string) {
+  return status === "complete";
 }
 
 function progressTotal(status: string | undefined, bytes: number | null | undefined, total: number | null | undefined) {
@@ -31,8 +41,21 @@ export default function Downloads() {
   const retry = useInstallRetry();
   const clear = useClearInstallDownload();
   const [selectedAlias, setSelectedAlias] = useState<string | null>(null);
+  const [restartTarget, setRestartTarget] = useState<{ alias: string; model: string } | null>(null);
+  const restartDialog = useRef<ConfirmDialogHandle>(null);
   const detail = useInstall(selectedAlias);
   const rows = downloads.data?.downloads ?? [];
+
+  function openRestart(alias: string, model: string) {
+    setRestartTarget({ alias, model });
+    requestAnimationFrame(() => restartDialog.current?.open());
+  }
+
+  function runRestart() {
+    if (!restartTarget) return;
+    retry.mutate({ alias: restartTarget.alias });
+    setRestartTarget(null);
+  }
 
   return (
     <div className="space-y-5">
@@ -76,6 +99,7 @@ export default function Downloads() {
                       bytes={row.bytes_downloaded}
                       total={progressTotal(row.status, row.bytes_downloaded, row.total_bytes)}
                       active={isActiveDownload(row.status)}
+                      complete={row.status === "complete"}
                     />
                   </td>
                   <td className="px-3 py-2">{formatTime(row.started_at)}</td>
@@ -100,6 +124,16 @@ export default function Downloads() {
                           aria-label={`Retry ${row.alias}`}
                         >
                           <RotateCcw className="h-4 w-4" aria-hidden /> Retry
+                        </button>
+                      )}
+                      {canRestart(row.status) && (
+                        <button
+                          className="focus-ring inline-flex items-center gap-1 border border-line bg-white px-2 py-1 text-xs hover:bg-stone-100"
+                          onClick={() => openRestart(row.alias, row.model)}
+                          title="Re-download model (verifies / refreshes cache)"
+                          aria-label={`Restart download for ${row.alias}`}
+                        >
+                          <RefreshCw className="h-4 w-4" aria-hidden /> Restart
                         </button>
                       )}
                       <button
@@ -152,10 +186,23 @@ export default function Downloads() {
                 detail.data?.download?.total_bytes
               )}
               active={isActiveDownload(detail.data?.download?.status)}
+              complete={detail.data?.download?.status === "complete"}
             />
           </div>
         </section>
       )}
+
+      <ConfirmDialog
+        ref={restartDialog}
+        title="Restart download"
+        body={
+          restartTarget
+            ? `Re-download ${restartTarget.model}? HuggingFace will skip files already on disk and refetch any that are missing or have changed; expect this to be quick on a healthy install.`
+            : ""
+        }
+        confirmLabel="Restart"
+        onConfirm={runRestart}
+      />
     </div>
   );
 }
