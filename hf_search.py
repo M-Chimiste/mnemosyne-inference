@@ -50,6 +50,15 @@ from huggingface_hub.utils import (
     RepositoryNotFoundError,
 )
 
+from repo_probe import (
+    BACKEND_LLAMA_CPP,
+    BACKEND_NONE,
+    BACKEND_VLLM,
+    RepoFormatProbe,
+    SiblingMeta,
+    probe_repo_format,
+)
+
 logger = logging.getLogger("hf-search")
 
 # ── Module state ─────────────────────────────────────────────────────
@@ -168,6 +177,7 @@ _config_cache_lock = threading.Lock()
 _SEARCH_TIMEOUT_SECONDS = 30
 _MODEL_INFO_TIMEOUT_SECONDS = 15
 _WEIGHT_EXTENSIONS = (".safetensors", ".bin", ".gguf", ".pt")
+_TRANSFORMER_WEIGHT_EXTENSIONS = (".safetensors", ".bin")
 
 # Modalities the search exposes. The Hub uses pipeline_tag values to bucket
 # repos; these four cover the LLM-shaped surface vLLM can serve.
@@ -408,11 +418,22 @@ def _normalize_architectures(raw: Any) -> list[str]:
 def _decide_compat(
     archs: list[str],
     fetch_status: str,
+    probe: Optional[RepoFormatProbe] = None,
 ) -> tuple[bool, Optional[str]]:
-    """Returns (is_compatible, compat_reason). Compatible iff fetch_status is
-    'ok', architectures non-empty, every entry in `_supported_archs`, and
-    the supported set is non-empty.
+    """Returns (is_compatible, compat_reason).
+
+    Semantics: compatible iff *at least one* backend can serve the repo —
+    so users searching with `filter_compat=true` see everything they could
+    install via any path. The `recommended_backend` field on the search row
+    tells the UI which backend will be picked by default.
+
+    Decision tree:
+      1. has_gguf       → compatible via llama.cpp (mixed-format included).
+      2. archs supported → compatible via vLLM (existing rule).
+      3. otherwise       → not compatible, with the existing reason text.
     """
+    if probe is not None and probe.has_gguf:
+        return True, "gguf via llama.cpp"
     if fetch_status == "gated":
         return False, "gated or unauthorized"
     if fetch_status == "missing":
@@ -429,35 +450,111 @@ def _decide_compat(
     return True, None
 
 
-# ── Size estimation ──────────────────────────────────────────────────
+# ── Size estimation + repo metadata (consolidated) ───────────────────
 
 
-def _safetensor_total(repo_id: str, token: Optional[str]) -> Optional[int]:
-    """Best-effort sum of weight-file sizes from `model_info(files_metadata=True)`.
-    Mirrors download_worker._safetensor_total to avoid import coupling. Returns
-    None on any failure — size-estimate failures must NOT change is_compatible
-    or compat_reason."""
+@dataclass
+class _RepoMetadata:
+    siblings: tuple[SiblingMeta, ...]
+    transformer_weight_total: Optional[int]
+    probe: RepoFormatProbe
+
+
+# Per-process repo-metadata cache, keyed (repo_id, version). Mirrors the
+# config-cache shape so size + probe + GGUF candidates share one fetch with
+# `_fetch_config` (which is keyed on the same (repo_id, version)).
+_META_CACHE_CAP = 256
+_META_CACHE_TTL_SECONDS = 600
+_meta_cache: "OrderedDict[tuple[str, Optional[str]], tuple[float, _RepoMetadata]]" = OrderedDict()
+_meta_cache_lock = threading.Lock()
+
+
+def _meta_cache_get(cache_key: tuple[str, Optional[str]]) -> Optional[_RepoMetadata]:
+    with _meta_cache_lock:
+        entry = _meta_cache.get(cache_key)
+        if entry is None:
+            return None
+        stored_at, meta = entry
+        _, version = cache_key
+        if version is None and time.monotonic() - stored_at > _META_CACHE_TTL_SECONDS:
+            _meta_cache.pop(cache_key, None)
+            return None
+        _meta_cache.move_to_end(cache_key)
+        return meta
+
+
+def _meta_cache_put(cache_key: tuple[str, Optional[str]], meta: _RepoMetadata) -> None:
+    with _meta_cache_lock:
+        _meta_cache[cache_key] = (time.monotonic(), meta)
+        _meta_cache.move_to_end(cache_key)
+        while len(_meta_cache) > _META_CACHE_CAP:
+            _meta_cache.popitem(last=False)
+
+
+def _clear_meta_cache() -> None:
+    """Test hook."""
+    with _meta_cache_lock:
+        _meta_cache.clear()
+
+
+def _fetch_repo_metadata(
+    repo_id: str,
+    token: Optional[str],
+    version: Optional[str],
+    revision: Optional[str] = None,
+) -> Optional[_RepoMetadata]:
+    """Single `model_info(files_metadata=True)` shared between the size
+    estimate and the GGUF probe. Cached per (repo_id, version)."""
+    cache_key = (repo_id, version)
+    cached = _meta_cache_get(cache_key)
+    if cached is not None:
+        return cached
     try:
         info = _api.model_info(
             repo_id,
             files_metadata=True,
+            revision=revision,
             timeout=_MODEL_INFO_TIMEOUT_SECONDS,
             token=token,
         )
     except Exception:  # noqa: BLE001
         return None
-    siblings = getattr(info, "siblings", None) or []
-    total = 0
-    found = False
-    for s in siblings:
+    raw_siblings = getattr(info, "siblings", None) or []
+    sibs: list[SiblingMeta] = []
+    transformer_total = 0
+    found_transformer = False
+    for s in raw_siblings:
         name = getattr(s, "rfilename", "") or ""
-        size = getattr(s, "size", None)
-        if size is None:
+        if not name:
             continue
-        if name.endswith(_WEIGHT_EXTENSIONS):
-            total += int(size)
-            found = True
-    return total if found else None
+        size_attr = getattr(s, "size", None)
+        size = int(size_attr) if size_attr is not None else None
+        sibs.append(SiblingMeta(rfilename=name, size=size))
+        if size is not None and name.endswith(_TRANSFORMER_WEIGHT_EXTENSIONS):
+            transformer_total += size
+            found_transformer = True
+    probe = probe_repo_format(sibs)
+    meta = _RepoMetadata(
+        siblings=tuple(sibs),
+        transformer_weight_total=transformer_total if found_transformer else None,
+        probe=probe,
+    )
+    _meta_cache_put(cache_key, meta)
+    return meta
+
+
+def _safetensor_total(
+    repo_id: str,
+    token: Optional[str],
+    revision: Optional[str] = None,
+) -> Optional[int]:
+    """Backwards-compatible thin wrapper for callers that only need the size
+    estimate. Routes through the consolidated metadata fetch so search-row
+    enrichment doesn't hit the Hub twice per result."""
+    meta = _fetch_repo_metadata(repo_id, token, version=revision, revision=revision)
+    if meta is None:
+        return None
+    return meta.transformer_weight_total
 
 
 def _bytes_to_gb(n: Optional[int]) -> Optional[float]:
@@ -606,17 +703,29 @@ def _row_for_model(
 ) -> dict:
     """Build the per-row dict. Per-row fetch errors stay row-level."""
     repo_id = m.id
+    version = _model_version(m)
     cfg_result = _fetch_config(
         repo_id,
         token=token,
         cache_dir=cache_dir,
-        version=_model_version(m),
+        version=version,
         revision=_model_revision(m),
     )
-    is_compatible, compat_reason = _decide_compat(
-        cfg_result.architectures, cfg_result.fetch_status,
+    meta = _fetch_repo_metadata(
+        repo_id,
+        token=token,
+        version=version,
+        revision=_model_revision(m),
     )
-    size_bytes = _safetensor_total(repo_id, token=token)
+    probe = meta.probe if meta is not None else None
+    is_compatible, compat_reason = _decide_compat(
+        cfg_result.architectures, cfg_result.fetch_status, probe,
+    )
+    size_bytes = meta.transformer_weight_total if meta is not None else None
+    has_gguf = probe.has_gguf if probe is not None else False
+    recommended_backend = (
+        probe.recommended_backend if probe is not None else BACKEND_VLLM
+    )
     last_modified = getattr(m, "last_modified", None)
     if last_modified is not None and not isinstance(last_modified, str):
         # ModelInfo emits datetime objects; serialize for JSON.
@@ -635,6 +744,8 @@ def _row_for_model(
         "last_modified": last_modified,
         "tags": list(getattr(m, "tags", []) or []),
         "pipeline_tag": getattr(m, "pipeline_tag", None),
+        "has_gguf": has_gguf,
+        "recommended_backend": recommended_backend,
     }
 
 
@@ -759,6 +870,55 @@ def _legacy_do_search_sync(
     """Compatibility wrapper for older direct tests/imports."""
     tags = _resolve_pipeline_tags(None, include_vision)
     return _do_search_sync(q, limit, 1, tags, _DEFAULT_SORT, filter_compat)
+
+
+def fetch_repo_files(
+    repo_id: str,
+    revision: Optional[str] = None,
+) -> dict:
+    """Probe a repo's siblings for the install-form GGUF dropdown.
+
+    Returns a dict of:
+      {
+        has_gguf, has_transformer_weights, recommended_backend,
+        gguf_candidates: [
+          {label, primary_filename, all_filenames, shard_count, size_bytes},
+          ...
+        ]
+      }
+
+    Shares the per-process metadata cache with `_row_for_model` so back-to-back
+    search → install navigations don't hit the Hub twice. Raises HFSearchError
+    on Hub-side failures so the route can map the status code.
+    """
+    token = os.environ.get("HUGGING_FACE_HUB_TOKEN") or None
+    # `revision` is None unless the caller pinned one; that's fine — the cache
+    # key absorbs it. Distinguish 'no metadata' from 'empty repo' by raising.
+    meta = _fetch_repo_metadata(
+        repo_id,
+        token=token,
+        version=revision,
+        revision=revision,
+    )
+    if meta is None:
+        raise HFSearchError(
+            502, f"could not fetch repo metadata for '{repo_id}'",
+        )
+    candidates = []
+    for c in meta.probe.gguf_candidates:
+        candidates.append({
+            "label": c.label,
+            "primary_filename": c.primary_filename,
+            "all_filenames": list(c.all_filenames),
+            "shard_count": c.shard_count,
+            "size_bytes": c.size_bytes,
+        })
+    return {
+        "has_gguf": meta.probe.has_gguf,
+        "has_transformer_weights": meta.probe.has_transformer_weights,
+        "recommended_backend": meta.probe.recommended_backend,
+        "gguf_candidates": candidates,
+    }
 
 
 async def run_search(

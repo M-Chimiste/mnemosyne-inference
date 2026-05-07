@@ -156,6 +156,7 @@ def install_fakes(
     fake_download.calls = download_calls
     fake_download.configs = cfg_map
     monkeypatch.setattr(hf_search, "hf_hub_download", fake_download)
-    # Wipe per-process cache between tests so cross-test pollution is impossible.
+    # Wipe per-process caches between tests so cross-test pollution is impossible.
     hf_search._clear_config_cache()
+    hf_search._clear_meta_cache()
     return fake_download

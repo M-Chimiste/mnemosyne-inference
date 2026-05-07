@@ -175,10 +175,19 @@ export default function Search() {
               )}
               {results.map((row) => (
                 <tr key={row.model_id} className="border-b border-line last:border-0">
-                  <td className="max-w-sm break-all px-3 py-2 font-medium">{row.model_id}</td>
+                  <td className="max-w-sm break-all px-3 py-2 font-medium">
+                    {row.model_id}
+                    {row.recommended_backend === "llama.cpp" && (
+                      <span className="ml-2 inline-flex rounded border border-amber/40 bg-amber/10 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-amber">
+                        llama.cpp
+                      </span>
+                    )}
+                  </td>
                   <td className="px-3 py-2">
                     {row.is_compatible ? (
-                      <span className="inline-flex rounded border border-pine/40 bg-pine/10 px-2 py-0.5 text-xs font-medium text-pine">compatible</span>
+                      <span className="inline-flex rounded border border-pine/40 bg-pine/10 px-2 py-0.5 text-xs font-medium text-pine">
+                        {row.compat_reason ? row.compat_reason : "compatible"}
+                      </span>
                     ) : (
                       <div className="max-w-xs text-brick">
                         <span className="inline-flex items-center gap-1 rounded border border-brick/40 bg-brick/10 px-2 py-0.5 text-xs font-medium">

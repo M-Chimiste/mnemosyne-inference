@@ -5,6 +5,7 @@ import type {
   CatalogRow,
   DownloadEntry,
   GpuStatus,
+  HfFilesResponse,
   HfPipelineTag,
   HfSearchEnvelope,
   HfSortOption,
@@ -65,6 +66,19 @@ export function useInstall(alias: string | null) {
     queryFn: () => api<InstallStatus>(`/manager/install/${encodeURIComponent(alias!)}`),
     enabled: Boolean(alias),
     refetchInterval: 2000
+  });
+}
+
+export function useHfFiles(params: { modelId: string | null; revision?: string }) {
+  return useQuery({
+    queryKey: ["hf-files", params.modelId, params.revision ?? "main"],
+    queryFn: () => {
+      const qs = new URLSearchParams({ model_id: params.modelId! });
+      if (params.revision) qs.set("revision", params.revision);
+      return api<HfFilesResponse>(`/manager/hf/files?${qs.toString()}`);
+    },
+    enabled: Boolean(params.modelId),
+    staleTime: 60_000
   });
 }
 

@@ -658,3 +658,142 @@ def test_corrupt_db_is_quarantined_and_replaced(tmp_path, caplog):
         "catalog corruption" in rec.getMessage().lower()
         for rec in caplog.records
     )
+
+
+# ── llama.cpp / GGUF reconcile ───────────────────────────────────────
+
+
+def _make_gguf_cache(
+    storage_root: str,
+    hf_id: str,
+    *,
+    filenames: list[str],
+    revision: str = "main",
+    sha: str = "c" * 40,
+) -> str:
+    """Build a fake HF cache dir with one or more `.gguf` files. Mirrors
+    `_make_cache` but doesn't write a `.safetensors` placeholder."""
+    safe = "models--" + hf_id.replace("/", "--")
+    repo = os.path.join(storage_root, "hub", safe)
+    snap = os.path.join(repo, "snapshots", sha)
+    os.makedirs(snap, exist_ok=True)
+    for name in filenames:
+        with open(os.path.join(snap, name), "wb") as f:
+            f.write(b"\x00")
+    refs_dir = os.path.join(repo, "refs")
+    os.makedirs(refs_dir, exist_ok=True)
+    with open(os.path.join(refs_dir, revision), "w") as f:
+        f.write(sha)
+    return snap
+
+
+def test_reconcile_llamacpp_installed_when_chosen_gguf_present(cat, tmp_path):
+    cat._raw_insert_model(
+        alias="qw-q4",
+        hf_model_id="bartowski/Qwen2.5-7B-Instruct-GGUF",
+        storage_location="tmp",
+        backend="llama.cpp",
+        gguf_filename="model-Q4_K_M.gguf",
+        status="partial",
+    )
+    _make_gguf_cache(
+        str(tmp_path),
+        "bartowski/Qwen2.5-7B-Instruct-GGUF",
+        filenames=["model-Q4_K_M.gguf", "model-Q8_0.gguf"],
+    )
+    cat.reconcile_cache({"tmp": str(tmp_path)})
+    row = cat.get_model("qw-q4")
+    assert row.status == "installed"
+    assert row.backend == "llama.cpp"
+    assert row.gguf_filename == "model-Q4_K_M.gguf"
+
+
+def test_reconcile_llamacpp_partial_when_chosen_quant_missing(cat, tmp_path):
+    """Two aliases share a repo, each pinning a different quant. The alias
+    whose specific GGUF is missing must NOT be promoted to installed even
+    though some other GGUF in the snapshot is present."""
+    cat._raw_insert_model(
+        alias="qw-q4",
+        hf_model_id="bartowski/Qwen2.5-7B-Instruct-GGUF",
+        storage_location="tmp",
+        backend="llama.cpp",
+        gguf_filename="model-Q4_K_M.gguf",
+        status="partial",
+    )
+    cat._raw_insert_model(
+        alias="qw-q8",
+        hf_model_id="bartowski/Qwen2.5-7B-Instruct-GGUF",
+        storage_location="tmp",
+        backend="llama.cpp",
+        gguf_filename="model-Q8_0.gguf",
+        status="partial",
+    )
+    # Only Q8_0 is on disk.
+    _make_gguf_cache(
+        str(tmp_path),
+        "bartowski/Qwen2.5-7B-Instruct-GGUF",
+        filenames=["model-Q8_0.gguf"],
+    )
+    cat.reconcile_cache({"tmp": str(tmp_path)})
+    assert cat.get_model("qw-q4").status == "partial"
+    assert cat.get_model("qw-q8").status == "installed"
+
+
+def test_reconcile_llamacpp_sharded_partial_when_one_shard_missing(cat, tmp_path):
+    cat._raw_insert_model(
+        alias="big-q8",
+        hf_model_id="org/big-gguf",
+        storage_location="tmp",
+        backend="llama.cpp",
+        gguf_filename="model-Q8_0-00001-of-00003.gguf",
+        status="partial",
+    )
+    # Only 2 of 3 shards present.
+    _make_gguf_cache(
+        str(tmp_path),
+        "org/big-gguf",
+        filenames=[
+            "model-Q8_0-00001-of-00003.gguf",
+            "model-Q8_0-00002-of-00003.gguf",
+        ],
+    )
+    cat.reconcile_cache({"tmp": str(tmp_path)})
+    assert cat.get_model("big-q8").status == "partial"
+
+
+def test_reconcile_llamacpp_sharded_installed_when_full(cat, tmp_path):
+    cat._raw_insert_model(
+        alias="big-q8",
+        hf_model_id="org/big-gguf",
+        storage_location="tmp",
+        backend="llama.cpp",
+        gguf_filename="model-Q8_0-00001-of-00003.gguf",
+        status="partial",
+    )
+    _make_gguf_cache(
+        str(tmp_path),
+        "org/big-gguf",
+        filenames=[
+            "model-Q8_0-00001-of-00003.gguf",
+            "model-Q8_0-00002-of-00003.gguf",
+            "model-Q8_0-00003-of-00003.gguf",
+        ],
+    )
+    cat.reconcile_cache({"tmp": str(tmp_path)})
+    assert cat.get_model("big-q8").status == "installed"
+
+
+def test_catalog_row_round_trips_backend_and_filename(cat):
+    cat._raw_insert_model(
+        alias="qw-q4",
+        hf_model_id="bartowski/Qwen2.5-7B-Instruct-GGUF",
+        storage_location="tmp",
+        backend="llama.cpp",
+        gguf_filename="model-Q4_K_M.gguf",
+    )
+    row = cat.get_model("qw-q4")
+    assert row.backend == "llama.cpp"
+    assert row.gguf_filename == "model-Q4_K_M.gguf"
+    api = row.to_api_dict()
+    assert api["backend"] == "llama.cpp"
+    assert api["gguf_filename"] == "model-Q4_K_M.gguf"

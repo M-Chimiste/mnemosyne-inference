@@ -1,8 +1,9 @@
 """Mnemosyne Inference — download worker subprocess.
 
 Standalone module run as `python -m download_worker <args-json-base64>`.
-Imports only `huggingface_hub`, `tqdm`, and stdlib — does NOT import
-`vllm`, `torch`, FastAPI, or any manager module so cold-start stays fast.
+Imports only `huggingface_hub`, `tqdm`, `repo_probe`, and stdlib — does NOT
+import `vllm`, `torch`, FastAPI, or any manager module so cold-start stays
+fast. `repo_probe` is itself stdlib-only.
 
 Args (base64-encoded JSON on argv[1]):
   {
@@ -10,14 +11,21 @@ Args (base64-encoded JSON on argv[1]):
     "model_id": "org/repo",
     "revision": "main",
     "cache_dir": "/storage/.../hub",
-    "ignore_patterns": ["*.pt", ...] | null
+    "ignore_patterns": ["*.pt", ...] | null,
+    "gguf_primary_filename": "...gguf" | null    # llama.cpp installs only
   }
+
+When `gguf_primary_filename` is set the worker switches to a select-only
+download: it expands the shard set (canonical `*-NNNNN-of-NNNNN.gguf`),
+passes that exact list as `allow_patterns`, and computes `total_bytes`
+across the shards alone — not the whole repo. Required for multi-quant
+GGUF repos where summing all weight files would massively over-report.
 
 HF token is read from HUGGING_FACE_HUB_TOKEN env on the worker side
 (parent puts it there for that one subprocess only).
 
 Stdout events (one JSON object per line):
-  {"event":"start","total_bytes": N | null}
+  {"event":"start","total_bytes": N | null,"selected_files":[...] | null}
   {"event":"progress","bytes_downloaded": N, "total_bytes": M}
   {"event":"complete","cache_path":"...","size_bytes": N, "resolved_sha":"..."}
   {"event":"error","message":"..."}
@@ -174,25 +182,78 @@ class _ProgressTqdm:
             cls._total_size = None
 
 
-def _safetensor_total(model_id: str, revision: str, token: Optional[str]) -> Optional[int]:
-    """Best-effort total-bytes estimate from HF API. Sums sizes of common
-    weight files. Returns None on any API failure."""
+def _model_siblings(
+    model_id: str, revision: str, token: Optional[str],
+) -> Optional[list[tuple[str, Optional[int]]]]:
+    """Return [(rfilename, size), ...] for a repo at `revision`. None on any
+    API failure. files_metadata=True gives sizes; without it `size` is None
+    and downstream callers fall back gracefully (no progress %, but
+    download still works)."""
     try:
         from huggingface_hub import HfApi
         api = HfApi()
-        info = api.model_info(model_id, revision=revision, token=token)
+        info = api.model_info(
+            model_id, revision=revision, token=token, files_metadata=True,
+        )
         siblings = getattr(info, "siblings", []) or []
-        total = 0
+        out: list[tuple[str, Optional[int]]] = []
         for s in siblings:
             name = getattr(s, "rfilename", "") or ""
-            size = getattr(s, "size", None)
-            if size is None:
+            if not name:
                 continue
-            if name.endswith((".safetensors", ".bin", ".gguf", ".pt")):
-                total += int(size)
-        return total or None
+            size = getattr(s, "size", None)
+            out.append((name, int(size) if size is not None else None))
+        return out
     except Exception:
         return None
+
+
+def _safetensor_total(model_id: str, revision: str, token: Optional[str]) -> Optional[int]:
+    """Best-effort total-bytes estimate for vLLM-style installs. Sums sizes
+    of common weight files. Returns None on any API failure or when no
+    weight file has a known size."""
+    siblings = _model_siblings(model_id, revision, token)
+    if siblings is None:
+        return None
+    total = 0
+    found = False
+    for name, size in siblings:
+        if size is None:
+            continue
+        if name.endswith((".safetensors", ".bin")):
+            total += size
+            found = True
+    return total if found else None
+
+
+def _gguf_selected_total(
+    model_id: str,
+    revision: str,
+    token: Optional[str],
+    primary_filename: str,
+) -> tuple[Optional[int], list[str]]:
+    """For a llama.cpp install, return (total_bytes, shard_filenames).
+
+    Shards are expanded from the primary's canonical name pattern; if the
+    primary is unsharded the returned list contains only that filename. When
+    sibling metadata is unavailable, falls back to `[primary_filename]` and
+    None size.
+    """
+    from repo_probe import expand_shard_filenames
+    siblings = _model_siblings(model_id, revision, token)
+    if siblings is None:
+        return None, [primary_filename]
+    all_names = [name for name, _size in siblings]
+    shards = expand_shard_filenames(primary_filename, all_names)
+    sizes_by_name = {name: size for name, size in siblings}
+    total: Optional[int] = 0
+    for name in shards:
+        sz = sizes_by_name.get(name)
+        if sz is None:
+            total = None
+            break
+        total += sz
+    return total, shards
 
 
 def _classify_error(exc: BaseException) -> Optional[str]:
@@ -239,6 +300,7 @@ def _run(args: dict) -> int:
     revision = args.get("revision") or "main"
     cache_dir = args["cache_dir"]
     ignore_patterns = args.get("ignore_patterns")
+    gguf_primary = args.get("gguf_primary_filename")
     token = os.environ.get("HUGGING_FACE_HUB_TOKEN") or None
 
     _install_parent_death_signal()
@@ -251,8 +313,29 @@ def _run(args: dict) -> int:
         os._exit(130)
     signal.signal(signal.SIGTERM, _on_sigterm)
 
-    total_estimate = _safetensor_total(model_id, revision, token)
-    _emit({"event": "start", "total_bytes": total_estimate})
+    selected_files: Optional[list[str]] = None
+    allow_patterns: Optional[list[str]] = None
+    if gguf_primary:
+        # llama.cpp install: download just the chosen shard set. Caller-supplied
+        # ignore_patterns are ignored — allow_patterns is the strict whitelist.
+        total_estimate, shard_names = _gguf_selected_total(
+            model_id, revision, token, gguf_primary,
+        )
+        selected_files = shard_names
+        # Use exact filenames as the allowlist; HF treats these as glob patterns
+        # but plain filenames match themselves only.
+        allow_patterns = list(shard_names)
+        # Accommodate clients that still passed ignore_patterns; allow_patterns
+        # is the dominant filter so this is just defensive.
+        ignore_patterns = None
+    else:
+        total_estimate = _safetensor_total(model_id, revision, token)
+
+    _emit({
+        "event": "start",
+        "total_bytes": total_estimate,
+        "selected_files": selected_files,
+    })
 
     _ProgressTqdm.reset_state()
     if total_estimate is not None:
@@ -261,15 +344,19 @@ def _run(args: dict) -> int:
 
     try:
         from huggingface_hub import snapshot_download
-        path = snapshot_download(
-            repo_id=model_id,
-            revision=revision,
-            cache_dir=cache_dir,
-            ignore_patterns=ignore_patterns,
-            token=token,
-            local_files_only=False,
-            tqdm_class=_ProgressTqdm,
-        )
+        snap_kwargs: dict = {
+            "repo_id": model_id,
+            "revision": revision,
+            "cache_dir": cache_dir,
+            "token": token,
+            "local_files_only": False,
+            "tqdm_class": _ProgressTqdm,
+        }
+        if allow_patterns is not None:
+            snap_kwargs["allow_patterns"] = allow_patterns
+        else:
+            snap_kwargs["ignore_patterns"] = ignore_patterns
+        path = snapshot_download(**snap_kwargs)
     except Exception as e:
         _emit({
             "event": "error",

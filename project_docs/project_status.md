@@ -1,25 +1,30 @@
 # Mnemosyne Inference — Project Status
 
-**Last updated:** 2026-04-29
+**Last updated:** 2026-05-07
 
 ## Current state
 
 **Active milestone:** M5 — Workstation-ready release
-**Active phase:** Phase 8 verification/hardening; Phase 5 snapshot gate remains open.
+**Active phase:** Phase 9 (llama.cpp backend) code landed; Phase 8 verification
+and Phase 5 snapshot gate still open.
 
 M3 is implemented: `/manager/install` is end-to-end functional with
 killable subprocess downloads, restart-recoverable state, multi-drive
 storage routing, and a catalog-backed legacy `/manager/download` shim.
-Phase 5 code has landed: `GET /manager/hf/search` returns vLLM-compatibility-
+Phase 5 code has landed: `GET /manager/hf/search` returns compatibility-
 flagged results sourced from runtime registry introspection (with a bundled
 JSON snapshot fallback), and `/manager/status` reports `vllm_arch_count` /
 `vllm_arch_source` so operators can see when the fallback is active. Phase 6
 code has landed: the admin port now serves a React/Vite SPA, exposes live
 best-effort GPU telemetry via `/manager/gpu`, and keeps `/ui/*` off the
 inference plane. Phase 7 docs/CLI packaging work has landed with a top-level
-README, executable `vllm-ctl`, and corrected admin auth examples. Phase 5 is
-still not marked complete until the bundled architecture snapshot is
-regenerated inside the pinned vLLM container and committed.
+README, executable `vllm-ctl`, and corrected admin auth examples. Phase 9
+adds `llama-server` as a parallel backend so GGUF-only repos install and
+serve without vLLM in the loop; auto-detection runs at install time, the
+catalog persists per-row backend + chosen GGUF filename, and reconcile
+validates the specific shard set. Phase 5 is still not marked complete
+until the bundled architecture snapshot is regenerated inside the pinned
+vLLM container and committed.
 
 ## Phase status
 
@@ -34,6 +39,7 @@ regenerated inside the pinned vLLM container and committed.
 | 6 — Admin UI | React + Vite SPA on the admin port | ✅ Done; host verification complete (2026-04-29) |
 | 7 — Packaging, compose, docs | Multi-stage Dockerfile, compose mounts, ops docs | ✅ Docs/CLI landed; CUDA quickstart smoke pending |
 | 8 — Verification & hardening | PRD acceptance scenarios | ⚠️ Code/docs landed; workstation acceptance pending |
+| 9 — llama.cpp backend for GGUF | Auto-detected llama-server dispatch alongside vLLM | ⚠️ Code landed (2026-05-07); CUDA workstation smoke pending |
 
 ## What has landed
 
@@ -263,14 +269,83 @@ regenerated inside the pinned vLLM container and committed.
   flips ✅ once `phase_8_acceptance.md` is filled in on the workstation.
 - Archived plan: [plans/phase_8.md](plans/phase_8.md).
 
+**Phase 9**
+
+- Second supervised inference backend: `llama-server` is now baked into
+  the Docker image (CUDA build from a pinned llama.cpp tag) and runs as
+  the resident subprocess for GGUF-only repos. The same `vllm_process`
+  global, `_swap_lock`, `ensure_loaded`, eviction loop, and `_proxy` are
+  shared with vLLM — only one model is resident at a time, so both
+  backends bind `127.0.0.1:8002` sequentially.
+- New pure module `repo_probe.py` (stdlib only) holds the GGUF grouping
+  rules and the `probe_repo_format` decision: `has_transformer_weights`
+  wins → vLLM (mixed-format included); GGUF-only → llama.cpp; neither →
+  rejected at install time. Imported by the catalog, `hf_search`, manager,
+  and the standalone `download_worker` (the latter only takes the pure
+  shard expander to keep its cold-start surface unchanged).
+- `runtime.py` gains pure `build_llama_argv` / `build_llama_env` mirroring
+  the vLLM builders. `vllm_manager._start_engine(profile)` dispatches to
+  `_start_vllm` or `_start_llama_cpp` based on `profile.backend`.
+- `ResolvedProfile` now decouples `served_model_name` (forwarded as the
+  upstream `"model"` field) from `engine_model_path` (the engine's
+  `--model` / `-m` argument). For llama.cpp rows the served name is the
+  user-facing alias and the engine is launched with `--alias <alias>`,
+  so the GGUF path stays inside the engine and the proxy keeps a stable
+  short name on the wire. A `model` back-compat property preserves
+  existing callers.
+- `config.ModelProfile`, `catalog.CatalogRow`, and the install request all
+  carry `backend` + `gguf_filename`. Catalog migration is additive
+  (`ALTER TABLE … ADD COLUMN`). Reconcile reads both columns and uses a new
+  backend-aware `_has_expected_weights` so a llama.cpp row only goes
+  `installed` when *its* specific GGUF (and all canonical
+  `*-NNNNN-of-NNNNN.gguf` shards) are present — even when other quants in
+  the same shared snapshot exist.
+- New admin route `GET /manager/hf/files?model_id=…&revision=…` returns
+  `{has_gguf, has_transformer_weights, recommended_backend,
+  gguf_candidates: [{label, primary_filename, all_filenames, shard_count,
+  size_bytes}, …]}` for the install-form dropdown. `hf_search.py` now
+  consolidates `model_info(files_metadata=True)` into a single cached
+  fetch shared by the size estimate, the GGUF probe, and the new files
+  endpoint, so search-row enrichment doesn't pay extra round-trips.
+- `_decide_compat` short-circuits to `is_compatible=true` when the repo
+  has GGUF siblings (covers GGUF-only and mixed-format repos with
+  unsupported architectures), so `filter_compat=true` no longer hides
+  installable llama.cpp models. Search rows now carry `has_gguf` and
+  `recommended_backend`.
+- Install endpoint validates backend + gguf_filename consistency:
+  llama.cpp without `gguf_filename` → 400; vLLM with `gguf_filename` →
+  400; explicit backend on a no-weight repo → 400 (`"no supported weight
+  files"`). When neither is supplied the install defaults to vLLM and
+  skips the Hub probe (preserves legacy clients and offline tests).
+  Retry trusts the row and skips the probe.
+- `download_worker.py` accepts `gguf_primary_filename` and switches to a
+  selected-only download: shards are expanded from the canonical filename
+  pattern, passed to `snapshot_download` as `allow_patterns`, and
+  `total_bytes` is summed across only the chosen shard set so progress
+  bars and free-space estimates stay honest on multi-quant repos.
+- `/manager/status` surfaces `backend`, `gguf_filename`, and `engine_pid`
+  alongside the existing keys; `vllm_pid` stays as a deprecated alias for
+  one release. `vllm-ctl status` prints the new fields. `vllm-ctl install`
+  learns `--backend`, `--gguf-filename`, and a `--list-gguf` mode that
+  prints the candidates a user can pick from before submitting.
+- UI wiring: backend selector + required GGUF dropdown in `InstallForm`,
+  per-row backend badge in `Catalog` and `Search`, backend + filename on
+  the Dashboard's resident card. New `useHfFiles` query is cached.
+- 17 new pure tests in `tests/test_repo_probe.py`. Existing suites
+  extended with engine-dispatch tests, llama.cpp argv/env coverage,
+  GGUF-vs-vLLM compat tests, install-validation rejections, and
+  reconcile assertions for sharded / mixed-quant repos.
+- Plan: [plans/llamacpp_plan.md](plans/llamacpp_plan.md). Workstation
+  smoke (build + install + load + swap a real GGUF repo) remains pending.
+
 ## Verification
 
 Latest host verification on macOS, no CUDA required:
 
-- `python -m pytest -q` → `253 passed`.
-- `cd ui && npm run build` → Vite production build succeeded.
-- `cd ui && npm test` → `9 passed`.
-- `python -m py_compile vllm_manager.py runtime.py config.py catalog.py profiles.py downloader.py download_worker.py hf_search.py logsetup.py scripts/refresh_arch_list.py`
+- `python -m pytest -q` → `318 passed`.
+- `cd ui && ./node_modules/.bin/tsc --noEmit` → clean.
+- `cd ui && ./node_modules/.bin/vite build` → Vite production build succeeded.
+- `python -m py_compile vllm_manager.py runtime.py config.py catalog.py profiles.py downloader.py download_worker.py hf_search.py logsetup.py repo_probe.py scripts/refresh_arch_list.py`
 - `bash -n vllm-ctl`
 - `./vllm-ctl help`
 - `git ls-files -s vllm-ctl` → `100755`
@@ -300,6 +375,17 @@ Workstation/GPU smoke validation is still outstanding:
 - Phase 7 CUDA quickstart smoke: copy examples into a clean compose dir,
   set `ADMIN_PASSWORD`, build/start on the workstation, confirm `/health`,
   authenticated `/manager/status`, and authenticated `/ui/`.
+- Phase 9 GGUF / llama.cpp smoke: rebuild image and confirm
+  `docker run --rm <img> which llama-server`. Search a known GGUF repo
+  (e.g. `bartowski/Qwen2.5-7B-Instruct-GGUF`) and verify
+  `recommended_backend == "llama.cpp"` and `has_gguf == true`. Install via
+  the UI dropdown, confirm `/manager/status` shows `backend: llama.cpp`
+  with the chosen `gguf_filename`, run a `/v1/chat/completions` call, and
+  inspect logs for `Launching llama-server`. Repeat with a sharded quant
+  (Q8_0 split into 3 files) to confirm only the shard set downloads and
+  reconcile flips to `partial` when a shard is manually deleted. Swap from
+  a vLLM model to a llama.cpp model and back to confirm clean teardown
+  and no port collision on `127.0.0.1:8002`.
 
 ## Open follow-ups
 
@@ -320,6 +406,13 @@ Workstation/GPU smoke validation is still outstanding:
   warns when `--size-gb` is not supplied; the Phase 6 UI sets it from search
   results when available, so the warning should primarily appear on
   hand-crafted curl/CLI calls or search rows without a size estimate.
+- **llama.cpp tag pin.** The Dockerfile pins `LLAMA_CPP_TAG=b6500`. Refresh
+  deliberately after checking llama.cpp release notes (CLI flags can shift
+  on minor bumps). The argv builders cover the documented stable flags;
+  rare additions land via `extra_args` in the catalog row.
+- **Phase 9 workstation smoke.** Phase 9 flips ✅ once the GGUF / llama.cpp
+  smoke (above) is run on a CUDA host and a real install + chat round-trip
+  is logged.
 
 ## Quick links
 
@@ -335,4 +428,5 @@ Workstation/GPU smoke validation is still outstanding:
 - [Phase 7 plan](plans/phase_7.md)
 - [Phase 8 plan](plans/phase_8.md)
 - [Phase 8 acceptance log](phase_8_acceptance.md)
+- [Phase 9 plan (llama.cpp backend)](plans/llamacpp_plan.md)
 - [Smoke checks](smoke_checks.md)

@@ -216,7 +216,7 @@ def test_kill_vllm_resets_state_even_when_usage_flush_fails(rich_config, monkeyp
         assert vllm_manager.vllm_process is None
         assert vllm_manager._runtime.resident_alias is None
         assert vllm_manager._runtime.request_count_delta == 0
-        assert any("Usage flush failed during vLLM teardown" in rec.getMessage() for rec in caplog.records)
+        assert any("Usage flush failed during engine teardown" in rec.getMessage() for rec in caplog.records)
     finally:
         if vllm_manager._catalog is not None:
             vllm_manager._catalog.close()

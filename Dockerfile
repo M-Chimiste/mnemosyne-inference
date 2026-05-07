@@ -30,7 +30,41 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       curl \
       git \
       jq \
+      build-essential \
+      cmake \
+      libcurl4-openssl-dev \
       && rm -rf /var/lib/apt/lists/*
+
+# ── llama.cpp (llama-server) ───────────────────────────────────────
+# Built from a pinned tag against the same CUDA toolkit as vLLM.
+# Refresh deliberately after checking llama.cpp release notes (the binary
+# CLI flags occasionally change). Last refreshed: 2026-05-07.
+ARG LLAMA_CPP_TAG=b6500
+# Compute capabilities to compile kernels for. Docker builds have no GPU,
+# so `-arch=native` falls back to a default arch and the resulting binary
+# may not run on the deployment card. The default targets RTX PRO 6000
+# Blackwell (sm_120); override to broaden coverage if you redeploy this
+# image to a non-Blackwell host. Common values:
+#  80  — A100 / Ampere data-center
+#  86  — RTX 30-series / A10 / A40
+#  89  — RTX 40-series / L4 / L40
+#  90  — H100 / H200 (Hopper)
+# 100  — Blackwell B100/B200 data-center
+# 120  — Blackwell workstation (RTX PRO 6000) / RTX 50-series consumer
+# Use a semicolon-separated list to bake in multiple arches:
+#   --build-arg CMAKE_CUDA_ARCHITECTURES="89;90;120"
+ARG CMAKE_CUDA_ARCHITECTURES="120"
+RUN git clone --depth 1 --branch ${LLAMA_CPP_TAG} \
+      https://github.com/ggerganov/llama.cpp /tmp/llama.cpp \
+ && cmake -S /tmp/llama.cpp -B /tmp/llama.cpp/build \
+      -DGGML_CUDA=ON \
+      -DCMAKE_CUDA_ARCHITECTURES="${CMAKE_CUDA_ARCHITECTURES}" \
+      -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF \
+      -DLLAMA_BUILD_EXAMPLES=OFF \
+ && cmake --build /tmp/llama.cpp/build -j --target llama-server \
+ && cp /tmp/llama.cpp/build/bin/llama-server /usr/local/bin/ \
+ && rm -rf /tmp/llama.cpp
+ENV LLAMA_SERVER_BIN=/usr/local/bin/llama-server
 
 # Keep Python packages outside Ubuntu's externally managed system environment.
 RUN python3 -m venv /opt/venv
@@ -64,7 +98,7 @@ RUN pip install --no-cache-dir \
 WORKDIR /app
 COPY vllm_manager.py config.py catalog.py profiles.py runtime.py \
      downloader.py download_worker.py hf_search.py logsetup.py \
-     vllm_supported_architectures.json ./
+     repo_probe.py vllm_supported_architectures.json ./
 COPY scripts/ ./scripts/
 COPY --from=ui-builder /ui/dist /app/static
 

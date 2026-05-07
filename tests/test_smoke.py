@@ -75,13 +75,15 @@ def test_resolve_request_model_legacy_alias_dict(client):
     """Phase 2 tier 3: legacy MODEL_ALIASES still resolves (with WARN logged)."""
     vllm_manager.MODEL_ALIASES["coder"] = "Qwen/Qwen2.5-Coder-7B-Instruct"
     profile = vllm_manager._resolve_request_model("coder")
-    assert profile.model == "Qwen/Qwen2.5-Coder-7B-Instruct"
+    assert profile.served_model_name == "Qwen/Qwen2.5-Coder-7B-Instruct"
+    assert profile.engine_model_path == "Qwen/Qwen2.5-Coder-7B-Instruct"
 
 
 def test_resolve_request_model_raw_passthrough(client):
     """Phase 2 tier 4: org/repo form synthesizes a profile."""
     profile = vllm_manager._resolve_request_model("org/some-model")
-    assert profile.model == "org/some-model"
+    assert profile.served_model_name == "org/some-model"
+    assert profile.engine_model_path == "org/some-model"
 
 
 def test_downloads_empty_initially(client):

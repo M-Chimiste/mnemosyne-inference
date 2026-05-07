@@ -255,7 +255,10 @@ def test_load_aliased_payload(rich_client):
     r = client.post("/manager/load", json={"model": "a-model"})
     assert r.status_code == 200
     body = r.json()
-    assert body == {"status": "loaded", "alias": "a-model", "model": "org/a-model"}
+    assert body == {
+        "status": "loaded", "alias": "a-model",
+        "model": "org/a-model", "backend": "vllm",
+    }
 
 
 def test_load_aliased_ignores_legacy_params(rich_client, caplog):
@@ -275,7 +278,8 @@ def test_load_raw_id_with_legacy_overrides(rich_client):
     )
     assert r.status_code == 200
     profile = stub.calls[0]
-    assert profile.model == "Qwen/Qwen2.5-7B-Instruct"
+    assert profile.served_model_name == "Qwen/Qwen2.5-7B-Instruct"
+    assert profile.engine_model_path == "Qwen/Qwen2.5-7B-Instruct"
     assert profile.gpu_memory_utilization == 0.85
     assert profile.gpus == [0]  # tp=1 → list(range(1))
 
@@ -439,3 +443,146 @@ def test_unload_when_nothing_loaded(rich_client):
     r = client.post("/manager/unload")
     assert r.status_code == 200
     assert r.json() == {"status": "nothing to unload"}
+
+
+# ── backend dispatch ──────────────────────────────────────────────────
+
+
+def test_canonicalize_model_field_uses_served_name():
+    """`_canonicalize_model_field` rewrites `"model"` to served_model_name —
+    not the engine_model_path. For llama.cpp this means the alias goes on
+    the wire and the filesystem path stays inside the engine."""
+    from profiles import ResolvedProfile
+    profile = ResolvedProfile(
+        alias="qw-q4",
+        served_model_name="qw-q4",
+        engine_model_path="/hf-cache/hub/models--repo/snapshots/aa/model.gguf",
+        gpus="all",
+        quantization=None,
+        max_model_len=None,
+        gpu_memory_utilization=0.9,
+        trust_remote_code=False,
+        storage_name="tmp",
+        storage_path="/tmp",
+        extra_args=(),
+        backend="llama.cpp",
+        gguf_filename="model.gguf",
+    )
+    body = json.dumps({"model": "qw-q4-alias", "prompt": "hi"}).encode()
+    rewritten = vllm_manager._canonicalize_model_field(body, profile)
+    parsed = json.loads(rewritten)
+    assert parsed["model"] == "qw-q4"
+    assert "/hf-cache" not in rewritten.decode()
+
+
+def test_start_engine_dispatches_to_llama_cpp(monkeypatch):
+    """A profile with backend='llama.cpp' routes to _start_llama_cpp, not
+    _start_vllm."""
+    import asyncio
+    from profiles import ResolvedProfile
+    profile = ResolvedProfile(
+        alias="qw-q4",
+        served_model_name="qw-q4",
+        engine_model_path="/hf-cache/.../model.gguf",
+        gpus="all",
+        quantization=None,
+        max_model_len=None,
+        gpu_memory_utilization=0.9,
+        trust_remote_code=False,
+        storage_name="tmp",
+        storage_path="/tmp",
+        extra_args=(),
+        backend="llama.cpp",
+        gguf_filename="model.gguf",
+    )
+
+    vllm_calls: list = []
+    llama_calls: list = []
+
+    async def fake_vllm(p):
+        vllm_calls.append(p)
+
+    async def fake_llama(p):
+        llama_calls.append(p)
+
+    monkeypatch.setattr(vllm_manager, "_start_vllm", fake_vllm)
+    monkeypatch.setattr(vllm_manager, "_start_llama_cpp", fake_llama)
+    asyncio.run(vllm_manager._start_engine(profile))
+    assert len(llama_calls) == 1
+    assert len(vllm_calls) == 0
+
+
+def test_start_engine_dispatches_to_vllm(monkeypatch):
+    import asyncio
+    from profiles import ResolvedProfile
+    profile = ResolvedProfile(
+        alias="qw",
+        served_model_name="Qwen/Qwen2.5-7B",
+        engine_model_path="Qwen/Qwen2.5-7B",
+        gpus="all",
+        quantization=None,
+        max_model_len=None,
+        gpu_memory_utilization=0.9,
+        trust_remote_code=False,
+        storage_name="tmp",
+        storage_path="/tmp",
+        extra_args=(),
+        backend="vllm",
+    )
+
+    vllm_calls: list = []
+    llama_calls: list = []
+
+    async def fake_vllm(p):
+        vllm_calls.append(p)
+
+    async def fake_llama(p):
+        llama_calls.append(p)
+
+    monkeypatch.setattr(vllm_manager, "_start_vllm", fake_vllm)
+    monkeypatch.setattr(vllm_manager, "_start_llama_cpp", fake_llama)
+    asyncio.run(vllm_manager._start_engine(profile))
+    assert len(vllm_calls) == 1
+    assert len(llama_calls) == 0
+
+
+def test_status_includes_backend_and_gguf(rich_client):
+    """`/manager/status` surfaces backend + gguf_filename for the resident
+    profile when llama.cpp is active."""
+    client, stub = rich_client
+    # Inject a llama.cpp config alias by mutating the loaded config in place.
+    # The rich fixture has 'a-model' and 'b-model' as vLLM; we wrap the start
+    # by directly populating runtime state to simulate a successful llama
+    # load.
+    from profiles import ResolvedProfile
+    profile = ResolvedProfile(
+        alias="qw-q4",
+        served_model_name="qw-q4",
+        engine_model_path="/hf/q4.gguf",
+        gpus="all",
+        quantization=None,
+        max_model_len=131072,
+        gpu_memory_utilization=0.9,
+        trust_remote_code=False,
+        storage_name="tmp",
+        storage_path="/tmp",
+        extra_args=(),
+        backend="llama.cpp",
+        gguf_filename="model-Q4_K_M.gguf",
+    )
+    vllm_manager._runtime.resident_alias = "qw-q4"
+    vllm_manager._runtime.resident_profile = profile
+    vllm_manager._runtime.model_load_time = time.time()
+    vllm_manager._runtime.last_used_at = time.time()
+
+    r = client.get("/manager/status")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["backend"] == "llama.cpp"
+    assert body["gguf_filename"] == "model-Q4_K_M.gguf"
+    assert body["loaded_model"] == "qw-q4"
+    # Reset so following tests in the suite see clean state.
+    vllm_manager._runtime.resident_alias = None
+    vllm_manager._runtime.resident_profile = None
+    vllm_manager._runtime.model_load_time = None
+    vllm_manager._runtime.last_used_at = None

@@ -259,7 +259,8 @@ class StubDownloader:
         self.fail_with_error: str | None = None
 
     def __call__(self, *, alias, model_id, revision, cache_dir, ignore_patterns,
-                 hf_token, catalog, storage_location):
+                 hf_token, catalog, storage_location,
+                 gguf_primary_filename=None):
         self.calls.append({
             "alias": alias,
             "model_id": model_id,
@@ -268,6 +269,7 @@ class StubDownloader:
             "ignore_patterns": ignore_patterns,
             "hf_token": hf_token,
             "storage_location": storage_location,
+            "gguf_primary_filename": gguf_primary_filename,
         })
 
         class Handle:

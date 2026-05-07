@@ -49,8 +49,15 @@ from catalog import (
 )
 from config import Config, ConfigError, GpuPlan, load_config, load_env
 from downloader import ConflictError, repo_cache_dir
-from profiles import ResolvedProfile, resolve_profile
-from runtime import RuntimeState, build_vllm_argv, build_vllm_env, derive_tp_size
+from profiles import ProfileNotReady, ResolvedProfile, resolve_profile
+from runtime import (
+    RuntimeState,
+    build_llama_argv,
+    build_llama_env,
+    build_vllm_argv,
+    build_vllm_env,
+    derive_tp_size,
+)
 
 # ──────────────────────────────────────────────
 # Configuration
@@ -127,16 +134,21 @@ _config: Optional[Config] = None
 _catalog: Optional[Catalog] = None
 
 # ──────────────────────────────────────────────
-# vLLM process management
+# Engine process management (vLLM + llama.cpp)
 # ──────────────────────────────────────────────
+# `vllm_process` is preserved as the public name (tests/external code reach
+# in to reset it). It holds whichever backend's subprocess is currently
+# resident — vLLM or llama-server. New code prefers the alias `engine_process`.
 
-async def _wait_for_vllm(timeout: int = STARTUP_TIMEOUT) -> bool:
-    url = f"http://{VLLM_INNER_HOST}:{VLLM_INNER_PORT}/health"
+
+async def _wait_for_health(url: str, timeout: int) -> bool:
+    """Poll a /health URL until the engine reports ready or the deadline
+    expires. Returns False if the process died early."""
     async with httpx.AsyncClient() as client:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if vllm_process and vllm_process.poll() is not None:
-                logger.error("vLLM process exited unexpectedly during startup")
+                logger.error("Engine subprocess exited unexpectedly during startup")
                 return False
             try:
                 r = await client.get(url, timeout=3)
@@ -148,14 +160,29 @@ async def _wait_for_vllm(timeout: int = STARTUP_TIMEOUT) -> bool:
     return False
 
 
-def _kill_vllm():
-    """Stop the resident vLLM subprocess (idempotent) and reset runtime state.
-    Flushes buffered usage to the catalog before clearing the resident alias
-    so the just-evicted model's last activity makes it to disk."""
+async def _wait_for_vllm(timeout: int = STARTUP_TIMEOUT) -> bool:
+    return await _wait_for_health(
+        f"http://{VLLM_INNER_HOST}:{VLLM_INNER_PORT}/health", timeout,
+    )
+
+
+async def _wait_for_llama_cpp(timeout: int = STARTUP_TIMEOUT) -> bool:
+    # llama-server returns {"status":"ok"} on /health once the model is
+    # fully memory-mapped; same poll cadence as vLLM.
+    return await _wait_for_health(
+        f"http://{VLLM_INNER_HOST}:{VLLM_INNER_PORT}/health", timeout,
+    )
+
+
+def _kill_engine():
+    """Stop the resident engine subprocess (idempotent) and reset runtime
+    state. Backend-agnostic — flushes buffered usage to the catalog before
+    clearing the resident alias so the just-evicted model's last activity
+    makes it to disk."""
     global vllm_process
-    _flush_usage_best_effort("vLLM teardown")
+    _flush_usage_best_effort("engine teardown")
     if vllm_process and vllm_process.poll() is None:
-        logger.info(f"Stopping vLLM (pid={vllm_process.pid}) ...")
+        logger.info(f"Stopping engine (pid={vllm_process.pid}) ...")
         vllm_process.terminate()
         try:
             vllm_process.wait(timeout=30)
@@ -163,7 +190,7 @@ def _kill_vllm():
             logger.warning("Graceful stop timed out — sending SIGKILL")
             vllm_process.kill()
             vllm_process.wait()
-        logger.info("vLLM stopped.")
+        logger.info("Engine stopped.")
     vllm_process = None
     _runtime.resident_alias = None
     _runtime.resident_profile = None
@@ -175,13 +202,17 @@ def _kill_vllm():
     _runtime.request_count_delta = 0
 
 
+# Back-compat alias — older test fixtures patch this name directly.
+_kill_vllm = _kill_engine
+
+
 async def _start_vllm(profile: ResolvedProfile) -> None:
     """Launch vLLM for `profile`. Cleans up half-launched subprocesses on any
     failure, including asyncio.CancelledError from a deadline-induced wait_for
     (called inside ensure_loaded). See plans/phase_2.md §5.2."""
     global vllm_process
 
-    _kill_vllm()
+    _kill_engine()
     visible = config_mod.gpu_indices_or_none()
     tp_size = derive_tp_size(profile, visible_gpus=visible, default_tp=DEFAULT_TP)
     if profile.gpus == "all" and not visible:
@@ -212,7 +243,7 @@ async def _start_vllm(profile: ResolvedProfile) -> None:
     except (Exception, asyncio.CancelledError):
         # Includes wait_for-induced CancelledError when ensure_loaded times out.
         # Always clean up the half-launched subprocess.
-        _kill_vllm()
+        _kill_engine()
         raise
 
     _runtime.resident_alias = profile.alias
@@ -223,8 +254,69 @@ async def _start_vllm(profile: ResolvedProfile) -> None:
     _runtime.last_used_at = now
     logger.info(
         "✓ Loaded alias='%s' model='%s' tp=%d gpu_mem=%.2f",
-        profile.alias, profile.model, tp_size, profile.gpu_memory_utilization,
+        profile.alias, profile.served_model_name, tp_size,
+        profile.gpu_memory_utilization,
     )
+
+
+async def _start_llama_cpp(profile: ResolvedProfile) -> None:
+    """Launch llama-server for `profile`. Mirrors `_start_vllm` lifecycle but
+    skips tp/gpu_mem (llama-server has its own knobs) and points
+    `--model` at the absolute GGUF path."""
+    global vllm_process
+
+    _kill_engine()
+    argv = build_llama_argv(profile, host=VLLM_INNER_HOST, port=VLLM_INNER_PORT)
+    env = build_llama_env(profile, base_env=os.environ)
+    logger.info(
+        "Launching llama-server (alias=%s gguf=%s): %s",
+        profile.alias, profile.gguf_filename, " ".join(argv),
+    )
+    vllm_process = subprocess.Popen(argv, env=env, stdout=sys.stdout, stderr=sys.stderr)
+
+    try:
+        startup_timeout = (
+            _config.server.startup_timeout_seconds
+            if _config is not None
+            else STARTUP_TIMEOUT
+        )
+        if not await _wait_for_llama_cpp(timeout=startup_timeout):
+            exit_code = vllm_process.poll() if vllm_process else None
+            raise RuntimeError(
+                f"llama-server failed to become ready for alias '{profile.alias}' "
+                f"(exit_code={exit_code}; see container logs — common causes: "
+                f"missing GGUF file, OOM, missing CUDA runtime)"
+            )
+    except (Exception, asyncio.CancelledError):
+        _kill_engine()
+        raise
+
+    _runtime.resident_alias = profile.alias
+    _runtime.resident_profile = profile
+    # llama.cpp doesn't have a tp_size concept; record the GPU plan length so
+    # /manager/status surfaces a meaningful number when the profile pinned
+    # specific GPUs.
+    if isinstance(profile.gpus, list):
+        _runtime.resident_tp_size = len(profile.gpus)
+    else:
+        _runtime.resident_tp_size = None
+    now = time.time()
+    _runtime.model_load_time = now
+    _runtime.last_used_at = now
+    logger.info(
+        "✓ Loaded alias='%s' gguf='%s' via llama.cpp",
+        profile.alias, profile.gguf_filename,
+    )
+
+
+async def _start_engine(profile: ResolvedProfile) -> None:
+    """Backend dispatch — selects vLLM or llama-server based on
+    `profile.backend`. The shared `vllm_process` global holds whichever
+    subprocess wins the lock, since only one model is resident at a time."""
+    if profile.backend == "llama.cpp":
+        await _start_llama_cpp(profile)
+    else:
+        await _start_vllm(profile)
 
 
 # ──────────────────────────────────────────────
@@ -282,11 +374,11 @@ async def ensure_loaded(profile: ResolvedProfile, deadline: float) -> None:
             _load_event = asyncio.Event()
             _load_error = None
             try:
-                await _run_until(lambda: _start_vllm(profile), deadline)
+                await _run_until(lambda: _start_engine(profile), deadline)
             except asyncio.TimeoutError:
-                # _start_vllm cleans up the half-launched subprocess in its
-                # own except block. Surface as 504.
-                raise HTTPException(504, f"vLLM load did not complete in time for '{target}'")
+                # _start_engine cleans up the half-launched subprocess in
+                # the backend-specific start function. Surface as 504.
+                raise HTTPException(504, f"engine load did not complete in time for '{target}'")
             except asyncio.CancelledError:
                 # Caller cancelled. Don't stash _load_error — piggybackers
                 # will re-check resident, see no model loaded, and retry
@@ -392,7 +484,8 @@ def _warn_legacy_alias_once(alias: str) -> None:
 def _synthesize_profile(model_id: str) -> ResolvedProfile:
     """Build an inline ResolvedProfile for a raw HF id or a legacy alias.
     Uses defaults from the loaded config; storage falls back to storage.default.
-    """
+    Synthetic profiles are always vLLM — llama.cpp installs require the
+    full install path so a `gguf_filename` is on file."""
     if _config is None:
         raise RuntimeError("config not loaded")
     storage_name = _config.storage.default
@@ -401,7 +494,8 @@ def _synthesize_profile(model_id: str) -> ResolvedProfile:
     )
     return ResolvedProfile(
         alias=model_id,  # synthetic — only used for log lines and status
-        model=model_id,
+        served_model_name=model_id,
+        engine_model_path=model_id,
         gpus="all",
         quantization=None,
         max_model_len=_config.defaults.max_model_len,
@@ -483,7 +577,10 @@ def _resolve_request_model(requested: str) -> ResolvedProfile:
     # Tier 1 — config alias
     config_alias = _config_alias_for(requested)
     if config_alias is not None:
-        return resolve_profile(config_alias, _config, _catalog)
+        try:
+            return resolve_profile(config_alias, _config, _catalog)
+        except ProfileNotReady as e:
+            raise HTTPException(status_code=409, detail=str(e))
     # Tier 2 — catalog ui_install row (must be fully installed)
     row = _ui_install_row_for_alias(requested)
     if row is not None:
@@ -769,10 +866,18 @@ async def status():
 
     Phase 0/1 keys (loaded_model, loading, vllm_pid, loaded_at,
     loaded_at_human, tp_size, gpu_mem_util, inner_endpoint) are preserved.
-    Phase 2 adds resident-profile detail and idle-eviction countdown."""
+    Phase 2 adds resident-profile detail and idle-eviction countdown.
+    The llama.cpp integration adds `backend`, `gguf_filename`, and
+    `engine_pid` (vllm_pid is kept as a deprecated alias for one release).
+    """
     profile = _runtime.resident_profile
-    loaded_model = profile.model if profile else None
+    loaded_model = profile.served_model_name if profile else None
     load_time = _runtime.model_load_time
+    engine_pid = (
+        vllm_process.pid
+        if vllm_process and vllm_process.poll() is None
+        else None
+    )
 
     last_used = _runtime.last_used_at
     idle_seconds = (time.time() - last_used) if last_used else None
@@ -787,7 +892,8 @@ async def status():
         # Phase 0/1 keys
         "loaded_model":   loaded_model,
         "loading":        _loading_target is not None,
-        "vllm_pid":       vllm_process.pid if vllm_process else None,
+        "vllm_pid":       engine_pid,    # deprecated alias of engine_pid
+        "engine_pid":     engine_pid,
         "loaded_at":      load_time,
         "loaded_at_human": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(load_time)) if load_time else None,
         "tp_size":        _runtime.resident_tp_size,
@@ -806,6 +912,13 @@ async def status():
         ),
         "inflight_requests": _runtime.inflight,
         "swap_target":       _loading_target,
+        # Backend dispatch surface
+        "backend":           profile.backend if profile else None,
+        "gguf_filename": (
+            profile.gguf_filename
+            if profile and profile.backend == "llama.cpp"
+            else None
+        ),
         # Phase 5 additions — surface fallback when vLLM registry import broke.
         "vllm_arch_count":   hf_search.get_arch_count(),
         "vllm_arch_source":  hf_search.get_arch_source(),
@@ -925,6 +1038,20 @@ async def gpu_status():
     return {"available": bool(gpus), "gpus": gpus}
 
 
+@admin_router.get("/manager/hf/files", tags=["manager"])
+async def hf_files_route(
+    model_id: str = Query(..., description="HuggingFace model id (org/repo)"),
+    revision: Optional[str] = Query(None, description="Optional revision/sha; default = repo's default branch"),
+):
+    """Probe an HF repo for installable file groups (the install form's
+    GGUF dropdown). Returns recommended_backend + sized GGUF candidates.
+    """
+    try:
+        return hf_search.fetch_repo_files(model_id, revision=revision)
+    except hf_search.HFSearchError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.detail)
+
+
 @admin_router.get("/manager/hf/search", tags=["manager"])
 async def hf_search_route(
     q: str = Query("", description="Search query; blank returns top models for the chosen sort"),
@@ -1035,7 +1162,12 @@ async def load_model(request: Request):
         _config.server.swap_queue_timeout_seconds if _config else 300
     )
     await ensure_loaded(profile, deadline)
-    return {"status": "loaded", "alias": profile.alias, "model": profile.model}
+    return {
+        "status": "loaded",
+        "alias": profile.alias,
+        "model": profile.served_model_name,
+        "backend": profile.backend,
+    }
 
 
 @admin_router.post("/manager/unload", tags=["manager"])
@@ -1112,6 +1244,10 @@ class InstallRequest(BaseModel):
     extra_args: list[str] = Field(default_factory=list)
     size_estimate_gb: Optional[float] = None
     ignore_patterns: Optional[list[str]] = None
+    # Optional explicit backend override; when omitted the install endpoint
+    # auto-detects from HF siblings. "none" cannot be persisted.
+    backend: Optional[str] = None
+    gguf_filename: Optional[str] = None
 
 
 class CatalogUpdateRequest(BaseModel):
@@ -1165,11 +1301,110 @@ def _gpus_to_json(gpus: GpuPlan) -> list:
     return list(gpus)
 
 
+def _resolve_install_backend(
+    request: InstallRequest,
+    *,
+    hf_token: Optional[str],
+    skip_probe: bool = False,
+) -> tuple[str, Optional[str]]:
+    """Decide the backend for an install and validate the chosen GGUF
+    filename when applicable.
+
+    Returns (backend, gguf_filename). Raises HTTPException(400) on any
+    inconsistency: backend=llama.cpp requires gguf_filename pointing at a
+    real candidate; backend=vllm forbids gguf_filename and requires
+    transformer weights when the probe runs.
+
+    Probe behavior:
+      - Normal /manager/install always probes the repo so GGUF-only repos
+        cannot be silently queued as vLLM installs.
+      - `skip_probe=True` is used by the legacy /manager/download shim,
+        which historically defaults to vLLM with no probe.
+    """
+    explicit_backend = request.backend
+    requested_filename = request.gguf_filename
+
+    if explicit_backend not in (None, "vllm", "llama.cpp"):
+        raise HTTPException(
+            400,
+            f"backend must be 'vllm' or 'llama.cpp', got {explicit_backend!r}",
+        )
+
+    if skip_probe:
+        # Trust the caller (retry path / legacy /manager/download): honor
+        # the explicit backend, but still enforce the gguf_filename ↔ backend
+        # invariant.
+        backend_choice = explicit_backend or "vllm"
+        if backend_choice == "llama.cpp" and not requested_filename:
+            raise HTTPException(
+                400,
+                "backend='llama.cpp' requires gguf_filename",
+            )
+        if backend_choice == "vllm" and requested_filename:
+            raise HTTPException(
+                400,
+                "gguf_filename is only valid when backend='llama.cpp'",
+            )
+        return backend_choice, requested_filename
+    try:
+        probe_payload = hf_search.fetch_repo_files(
+            request.model, revision=request.revision,
+        )
+    except hf_search.HFSearchError as e:
+        raise HTTPException(e.status_code, e.detail)
+
+    has_gguf = bool(probe_payload.get("has_gguf"))
+    has_transformer = bool(probe_payload.get("has_transformer_weights"))
+    candidates = probe_payload.get("gguf_candidates") or []
+    primaries = {c["primary_filename"] for c in candidates}
+
+    backend = explicit_backend or probe_payload.get("recommended_backend") or "vllm"
+    if backend == "none":
+        raise HTTPException(
+            400,
+            f"repo '{request.model}' has no supported weight files",
+        )
+
+    if backend == "llama.cpp":
+        if not has_gguf:
+            raise HTTPException(
+                400,
+                f"repo '{request.model}' has no .gguf siblings; cannot install via llama.cpp",
+            )
+        if not requested_filename:
+            raise HTTPException(
+                400,
+                "backend='llama.cpp' requires gguf_filename — pick one from /manager/hf/files",
+            )
+        if requested_filename not in primaries:
+            raise HTTPException(
+                400,
+                f"gguf_filename '{requested_filename}' is not a recognized "
+                f"GGUF candidate for '{request.model}'",
+            )
+        return "llama.cpp", requested_filename
+
+    # backend == "vllm"
+    if requested_filename:
+        raise HTTPException(
+            400,
+            "gguf_filename is only valid when backend='llama.cpp'",
+        )
+    if not has_transformer:
+        raise HTTPException(
+            400,
+            f"repo '{request.model}' has no .safetensors / .bin siblings; "
+            "use backend='llama.cpp' with a gguf_filename instead",
+        )
+    return "vllm", None
+
+
 async def _install_internal(
     request: InstallRequest,
     *,
     hf_token_override: Optional[str] = None,
     allow_cache_only_alias: bool = False,
+    skip_backend_probe: bool = False,
 ) -> dict:
     """Body of POST /manager/install, factored out so the legacy shim can
     reuse it without going through HTTP."""
@@ -1215,6 +1450,14 @@ async def _install_internal(
 
     _free_space_check(storage_path, request.size_estimate_gb, model_id)
 
+    hf_token = hf_token_override
+    if hf_token is None:
+        hf_token = os.environ.get("HUGGING_FACE_HUB_TOKEN") or None
+
+    backend, gguf_filename = _resolve_install_backend(
+        request, hf_token=hf_token, skip_probe=skip_backend_probe,
+    )
+
     gpus_for_catalog = _gpus_to_json(request.gpus)
 
     _catalog.start_install_tx(
@@ -1227,11 +1470,9 @@ async def _install_internal(
         max_model_len=request.max_model_len,
         storage_location=storage_name,
         extra_args=list(request.extra_args),
+        backend=backend,
+        gguf_filename=gguf_filename,
     )
-
-    hf_token = hf_token_override
-    if hf_token is None:
-        hf_token = os.environ.get("HUGGING_FACE_HUB_TOKEN") or None
 
     cache_dir = os.path.join(storage_path, "hub")
     try:
@@ -1244,6 +1485,7 @@ async def _install_internal(
             hf_token=hf_token,
             catalog=_catalog,
             storage_location=storage_name,
+            gguf_primary_filename=gguf_filename,
         )
     except ConflictError as e:
         # Race: another worker came in between our checks and the spawn.
@@ -1261,6 +1503,8 @@ async def _install_internal(
     return {
         "alias": alias,
         "status": "queued",
+        "backend": backend,
+        "gguf_filename": gguf_filename,
         "poll": f"/manager/install/{alias}",
     }
 
@@ -1328,7 +1572,12 @@ async def retry_install_route(alias: str, force: bool = False):
             max_model_len=row.max_model_len,
             storage=row.storage_location,
             extra_args=extra_args,
+            backend=row.backend,
+            gguf_filename=row.gguf_filename,
         ),
+        # The row was validated when first installed; trust it on retry to
+        # avoid an extra Hub round-trip and keep retries usable offline.
+        skip_backend_probe=True,
     )
 
 
@@ -1595,6 +1844,7 @@ async def download_model(request: Request):
             ),
             hf_token_override=hf_token,
             allow_cache_only_alias=True,
+            skip_backend_probe=True,
         )
     except HTTPException as e:
         # Surface as v0-shaped failure (no started_at / poll).
@@ -1740,11 +1990,12 @@ def _peek_model_field(body: bytes) -> Optional[str]:
 
 
 def _canonicalize_model_field(body: bytes, profile: Optional[ResolvedProfile]) -> bytes:
-    """Rewrite request JSON to the vLLM served model name after resolution.
+    """Rewrite request JSON to the engine-served model name after resolution.
 
-    The manager accepts aliases and case-insensitive HF ids, but vLLM's OpenAI
-    server validates the literal `model` field against its served name. Keep the
-    public lookup flexible while sending the canonical HF id upstream.
+    The manager accepts aliases and case-insensitive HF ids, but the inner
+    engine validates the literal `model` field against its served name (vLLM:
+    the HF id passed to --model; llama-server: the alias passed to --alias).
+    Keep the public lookup flexible while sending the canonical name upstream.
     """
     if profile is None or not body:
         return body
@@ -1754,9 +2005,9 @@ def _canonicalize_model_field(body: bytes, profile: Optional[ResolvedProfile]) -
         return body
     if not isinstance(payload, dict) or not isinstance(payload.get("model"), str):
         return body
-    if payload["model"] == profile.model:
+    if payload["model"] == profile.served_model_name:
         return body
-    payload["model"] = profile.model
+    payload["model"] = profile.served_model_name
     return json.dumps(payload, separators=(",", ":")).encode("utf-8")
 
 

@@ -106,6 +106,23 @@ class ModelProfile(BaseModel):
     storage: str | None = None
     extra_args: list[str] = Field(default_factory=list)
     revision: str = "main"
+    # Backend dispatch. Defaults to vLLM so existing configs round-trip.
+    # llama.cpp requires gguf_filename to be set (the primary shard for
+    # sharded models, the lone file otherwise).
+    backend: Literal["vllm", "llama.cpp"] = "vllm"
+    gguf_filename: str | None = None
+
+    @model_validator(mode="after")
+    def _backend_consistency(self) -> "ModelProfile":
+        if self.backend == "llama.cpp" and not self.gguf_filename:
+            raise ValueError(
+                f"model '{self.alias}' has backend='llama.cpp' but no gguf_filename"
+            )
+        if self.backend == "vllm" and self.gguf_filename:
+            raise ValueError(
+                f"model '{self.alias}' has gguf_filename set but backend is 'vllm'"
+            )
+        return self
 
     @field_validator("alias")
     @classmethod
