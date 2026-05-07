@@ -54,16 +54,36 @@ ARG LLAMA_CPP_TAG=b6500
 # Use a semicolon-separated list to bake in multiple arches:
 #   --build-arg CMAKE_CUDA_ARCHITECTURES="89;90;120"
 ARG CMAKE_CUDA_ARCHITECTURES="120"
-RUN git clone --depth 1 --branch ${LLAMA_CPP_TAG} \
+# Link-time fix for `libcuda.so.1`: the CUDA devel image provides `libcuda.so`
+# (no .1 SONAME) in a stubs directory for build-time linking. ggml-cuda's
+# SONAME demands `libcuda.so.1`, so we symlink it and register the stub dir
+# with ldconfig before the build, then unregister + remove it afterward so
+# the runtime container falls back to the real driver supplied by the NVIDIA
+# Container Toolkit. Stub path is discovered dynamically because CUDA 13
+# could move it; we fail loudly if not found.
+RUN set -eu \
+ && STUB_DIR="$(dirname "$(find /usr/local /usr/lib -name libcuda.so 2>/dev/null | head -n1)")" \
+ && [ -n "${STUB_DIR}" ] && [ -f "${STUB_DIR}/libcuda.so" ] \
+      || (echo "could not locate libcuda.so stub in CUDA devel image" >&2; exit 1) \
+ && echo "Using libcuda stub dir: ${STUB_DIR}" \
+ && ln -sf "${STUB_DIR}/libcuda.so" "${STUB_DIR}/libcuda.so.1" \
+ && echo "${STUB_DIR}" > /etc/ld.so.conf.d/zz-cuda-stubs.conf \
+ && ldconfig \
+ && git clone --depth 1 --branch ${LLAMA_CPP_TAG} \
       https://github.com/ggerganov/llama.cpp /tmp/llama.cpp \
  && cmake -S /tmp/llama.cpp -B /tmp/llama.cpp/build \
       -DGGML_CUDA=ON \
       -DCMAKE_CUDA_ARCHITECTURES="${CMAKE_CUDA_ARCHITECTURES}" \
+      -DCMAKE_EXE_LINKER_FLAGS="-Wl,-rpath-link,${STUB_DIR}" \
+      -DCMAKE_SHARED_LINKER_FLAGS="-Wl,-rpath-link,${STUB_DIR}" \
       -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF \
       -DLLAMA_BUILD_EXAMPLES=OFF \
  && cmake --build /tmp/llama.cpp/build -j --target llama-server \
  && cp /tmp/llama.cpp/build/bin/llama-server /usr/local/bin/ \
- && rm -rf /tmp/llama.cpp
+ && rm -rf /tmp/llama.cpp \
+ && rm -f "${STUB_DIR}/libcuda.so.1" \
+ && rm -f /etc/ld.so.conf.d/zz-cuda-stubs.conf \
+ && ldconfig
 ENV LLAMA_SERVER_BIN=/usr/local/bin/llama-server
 
 # Keep Python packages outside Ubuntu's externally managed system environment.
