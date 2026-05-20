@@ -14,7 +14,7 @@ import sqlite3
 import threading
 import time
 from dataclasses import dataclass
-from typing import Optional
+from typing import Iterable, Optional
 
 from config import ModelProfile
 from repo_probe import expand_shard_filenames
@@ -22,7 +22,7 @@ from repo_probe import expand_shard_filenames
 logger = logging.getLogger("vllm-manager.catalog")
 
 DEFAULT_DB_PATH = "/state/mnemosyne.db"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 3
 
 _RESERVED_PREFIX_COLON = "__cache__:"
 _RESERVED_PREFIX_SLASH = "__cache__/"
@@ -315,24 +315,26 @@ class Catalog:
                   version INTEGER PRIMARY KEY
                 );
                 CREATE TABLE IF NOT EXISTS models (
-                  alias              TEXT PRIMARY KEY,
-                  hf_model_id        TEXT NOT NULL,
-                  source             TEXT NOT NULL,
-                  quantization       TEXT,
-                  gpus               TEXT NOT NULL,
-                  max_model_len      INTEGER,
-                  storage_location   TEXT NOT NULL,
-                  cache_path         TEXT,
-                  size_bytes         INTEGER,
-                  status             TEXT NOT NULL,
-                  installed_at       INTEGER,
-                  last_used_at       INTEGER,
-                  request_count      INTEGER DEFAULT 0,
-                  extra_args         TEXT,
-                  revision           TEXT NOT NULL DEFAULT 'main',
-                  resolved_sha       TEXT,
-                  backend            TEXT NOT NULL DEFAULT 'vllm',
-                  gguf_filename      TEXT
+                  alias                   TEXT PRIMARY KEY,
+                  hf_model_id             TEXT NOT NULL,
+                  source                  TEXT NOT NULL,
+                  quantization            TEXT,
+                  gpus                    TEXT NOT NULL,
+                  max_model_len           INTEGER,
+                  storage_location        TEXT NOT NULL,
+                  cache_path              TEXT,
+                  size_bytes              INTEGER,
+                  status                  TEXT NOT NULL,
+                  installed_at            INTEGER,
+                  last_used_at            INTEGER,
+                  request_count           INTEGER DEFAULT 0,
+                  extra_args              TEXT,
+                  revision                TEXT NOT NULL DEFAULT 'main',
+                  resolved_sha            TEXT,
+                  backend                 TEXT NOT NULL DEFAULT 'vllm',
+                  gguf_filename           TEXT,
+                  total_prompt_tokens     INTEGER NOT NULL DEFAULT 0,
+                  total_completion_tokens INTEGER NOT NULL DEFAULT 0
                 );
                 CREATE TABLE IF NOT EXISTS downloads (
                   id                 INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -345,9 +347,36 @@ class Catalog:
                   total_bytes        INTEGER,
                   error              TEXT
                 );
-                CREATE INDEX IF NOT EXISTS idx_downloads_alias  ON downloads(alias);
-                CREATE INDEX IF NOT EXISTS idx_models_last_used ON models(last_used_at);
-                CREATE INDEX IF NOT EXISTS idx_models_hf_id     ON models(hf_model_id);
+                CREATE TABLE IF NOT EXISTS request_usage (
+                  id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+                  ts                 REAL NOT NULL,
+                  requested_model    TEXT,
+                  alias              TEXT,
+                  backend            TEXT,
+                  prompt_tokens      INTEGER NOT NULL DEFAULT 0,
+                  completion_tokens  INTEGER NOT NULL DEFAULT 0,
+                  total_tokens       INTEGER NOT NULL DEFAULT 0,
+                  usage_json         TEXT
+                );
+                CREATE TABLE IF NOT EXISTS pg_usage_outbox (
+                  id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+                  event_id           TEXT    NOT NULL UNIQUE,
+                  ts                 REAL    NOT NULL,
+                  requested_model    TEXT,
+                  alias              TEXT,
+                  backend            TEXT,
+                  endpoint           TEXT    NOT NULL,
+                  streamed           INTEGER NOT NULL DEFAULT 0,
+                  prompt_tokens      INTEGER NOT NULL DEFAULT 0,
+                  completion_tokens  INTEGER NOT NULL DEFAULT 0,
+                  total_tokens       INTEGER NOT NULL DEFAULT 0,
+                  response_ms        REAL    NOT NULL DEFAULT 0,
+                  status_code        INTEGER NOT NULL DEFAULT 200
+                );
+                CREATE INDEX IF NOT EXISTS idx_downloads_alias       ON downloads(alias);
+                CREATE INDEX IF NOT EXISTS idx_models_last_used      ON models(last_used_at);
+                CREATE INDEX IF NOT EXISTS idx_models_hf_id          ON models(hf_model_id);
+                CREATE INDEX IF NOT EXISTS idx_request_usage_alias_ts ON request_usage(alias, ts);
                 """
             )
             existing = self._conn.execute("SELECT version FROM schema_version").fetchone()
@@ -355,7 +384,14 @@ class Catalog:
                 self._conn.execute(
                     "INSERT INTO schema_version(version) VALUES (?)", (SCHEMA_VERSION,)
                 )
-            # Future: elif existing["version"] < SCHEMA_VERSION: run migrations.
+            elif int(existing["version"]) < SCHEMA_VERSION:
+                # All additions through v3 are additive (CREATE TABLE IF NOT
+                # EXISTS / additive ALTERs above), so the only step here is
+                # bumping the stored version once the bootstrap script has
+                # ensured every needed table exists.
+                self._conn.execute(
+                    "UPDATE schema_version SET version = ?", (SCHEMA_VERSION,)
+                )
 
     def _migrate_revision_column(self) -> None:
         """Additive ALTER for legacy DBs predating later phases. On a fresh DB,
@@ -380,6 +416,16 @@ class Catalog:
             if "gguf_filename" not in cols:
                 self._conn.execute(
                     "ALTER TABLE models ADD COLUMN gguf_filename TEXT"
+                )
+            if "total_prompt_tokens" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE models ADD COLUMN total_prompt_tokens "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
+            if "total_completion_tokens" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE models ADD COLUMN total_completion_tokens "
+                    "INTEGER NOT NULL DEFAULT 0"
                 )
 
     # ── sync ──────────────────────────────────────────────────────────
@@ -749,10 +795,133 @@ class Catalog:
                 (int(last_used_at), delta, alias),
             )
 
+    def record_usage_batch(self, rows: Iterable[tuple]) -> None:
+        """Drain pending token-usage rows from the proxy hot path.
+
+        Each tuple: (ts, requested_model, alias, backend,
+                     prompt_tokens, completion_tokens, total_tokens, usage_json).
+        Inserts one row per request into request_usage and bumps per-alias
+        aggregate columns on models in a single transaction. Aliases with
+        no matching models row (raw HF id passthrough) are still logged in
+        request_usage; the UPDATE silently matches zero rows.
+        """
+        rows = list(rows)
+        if not rows:
+            return
+        agg: dict[str, tuple[int, int, float]] = {}
+        for ts, _req, alias, _backend, prompt, completion, _total, _uj in rows:
+            if not alias:
+                continue
+            p_sum, c_sum, last_ts = agg.get(alias, (0, 0, 0.0))
+            agg[alias] = (p_sum + prompt, c_sum + completion, max(last_ts, ts))
+        with self._lock, self._conn:
+            self._conn.executemany(
+                "INSERT INTO request_usage "
+                "(ts, requested_model, alias, backend, prompt_tokens, "
+                " completion_tokens, total_tokens, usage_json) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                rows,
+            )
+            for alias, (p_sum, c_sum, last_ts) in agg.items():
+                self._conn.execute(
+                    "UPDATE models SET "
+                    "total_prompt_tokens = COALESCE(total_prompt_tokens, 0) + ?, "
+                    "total_completion_tokens = COALESCE(total_completion_tokens, 0) + ?, "
+                    "last_used_at = MAX(COALESCE(last_used_at, 0), ?) "
+                    "WHERE alias = ?",
+                    (p_sum, c_sum, int(last_ts), alias),
+                )
+
     def schema_version(self) -> int:
         with self._lock:
             row = self._conn.execute("SELECT version FROM schema_version").fetchone()
         return int(row["version"]) if row else -1
+
+    # ── token-sidecar outbox (v3) ─────────────────────────────────────
+    #
+    # Mirror of the postgres token_usage table, used as a local cache so a
+    # postgres outage or container restart doesn't drop usage data. The
+    # background pg-flush loop drains this table in event_id-order.
+
+    def enqueue_pg_outbox(self, rows: Iterable[tuple]) -> None:
+        """Append a batch to the postgres outbox.
+
+        Each row is a 12-tuple:
+          (event_id, ts, requested_model, alias, backend, endpoint,
+           streamed, prompt, completion, total, response_ms, status_code)
+        Caller is responsible for stable, unique event_ids (UUIDs); the
+        UNIQUE index plus INSERT OR IGNORE drops accidental dupes silently.
+        """
+        rows = list(rows)
+        if not rows:
+            return
+        with self._lock, self._conn:
+            self._conn.executemany(
+                "INSERT OR IGNORE INTO pg_usage_outbox "
+                "(event_id, ts, requested_model, alias, backend, endpoint, "
+                " streamed, prompt_tokens, completion_tokens, total_tokens, "
+                " response_ms, status_code) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                rows,
+            )
+
+    def peek_pg_outbox(self, limit: int) -> list[sqlite3.Row]:
+        """Return up to `limit` oldest outbox rows in insertion order.
+
+        Caller passes `r["event_id"]` etc. through the postgres writer, then
+        calls `delete_pg_outbox([r["id"] for r in rows])` after a successful
+        write. The SQLite `id` column is the durable handle for deletion;
+        `event_id` is the de-dup key on the postgres side.
+        """
+        if limit <= 0:
+            return []
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT id, event_id, ts, requested_model, alias, backend, "
+                " endpoint, streamed, prompt_tokens, completion_tokens, "
+                " total_tokens, response_ms, status_code "
+                "FROM pg_usage_outbox ORDER BY id LIMIT ?",
+                (int(limit),),
+            )
+            return cur.fetchall()
+
+    def delete_pg_outbox(self, ids: Iterable[int]) -> int:
+        """Delete the named outbox rows. Returns the count actually removed."""
+        ids = [int(i) for i in ids]
+        if not ids:
+            return 0
+        with self._lock, self._conn:
+            # Use a single DELETE with an IN-list to keep this atomic.
+            placeholders = ",".join("?" * len(ids))
+            cur = self._conn.execute(
+                f"DELETE FROM pg_usage_outbox WHERE id IN ({placeholders})", ids,
+            )
+            return cur.rowcount
+
+    def count_pg_outbox(self) -> int:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS c FROM pg_usage_outbox"
+            ).fetchone()
+        return int(row["c"]) if row else 0
+
+    def prune_pg_outbox(self, keep: int) -> int:
+        """Drop oldest outbox rows until at most `keep` remain.
+
+        Called when the outbox is over `max_outbox_rows` so a long postgres
+        outage can't fill the SQLite catalog indefinitely. Returns the
+        number of rows actually dropped.
+        """
+        keep = max(0, int(keep))
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "DELETE FROM pg_usage_outbox WHERE id IN ("
+                "  SELECT id FROM pg_usage_outbox "
+                "  ORDER BY id DESC LIMIT -1 OFFSET ?"
+                ")",
+                (keep,),
+            )
+            return cur.rowcount
 
     # ── install / download transitions (Phase 4 §3b) ──────────────────
 

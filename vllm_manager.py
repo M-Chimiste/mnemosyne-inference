@@ -23,6 +23,7 @@ import os
 import json
 import time
 import threading
+import uuid
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -52,6 +53,7 @@ from downloader import ConflictError, repo_cache_dir
 from profiles import ProfileNotReady, ResolvedProfile, resolve_profile
 from runtime import (
     RuntimeState,
+    UsageEntry,
     build_llama_argv,
     build_llama_env,
     build_vllm_argv,
@@ -127,7 +129,17 @@ _load_event:     Optional[asyncio.Event]    = None
 _load_error:     Optional[BaseException]    = None
 _eviction_task:  Optional[asyncio.Task]     = None
 _flush_task:     Optional[asyncio.Task]     = None
+_pg_flush_task:  Optional[asyncio.Task]     = None
 _legacy_alias_warned: set[str]              = set()
+
+# Optional postgres token-usage sink (token_sidecar). `_pg_writer` is None
+# when the sidecar is disabled or its DSN is missing; `_pg_last_*` feeds the
+# /manager/status payload so the health of the path is visible without
+# psql-ing the central DB.
+_pg_writer = None  # type: Optional["pg_writer.PgWriter"]
+_pg_last_flush_at: Optional[float] = None
+_pg_last_flush_count: int = 0
+_pg_last_error: Optional[str] = None
 
 # Phase 1 globals — populated by lifespan, reset by tests/conftest.py::client.
 _config: Optional[Config] = None
@@ -402,16 +414,56 @@ async def ensure_loaded(profile: ResolvedProfile, deadline: float) -> None:
 # ──────────────────────────────────────────────
 
 def _flush_usage() -> None:
-    """Sync. Single UPDATE per call. Safe from any context — no-op if there's
-    nothing to flush. Called from _flush_loop, _kill_vllm, and lifespan exit."""
+    """Sync. Safe from any context — no-op if there's nothing to flush.
+    Called from _flush_loop, _kill_vllm, and lifespan exit.
+
+    Drains two buffers:
+      - `request_count_delta` for the currently-resident alias (legacy
+        per-resident counter on `models.request_count`).
+      - `usage_rows` of per-request token-usage tuples (Phase: token
+        tracking) — keyed per-row by alias so eviction between request and
+        flush is handled cleanly.
+
+    When token_sidecar is enabled, the same rows are mirrored into the
+    SQLite outbox (`pg_usage_outbox`) so the postgres flush loop can ship
+    them upstream durably across restarts.
+    """
     if _catalog is None:
         return
     alias = _runtime.resident_alias
     delta = _runtime.request_count_delta
-    if alias is None or delta == 0:
+    if alias is not None and delta > 0:
+        _catalog.bump_usage(alias, _runtime.last_used_at, delta)
+        _runtime.request_count_delta = 0
+    if not _runtime.usage_rows:
         return
-    _catalog.bump_usage(alias, _runtime.last_used_at, delta)
-    _runtime.request_count_delta = 0
+    entries: list[UsageEntry] = []
+    while _runtime.usage_rows:
+        entries.append(_runtime.usage_rows.popleft())
+    # Project to the 8-tuple shape `record_usage_batch` expects (the wire
+    # format the existing analytics path was built around — kept stable).
+    analytics_rows = [
+        (
+            e.ts, e.requested_model, e.alias, e.backend,
+            e.prompt_tokens, e.completion_tokens, e.total_tokens, e.usage_json,
+        )
+        for e in entries
+    ]
+    _catalog.record_usage_batch(analytics_rows)
+    # Mirror to the postgres outbox when the sidecar is enabled. Done in
+    # the same flush tick so a missed analytics write and a missed outbox
+    # write fail together (or not at all).
+    if _config is not None and _config.token_sidecar.enabled:
+        outbox_rows = [
+            (
+                e.event_id, e.ts, e.requested_model, e.alias, e.backend,
+                e.endpoint, 1 if e.streamed else 0,
+                e.prompt_tokens, e.completion_tokens, e.total_tokens,
+                e.response_ms, e.status_code,
+            )
+            for e in entries
+        ]
+        _catalog.enqueue_pg_outbox(outbox_rows)
 
 
 def _flush_usage_best_effort(context: str) -> None:
@@ -430,6 +482,68 @@ async def _flush_loop() -> None:
             _flush_usage()
         except Exception as e:
             logger.warning("Usage flush failed: %s", e)
+
+
+# ──────────────────────────────────────────────
+# Postgres token-sidecar outbox flush
+# ──────────────────────────────────────────────
+
+async def _pg_flush_once() -> None:
+    """Drain one batch of outbox rows to postgres.
+
+    Order of operations:
+      1. Prune the outbox if it's over the configured cap (independent of
+         postgres reachability — keeps SQLite bounded during long outages).
+      2. SELECT up to `batch_size` oldest rows.
+      3. Write them via PgWriter.write_batch (ON CONFLICT DO NOTHING).
+      4. Delete the SQLite rows whose write succeeded.
+
+    Errors raise; the caller (loop / best-effort shutdown helper) catches.
+    """
+    global _pg_last_flush_at, _pg_last_flush_count, _pg_last_error
+    if _catalog is None or _pg_writer is None or _config is None:
+        return
+    cfg = _config.token_sidecar
+    pending = _catalog.count_pg_outbox()
+    if pending > cfg.max_outbox_rows:
+        dropped = _catalog.prune_pg_outbox(keep=cfg.max_outbox_rows)
+        logger.warning(
+            "Token-sidecar outbox over cap (%d > %d); dropped %d oldest rows",
+            pending, cfg.max_outbox_rows, dropped,
+        )
+    rows = _catalog.peek_pg_outbox(limit=cfg.batch_size)
+    if not rows:
+        return
+    try:
+        sent = await _pg_writer.write_batch(rows)
+    except Exception as e:
+        _pg_last_error = f"{type(e).__name__}: {e}"
+        raise
+    _catalog.delete_pg_outbox([r["id"] for r in rows])
+    _pg_last_flush_at = time.time()
+    _pg_last_flush_count = sent
+    _pg_last_error = None
+
+
+async def _pg_flush_loop() -> None:
+    """Background task: drain the outbox every `flush_interval_seconds`."""
+    if _config is None or not _config.token_sidecar.enabled:
+        return
+    interval = max(1, int(_config.token_sidecar.flush_interval_seconds))
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            await _pg_flush_once()
+        except Exception as e:
+            logger.warning("Postgres usage flush failed: %s", e)
+
+
+async def _pg_flush_once_best_effort(context: str) -> None:
+    """Flush the postgres outbox without raising. Used during shutdown."""
+    try:
+        await _pg_flush_once()
+    except Exception as e:
+        logger.warning("Postgres flush failed during %s: %s", context, e)
 
 
 # ──────────────────────────────────────────────
@@ -731,6 +845,8 @@ async def manager_lifespan(
         the tasks would never run.
     """
     global _config, _catalog, _runtime, _eviction_task, _flush_task
+    global _pg_writer, _pg_flush_task, _pg_last_flush_at
+    global _pg_last_flush_count, _pg_last_error
     if cfg is None:
         load_env()
         cfg = load_config()
@@ -779,6 +895,45 @@ async def manager_lifespan(
         _eviction_task = None
         _flush_task = None
 
+    # Token-sidecar postgres writer + flush loop (optional). Lazy-import
+    # so a broken psycopg install doesn't take down the whole manager.
+    _pg_writer = None
+    _pg_flush_task = None
+    _pg_last_flush_at = None
+    _pg_last_flush_count = 0
+    _pg_last_error = None
+    ts_cfg = _config.token_sidecar
+    if ts_cfg.enabled:
+        dsn = os.environ.get("TOKEN_SIDECAR_POSTGRES_DSN", "").strip()
+        if not dsn:
+            logger.warning(
+                "token_sidecar.enabled=true but TOKEN_SIDECAR_POSTGRES_DSN "
+                "is unset; sink disabled (rows will still buffer in SQLite)"
+            )
+        else:
+            try:
+                import pg_writer as pg_writer_mod
+                _pg_writer = pg_writer_mod.PgWriter(
+                    dsn=dsn,
+                    node_id=ts_cfg.node_id,
+                    connect_timeout=ts_cfg.connect_timeout_seconds,
+                    logger=logger,
+                )
+                if spawn_background:
+                    _pg_flush_task = asyncio.create_task(
+                        _pg_flush_loop(), name="pg-usage-flush",
+                    )
+                logger.info(
+                    "Token sidecar enabled (node_id=%s, batch=%d, interval=%ds)",
+                    ts_cfg.node_id,
+                    ts_cfg.batch_size,
+                    ts_cfg.flush_interval_seconds,
+                )
+            except Exception as e:
+                logger.error("Token sidecar setup failed: %s", e)
+                _pg_writer = None
+                _pg_flush_task = None
+
     logger.info(
         f"\n"
         f"  ┌─────────────────────────────────────────────────────┐\n"
@@ -795,15 +950,16 @@ async def manager_lifespan(
         yield
     finally:
         # Cancel infinite tasks first so they don't fight teardown.
-        for t in (_eviction_task, _flush_task):
+        for t in (_eviction_task, _flush_task, _pg_flush_task):
             if t is not None and not t.done():
                 t.cancel()
-        for t in (_eviction_task, _flush_task):
+        for t in (_eviction_task, _flush_task, _pg_flush_task):
             if t is not None:
                 with contextlib.suppress(asyncio.CancelledError):
                     await t
         _eviction_task = None
         _flush_task = None
+        _pg_flush_task = None
         # SIGTERM all in-flight installs so we exit cleanly. Worker's
         # prctl(PDEATHSIG) is belt-and-suspenders on Linux; this is the
         # primary cleanup path.
@@ -816,6 +972,14 @@ async def manager_lifespan(
         # Final flush before _kill_vllm wipes _runtime — belt-and-suspenders
         # in case _kill_vllm's internal flush ever moves.
         _flush_usage_best_effort("lifespan shutdown")
+        # Last chance for the outbox to ship rows that just landed in the
+        # final SQLite flush above. Best-effort: never block teardown on
+        # postgres reachability.
+        if _pg_writer is not None:
+            await _pg_flush_once_best_effort("lifespan shutdown")
+            with contextlib.suppress(Exception):
+                await _pg_writer.close()
+            _pg_writer = None
         logger.info("Shutting down — stopping vLLM ...")
         _kill_vllm()
         if _catalog is not None:
@@ -922,6 +1086,17 @@ async def status():
         # Phase 5 additions — surface fallback when vLLM registry import broke.
         "vllm_arch_count":   hf_search.get_arch_count(),
         "vllm_arch_source":  hf_search.get_arch_source(),
+        # Token-sidecar postgres path. `enabled` reflects config; `writer_ready`
+        # tells you whether the DSN was set + the writer imported cleanly.
+        "token_sidecar": {
+            "enabled":          _config.token_sidecar.enabled if _config else False,
+            "node_id":          _config.token_sidecar.node_id if _config else "",
+            "writer_ready":     _pg_writer is not None,
+            "outbox_pending":   _catalog.count_pg_outbox() if _catalog else 0,
+            "last_flush_at":    _pg_last_flush_at,
+            "last_flush_count": _pg_last_flush_count,
+            "last_error":       _pg_last_error,
+        },
     }
 
 
@@ -1972,6 +2147,14 @@ async def health():
 
 VLLM_BASE = f"http://{VLLM_INNER_HOST}:{VLLM_INNER_PORT}"
 
+# Endpoints whose 200 responses carry an OpenAI-style `usage` block. Used by
+# the token-usage tracker to avoid parsing irrelevant payloads (e.g. /v1/models).
+_USAGE_ENDPOINTS = frozenset({
+    "v1/chat/completions",
+    "v1/completions",
+    "v1/embeddings",
+})
+
 # Legacy in-memory aliases (deprecated; tier 3 in _resolve_request_model).
 # Kept for /manager/aliases CRUD compatibility — Phase 3/4 retire it.
 MODEL_ALIASES: dict[str, str] = {}
@@ -2011,6 +2194,128 @@ def _canonicalize_model_field(body: bytes, profile: Optional[ResolvedProfile]) -
     return json.dumps(payload, separators=(",", ":")).encode("utf-8")
 
 
+def _ensure_stream_usage(body: bytes) -> tuple[bytes, bool]:
+    """Inject `stream_options.include_usage: true` into streaming requests.
+
+    vLLM only emits the trailing `usage` SSE event when the client opts in
+    via stream_options. We force the opt-in so the proxy can record token
+    counts, and return a flag indicating whether the *client* had already
+    asked for it — the streaming wrapper uses that flag to decide whether
+    to forward the synthetic usage event to the client or strip it.
+
+    Returns (possibly-rewritten body, client_asked_for_usage).
+    """
+    if not body:
+        return body, False
+    try:
+        payload = json.loads(body)
+    except Exception:
+        return body, False
+    if not isinstance(payload, dict) or not payload.get("stream"):
+        return body, False
+    opts = payload.get("stream_options")
+    if isinstance(opts, dict) and opts.get("include_usage") is True:
+        return body, True
+    new_opts = dict(opts) if isinstance(opts, dict) else {}
+    new_opts["include_usage"] = True
+    payload["stream_options"] = new_opts
+    return json.dumps(payload, separators=(",", ":")).encode("utf-8"), False
+
+
+def _process_sse_event(
+    event_bytes: bytes,
+    client_asked_for_usage: bool,
+) -> tuple[bool, Optional[dict]]:
+    """Inspect one complete SSE event for an OpenAI `usage` block.
+
+    Returns (forward, usage). `forward=False` means drop this event from the
+    downstream stream — used to hide the synthetic usage event from clients
+    that did not request it. `usage` is the parsed dict when present.
+    """
+    text = event_bytes.decode("utf-8", errors="replace").rstrip("\r\n")
+    data_lines: list[str] = []
+    for raw in text.split("\n"):
+        line = raw.rstrip("\r")
+        if line.startswith("data:"):
+            data_lines.append(line[5:].lstrip())
+    if not data_lines:
+        return True, None
+    data = "\n".join(data_lines)
+    if data == "[DONE]":
+        return True, None
+    try:
+        payload = json.loads(data)
+    except Exception:
+        return True, None
+    if not isinstance(payload, dict):
+        return True, None
+    usage = payload.get("usage")
+    if not isinstance(usage, dict):
+        return True, None
+    if not client_asked_for_usage:
+        choices = payload.get("choices")
+        if isinstance(choices, list) and len(choices) == 0:
+            return False, usage
+    return True, usage
+
+
+def _append_usage_row(
+    *,
+    requested_model: Optional[str],
+    alias: Optional[str],
+    backend: Optional[str],
+    usage: dict,
+    endpoint: str,
+    streamed: bool,
+    response_ms: float,
+    status_code: int,
+) -> None:
+    """Queue a per-request usage row for the next `_flush_loop` tick.
+
+    No-op when `alias` is unknown (raw HF id passthrough with no resident
+    profile). Defensive about non-integer token counts since vLLM and
+    llama-server have shipped occasional `null` values in error-but-200 paths.
+
+    `event_id` is generated here (UUID4 hex) so the same identity rides both
+    the in-memory deque and the durable SQLite outbox — the postgres-side
+    `ON CONFLICT (event_id) DO NOTHING` then makes DELETE-after-success
+    safe to retry.
+    """
+    if not alias:
+        return
+    try:
+        prompt = int(usage.get("prompt_tokens") or 0)
+    except (TypeError, ValueError):
+        prompt = 0
+    try:
+        completion = int(usage.get("completion_tokens") or 0)
+    except (TypeError, ValueError):
+        completion = 0
+    try:
+        total = int(usage.get("total_tokens") or (prompt + completion))
+    except (TypeError, ValueError):
+        total = prompt + completion
+    try:
+        usage_json = json.dumps(usage, separators=(",", ":"))
+    except Exception:
+        usage_json = None
+    _runtime.usage_rows.append(UsageEntry(
+        ts=time.time(),
+        requested_model=requested_model,
+        alias=alias,
+        backend=backend or "vllm",
+        prompt_tokens=prompt,
+        completion_tokens=completion,
+        total_tokens=total,
+        usage_json=usage_json,
+        event_id=uuid.uuid4().hex,
+        endpoint=endpoint,
+        streamed=streamed,
+        response_ms=response_ms,
+        status_code=status_code,
+    ))
+
+
 async def _open_upstream(
     request: Request, path: str, body: bytes
 ) -> tuple[httpx.AsyncClient, httpx.Response]:
@@ -2039,18 +2344,84 @@ async def _open_upstream(
         raise
 
 
-async def _wrap_stream(client: httpx.AsyncClient, response: httpx.Response):
+async def _wrap_stream(
+    client: httpx.AsyncClient,
+    response: httpx.Response,
+    *,
+    requested_model: Optional[str] = None,
+    alias: Optional[str] = None,
+    backend: Optional[str] = None,
+    status_code: int = 200,
+    client_asked_for_usage: bool = False,
+    path: str = "",
+    request_start_monotonic: Optional[float] = None,
+):
     """Stream upstream chunks and own the inflight + usage accounting for
     this request. Reaching here means upstream returned headers, so usage
     IS counted — even on client disconnect mid-stream (model performed work).
-    See plans/phase_2.md §5.4."""
+    See plans/phase_2.md §5.4.
+
+    When the upstream returned a 2xx on a `_USAGE_ENDPOINTS` path, the wrapper
+    additionally parses the SSE stream event-by-event, captures the trailing
+    `usage` block, and (when the client did not opt in to that event) strips
+    it from the bytes forwarded to the client.
+    """
+    track_usage = (
+        200 <= status_code < 300
+        and path in _USAGE_ENDPOINTS
+    )
+    last_usage: Optional[dict] = None
+    buffer = bytearray()
     try:
         async for chunk in response.aiter_bytes():
-            yield chunk
+            if not track_usage:
+                yield chunk
+                continue
+            buffer.extend(chunk)
+            while True:
+                idx = buffer.find(b"\n\n")
+                idx_crlf = buffer.find(b"\r\n\r\n")
+                if idx == -1 and idx_crlf == -1:
+                    break
+                if idx == -1 or (idx_crlf != -1 and idx_crlf < idx):
+                    boundary, sep_len = idx_crlf, 4
+                else:
+                    boundary, sep_len = idx, 2
+                event_bytes = bytes(buffer[:boundary + sep_len])
+                del buffer[:boundary + sep_len]
+                forward, usage = _process_sse_event(
+                    event_bytes, client_asked_for_usage,
+                )
+                if usage is not None:
+                    last_usage = usage
+                if forward:
+                    yield event_bytes
+        if track_usage and buffer:
+            # Stream ended without a trailing event terminator — forward
+            # the tail verbatim so the client doesn't see truncation.
+            yield bytes(buffer)
     finally:
         _runtime.inflight -= 1
         _runtime.last_used_at = time.time()
         _runtime.request_count_delta += 1
+        if track_usage and last_usage is not None:
+            try:
+                if request_start_monotonic is not None:
+                    response_ms = (time.monotonic() - request_start_monotonic) * 1000.0
+                else:
+                    response_ms = 0.0
+                _append_usage_row(
+                    requested_model=requested_model,
+                    alias=alias,
+                    backend=backend,
+                    usage=last_usage,
+                    endpoint=f"/{path}" if not path.startswith("/") else path,
+                    streamed=True,
+                    response_ms=response_ms,
+                    status_code=status_code,
+                )
+            except Exception as e:
+                logger.warning("Failed to queue streaming usage row: %s", e)
         with contextlib.suppress(Exception):
             await response.aclose()
         with contextlib.suppress(Exception):
@@ -2075,6 +2446,7 @@ async def _proxy(request: Request, path: str, body: bytes):
       - Single deadline computed at arrival, gates lock-wait, event-wait,
         and _start_vllm itself.
     """
+    request_start_monotonic = time.monotonic()
     requested = _peek_model_field(body)
     if requested is None and _runtime.resident_alias is None:
         raise HTTPException(
@@ -2113,11 +2485,23 @@ async def _proxy(request: Request, path: str, body: bytes):
         finally:
             _swap_lock.release()
 
+    # Snapshot the model context used to tag any usage row we record. After
+    # the inflight increment, eviction cannot fire (it bails when inflight>0),
+    # so reading `_runtime.resident_profile` is safe for the request lifetime.
+    if profile is not None:
+        usage_alias: Optional[str] = profile.alias
+        usage_backend: Optional[str] = profile.backend
+    else:
+        resident = _runtime.resident_profile
+        usage_alias = resident.alias if resident else None
+        usage_backend = resident.backend if resident else None
+
     is_streaming = False
     upstream_ok = False
     client: Optional[httpx.AsyncClient] = None
     response: Optional[httpx.Response] = None
     upstream_body = _canonicalize_model_field(body, profile)
+    upstream_body, client_asked_for_usage = _ensure_stream_usage(upstream_body)
     try:
         client, response = await _open_upstream(request, f"{path}", upstream_body)
         upstream_ok = True
@@ -2128,7 +2512,17 @@ async def _proxy(request: Request, path: str, body: bytes):
             wrapped_client, wrapped_response = client, response
             client, response = None, None  # don't close in this finally
             return StreamingResponse(
-                _wrap_stream(wrapped_client, wrapped_response),
+                _wrap_stream(
+                    wrapped_client,
+                    wrapped_response,
+                    requested_model=requested,
+                    alias=usage_alias,
+                    backend=usage_backend,
+                    status_code=wrapped_response.status_code,
+                    client_asked_for_usage=client_asked_for_usage,
+                    path=path,
+                    request_start_monotonic=request_start_monotonic,
+                ),
                 status_code=wrapped_response.status_code,
                 headers=dict(wrapped_response.headers),
                 media_type="text/event-stream",
@@ -2138,6 +2532,27 @@ async def _proxy(request: Request, path: str, body: bytes):
             body_json = json.loads(content)
         except Exception:
             body_json = {"raw": content.decode(errors="replace")}
+        if (
+            200 <= response.status_code < 300
+            and path in _USAGE_ENDPOINTS
+            and isinstance(body_json, dict)
+        ):
+            usage = body_json.get("usage")
+            if isinstance(usage, dict):
+                try:
+                    response_ms = (time.monotonic() - request_start_monotonic) * 1000.0
+                    _append_usage_row(
+                        requested_model=requested,
+                        alias=usage_alias,
+                        backend=usage_backend,
+                        usage=usage,
+                        endpoint=f"/{path}",
+                        streamed=False,
+                        response_ms=response_ms,
+                        status_code=response.status_code,
+                    )
+                except Exception as e:
+                    logger.warning("Failed to queue usage row: %s", e)
         return JSONResponse(content=body_json, status_code=response.status_code)
     finally:
         if not is_streaming:

@@ -586,3 +586,235 @@ def test_status_includes_backend_and_gguf(rich_client):
     vllm_manager._runtime.resident_profile = None
     vllm_manager._runtime.model_load_time = None
     vllm_manager._runtime.last_used_at = None
+
+
+# ── token usage tracking ──────────────────────────────────────────────
+
+
+def _usage_body(prompt=10, completion=5, total=15) -> bytes:
+    return json.dumps({
+        "choices": [{"message": {"content": "ok"}}],
+        "usage": {
+            "prompt_tokens": prompt,
+            "completion_tokens": completion,
+            "total_tokens": total,
+        },
+    }).encode()
+
+
+def test_usage_recorded_non_streaming(rich_client, monkeypatch):
+    """A 2xx non-streaming response on an allowlisted endpoint queues a row
+    and `_flush_usage` drains it into request_usage + models aggregates."""
+    client, _stub = rich_client
+    _patch_upstream(monkeypatch, _FakeResponse(body=_usage_body(11, 7, 18)))
+    r = client.post(
+        "/v1/chat/completions",
+        json={"model": "a-model", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert r.status_code == 200
+    rows = list(vllm_manager._runtime.usage_rows)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.requested_model == "a-model"
+    assert row.alias == "a-model"
+    assert row.backend == "vllm"
+    assert (row.prompt_tokens, row.completion_tokens, row.total_tokens) == (11, 7, 18)
+    assert json.loads(row.usage_json)["prompt_tokens"] == 11
+    # Sidecar fields populated even when token_sidecar is disabled —
+    # the deque shape is uniform; the outbox mirror only kicks in on flush.
+    assert row.endpoint == "/v1/chat/completions"
+    assert row.streamed is False
+    assert row.status_code == 200
+    assert row.response_ms >= 0
+    assert len(row.event_id) == 32  # uuid4().hex
+
+    vllm_manager._flush_usage()
+    assert not vllm_manager._runtime.usage_rows
+    db_rows = vllm_manager._catalog._conn.execute(
+        "SELECT alias, prompt_tokens, completion_tokens, total_tokens "
+        "FROM request_usage ORDER BY id"
+    ).fetchall()
+    assert len(db_rows) == 1
+    assert (db_rows[0]["alias"], db_rows[0]["prompt_tokens"],
+            db_rows[0]["completion_tokens"], db_rows[0]["total_tokens"]) == (
+        "a-model", 11, 7, 18,
+    )
+    model_row = vllm_manager._catalog._conn.execute(
+        "SELECT total_prompt_tokens, total_completion_tokens "
+        "FROM models WHERE alias='a-model'"
+    ).fetchone()
+    assert (model_row["total_prompt_tokens"],
+            model_row["total_completion_tokens"]) == (11, 7)
+
+
+def test_usage_skipped_on_non_2xx(rich_client, monkeypatch):
+    """An upstream 500 (even with a usage block) must not queue a row."""
+    client, _stub = rich_client
+    _patch_upstream(monkeypatch, _FakeResponse(body=_usage_body(), status_code=500))
+    r = client.post("/v1/chat/completions", json={"model": "a-model"})
+    assert r.status_code == 500
+    assert not vllm_manager._runtime.usage_rows
+
+
+def test_usage_skipped_when_usage_block_missing(rich_client, monkeypatch):
+    """No `usage` in the response → no row queued."""
+    client, _stub = rich_client
+    _patch_upstream(monkeypatch, _FakeResponse(
+        body=b'{"choices":[{"message":{"content":"ok"}}]}',
+    ))
+    r = client.post("/v1/chat/completions", json={"model": "a-model"})
+    assert r.status_code == 200
+    assert not vllm_manager._runtime.usage_rows
+
+
+def test_usage_skipped_for_non_allowlisted_path(rich_client, monkeypatch):
+    """Only chat/completions, completions, embeddings are inspected for
+    usage — a random /v1/models-style path with a usage-shaped body is
+    intentionally ignored."""
+    client, _stub = rich_client
+    _patch_upstream(monkeypatch, _FakeResponse(body=_usage_body()))
+    r = client.post("/v1/models", json={"model": "a-model"})
+    assert r.status_code == 200
+    assert not vllm_manager._runtime.usage_rows
+
+
+def test_usage_resident_profile_used_when_no_model_field(rich_client, monkeypatch):
+    """A request that omits `model` rides the resident; the queued row is
+    tagged with the resident alias and backend."""
+    client, _stub = rich_client
+    # Load a-model first so the proxy has a resident.
+    client.post("/manager/load", json={"model": "a-model"})
+    _patch_upstream(monkeypatch, _FakeResponse(body=_usage_body(3, 2, 5)))
+    r = client.post("/v1/chat/completions", json={"messages": []})
+    assert r.status_code == 200
+    rows = list(vllm_manager._runtime.usage_rows)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.requested_model is None
+    assert row.alias == "a-model"
+    assert row.backend == "vllm"
+    assert (row.prompt_tokens, row.completion_tokens, row.total_tokens) == (3, 2, 5)
+
+
+def test_streaming_usage_recorded_when_client_opted_in(rich_client, monkeypatch):
+    """Client sends `stream_options.include_usage: true`. The injected SSE
+    usage event reaches the client unchanged AND a row is queued."""
+    client, _stub = rich_client
+    # Final event mirrors vLLM's shape: choices=[], usage={...}.
+    chunks = [
+        b'data: {"choices":[{"delta":{"content":"hi"},"index":0}],"usage":null}\n\n',
+        b'data: {"choices":[],"usage":{"prompt_tokens":4,"completion_tokens":2,"total_tokens":6}}\n\n',
+        b'data: [DONE]\n\n',
+    ]
+    captured: dict = {}
+
+    async def _open_upstream(_request, _path, body):
+        captured["body"] = json.loads(body)
+        return _FakeClient(), _FakeResponse(
+            content_type="text/event-stream",
+            chunks=chunks,
+        )
+
+    monkeypatch.setattr(vllm_manager, "_open_upstream", _open_upstream)
+    r = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "a-model",
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        },
+    )
+    text = r.content.decode()
+    assert r.status_code == 200
+    # Upstream body keeps include_usage=True (already set by client).
+    assert captured["body"]["stream_options"]["include_usage"] is True
+    # All three events forwarded.
+    assert text.count("data:") == 3
+    assert "completion_tokens" in text
+    rows = list(vllm_manager._runtime.usage_rows)
+    assert len(rows) == 1
+    assert rows[0][4:7] == (4, 2, 6)  # prompt, completion, total
+
+
+def test_streaming_usage_injected_and_stripped(rich_client, monkeypatch):
+    """Client did NOT request usage. The proxy injects
+    `stream_options.include_usage: true` upstream, records usage, and
+    strips the trailing usage-only event before yielding to the client."""
+    client, _stub = rich_client
+    chunks = [
+        b'data: {"choices":[{"delta":{"content":"hi"},"index":0}]}\n\n',
+        b'data: {"choices":[],"usage":{"prompt_tokens":4,"completion_tokens":2,"total_tokens":6}}\n\n',
+        b'data: [DONE]\n\n',
+    ]
+    captured: dict = {}
+
+    async def _open_upstream(_request, _path, body):
+        captured["body"] = json.loads(body)
+        return _FakeClient(), _FakeResponse(
+            content_type="text/event-stream",
+            chunks=chunks,
+        )
+
+    monkeypatch.setattr(vllm_manager, "_open_upstream", _open_upstream)
+    r = client.post(
+        "/v1/chat/completions",
+        json={"model": "a-model", "stream": True},
+    )
+    text = r.content.decode()
+    assert r.status_code == 200
+    # Injection happened upstream.
+    assert captured["body"]["stream_options"]["include_usage"] is True
+    # The usage-only event was stripped from the client-visible stream.
+    assert "completion_tokens" not in text
+    # But [DONE] and the content delta survived.
+    assert "[DONE]" in text
+    assert "hi" in text
+    # And the row was recorded.
+    rows = list(vllm_manager._runtime.usage_rows)
+    assert len(rows) == 1
+    assert rows[0][4:7] == (4, 2, 6)
+
+
+def test_streaming_usage_skipped_on_non_2xx(rich_client, monkeypatch):
+    """Non-2xx streaming response → forward chunks unchanged, no row queued."""
+    client, _stub = rich_client
+    chunks = [b'data: {"error":"boom"}\n\n']
+    _patch_upstream(monkeypatch, _FakeResponse(
+        content_type="text/event-stream",
+        chunks=chunks,
+        status_code=500,
+    ))
+    r = client.post(
+        "/v1/chat/completions",
+        json={"model": "a-model", "stream": True},
+    )
+    _ = r.content
+    assert r.status_code == 500
+    assert not vllm_manager._runtime.usage_rows
+
+
+def test_ensure_stream_usage_noop_when_not_streaming():
+    body = json.dumps({"model": "x", "messages": []}).encode()
+    new_body, opted = vllm_manager._ensure_stream_usage(body)
+    assert new_body == body
+    assert opted is False
+
+
+def test_ensure_stream_usage_injects_when_missing():
+    body = json.dumps({"model": "x", "stream": True}).encode()
+    new_body, opted = vllm_manager._ensure_stream_usage(body)
+    payload = json.loads(new_body)
+    assert payload["stream_options"]["include_usage"] is True
+    assert opted is False
+
+
+def test_ensure_stream_usage_preserves_when_client_set():
+    body = json.dumps({
+        "model": "x", "stream": True,
+        "stream_options": {"include_usage": True, "other": 1},
+    }).encode()
+    new_body, opted = vllm_manager._ensure_stream_usage(body)
+    payload = json.loads(new_body)
+    assert payload["stream_options"]["include_usage"] is True
+    assert payload["stream_options"]["other"] == 1
+    assert opted is True

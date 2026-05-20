@@ -29,6 +29,18 @@ defaults:
   trust_remote_code: true
   max_model_len: null               # null → vLLM derives from model config
 
+# Optional: forward per-request token usage to a central Postgres ledger
+# (DSN comes from TOKEN_SIDECAR_POSTGRES_DSN in .env). Rows are batched
+# locally in the SQLite catalog so a Postgres outage doesn't drop data
+# and a container restart doesn't lose anything past the last in-memory
+# flush. Disabled by default.
+token_sidecar:
+  enabled: false
+  node_id: ""                       # e.g. "Mnemosyne" — unique per host
+  flush_interval_seconds: 30
+  batch_size: 500
+  max_outbox_rows: 100000           # outbox cap; oldest dropped past this
+
 models:
   # Tensor-parallel across both GPUs.
   - alias: qwen-72b-awq

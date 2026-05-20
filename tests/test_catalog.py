@@ -9,6 +9,7 @@ import pytest
 
 from catalog import (
     Catalog,
+    SCHEMA_VERSION,
     is_cache_only_alias,
     open_catalog,
     synthetic_alias,
@@ -61,13 +62,15 @@ def cat():
 # ── schema bootstrap ────────────────────────────────────────────────
 
 def test_bootstrap_creates_tables_and_version(cat):
-    assert cat.schema_version() == 1
+    assert cat.schema_version() == SCHEMA_VERSION
     # tables exist
     rows = cat._conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
     ).fetchall()
     names = {r["name"] for r in rows}
-    assert {"models", "downloads", "schema_version"} <= names
+    assert {
+        "models", "downloads", "schema_version", "request_usage", "pg_usage_outbox",
+    } <= names
 
 
 def test_bootstrap_idempotent():
@@ -75,7 +78,7 @@ def test_bootstrap_idempotent():
     try:
         # Re-running on the same connection is a no-op (CREATE IF NOT EXISTS).
         c1._bootstrap()
-        assert c1.schema_version() == 1
+        assert c1.schema_version() == SCHEMA_VERSION
     finally:
         c1.close()
 
@@ -597,11 +600,152 @@ def test_legacy_db_migration_adds_revision(tmp_path):
         cols = {row["name"] for row in cat._conn.execute("PRAGMA table_info('models')")}
         assert "revision" in cols
         assert "resolved_sha" in cols
+        # The token-aggregate columns and request_usage table land on open too.
+        assert "total_prompt_tokens" in cols
+        assert "total_completion_tokens" in cols
+        table_names = {
+            r["name"] for r in cat._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        assert "request_usage" in table_names
         row = cat.get_model("legacy")
         assert row.revision == "main"  # default backfill
         assert row.resolved_sha is None
     finally:
         cat.close()
+
+
+# ── token usage tracking ─────────────────────────────────────────────
+
+
+def test_record_usage_batch_inserts_and_aggregates(cat):
+    cat._raw_insert_model(
+        alias="a", hf_model_id="org/a", storage_location="tmp",
+    )
+    cat._raw_insert_model(
+        alias="b", hf_model_id="org/b", storage_location="tmp",
+    )
+    now = time.time()
+    cat.record_usage_batch([
+        (now,     "a", "a", "vllm",     10, 5,  15, '{"prompt_tokens":10}'),
+        (now + 1, "a", "a", "vllm",      2, 1,   3, None),
+        (now + 2, "b", "b", "llama.cpp", 7, 3,  10, None),
+        # No matching models row → row in request_usage, no aggregate bump.
+        (now + 3, "ghost", "ghost", "vllm", 1, 1, 2, None),
+    ])
+
+    rows = cat._conn.execute(
+        "SELECT alias, prompt_tokens, completion_tokens, total_tokens "
+        "FROM request_usage ORDER BY id"
+    ).fetchall()
+    assert [(r["alias"], r["prompt_tokens"], r["completion_tokens"],
+             r["total_tokens"]) for r in rows] == [
+        ("a", 10, 5, 15),
+        ("a",  2, 1,  3),
+        ("b",  7, 3, 10),
+        ("ghost", 1, 1, 2),
+    ]
+
+    row_a = cat._conn.execute(
+        "SELECT total_prompt_tokens, total_completion_tokens, last_used_at "
+        "FROM models WHERE alias='a'"
+    ).fetchone()
+    assert row_a["total_prompt_tokens"] == 12
+    assert row_a["total_completion_tokens"] == 6
+    assert row_a["last_used_at"] == int(now + 1)
+    row_b = cat._conn.execute(
+        "SELECT total_prompt_tokens, total_completion_tokens "
+        "FROM models WHERE alias='b'"
+    ).fetchone()
+    assert row_b["total_prompt_tokens"] == 7
+    assert row_b["total_completion_tokens"] == 3
+
+
+def test_record_usage_batch_empty_is_noop(cat):
+    cat.record_usage_batch([])
+    rows = cat._conn.execute("SELECT COUNT(*) AS c FROM request_usage").fetchone()
+    assert rows["c"] == 0
+
+
+# ── token-sidecar outbox (v3) ────────────────────────────────────────
+
+
+def _outbox_row(event_id, ts, *, alias="a-model", endpoint="/v1/chat/completions",
+                streamed=0, prompt=10, completion=5, total=15,
+                response_ms=42.0, status=200):
+    return (
+        event_id, ts, alias, alias, "vllm", endpoint, streamed,
+        prompt, completion, total, response_ms, status,
+    )
+
+
+def test_enqueue_pg_outbox_round_trip(cat):
+    rows = [
+        _outbox_row("e1", 100.0, prompt=10, completion=5, total=15),
+        _outbox_row("e2", 101.0, streamed=1, prompt=7, completion=3, total=10),
+    ]
+    cat.enqueue_pg_outbox(rows)
+    assert cat.count_pg_outbox() == 2
+    peeked = cat.peek_pg_outbox(10)
+    assert [r["event_id"] for r in peeked] == ["e1", "e2"]
+    assert peeked[0]["prompt_tokens"] == 10
+    assert peeked[0]["streamed"] == 0
+    assert peeked[1]["streamed"] == 1
+    # response_ms round-trips as float, status_code as int.
+    assert peeked[0]["response_ms"] == 42.0
+    assert peeked[0]["status_code"] == 200
+
+
+def test_enqueue_pg_outbox_dedups_on_event_id(cat):
+    cat.enqueue_pg_outbox([_outbox_row("e1", 100.0)])
+    # Same event_id with different fields — second insert should be ignored.
+    cat.enqueue_pg_outbox([_outbox_row("e1", 200.0, prompt=999)])
+    assert cat.count_pg_outbox() == 1
+    rows = cat.peek_pg_outbox(10)
+    assert rows[0]["ts"] == 100.0
+    assert rows[0]["prompt_tokens"] == 10
+
+
+def test_peek_pg_outbox_ordering_and_limit(cat):
+    for i in range(5):
+        cat.enqueue_pg_outbox([_outbox_row(f"e{i}", 100.0 + i)])
+    peeked = cat.peek_pg_outbox(3)
+    # Insertion order (id ASC).
+    assert [r["event_id"] for r in peeked] == ["e0", "e1", "e2"]
+
+
+def test_delete_pg_outbox_removes_only_named_ids(cat):
+    for i in range(4):
+        cat.enqueue_pg_outbox([_outbox_row(f"e{i}", 100.0 + i)])
+    all_rows = cat.peek_pg_outbox(10)
+    drop_ids = [r["id"] for r in all_rows if r["event_id"] in {"e1", "e3"}]
+    deleted = cat.delete_pg_outbox(drop_ids)
+    assert deleted == 2
+    remaining = [r["event_id"] for r in cat.peek_pg_outbox(10)]
+    assert remaining == ["e0", "e2"]
+
+
+def test_delete_pg_outbox_empty_is_noop(cat):
+    cat.enqueue_pg_outbox([_outbox_row("e1", 100.0)])
+    assert cat.delete_pg_outbox([]) == 0
+    assert cat.count_pg_outbox() == 1
+
+
+def test_prune_pg_outbox_drops_oldest(cat):
+    for i in range(10):
+        cat.enqueue_pg_outbox([_outbox_row(f"e{i}", 100.0 + i)])
+    dropped = cat.prune_pg_outbox(keep=3)
+    assert dropped == 7
+    remaining = [r["event_id"] for r in cat.peek_pg_outbox(10)]
+    # Newest three survive — id-ordered, so the largest ids.
+    assert remaining == ["e7", "e8", "e9"]
+
+
+def test_prune_pg_outbox_keep_zero_clears_table(cat):
+    cat.enqueue_pg_outbox([_outbox_row("e1", 100.0)])
+    cat.prune_pg_outbox(keep=0)
+    assert cat.count_pg_outbox() == 0
 
 
 # ── Phase 8 D4: corruption guard ─────────────────────────────────────

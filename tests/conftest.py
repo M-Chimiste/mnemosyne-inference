@@ -114,6 +114,11 @@ def _reset_globals():
     vllm_manager._load_error = None
     vllm_manager._eviction_task = None
     vllm_manager._flush_task = None
+    vllm_manager._pg_flush_task = None
+    vllm_manager._pg_writer = None
+    vllm_manager._pg_last_flush_at = None
+    vllm_manager._pg_last_flush_count = 0
+    vllm_manager._pg_last_error = None
     vllm_manager._legacy_alias_warned.clear()
     # Reset the lock so a new event loop's primitives don't tangle with
     # one held over from a prior test.

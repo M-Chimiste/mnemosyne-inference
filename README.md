@@ -294,6 +294,72 @@ unless you say otherwise. Translate PRD §5.10 / §5.13 into rules:
 - **For belt-and-suspenders**, firewall both ports at the router for hosts
   outside your subnet.
 
+## Token usage telemetry
+
+Every successful `/v1/{chat/completions,completions,embeddings}` call is
+accounted for locally in the SQLite `request_usage` table — open
+`/manager/status` or query `~/vllm-manager/state/mnemosyne.db` directly.
+
+For multi-node fleets, the manager can additionally forward every row to a
+central Postgres ledger (a "token sidecar"). The local SQLite is the
+durable cache: a Postgres outage or container restart never drops data.
+
+1. **Apply the schema once** on the central host. The writer role is
+   intentionally privilege-limited and cannot DDL — apply this as a
+   superuser:
+   ```sql
+   CREATE TABLE public.token_usage (
+       event_id          text                        PRIMARY KEY,
+       timestamp         timestamp with time zone    NOT NULL,
+       node_id           text                        NOT NULL,
+       model             text                        NOT NULL,
+       prompt_tokens     integer                     NOT NULL DEFAULT 0,
+       completion_tokens integer                     NOT NULL DEFAULT 0,
+       total_tokens      integer                     NOT NULL DEFAULT 0,
+       response_ms       double precision            NOT NULL,
+       endpoint          text                        NOT NULL DEFAULT '/v1/unknown',
+       status_code       integer                     NOT NULL DEFAULT 200,
+       ingested_at       timestamp with time zone    NOT NULL DEFAULT now()
+   );
+   CREATE INDEX idx_token_usage_timestamp        ON public.token_usage(timestamp);
+   CREATE INDEX idx_token_usage_node_timestamp   ON public.token_usage(node_id, timestamp);
+   CREATE INDEX idx_token_usage_model_timestamp  ON public.token_usage(model, timestamp);
+   ```
+   To audit any host's view of the schema, run
+   `TOKEN_SIDECAR_POSTGRES_DSN=... .venv/bin/python scripts/probe_token_sidecar_schema.py`
+   from the manager checkout.
+2. **Set the DSN** in `~/vllm-manager/.env`:
+   ```
+   TOKEN_SIDECAR_POSTGRES_DSN=postgresql://token_sidecar_writer:...@central-host:5432/token_sidecar
+   ```
+3. **Enable the sink** in `~/vllm-manager/config.yaml`:
+   ```yaml
+   token_sidecar:
+     enabled: true
+     node_id: Mnemosyne          # unique per host
+     flush_interval_seconds: 30
+     batch_size: 500
+     max_outbox_rows: 100000
+   ```
+4. **Restart**: `vllm-ctl restart`. Look for
+   `Token sidecar enabled (node_id=Mnemosyne, batch=500, interval=30s)` in
+   the logs.
+5. **Verify**:
+   ```bash
+   ADMIN_PASSWORD="$(grep -E '^ADMIN_PASSWORD=' ~/vllm-manager/.env | head -1 | cut -d= -f2-)"
+   curl -s -u admin:"$ADMIN_PASSWORD" http://localhost:8001/manager/status \
+     | jq .token_sidecar
+   # { "enabled": true, "writer_ready": true, "outbox_pending": 0,
+   #   "last_flush_at": 1716234567.12, "last_flush_count": 7, "last_error": null }
+   ```
+
+The DSN is secret-bearing and stays in `.env` (gitignored); everything else
+is declarative config that `vllm-ctl reload` will pick up. Both the SQLite
+outbox and the postgres `event_id` PK use UUIDs so a DELETE-after-success
+retry is naturally idempotent — `outbox_pending` should sit at zero in
+steady state, but is allowed to grow up to `max_outbox_rows` during
+outages, with oldest rows dropped past the cap (logged as a warning).
+
 ## Common operations
 
 A short tour of the CLI; mirrors `vllm-ctl help` ordering.

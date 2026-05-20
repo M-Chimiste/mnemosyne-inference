@@ -16,10 +16,35 @@ passes the result into `derive_tp_size`. See project_docs/plans/phase_2.md §4.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
-from typing import Mapping, Optional
+from collections import deque
+from dataclasses import dataclass, field
+from typing import Mapping, NamedTuple, Optional
 
 from profiles import ResolvedProfile
+
+
+class UsageEntry(NamedTuple):
+    """One per-request token-usage record buffered in `_runtime.usage_rows`.
+
+    The first 8 fields back the existing SQLite `request_usage` analytics
+    table (catalog.record_usage_batch slices them positionally). The
+    remaining fields back the optional postgres token-sidecar outbox
+    (event_id is a UUID, response_ms is wall-clock, status_code is the
+    upstream HTTP status).
+    """
+    ts: float
+    requested_model: Optional[str]
+    alias: Optional[str]
+    backend: Optional[str]
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+    usage_json: Optional[str]
+    event_id: str
+    endpoint: str
+    streamed: bool
+    response_ms: float
+    status_code: int
 
 
 @dataclass
@@ -33,6 +58,9 @@ class RuntimeState:
     last_used_at: Optional[float] = None
     request_count_delta: int = 0
     inflight: int = 0
+    # Pending per-request token-usage rows drained by `_flush_loop`.
+    # See `UsageEntry` for field layout.
+    usage_rows: deque = field(default_factory=deque)
 
 
 def derive_tp_size(

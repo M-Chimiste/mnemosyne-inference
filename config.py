@@ -155,12 +155,41 @@ class ModelProfile(BaseModel):
         raise ValueError(f"gpus must be 'all' or a list of non-negative ints, got {v!r}")
 
 
+class TokenSidecar(BaseModel):
+    """Forward per-request token usage to a central Postgres ledger.
+
+    DSN lives in `.env` as `TOKEN_SIDECAR_POSTGRES_DSN` (it embeds a password).
+    Everything else is declarative config so `vllm-ctl reload` can pick it up.
+    Disabled by default; node_id is required when enabled.
+    """
+    model_config = ConfigDict(extra="forbid")
+    enabled: bool = False
+    node_id: str = ""
+    flush_interval_seconds: int = 30
+    batch_size: int = 500
+    # Cap on rows held locally in the SQLite outbox. Past this, the oldest
+    # rows are dropped (with a WARN log) so a long Postgres outage can't OOM
+    # the catalog. At default batch_size=500 / interval=30s, 100k rows is
+    # ~17 hours of headroom for a heavily-used box.
+    max_outbox_rows: int = 100_000
+    connect_timeout_seconds: float = 5.0
+
+    @model_validator(mode="after")
+    def _node_id_required_when_enabled(self) -> "TokenSidecar":
+        if self.enabled and not self.node_id.strip():
+            raise ValueError(
+                "token_sidecar.node_id is required when token_sidecar.enabled=true"
+            )
+        return self
+
+
 class Config(BaseModel):
     model_config = ConfigDict(extra="forbid")
     server: Server = Field(default_factory=Server)
     storage: Storage
     defaults: Defaults = Field(default_factory=Defaults)
     models: list[ModelProfile] = Field(default_factory=list)
+    token_sidecar: TokenSidecar = Field(default_factory=TokenSidecar)
 
     @model_validator(mode="after")
     def _cross_refs(self) -> "Config":
