@@ -27,7 +27,9 @@ function resultFromRow(row: CatalogRow): HfSearchResult {
     likes: null,
     last_modified: null,
     tags: [],
-    pipeline_tag: null
+    pipeline_tag: null,
+    has_gguf: row.backend === "llama.cpp",
+    recommended_backend: row.backend
   };
 }
 
@@ -200,6 +202,7 @@ export default function Catalog() {
               <tr>
                 <th className="px-3 py-2">Alias</th>
                 <th className="px-3 py-2">Source</th>
+                <th className="px-3 py-2">Backend</th>
                 <th className="px-3 py-2">HF Model</th>
                 <th className="px-3 py-2">Status</th>
                 <th className="px-3 py-2">GPU</th>
@@ -220,6 +223,22 @@ export default function Catalog() {
                   <tr key={row.alias} className="border-b border-line last:border-0">
                     <td className="px-3 py-2 font-medium">{row.alias}</td>
                     <td className="px-3 py-2"><SourceBadge row={row} /></td>
+                    <td className="px-3 py-2 text-xs">
+                      {row.backend === "llama.cpp" ? (
+                        <span className="inline-flex rounded border border-amber/40 bg-amber/10 px-1.5 py-0.5 font-medium uppercase tracking-wide text-amber">
+                          llama.cpp
+                        </span>
+                      ) : (
+                        <span className="inline-flex rounded border border-line bg-stone-50 px-1.5 py-0.5 font-medium uppercase tracking-wide text-stone-600">
+                          vLLM
+                        </span>
+                      )}
+                      {row.gguf_filename && (
+                        <div className="mt-0.5 max-w-[14rem] truncate text-[11px] text-stone-500" title={row.gguf_filename}>
+                          {row.gguf_filename}
+                        </div>
+                      )}
+                    </td>
                     <td className="max-w-sm break-all px-3 py-2 text-stone-700">{row.hf_model_id}</td>
                     <td className="px-3 py-2"><StatusBadge status={row.status} /></td>
                     <td className="px-3 py-2">{formatGpuPlan(row.gpus)}</td>
@@ -287,7 +306,7 @@ export default function Catalog() {
                 );
               })}
               {rows.length === 0 && (
-                <tr><td className="px-3 py-6 text-center text-stone-600" colSpan={9}>No catalog rows.</td></tr>
+                <tr><td className="px-3 py-6 text-center text-stone-600" colSpan={10}>No catalog rows.</td></tr>
               )}
             </tbody>
           </table>

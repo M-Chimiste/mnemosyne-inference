@@ -16,3 +16,4 @@ huggingface_hub
 uvicorn
 pyyaml
 pydantic>=2
+psycopg[binary]>=3.2,<4

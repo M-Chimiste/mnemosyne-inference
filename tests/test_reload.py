@@ -242,7 +242,7 @@ def test_catalog_row_shape(client, tmp_paths):
         "alias", "hf_model_id", "source", "quantization", "gpus",
         "max_model_len", "storage_location", "cache_path", "size_bytes",
         "status", "installed_at", "last_used_at", "request_count", "extra_args",
-        "revision", "resolved_sha",
+        "revision", "resolved_sha", "backend", "gguf_filename",
     }
     assert row["alias"] == "qw"
     assert row["hf_model_id"] == "org/qw"

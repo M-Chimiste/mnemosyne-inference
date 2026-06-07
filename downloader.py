@@ -116,6 +116,7 @@ def _spawn_worker(
     cache_dir: str,
     ignore_patterns: Optional[list[str]],
     env: dict[str, str],
+    gguf_primary_filename: Optional[str] = None,
 ) -> subprocess.Popen:
     """Run `python -m download_worker <args>`. Stdout is line-delimited
     JSON; stderr is inherited so worker tracebacks land in manager logs."""
@@ -125,6 +126,7 @@ def _spawn_worker(
         "revision": revision,
         "cache_dir": cache_dir,
         "ignore_patterns": ignore_patterns,
+        "gguf_primary_filename": gguf_primary_filename,
     }
     encoded = base64.b64encode(json.dumps(args).encode("utf-8")).decode("ascii")
     cmd = [sys.executable, "-m", "download_worker", encoded]
@@ -250,6 +252,7 @@ def start_install(
     hf_token: Optional[str] = None,
     catalog: Catalog,
     storage_location: str,
+    gguf_primary_filename: Optional[str] = None,
 ) -> DownloadHandle:
     """Spawn the worker subprocess for a queued download.
 
@@ -260,6 +263,9 @@ def start_install(
 
     Raises ConflictError if there is already an active install for this
     alias OR for the same (storage_location, model_id) repo cache dir.
+
+    `gguf_primary_filename` triggers the worker's select-only download path
+    for llama.cpp installs (single file or canonical shard group).
     """
     with _active_lock:
         if alias in _active:
@@ -279,6 +285,7 @@ def start_install(
             cache_dir=cache_dir,
             ignore_patterns=ignore_patterns,
             env=env,
+            gguf_primary_filename=gguf_primary_filename,
         )
         handle = DownloadHandle(
             alias=alias,

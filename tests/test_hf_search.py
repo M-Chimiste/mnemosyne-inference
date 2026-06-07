@@ -187,11 +187,30 @@ def test_missing_config_json_flagged_not_dropped(client, monkeypatch):
     assert body["results"][0]["compat_reason"] == "missing config.architectures"
 
 
+def _make_hf_http_error(message: str, status_code: int) -> HfHubHTTPError:
+    """Build an HfHubHTTPError without going through the library's stricter
+    constructor (which now requires `response`). Covers GatedRepoError too —
+    it's a subclass that delegates to the same init."""
+    class FakeResponse:
+        def __init__(self, code: int):
+            self.status_code = code
+            self.headers: dict[str, str] = {}
+            self.request = None
+    err = HfHubHTTPError.__new__(HfHubHTTPError)
+    Exception.__init__(err, message)
+    err.response = FakeResponse(status_code)
+    err.server_message = message
+    err.request_id = None
+    return err
+
+
 def test_per_row_403_flagged_gated(client, monkeypatch):
+    err = _make_hf_http_error("nope", 403)
+    err.__class__ = GatedRepoError
     _build_response(
         monkeypatch,
         list_results={"text-generation": [FakeModelInfo("gated/repo")]},
-        config_errors={"gated/repo": GatedRepoError("nope")},
+        config_errors={"gated/repo": err},
     )
     r = client.get("/manager/hf/search?q=gated&pipeline_tags=text-generation")
     body = r.json()
@@ -200,12 +219,7 @@ def test_per_row_403_flagged_gated(client, monkeypatch):
 
 
 def test_endpoint_level_401_returns_502_with_token_hint(client, monkeypatch):
-    class FakeResponse:
-        status_code = 401
-        headers: dict[str, str] = {}
-        request = None
-    err = HfHubHTTPError("unauthorized")
-    err.response = FakeResponse()  # avoid HfHubHTTPError's constructor probing response.headers
+    err = _make_hf_http_error("unauthorized", 401)
     _build_response(monkeypatch, list_error=err)
     r = client.get("/manager/hf/search?q=anything")
     assert r.status_code == 502
@@ -353,6 +367,93 @@ def test_size_estimate_from_siblings(client, monkeypatch):
     assert api.model_info_calls[0]["timeout"] == 15
 
 
+def test_gguf_only_repo_is_compatible_via_llama_cpp(client, monkeypatch):
+    """A repo with .gguf siblings and no transformer weights is compatible
+    via llama.cpp regardless of config.architectures (the file is often
+    missing on community GGUF repos)."""
+    sib = [
+        FakeSibling("model-Q4_K_M.gguf", size=4_000_000_000),
+        FakeSibling("model-Q8_0.gguf", size=8_000_000_000),
+    ]
+    info = FakeModelInfo("bartowski/Qwen2.5-7B-Instruct-GGUF", siblings=sib)
+    _build_response(
+        monkeypatch,
+        list_results={"text-generation": [info]},
+        # No config.json — the GGUF override should kick in regardless.
+        model_info_map={"bartowski/Qwen2.5-7B-Instruct-GGUF": info},
+    )
+    body = client.get(
+        "/manager/hf/search?q=qwen+gguf&pipeline_tags=text-generation"
+    ).json()
+    row = body["results"][0]
+    assert row["is_compatible"] is True
+    assert row["compat_reason"] == "gguf via llama.cpp"
+    assert row["has_gguf"] is True
+    assert row["recommended_backend"] == "llama.cpp"
+
+
+def test_mixed_format_repo_keeps_vllm_compat(client, monkeypatch):
+    """A repo that ships both .safetensors and .gguf still resolves via vLLM
+    when its architecture is supported — only the recommended backend reflects
+    the mixed-format nature."""
+    sib = [
+        FakeSibling("model.safetensors", size=5_000_000_000),
+        FakeSibling("model-Q4_K_M.gguf", size=4_000_000_000),
+    ]
+    info = FakeModelInfo("org/mixed", siblings=sib)
+    _build_response(
+        monkeypatch,
+        list_results={"text-generation": [info]},
+        configs={"org/mixed": {"architectures": ["Qwen2ForCausalLM"]}},
+        model_info_map={"org/mixed": info},
+    )
+    body = client.get("/manager/hf/search?q=mixed").json()
+    row = body["results"][0]
+    # Recommends vLLM because transformer weights are present...
+    assert row["recommended_backend"] == "vllm"
+    assert row["size_estimate_gb"] == 5.0
+    # ...and is still compatible (the GGUF short-circuit fires first when
+    # .gguf siblings exist, so reason == "gguf via llama.cpp"; what matters
+    # is is_compatible=True).
+    assert row["is_compatible"] is True
+
+
+def test_search_uses_one_model_info_per_row(client, monkeypatch):
+    """`_safetensor_total` and the GGUF probe share a single
+    model_info(files_metadata=True) call per result — the consolidated
+    metadata cache."""
+    info = FakeModelInfo(
+        "x/y",
+        siblings=[FakeSibling("model.safetensors", size=1_000_000_000)],
+    )
+    api = _build_response(
+        monkeypatch,
+        list_results={"text-generation": [info]},
+        configs={"x/y": {"architectures": ["LlamaForCausalLM"]}},
+        model_info_map={"x/y": info},
+    )
+    client.get("/manager/hf/search?q=x").json()
+    # Exactly one model_info call for the row (size + probe in one fetch).
+    assert len(api.model_info_calls) == 1
+
+
+def test_repo_with_no_weights_marks_incompatible(client, monkeypatch):
+    info = FakeModelInfo(
+        "some/dataset-only",
+        siblings=[FakeSibling("README.md", size=200)],
+    )
+    _build_response(
+        monkeypatch,
+        list_results={"text-generation": [info]},
+        # Missing config.json — fetch_status='missing'.
+        model_info_map={"some/dataset-only": info},
+    )
+    body = client.get("/manager/hf/search?q=dataset").json()
+    row = body["results"][0]
+    assert row["is_compatible"] is False
+    assert row["recommended_backend"] == "none"
+
+
 def test_config_cache_key_changes_with_sha(client, monkeypatch):
     api = _build_response(
         monkeypatch,
@@ -401,6 +502,37 @@ def test_config_fetch_uses_sha_as_revision(client, monkeypatch):
     )
     client.get("/manager/hf/search?q=x")
     assert api.download_calls[0]["revision"] == "abc123"
+    assert api.model_info_calls[0]["revision"] == "abc123"
+
+
+def test_hf_files_uses_requested_revision(client, monkeypatch):
+    info = FakeModelInfo(
+        "x/y",
+        siblings=[FakeSibling("model-Q4_K_M.gguf", size=4_000_000_000)],
+    )
+    api = _build_response(
+        monkeypatch,
+        model_info_map={"x/y": info},
+    )
+    r = client.get("/manager/hf/files?model_id=x/y&revision=dev")
+    assert r.status_code == 200, r.text
+    assert api.model_info_calls[0]["revision"] == "dev"
+    assert r.json()["recommended_backend"] == "llama.cpp"
+
+
+def test_hf_files_cache_distinguishes_revisions(client, monkeypatch):
+    info = FakeModelInfo(
+        "x/y",
+        siblings=[FakeSibling("model-Q4_K_M.gguf", size=4_000_000_000)],
+    )
+    api = _build_response(
+        monkeypatch,
+        model_info_map={"x/y": info},
+    )
+    client.get("/manager/hf/files?model_id=x/y&revision=dev")
+    client.get("/manager/hf/files?model_id=x/y&revision=main")
+    revisions = [c["revision"] for c in api.model_info_calls]
+    assert revisions == ["dev", "main"]
 
 
 def test_size_estimate_failure_does_not_change_compat(client, monkeypatch):

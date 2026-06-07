@@ -58,4 +58,9 @@ def test_proxy_passes_image_content_blocks_unchanged(rich_client, monkeypatch):
     }
     r = client.post("/v1/chat/completions", json=payload)
     assert r.status_code == 200
-    assert json.loads(captured["body"]) == payload
+    # `_canonicalize_model_field` rewrites the alias `a-model` to the
+    # served model name (`org/a-model` per rich_config). Everything else —
+    # the image_url content block in particular — must round-trip verbatim.
+    forwarded = json.loads(captured["body"])
+    assert forwarded["model"] == "org/a-model"
+    assert forwarded["messages"] == payload["messages"]

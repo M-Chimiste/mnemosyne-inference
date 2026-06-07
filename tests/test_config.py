@@ -18,7 +18,7 @@ from config import (
     load_config,
     load_env,
 )
-from profiles import resolve_profile
+from profiles import ProfileNotReady, resolve_profile
 
 
 # ── helpers ──────────────────────────────────────────────────────────
@@ -415,5 +415,78 @@ def test_resolve_profile_config_wins_over_ui_install(tmp_path):
         rp = resolve_profile("qw7b", cfg, catalog=cat)
         # Config alias still wins
         assert rp.model == "Qwen/Qwen2.5-7B"
+    finally:
+        cat.close()
+
+
+def test_resolve_profile_config_llamacpp_uses_reconciled_cache_path(tmp_path):
+    from catalog import open_catalog
+    cfg = Config.model_validate({
+        "storage": {
+            "default": "tmp",
+            "locations": [{"name": "tmp", "path": str(tmp_path)}],
+        },
+        "models": [{
+            "alias": "gguf",
+            "model": "org/gguf-repo",
+            "backend": "llama.cpp",
+            "gguf_filename": "model-Q4_K_M.gguf",
+        }],
+    })
+    snap = tmp_path / "hub" / "models--org--gguf-repo" / "snapshots" / ("a" * 40)
+    snap.mkdir(parents=True)
+    gguf = snap / "model-Q4_K_M.gguf"
+    gguf.write_text("fake")
+    cat = open_catalog(":memory:")
+    try:
+        cat._raw_insert_model(
+            alias="gguf",
+            hf_model_id="org/gguf-repo",
+            source="config",
+            gpus='"all"',
+            storage_location="tmp",
+            status="installed",
+            cache_path=str(snap),
+            resolved_sha="a" * 40,
+            backend="llama.cpp",
+            gguf_filename="model-Q4_K_M.gguf",
+        )
+        rp = resolve_profile("gguf", cfg, catalog=cat)
+        assert rp.served_model_name == "gguf"
+        assert rp.engine_model_path == str(gguf)
+        assert "snapshots/main" not in rp.engine_model_path
+    finally:
+        cat.close()
+
+
+def test_resolve_profile_config_llamacpp_requires_installed_cache_row(tmp_path):
+    from catalog import open_catalog
+    cfg = Config.model_validate({
+        "storage": {
+            "default": "tmp",
+            "locations": [{"name": "tmp", "path": str(tmp_path)}],
+        },
+        "models": [{
+            "alias": "gguf",
+            "model": "org/gguf-repo",
+            "backend": "llama.cpp",
+            "gguf_filename": "model-Q4_K_M.gguf",
+        }],
+    })
+    cat = open_catalog(":memory:")
+    try:
+        cat._raw_insert_model(
+            alias="gguf",
+            hf_model_id="org/gguf-repo",
+            source="config",
+            gpus='"all"',
+            storage_location="tmp",
+            status="partial",
+            cache_path=None,
+            backend="llama.cpp",
+            gguf_filename="model-Q4_K_M.gguf",
+        )
+        with pytest.raises(ProfileNotReady):
+            resolve_profile("gguf", cfg, catalog=cat)
     finally:
         cat.close()

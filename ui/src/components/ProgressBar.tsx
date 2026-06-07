@@ -3,15 +3,22 @@ import { formatBytes } from "../lib/format";
 export function ProgressBar({
   bytes,
   total,
-  active = false
+  active = false,
+  complete = false
 }: {
   bytes: number | null | undefined;
   total: number | null | undefined;
   active?: boolean;
+  complete?: boolean;
 }) {
-  const pct = total && total > 0 ? Math.min(100, Math.round(((bytes ?? 0) / total) * 100)) : 0;
-  const hasKnownProgress = total && total > 0;
-  const label = hasKnownProgress ? `${pct}%` : active ? `${formatBytes(bytes)} fetched` : "—";
+  const rawPct =
+    total && total > 0 ? Math.min(100, Math.round(((bytes ?? 0) / total) * 100)) : 0;
+  // Worker's 1-Hz progress emitter can drop the final sample, leaving a
+  // genuinely-complete download stuck at 93%-ish. When the catalog says
+  // status='complete', trust it over the byte count.
+  const pct = complete ? 100 : rawPct;
+  const hasKnownProgress = complete || (total && total > 0);
+  const label = complete ? "100%" : hasKnownProgress ? `${rawPct}%` : active ? `${formatBytes(bytes)} fetched` : "—";
   return (
     <div className="w-32">
       <div className="h-2 overflow-hidden rounded bg-stone-200">

@@ -15,7 +15,14 @@ import sys
 import pytest
 
 from profiles import ResolvedProfile
-from runtime import RuntimeState, build_vllm_argv, build_vllm_env, derive_tp_size
+from runtime import (
+    RuntimeState,
+    build_llama_argv,
+    build_llama_env,
+    build_vllm_argv,
+    build_vllm_env,
+    derive_tp_size,
+)
 
 
 def _profile(
@@ -30,10 +37,18 @@ def _profile(
     storage_name: str = "default",
     storage_path: str = "/storage/default",
     extra_args: tuple[str, ...] = (),
+    backend: str = "vllm",
+    served_model_name: str | None = None,
+    engine_model_path: str | None = None,
+    gguf_filename: str | None = None,
+    revision: str = "main",
 ) -> ResolvedProfile:
+    served = served_model_name if served_model_name is not None else model
+    engine_path = engine_model_path if engine_model_path is not None else model
     return ResolvedProfile(
         alias=alias,
-        model=model,
+        served_model_name=served,
+        engine_model_path=engine_path,
         gpus=gpus,
         quantization=quantization,
         max_model_len=max_model_len,
@@ -42,6 +57,9 @@ def _profile(
         storage_name=storage_name,
         storage_path=storage_path,
         extra_args=extra_args,
+        revision=revision,
+        backend=backend,
+        gguf_filename=gguf_filename,
     )
 
 
@@ -110,13 +128,7 @@ def test_argv_revision_omitted_when_main():
 
 
 def test_argv_revision_emitted_when_set():
-    p = ResolvedProfile(
-        alias="x", model="org/x", gpus="all",
-        quantization=None, max_model_len=None,
-        gpu_memory_utilization=0.9, trust_remote_code=False,
-        storage_name="d", storage_path="/d", extra_args=(),
-        revision="dev",
-    )
+    p = _profile(model="org/x", trust_remote_code=False, revision="dev")
     argv = build_vllm_argv(p, host="h", port=1, tp_size=1)
     idx = argv.index("--revision")
     assert argv[idx + 1] == "dev"
@@ -219,3 +231,105 @@ def test_runtime_state_defaults_are_empty():
     assert rs.last_used_at is None
     assert rs.request_count_delta == 0
     assert rs.inflight == 0
+
+
+# ── build_llama_argv ──────────────────────────────────────────────────
+
+
+def _llama_profile(**overrides) -> ResolvedProfile:
+    """Convenience factory for the llama.cpp builder tests."""
+    base = dict(
+        alias="qw-q4",
+        served_model_name="qw-q4",
+        engine_model_path="/hf-cache/hub/models--repo/snapshots/aa/model-Q4_K_M.gguf",
+        backend="llama.cpp",
+        gguf_filename="model-Q4_K_M.gguf",
+    )
+    base.update(overrides)
+    return _profile(**base)
+
+
+def test_llama_argv_mandatory_flags_present(monkeypatch):
+    monkeypatch.setenv("LLAMA_SERVER_BIN", "/usr/local/bin/llama-server")
+    argv = build_llama_argv(_llama_profile(), host="127.0.0.1", port=8002)
+    assert argv[0] == "/usr/local/bin/llama-server"
+    assert argv[argv.index("--model") + 1].endswith("model-Q4_K_M.gguf")
+    assert argv[argv.index("--alias") + 1] == "qw-q4"
+    assert argv[argv.index("--host") + 1] == "127.0.0.1"
+    assert argv[argv.index("--port") + 1] == "8002"
+    assert argv[argv.index("--n-gpu-layers") + 1] == "999"
+    assert "--jinja" in argv
+
+
+def test_llama_argv_max_model_len_emits_c_flag():
+    argv = build_llama_argv(
+        _llama_profile(max_model_len=131072), host="h", port=1,
+    )
+    idx = argv.index("-c")
+    assert argv[idx + 1] == "131072"
+
+
+def test_llama_argv_max_model_len_omitted_when_none():
+    argv = build_llama_argv(_llama_profile(), host="h", port=1)
+    assert "-c" not in argv
+
+
+def test_llama_argv_extra_args_appended_last():
+    argv = build_llama_argv(
+        _llama_profile(extra_args=("--ctx-size", "8192")),
+        host="h", port=1,
+    )
+    assert argv[-2:] == ["--ctx-size", "8192"]
+
+
+def test_llama_argv_tensor_split_when_explicit_list():
+    argv = build_llama_argv(_llama_profile(gpus=[0, 1]), host="h", port=1)
+    idx = argv.index("--tensor-split")
+    assert argv[idx + 1] == "1,1"
+
+
+def test_llama_argv_no_tensor_split_for_all():
+    argv = build_llama_argv(_llama_profile(gpus="all"), host="h", port=1)
+    assert "--tensor-split" not in argv
+
+
+def test_llama_argv_no_tensor_split_for_single_gpu():
+    argv = build_llama_argv(_llama_profile(gpus=[1]), host="h", port=1)
+    assert "--tensor-split" not in argv
+
+
+def test_llama_argv_explicit_bin_path_wins(monkeypatch):
+    monkeypatch.setenv("LLAMA_SERVER_BIN", "/should-be-ignored")
+    argv = build_llama_argv(
+        _llama_profile(), host="h", port=1, bin_path="/opt/llama-server",
+    )
+    assert argv[0] == "/opt/llama-server"
+
+
+# ── build_llama_env ───────────────────────────────────────────────────
+
+
+def test_llama_env_all_pops_inherited_cvd():
+    base = {"CUDA_VISIBLE_DEVICES": "0", "OTHER": "keep"}
+    env = build_llama_env(_llama_profile(gpus="all"), base_env=base)
+    assert "CUDA_VISIBLE_DEVICES" not in env
+    assert env["OTHER"] == "keep"
+
+
+def test_llama_env_explicit_list_sets_cvd():
+    env = build_llama_env(_llama_profile(gpus=[0, 1]), base_env={})
+    assert env["CUDA_VISIBLE_DEVICES"] == "0,1"
+
+
+def test_llama_env_hf_home_set_to_storage_path():
+    env = build_llama_env(
+        _llama_profile(storage_path="/mnt/nvme/hf"), base_env={},
+    )
+    assert env["HF_HOME"] == "/mnt/nvme/hf"
+
+
+def test_llama_env_does_not_mutate_base_env():
+    base = {"CUDA_VISIBLE_DEVICES": "0", "FOO": "bar"}
+    snapshot = dict(base)
+    build_llama_env(_llama_profile(gpus="all"), base_env=base)
+    assert base == snapshot

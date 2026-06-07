@@ -17,6 +17,24 @@ def _wait_for_status(client, alias: str, status: str, timeout: float = 2.0):
     raise AssertionError(f"alias '{alias}' did not reach status='{status}'")
 
 
+@pytest.fixture(autouse=True)
+def _default_transformer_repo_probe(monkeypatch):
+    """Most install tests exercise non-GGUF vLLM installs. Keep them offline
+    while preserving the production behavior that /manager/install probes
+    before choosing a backend."""
+    import hf_search
+
+    def fake_fetch_repo_files(model_id, revision=None):
+        return {
+            "has_gguf": False,
+            "has_transformer_weights": True,
+            "recommended_backend": "vllm",
+            "gguf_candidates": [],
+        }
+
+    monkeypatch.setattr(hf_search, "fetch_repo_files", fake_fetch_repo_files)
+
+
 # ── happy path ──────────────────────────────────────────────────────
 
 
@@ -253,6 +271,208 @@ def test_install_retry_recreates_install(client, stub_downloader):
     assert r.status_code == 202
     # Should have spawned again.
     assert any(c["alias"] == "qw" for c in stub_downloader.calls)
+
+
+# ── backend dispatch / GGUF validation ──────────────────────────────
+
+
+def test_install_autodetects_transformer_only_as_vllm(client, stub_downloader):
+    """No backend / no gguf_filename still queues vLLM when the repo probe
+    confirms transformer weights."""
+    r = client.post("/manager/install", json={
+        "alias": "qw",
+        "model": "Qwen/Qwen2.5-7B",
+    })
+    assert r.status_code == 202, r.text
+    assert r.json()["backend"] == "vllm"
+    row = client.get("/manager/install/qw").json()
+    assert row["backend"] == "vllm"
+    assert row["gguf_filename"] is None
+
+
+def test_install_autodetects_gguf_only_and_requires_filename(
+    client, stub_downloader, monkeypatch,
+):
+    import hf_search
+    monkeypatch.setattr(
+        hf_search, "fetch_repo_files",
+        lambda model_id, revision=None: {
+            "has_gguf": True,
+            "has_transformer_weights": False,
+            "recommended_backend": "llama.cpp",
+            "gguf_candidates": [{
+                "label": "Q4_K_M",
+                "primary_filename": "model-Q4_K_M.gguf",
+                "all_filenames": ["model-Q4_K_M.gguf"],
+                "shard_count": 1,
+                "size_bytes": 4_400_000_000,
+            }],
+        },
+    )
+    r = client.post("/manager/install", json={
+        "alias": "qw-q4",
+        "model": "bartowski/Qwen2.5-7B-Instruct-GGUF",
+    })
+    assert r.status_code == 400
+    assert "gguf_filename" in r.json()["detail"]
+    assert not stub_downloader.calls
+
+
+def test_install_autodetects_no_supported_weights_returns_400(
+    client, stub_downloader, monkeypatch,
+):
+    import hf_search
+    monkeypatch.setattr(
+        hf_search, "fetch_repo_files",
+        lambda model_id, revision=None: {
+            "has_gguf": False,
+            "has_transformer_weights": False,
+            "recommended_backend": "none",
+            "gguf_candidates": [],
+        },
+    )
+    r = client.post("/manager/install", json={
+        "alias": "empty",
+        "model": "some/config-only-repo",
+    })
+    assert r.status_code == 400
+    assert "no supported weight files" in r.json()["detail"]
+    assert not stub_downloader.calls
+
+
+def test_install_rejects_gguf_filename_without_backend(client, stub_downloader):
+    """gguf_filename without backend=llama.cpp is incoherent."""
+    r = client.post("/manager/install", json={
+        "alias": "qw",
+        "model": "Qwen/Qwen2.5-7B",
+        "gguf_filename": "model.gguf",
+    })
+    assert r.status_code == 400
+    assert "gguf_filename" in r.json()["detail"]
+    assert not stub_downloader.calls
+
+
+def test_install_rejects_invalid_backend(client, stub_downloader):
+    r = client.post("/manager/install", json={
+        "alias": "qw",
+        "model": "Qwen/Qwen2.5-7B",
+        "backend": "tensorrt",
+    })
+    assert r.status_code == 400
+
+
+def test_install_llamacpp_requires_gguf_filename(client, stub_downloader, monkeypatch):
+    """Even when the probe is bypassed, backend=llama.cpp without
+    gguf_filename is rejected."""
+    import hf_search
+    # Stub the probe to avoid the Hub. Returns a believable GGUF candidate so
+    # we know the rejection comes from the missing-filename branch.
+    monkeypatch.setattr(
+        hf_search, "fetch_repo_files",
+        lambda model_id, revision=None: {
+            "has_gguf": True,
+            "has_transformer_weights": False,
+            "recommended_backend": "llama.cpp",
+            "gguf_candidates": [{
+                "label": "Q4_K_M",
+                "primary_filename": "model-Q4_K_M.gguf",
+                "all_filenames": ["model-Q4_K_M.gguf"],
+                "shard_count": 1,
+                "size_bytes": 4_400_000_000,
+            }],
+        },
+    )
+    r = client.post("/manager/install", json={
+        "alias": "qw",
+        "model": "bartowski/Qwen2.5-7B-Instruct-GGUF",
+        "backend": "llama.cpp",
+    })
+    assert r.status_code == 400
+    assert "gguf_filename" in r.json()["detail"]
+
+
+def test_install_llamacpp_rejects_unknown_filename(client, stub_downloader, monkeypatch):
+    import hf_search
+    monkeypatch.setattr(
+        hf_search, "fetch_repo_files",
+        lambda model_id, revision=None: {
+            "has_gguf": True,
+            "has_transformer_weights": False,
+            "recommended_backend": "llama.cpp",
+            "gguf_candidates": [{
+                "label": "Q4_K_M",
+                "primary_filename": "model-Q4_K_M.gguf",
+                "all_filenames": ["model-Q4_K_M.gguf"],
+                "shard_count": 1,
+                "size_bytes": 4_400_000_000,
+            }],
+        },
+    )
+    r = client.post("/manager/install", json={
+        "alias": "qw",
+        "model": "bartowski/Qwen2.5-7B-Instruct-GGUF",
+        "backend": "llama.cpp",
+        "gguf_filename": "model-Q9000.gguf",
+    })
+    assert r.status_code == 400
+
+
+def test_install_llamacpp_persists_backend_and_filename(client, stub_downloader, monkeypatch):
+    import hf_search
+    monkeypatch.setattr(
+        hf_search, "fetch_repo_files",
+        lambda model_id, revision=None: {
+            "has_gguf": True,
+            "has_transformer_weights": False,
+            "recommended_backend": "llama.cpp",
+            "gguf_candidates": [{
+                "label": "Q4_K_M",
+                "primary_filename": "model-Q4_K_M.gguf",
+                "all_filenames": ["model-Q4_K_M.gguf"],
+                "shard_count": 1,
+                "size_bytes": 4_400_000_000,
+            }],
+        },
+    )
+    r = client.post("/manager/install", json={
+        "alias": "qw-q4",
+        "model": "bartowski/Qwen2.5-7B-Instruct-GGUF",
+        "backend": "llama.cpp",
+        "gguf_filename": "model-Q4_K_M.gguf",
+    })
+    assert r.status_code == 202, r.text
+    body = r.json()
+    assert body["backend"] == "llama.cpp"
+    assert body["gguf_filename"] == "model-Q4_K_M.gguf"
+    row = client.get("/manager/install/qw-q4").json()
+    assert row["backend"] == "llama.cpp"
+    assert row["gguf_filename"] == "model-Q4_K_M.gguf"
+    # Worker call should propagate the chosen filename.
+    assert stub_downloader.calls
+    # The stub captures kwargs we passed; gguf_primary_filename is one of them.
+    last = stub_downloader.calls[-1]
+    # Note: the stub signature uses the same kwarg name.
+    assert last.get("gguf_primary_filename") == "model-Q4_K_M.gguf"
+
+
+def test_install_rejects_repo_with_no_weights(client, stub_downloader, monkeypatch):
+    import hf_search
+    monkeypatch.setattr(
+        hf_search, "fetch_repo_files",
+        lambda model_id, revision=None: {
+            "has_gguf": False,
+            "has_transformer_weights": False,
+            "recommended_backend": "none",
+            "gguf_candidates": [],
+        },
+    )
+    # An explicit backend triggers the probe path; the probe says "none" → 400.
+    r = client.post("/manager/install", json={
+        "alias": "qw",
+        "model": "some/dataset-only-repo",
+        "backend": "vllm",
+    })
+    assert r.status_code == 400
 
 
 def test_install_retry_force_wipes_cache(client, stub_downloader, tmp_paths):

@@ -1,9 +1,13 @@
 export type GpuPlan = "all" | number[];
 
+export type Backend = "vllm" | "llama.cpp";
+export type RecommendedBackend = Backend | "none";
+
 export interface ManagerStatus {
   loaded_model: string | null;
   loading: boolean;
-  vllm_pid: number | null;
+  vllm_pid: number | null;       // deprecated alias of engine_pid
+  engine_pid?: number | null;
   loaded_at: number | null;
   loaded_at_human: string | null;
   tp_size: number | null;
@@ -19,6 +23,8 @@ export interface ManagerStatus {
   seconds_until_eviction: number | null;
   inflight_requests: number;
   swap_target: string | null;
+  backend: Backend | null;
+  gguf_filename: string | null;
   vllm_arch_count: number;
   vllm_arch_source: string;
 }
@@ -60,6 +66,8 @@ export interface CatalogRow {
   extra_args: string[];
   revision: string;
   resolved_sha: string | null;
+  backend: Backend;
+  gguf_filename: string | null;
 }
 
 export interface HfSearchResult {
@@ -73,6 +81,23 @@ export interface HfSearchResult {
   last_modified: string | null;
   tags: string[];
   pipeline_tag: string | null;
+  has_gguf?: boolean;
+  recommended_backend?: RecommendedBackend;
+}
+
+export interface GgufCandidate {
+  label: string;
+  primary_filename: string;
+  all_filenames: string[];
+  shard_count: number;
+  size_bytes: number | null;
+}
+
+export interface HfFilesResponse {
+  has_gguf: boolean;
+  has_transformer_weights: boolean;
+  recommended_backend: RecommendedBackend;
+  gguf_candidates: GgufCandidate[];
 }
 
 export type HfSortOption = "trending" | "downloads" | "likes" | "recent";
@@ -139,6 +164,8 @@ export interface InstallRequest {
   extra_args: string[];
   size_estimate_gb?: number | null;
   ignore_patterns?: string[] | null;
+  backend?: Backend | null;
+  gguf_filename?: string | null;
 }
 
 export interface CatalogUpdateRequest {

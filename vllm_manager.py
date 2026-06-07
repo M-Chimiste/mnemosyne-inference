@@ -23,6 +23,7 @@ import os
 import json
 import time
 import threading
+import uuid
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -49,8 +50,16 @@ from catalog import (
 )
 from config import Config, ConfigError, GpuPlan, load_config, load_env
 from downloader import ConflictError, repo_cache_dir
-from profiles import ResolvedProfile, resolve_profile
-from runtime import RuntimeState, build_vllm_argv, build_vllm_env, derive_tp_size
+from profiles import ProfileNotReady, ResolvedProfile, resolve_profile
+from runtime import (
+    RuntimeState,
+    UsageEntry,
+    build_llama_argv,
+    build_llama_env,
+    build_vllm_argv,
+    build_vllm_env,
+    derive_tp_size,
+)
 
 # ──────────────────────────────────────────────
 # Configuration
@@ -120,23 +129,38 @@ _load_event:     Optional[asyncio.Event]    = None
 _load_error:     Optional[BaseException]    = None
 _eviction_task:  Optional[asyncio.Task]     = None
 _flush_task:     Optional[asyncio.Task]     = None
+_pg_flush_task:  Optional[asyncio.Task]     = None
 _legacy_alias_warned: set[str]              = set()
+
+# Optional postgres token-usage sink (token_sidecar). `_pg_writer` is None
+# when the sidecar is disabled or its DSN is missing; `_pg_last_*` feeds the
+# /manager/status payload so the health of the path is visible without
+# psql-ing the central DB.
+_pg_writer = None  # type: Optional["pg_writer.PgWriter"]
+_pg_last_flush_at: Optional[float] = None
+_pg_last_flush_count: int = 0
+_pg_last_error: Optional[str] = None
 
 # Phase 1 globals — populated by lifespan, reset by tests/conftest.py::client.
 _config: Optional[Config] = None
 _catalog: Optional[Catalog] = None
 
 # ──────────────────────────────────────────────
-# vLLM process management
+# Engine process management (vLLM + llama.cpp)
 # ──────────────────────────────────────────────
+# `vllm_process` is preserved as the public name (tests/external code reach
+# in to reset it). It holds whichever backend's subprocess is currently
+# resident — vLLM or llama-server. New code prefers the alias `engine_process`.
 
-async def _wait_for_vllm(timeout: int = STARTUP_TIMEOUT) -> bool:
-    url = f"http://{VLLM_INNER_HOST}:{VLLM_INNER_PORT}/health"
+
+async def _wait_for_health(url: str, timeout: int) -> bool:
+    """Poll a /health URL until the engine reports ready or the deadline
+    expires. Returns False if the process died early."""
     async with httpx.AsyncClient() as client:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if vllm_process and vllm_process.poll() is not None:
-                logger.error("vLLM process exited unexpectedly during startup")
+                logger.error("Engine subprocess exited unexpectedly during startup")
                 return False
             try:
                 r = await client.get(url, timeout=3)
@@ -148,14 +172,29 @@ async def _wait_for_vllm(timeout: int = STARTUP_TIMEOUT) -> bool:
     return False
 
 
-def _kill_vllm():
-    """Stop the resident vLLM subprocess (idempotent) and reset runtime state.
-    Flushes buffered usage to the catalog before clearing the resident alias
-    so the just-evicted model's last activity makes it to disk."""
+async def _wait_for_vllm(timeout: int = STARTUP_TIMEOUT) -> bool:
+    return await _wait_for_health(
+        f"http://{VLLM_INNER_HOST}:{VLLM_INNER_PORT}/health", timeout,
+    )
+
+
+async def _wait_for_llama_cpp(timeout: int = STARTUP_TIMEOUT) -> bool:
+    # llama-server returns {"status":"ok"} on /health once the model is
+    # fully memory-mapped; same poll cadence as vLLM.
+    return await _wait_for_health(
+        f"http://{VLLM_INNER_HOST}:{VLLM_INNER_PORT}/health", timeout,
+    )
+
+
+def _kill_engine():
+    """Stop the resident engine subprocess (idempotent) and reset runtime
+    state. Backend-agnostic — flushes buffered usage to the catalog before
+    clearing the resident alias so the just-evicted model's last activity
+    makes it to disk."""
     global vllm_process
-    _flush_usage_best_effort("vLLM teardown")
+    _flush_usage_best_effort("engine teardown")
     if vllm_process and vllm_process.poll() is None:
-        logger.info(f"Stopping vLLM (pid={vllm_process.pid}) ...")
+        logger.info(f"Stopping engine (pid={vllm_process.pid}) ...")
         vllm_process.terminate()
         try:
             vllm_process.wait(timeout=30)
@@ -163,7 +202,7 @@ def _kill_vllm():
             logger.warning("Graceful stop timed out — sending SIGKILL")
             vllm_process.kill()
             vllm_process.wait()
-        logger.info("vLLM stopped.")
+        logger.info("Engine stopped.")
     vllm_process = None
     _runtime.resident_alias = None
     _runtime.resident_profile = None
@@ -175,13 +214,17 @@ def _kill_vllm():
     _runtime.request_count_delta = 0
 
 
+# Back-compat alias — older test fixtures patch this name directly.
+_kill_vllm = _kill_engine
+
+
 async def _start_vllm(profile: ResolvedProfile) -> None:
     """Launch vLLM for `profile`. Cleans up half-launched subprocesses on any
     failure, including asyncio.CancelledError from a deadline-induced wait_for
     (called inside ensure_loaded). See plans/phase_2.md §5.2."""
     global vllm_process
 
-    _kill_vllm()
+    _kill_engine()
     visible = config_mod.gpu_indices_or_none()
     tp_size = derive_tp_size(profile, visible_gpus=visible, default_tp=DEFAULT_TP)
     if profile.gpus == "all" and not visible:
@@ -212,7 +255,7 @@ async def _start_vllm(profile: ResolvedProfile) -> None:
     except (Exception, asyncio.CancelledError):
         # Includes wait_for-induced CancelledError when ensure_loaded times out.
         # Always clean up the half-launched subprocess.
-        _kill_vllm()
+        _kill_engine()
         raise
 
     _runtime.resident_alias = profile.alias
@@ -223,8 +266,69 @@ async def _start_vllm(profile: ResolvedProfile) -> None:
     _runtime.last_used_at = now
     logger.info(
         "✓ Loaded alias='%s' model='%s' tp=%d gpu_mem=%.2f",
-        profile.alias, profile.model, tp_size, profile.gpu_memory_utilization,
+        profile.alias, profile.served_model_name, tp_size,
+        profile.gpu_memory_utilization,
     )
+
+
+async def _start_llama_cpp(profile: ResolvedProfile) -> None:
+    """Launch llama-server for `profile`. Mirrors `_start_vllm` lifecycle but
+    skips tp/gpu_mem (llama-server has its own knobs) and points
+    `--model` at the absolute GGUF path."""
+    global vllm_process
+
+    _kill_engine()
+    argv = build_llama_argv(profile, host=VLLM_INNER_HOST, port=VLLM_INNER_PORT)
+    env = build_llama_env(profile, base_env=os.environ)
+    logger.info(
+        "Launching llama-server (alias=%s gguf=%s): %s",
+        profile.alias, profile.gguf_filename, " ".join(argv),
+    )
+    vllm_process = subprocess.Popen(argv, env=env, stdout=sys.stdout, stderr=sys.stderr)
+
+    try:
+        startup_timeout = (
+            _config.server.startup_timeout_seconds
+            if _config is not None
+            else STARTUP_TIMEOUT
+        )
+        if not await _wait_for_llama_cpp(timeout=startup_timeout):
+            exit_code = vllm_process.poll() if vllm_process else None
+            raise RuntimeError(
+                f"llama-server failed to become ready for alias '{profile.alias}' "
+                f"(exit_code={exit_code}; see container logs — common causes: "
+                f"missing GGUF file, OOM, missing CUDA runtime)"
+            )
+    except (Exception, asyncio.CancelledError):
+        _kill_engine()
+        raise
+
+    _runtime.resident_alias = profile.alias
+    _runtime.resident_profile = profile
+    # llama.cpp doesn't have a tp_size concept; record the GPU plan length so
+    # /manager/status surfaces a meaningful number when the profile pinned
+    # specific GPUs.
+    if isinstance(profile.gpus, list):
+        _runtime.resident_tp_size = len(profile.gpus)
+    else:
+        _runtime.resident_tp_size = None
+    now = time.time()
+    _runtime.model_load_time = now
+    _runtime.last_used_at = now
+    logger.info(
+        "✓ Loaded alias='%s' gguf='%s' via llama.cpp",
+        profile.alias, profile.gguf_filename,
+    )
+
+
+async def _start_engine(profile: ResolvedProfile) -> None:
+    """Backend dispatch — selects vLLM or llama-server based on
+    `profile.backend`. The shared `vllm_process` global holds whichever
+    subprocess wins the lock, since only one model is resident at a time."""
+    if profile.backend == "llama.cpp":
+        await _start_llama_cpp(profile)
+    else:
+        await _start_vllm(profile)
 
 
 # ──────────────────────────────────────────────
@@ -282,11 +386,11 @@ async def ensure_loaded(profile: ResolvedProfile, deadline: float) -> None:
             _load_event = asyncio.Event()
             _load_error = None
             try:
-                await _run_until(lambda: _start_vllm(profile), deadline)
+                await _run_until(lambda: _start_engine(profile), deadline)
             except asyncio.TimeoutError:
-                # _start_vllm cleans up the half-launched subprocess in its
-                # own except block. Surface as 504.
-                raise HTTPException(504, f"vLLM load did not complete in time for '{target}'")
+                # _start_engine cleans up the half-launched subprocess in
+                # the backend-specific start function. Surface as 504.
+                raise HTTPException(504, f"engine load did not complete in time for '{target}'")
             except asyncio.CancelledError:
                 # Caller cancelled. Don't stash _load_error — piggybackers
                 # will re-check resident, see no model loaded, and retry
@@ -310,16 +414,56 @@ async def ensure_loaded(profile: ResolvedProfile, deadline: float) -> None:
 # ──────────────────────────────────────────────
 
 def _flush_usage() -> None:
-    """Sync. Single UPDATE per call. Safe from any context — no-op if there's
-    nothing to flush. Called from _flush_loop, _kill_vllm, and lifespan exit."""
+    """Sync. Safe from any context — no-op if there's nothing to flush.
+    Called from _flush_loop, _kill_vllm, and lifespan exit.
+
+    Drains two buffers:
+      - `request_count_delta` for the currently-resident alias (legacy
+        per-resident counter on `models.request_count`).
+      - `usage_rows` of per-request token-usage tuples (Phase: token
+        tracking) — keyed per-row by alias so eviction between request and
+        flush is handled cleanly.
+
+    When token_sidecar is enabled, the same rows are mirrored into the
+    SQLite outbox (`pg_usage_outbox`) so the postgres flush loop can ship
+    them upstream durably across restarts.
+    """
     if _catalog is None:
         return
     alias = _runtime.resident_alias
     delta = _runtime.request_count_delta
-    if alias is None or delta == 0:
+    if alias is not None and delta > 0:
+        _catalog.bump_usage(alias, _runtime.last_used_at, delta)
+        _runtime.request_count_delta = 0
+    if not _runtime.usage_rows:
         return
-    _catalog.bump_usage(alias, _runtime.last_used_at, delta)
-    _runtime.request_count_delta = 0
+    entries: list[UsageEntry] = []
+    while _runtime.usage_rows:
+        entries.append(_runtime.usage_rows.popleft())
+    # Project to the 8-tuple shape `record_usage_batch` expects (the wire
+    # format the existing analytics path was built around — kept stable).
+    analytics_rows = [
+        (
+            e.ts, e.requested_model, e.alias, e.backend,
+            e.prompt_tokens, e.completion_tokens, e.total_tokens, e.usage_json,
+        )
+        for e in entries
+    ]
+    _catalog.record_usage_batch(analytics_rows)
+    # Mirror to the postgres outbox when the sidecar is enabled. Done in
+    # the same flush tick so a missed analytics write and a missed outbox
+    # write fail together (or not at all).
+    if _config is not None and _config.token_sidecar.enabled:
+        outbox_rows = [
+            (
+                e.event_id, e.ts, e.requested_model, e.alias, e.backend,
+                e.endpoint, 1 if e.streamed else 0,
+                e.prompt_tokens, e.completion_tokens, e.total_tokens,
+                e.response_ms, e.status_code,
+            )
+            for e in entries
+        ]
+        _catalog.enqueue_pg_outbox(outbox_rows)
 
 
 def _flush_usage_best_effort(context: str) -> None:
@@ -338,6 +482,68 @@ async def _flush_loop() -> None:
             _flush_usage()
         except Exception as e:
             logger.warning("Usage flush failed: %s", e)
+
+
+# ──────────────────────────────────────────────
+# Postgres token-sidecar outbox flush
+# ──────────────────────────────────────────────
+
+async def _pg_flush_once() -> None:
+    """Drain one batch of outbox rows to postgres.
+
+    Order of operations:
+      1. Prune the outbox if it's over the configured cap (independent of
+         postgres reachability — keeps SQLite bounded during long outages).
+      2. SELECT up to `batch_size` oldest rows.
+      3. Write them via PgWriter.write_batch (ON CONFLICT DO NOTHING).
+      4. Delete the SQLite rows whose write succeeded.
+
+    Errors raise; the caller (loop / best-effort shutdown helper) catches.
+    """
+    global _pg_last_flush_at, _pg_last_flush_count, _pg_last_error
+    if _catalog is None or _pg_writer is None or _config is None:
+        return
+    cfg = _config.token_sidecar
+    pending = _catalog.count_pg_outbox()
+    if pending > cfg.max_outbox_rows:
+        dropped = _catalog.prune_pg_outbox(keep=cfg.max_outbox_rows)
+        logger.warning(
+            "Token-sidecar outbox over cap (%d > %d); dropped %d oldest rows",
+            pending, cfg.max_outbox_rows, dropped,
+        )
+    rows = _catalog.peek_pg_outbox(limit=cfg.batch_size)
+    if not rows:
+        return
+    try:
+        sent = await _pg_writer.write_batch(rows)
+    except Exception as e:
+        _pg_last_error = f"{type(e).__name__}: {e}"
+        raise
+    _catalog.delete_pg_outbox([r["id"] for r in rows])
+    _pg_last_flush_at = time.time()
+    _pg_last_flush_count = sent
+    _pg_last_error = None
+
+
+async def _pg_flush_loop() -> None:
+    """Background task: drain the outbox every `flush_interval_seconds`."""
+    if _config is None or not _config.token_sidecar.enabled:
+        return
+    interval = max(1, int(_config.token_sidecar.flush_interval_seconds))
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            await _pg_flush_once()
+        except Exception as e:
+            logger.warning("Postgres usage flush failed: %s", e)
+
+
+async def _pg_flush_once_best_effort(context: str) -> None:
+    """Flush the postgres outbox without raising. Used during shutdown."""
+    try:
+        await _pg_flush_once()
+    except Exception as e:
+        logger.warning("Postgres flush failed during %s: %s", context, e)
 
 
 # ──────────────────────────────────────────────
@@ -392,7 +598,8 @@ def _warn_legacy_alias_once(alias: str) -> None:
 def _synthesize_profile(model_id: str) -> ResolvedProfile:
     """Build an inline ResolvedProfile for a raw HF id or a legacy alias.
     Uses defaults from the loaded config; storage falls back to storage.default.
-    """
+    Synthetic profiles are always vLLM — llama.cpp installs require the
+    full install path so a `gguf_filename` is on file."""
     if _config is None:
         raise RuntimeError("config not loaded")
     storage_name = _config.storage.default
@@ -401,7 +608,8 @@ def _synthesize_profile(model_id: str) -> ResolvedProfile:
     )
     return ResolvedProfile(
         alias=model_id,  # synthetic — only used for log lines and status
-        model=model_id,
+        served_model_name=model_id,
+        engine_model_path=model_id,
         gpus="all",
         quantization=None,
         max_model_len=_config.defaults.max_model_len,
@@ -483,7 +691,10 @@ def _resolve_request_model(requested: str) -> ResolvedProfile:
     # Tier 1 — config alias
     config_alias = _config_alias_for(requested)
     if config_alias is not None:
-        return resolve_profile(config_alias, _config, _catalog)
+        try:
+            return resolve_profile(config_alias, _config, _catalog)
+        except ProfileNotReady as e:
+            raise HTTPException(status_code=409, detail=str(e))
     # Tier 2 — catalog ui_install row (must be fully installed)
     row = _ui_install_row_for_alias(requested)
     if row is not None:
@@ -634,6 +845,8 @@ async def manager_lifespan(
         the tasks would never run.
     """
     global _config, _catalog, _runtime, _eviction_task, _flush_task
+    global _pg_writer, _pg_flush_task, _pg_last_flush_at
+    global _pg_last_flush_count, _pg_last_error
     if cfg is None:
         load_env()
         cfg = load_config()
@@ -682,6 +895,45 @@ async def manager_lifespan(
         _eviction_task = None
         _flush_task = None
 
+    # Token-sidecar postgres writer + flush loop (optional). Lazy-import
+    # so a broken psycopg install doesn't take down the whole manager.
+    _pg_writer = None
+    _pg_flush_task = None
+    _pg_last_flush_at = None
+    _pg_last_flush_count = 0
+    _pg_last_error = None
+    ts_cfg = _config.token_sidecar
+    if ts_cfg.enabled:
+        dsn = os.environ.get("TOKEN_SIDECAR_POSTGRES_DSN", "").strip()
+        if not dsn:
+            logger.warning(
+                "token_sidecar.enabled=true but TOKEN_SIDECAR_POSTGRES_DSN "
+                "is unset; sink disabled (rows will still buffer in SQLite)"
+            )
+        else:
+            try:
+                import pg_writer as pg_writer_mod
+                _pg_writer = pg_writer_mod.PgWriter(
+                    dsn=dsn,
+                    node_id=ts_cfg.node_id,
+                    connect_timeout=ts_cfg.connect_timeout_seconds,
+                    logger=logger,
+                )
+                if spawn_background:
+                    _pg_flush_task = asyncio.create_task(
+                        _pg_flush_loop(), name="pg-usage-flush",
+                    )
+                logger.info(
+                    "Token sidecar enabled (node_id=%s, batch=%d, interval=%ds)",
+                    ts_cfg.node_id,
+                    ts_cfg.batch_size,
+                    ts_cfg.flush_interval_seconds,
+                )
+            except Exception as e:
+                logger.error("Token sidecar setup failed: %s", e)
+                _pg_writer = None
+                _pg_flush_task = None
+
     logger.info(
         f"\n"
         f"  ┌─────────────────────────────────────────────────────┐\n"
@@ -698,15 +950,16 @@ async def manager_lifespan(
         yield
     finally:
         # Cancel infinite tasks first so they don't fight teardown.
-        for t in (_eviction_task, _flush_task):
+        for t in (_eviction_task, _flush_task, _pg_flush_task):
             if t is not None and not t.done():
                 t.cancel()
-        for t in (_eviction_task, _flush_task):
+        for t in (_eviction_task, _flush_task, _pg_flush_task):
             if t is not None:
                 with contextlib.suppress(asyncio.CancelledError):
                     await t
         _eviction_task = None
         _flush_task = None
+        _pg_flush_task = None
         # SIGTERM all in-flight installs so we exit cleanly. Worker's
         # prctl(PDEATHSIG) is belt-and-suspenders on Linux; this is the
         # primary cleanup path.
@@ -719,6 +972,14 @@ async def manager_lifespan(
         # Final flush before _kill_vllm wipes _runtime — belt-and-suspenders
         # in case _kill_vllm's internal flush ever moves.
         _flush_usage_best_effort("lifespan shutdown")
+        # Last chance for the outbox to ship rows that just landed in the
+        # final SQLite flush above. Best-effort: never block teardown on
+        # postgres reachability.
+        if _pg_writer is not None:
+            await _pg_flush_once_best_effort("lifespan shutdown")
+            with contextlib.suppress(Exception):
+                await _pg_writer.close()
+            _pg_writer = None
         logger.info("Shutting down — stopping vLLM ...")
         _kill_vllm()
         if _catalog is not None:
@@ -769,10 +1030,18 @@ async def status():
 
     Phase 0/1 keys (loaded_model, loading, vllm_pid, loaded_at,
     loaded_at_human, tp_size, gpu_mem_util, inner_endpoint) are preserved.
-    Phase 2 adds resident-profile detail and idle-eviction countdown."""
+    Phase 2 adds resident-profile detail and idle-eviction countdown.
+    The llama.cpp integration adds `backend`, `gguf_filename`, and
+    `engine_pid` (vllm_pid is kept as a deprecated alias for one release).
+    """
     profile = _runtime.resident_profile
-    loaded_model = profile.model if profile else None
+    loaded_model = profile.served_model_name if profile else None
     load_time = _runtime.model_load_time
+    engine_pid = (
+        vllm_process.pid
+        if vllm_process and vllm_process.poll() is None
+        else None
+    )
 
     last_used = _runtime.last_used_at
     idle_seconds = (time.time() - last_used) if last_used else None
@@ -787,7 +1056,8 @@ async def status():
         # Phase 0/1 keys
         "loaded_model":   loaded_model,
         "loading":        _loading_target is not None,
-        "vllm_pid":       vllm_process.pid if vllm_process else None,
+        "vllm_pid":       engine_pid,    # deprecated alias of engine_pid
+        "engine_pid":     engine_pid,
         "loaded_at":      load_time,
         "loaded_at_human": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(load_time)) if load_time else None,
         "tp_size":        _runtime.resident_tp_size,
@@ -806,9 +1076,27 @@ async def status():
         ),
         "inflight_requests": _runtime.inflight,
         "swap_target":       _loading_target,
+        # Backend dispatch surface
+        "backend":           profile.backend if profile else None,
+        "gguf_filename": (
+            profile.gguf_filename
+            if profile and profile.backend == "llama.cpp"
+            else None
+        ),
         # Phase 5 additions — surface fallback when vLLM registry import broke.
         "vllm_arch_count":   hf_search.get_arch_count(),
         "vllm_arch_source":  hf_search.get_arch_source(),
+        # Token-sidecar postgres path. `enabled` reflects config; `writer_ready`
+        # tells you whether the DSN was set + the writer imported cleanly.
+        "token_sidecar": {
+            "enabled":          _config.token_sidecar.enabled if _config else False,
+            "node_id":          _config.token_sidecar.node_id if _config else "",
+            "writer_ready":     _pg_writer is not None,
+            "outbox_pending":   _catalog.count_pg_outbox() if _catalog else 0,
+            "last_flush_at":    _pg_last_flush_at,
+            "last_flush_count": _pg_last_flush_count,
+            "last_error":       _pg_last_error,
+        },
     }
 
 
@@ -925,6 +1213,20 @@ async def gpu_status():
     return {"available": bool(gpus), "gpus": gpus}
 
 
+@admin_router.get("/manager/hf/files", tags=["manager"])
+async def hf_files_route(
+    model_id: str = Query(..., description="HuggingFace model id (org/repo)"),
+    revision: Optional[str] = Query(None, description="Optional revision/sha; default = repo's default branch"),
+):
+    """Probe an HF repo for installable file groups (the install form's
+    GGUF dropdown). Returns recommended_backend + sized GGUF candidates.
+    """
+    try:
+        return hf_search.fetch_repo_files(model_id, revision=revision)
+    except hf_search.HFSearchError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.detail)
+
+
 @admin_router.get("/manager/hf/search", tags=["manager"])
 async def hf_search_route(
     q: str = Query("", description="Search query; blank returns top models for the chosen sort"),
@@ -1035,7 +1337,12 @@ async def load_model(request: Request):
         _config.server.swap_queue_timeout_seconds if _config else 300
     )
     await ensure_loaded(profile, deadline)
-    return {"status": "loaded", "alias": profile.alias, "model": profile.model}
+    return {
+        "status": "loaded",
+        "alias": profile.alias,
+        "model": profile.served_model_name,
+        "backend": profile.backend,
+    }
 
 
 @admin_router.post("/manager/unload", tags=["manager"])
@@ -1112,6 +1419,10 @@ class InstallRequest(BaseModel):
     extra_args: list[str] = Field(default_factory=list)
     size_estimate_gb: Optional[float] = None
     ignore_patterns: Optional[list[str]] = None
+    # Optional explicit backend override; when omitted the install endpoint
+    # auto-detects from HF siblings. "none" cannot be persisted.
+    backend: Optional[str] = None
+    gguf_filename: Optional[str] = None
 
 
 class CatalogUpdateRequest(BaseModel):
@@ -1165,11 +1476,110 @@ def _gpus_to_json(gpus: GpuPlan) -> list:
     return list(gpus)
 
 
+def _resolve_install_backend(
+    request: InstallRequest,
+    *,
+    hf_token: Optional[str],
+    skip_probe: bool = False,
+) -> tuple[str, Optional[str]]:
+    """Decide the backend for an install and validate the chosen GGUF
+    filename when applicable.
+
+    Returns (backend, gguf_filename). Raises HTTPException(400) on any
+    inconsistency: backend=llama.cpp requires gguf_filename pointing at a
+    real candidate; backend=vllm forbids gguf_filename and requires
+    transformer weights when the probe runs.
+
+    Probe behavior:
+      - Normal /manager/install always probes the repo so GGUF-only repos
+        cannot be silently queued as vLLM installs.
+      - `skip_probe=True` is used by the legacy /manager/download shim,
+        which historically defaults to vLLM with no probe.
+    """
+    explicit_backend = request.backend
+    requested_filename = request.gguf_filename
+
+    if explicit_backend not in (None, "vllm", "llama.cpp"):
+        raise HTTPException(
+            400,
+            f"backend must be 'vllm' or 'llama.cpp', got {explicit_backend!r}",
+        )
+
+    if skip_probe:
+        # Trust the caller (retry path / legacy /manager/download): honor
+        # the explicit backend, but still enforce the gguf_filename ↔ backend
+        # invariant.
+        backend_choice = explicit_backend or "vllm"
+        if backend_choice == "llama.cpp" and not requested_filename:
+            raise HTTPException(
+                400,
+                "backend='llama.cpp' requires gguf_filename",
+            )
+        if backend_choice == "vllm" and requested_filename:
+            raise HTTPException(
+                400,
+                "gguf_filename is only valid when backend='llama.cpp'",
+            )
+        return backend_choice, requested_filename
+    try:
+        probe_payload = hf_search.fetch_repo_files(
+            request.model, revision=request.revision,
+        )
+    except hf_search.HFSearchError as e:
+        raise HTTPException(e.status_code, e.detail)
+
+    has_gguf = bool(probe_payload.get("has_gguf"))
+    has_transformer = bool(probe_payload.get("has_transformer_weights"))
+    candidates = probe_payload.get("gguf_candidates") or []
+    primaries = {c["primary_filename"] for c in candidates}
+
+    backend = explicit_backend or probe_payload.get("recommended_backend") or "vllm"
+    if backend == "none":
+        raise HTTPException(
+            400,
+            f"repo '{request.model}' has no supported weight files",
+        )
+
+    if backend == "llama.cpp":
+        if not has_gguf:
+            raise HTTPException(
+                400,
+                f"repo '{request.model}' has no .gguf siblings; cannot install via llama.cpp",
+            )
+        if not requested_filename:
+            raise HTTPException(
+                400,
+                "backend='llama.cpp' requires gguf_filename — pick one from /manager/hf/files",
+            )
+        if requested_filename not in primaries:
+            raise HTTPException(
+                400,
+                f"gguf_filename '{requested_filename}' is not a recognized "
+                f"GGUF candidate for '{request.model}'",
+            )
+        return "llama.cpp", requested_filename
+
+    # backend == "vllm"
+    if requested_filename:
+        raise HTTPException(
+            400,
+            "gguf_filename is only valid when backend='llama.cpp'",
+        )
+    if not has_transformer:
+        raise HTTPException(
+            400,
+            f"repo '{request.model}' has no .safetensors / .bin siblings; "
+            "use backend='llama.cpp' with a gguf_filename instead",
+        )
+    return "vllm", None
+
+
 async def _install_internal(
     request: InstallRequest,
     *,
     hf_token_override: Optional[str] = None,
     allow_cache_only_alias: bool = False,
+    skip_backend_probe: bool = False,
 ) -> dict:
     """Body of POST /manager/install, factored out so the legacy shim can
     reuse it without going through HTTP."""
@@ -1215,6 +1625,14 @@ async def _install_internal(
 
     _free_space_check(storage_path, request.size_estimate_gb, model_id)
 
+    hf_token = hf_token_override
+    if hf_token is None:
+        hf_token = os.environ.get("HUGGING_FACE_HUB_TOKEN") or None
+
+    backend, gguf_filename = _resolve_install_backend(
+        request, hf_token=hf_token, skip_probe=skip_backend_probe,
+    )
+
     gpus_for_catalog = _gpus_to_json(request.gpus)
 
     _catalog.start_install_tx(
@@ -1227,11 +1645,9 @@ async def _install_internal(
         max_model_len=request.max_model_len,
         storage_location=storage_name,
         extra_args=list(request.extra_args),
+        backend=backend,
+        gguf_filename=gguf_filename,
     )
-
-    hf_token = hf_token_override
-    if hf_token is None:
-        hf_token = os.environ.get("HUGGING_FACE_HUB_TOKEN") or None
 
     cache_dir = os.path.join(storage_path, "hub")
     try:
@@ -1244,6 +1660,7 @@ async def _install_internal(
             hf_token=hf_token,
             catalog=_catalog,
             storage_location=storage_name,
+            gguf_primary_filename=gguf_filename,
         )
     except ConflictError as e:
         # Race: another worker came in between our checks and the spawn.
@@ -1261,6 +1678,8 @@ async def _install_internal(
     return {
         "alias": alias,
         "status": "queued",
+        "backend": backend,
+        "gguf_filename": gguf_filename,
         "poll": f"/manager/install/{alias}",
     }
 
@@ -1328,7 +1747,12 @@ async def retry_install_route(alias: str, force: bool = False):
             max_model_len=row.max_model_len,
             storage=row.storage_location,
             extra_args=extra_args,
+            backend=row.backend,
+            gguf_filename=row.gguf_filename,
         ),
+        # The row was validated when first installed; trust it on retry to
+        # avoid an extra Hub round-trip and keep retries usable offline.
+        skip_backend_probe=True,
     )
 
 
@@ -1595,6 +2019,7 @@ async def download_model(request: Request):
             ),
             hf_token_override=hf_token,
             allow_cache_only_alias=True,
+            skip_backend_probe=True,
         )
     except HTTPException as e:
         # Surface as v0-shaped failure (no started_at / poll).
@@ -1722,6 +2147,14 @@ async def health():
 
 VLLM_BASE = f"http://{VLLM_INNER_HOST}:{VLLM_INNER_PORT}"
 
+# Endpoints whose 200 responses carry an OpenAI-style `usage` block. Used by
+# the token-usage tracker to avoid parsing irrelevant payloads (e.g. /v1/models).
+_USAGE_ENDPOINTS = frozenset({
+    "v1/chat/completions",
+    "v1/completions",
+    "v1/embeddings",
+})
+
 # Legacy in-memory aliases (deprecated; tier 3 in _resolve_request_model).
 # Kept for /manager/aliases CRUD compatibility — Phase 3/4 retire it.
 MODEL_ALIASES: dict[str, str] = {}
@@ -1740,11 +2173,12 @@ def _peek_model_field(body: bytes) -> Optional[str]:
 
 
 def _canonicalize_model_field(body: bytes, profile: Optional[ResolvedProfile]) -> bytes:
-    """Rewrite request JSON to the vLLM served model name after resolution.
+    """Rewrite request JSON to the engine-served model name after resolution.
 
-    The manager accepts aliases and case-insensitive HF ids, but vLLM's OpenAI
-    server validates the literal `model` field against its served name. Keep the
-    public lookup flexible while sending the canonical HF id upstream.
+    The manager accepts aliases and case-insensitive HF ids, but the inner
+    engine validates the literal `model` field against its served name (vLLM:
+    the HF id passed to --model; llama-server: the alias passed to --alias).
+    Keep the public lookup flexible while sending the canonical name upstream.
     """
     if profile is None or not body:
         return body
@@ -1754,10 +2188,132 @@ def _canonicalize_model_field(body: bytes, profile: Optional[ResolvedProfile]) -
         return body
     if not isinstance(payload, dict) or not isinstance(payload.get("model"), str):
         return body
-    if payload["model"] == profile.model:
+    if payload["model"] == profile.served_model_name:
         return body
-    payload["model"] = profile.model
+    payload["model"] = profile.served_model_name
     return json.dumps(payload, separators=(",", ":")).encode("utf-8")
+
+
+def _ensure_stream_usage(body: bytes) -> tuple[bytes, bool]:
+    """Inject `stream_options.include_usage: true` into streaming requests.
+
+    vLLM only emits the trailing `usage` SSE event when the client opts in
+    via stream_options. We force the opt-in so the proxy can record token
+    counts, and return a flag indicating whether the *client* had already
+    asked for it — the streaming wrapper uses that flag to decide whether
+    to forward the synthetic usage event to the client or strip it.
+
+    Returns (possibly-rewritten body, client_asked_for_usage).
+    """
+    if not body:
+        return body, False
+    try:
+        payload = json.loads(body)
+    except Exception:
+        return body, False
+    if not isinstance(payload, dict) or not payload.get("stream"):
+        return body, False
+    opts = payload.get("stream_options")
+    if isinstance(opts, dict) and opts.get("include_usage") is True:
+        return body, True
+    new_opts = dict(opts) if isinstance(opts, dict) else {}
+    new_opts["include_usage"] = True
+    payload["stream_options"] = new_opts
+    return json.dumps(payload, separators=(",", ":")).encode("utf-8"), False
+
+
+def _process_sse_event(
+    event_bytes: bytes,
+    client_asked_for_usage: bool,
+) -> tuple[bool, Optional[dict]]:
+    """Inspect one complete SSE event for an OpenAI `usage` block.
+
+    Returns (forward, usage). `forward=False` means drop this event from the
+    downstream stream — used to hide the synthetic usage event from clients
+    that did not request it. `usage` is the parsed dict when present.
+    """
+    text = event_bytes.decode("utf-8", errors="replace").rstrip("\r\n")
+    data_lines: list[str] = []
+    for raw in text.split("\n"):
+        line = raw.rstrip("\r")
+        if line.startswith("data:"):
+            data_lines.append(line[5:].lstrip())
+    if not data_lines:
+        return True, None
+    data = "\n".join(data_lines)
+    if data == "[DONE]":
+        return True, None
+    try:
+        payload = json.loads(data)
+    except Exception:
+        return True, None
+    if not isinstance(payload, dict):
+        return True, None
+    usage = payload.get("usage")
+    if not isinstance(usage, dict):
+        return True, None
+    if not client_asked_for_usage:
+        choices = payload.get("choices")
+        if isinstance(choices, list) and len(choices) == 0:
+            return False, usage
+    return True, usage
+
+
+def _append_usage_row(
+    *,
+    requested_model: Optional[str],
+    alias: Optional[str],
+    backend: Optional[str],
+    usage: dict,
+    endpoint: str,
+    streamed: bool,
+    response_ms: float,
+    status_code: int,
+) -> None:
+    """Queue a per-request usage row for the next `_flush_loop` tick.
+
+    No-op when `alias` is unknown (raw HF id passthrough with no resident
+    profile). Defensive about non-integer token counts since vLLM and
+    llama-server have shipped occasional `null` values in error-but-200 paths.
+
+    `event_id` is generated here (UUID4 hex) so the same identity rides both
+    the in-memory deque and the durable SQLite outbox — the postgres-side
+    `ON CONFLICT (event_id) DO NOTHING` then makes DELETE-after-success
+    safe to retry.
+    """
+    if not alias:
+        return
+    try:
+        prompt = int(usage.get("prompt_tokens") or 0)
+    except (TypeError, ValueError):
+        prompt = 0
+    try:
+        completion = int(usage.get("completion_tokens") or 0)
+    except (TypeError, ValueError):
+        completion = 0
+    try:
+        total = int(usage.get("total_tokens") or (prompt + completion))
+    except (TypeError, ValueError):
+        total = prompt + completion
+    try:
+        usage_json = json.dumps(usage, separators=(",", ":"))
+    except Exception:
+        usage_json = None
+    _runtime.usage_rows.append(UsageEntry(
+        ts=time.time(),
+        requested_model=requested_model,
+        alias=alias,
+        backend=backend or "vllm",
+        prompt_tokens=prompt,
+        completion_tokens=completion,
+        total_tokens=total,
+        usage_json=usage_json,
+        event_id=uuid.uuid4().hex,
+        endpoint=endpoint,
+        streamed=streamed,
+        response_ms=response_ms,
+        status_code=status_code,
+    ))
 
 
 async def _open_upstream(
@@ -1788,18 +2344,84 @@ async def _open_upstream(
         raise
 
 
-async def _wrap_stream(client: httpx.AsyncClient, response: httpx.Response):
+async def _wrap_stream(
+    client: httpx.AsyncClient,
+    response: httpx.Response,
+    *,
+    requested_model: Optional[str] = None,
+    alias: Optional[str] = None,
+    backend: Optional[str] = None,
+    status_code: int = 200,
+    client_asked_for_usage: bool = False,
+    path: str = "",
+    request_start_monotonic: Optional[float] = None,
+):
     """Stream upstream chunks and own the inflight + usage accounting for
     this request. Reaching here means upstream returned headers, so usage
     IS counted — even on client disconnect mid-stream (model performed work).
-    See plans/phase_2.md §5.4."""
+    See plans/phase_2.md §5.4.
+
+    When the upstream returned a 2xx on a `_USAGE_ENDPOINTS` path, the wrapper
+    additionally parses the SSE stream event-by-event, captures the trailing
+    `usage` block, and (when the client did not opt in to that event) strips
+    it from the bytes forwarded to the client.
+    """
+    track_usage = (
+        200 <= status_code < 300
+        and path in _USAGE_ENDPOINTS
+    )
+    last_usage: Optional[dict] = None
+    buffer = bytearray()
     try:
         async for chunk in response.aiter_bytes():
-            yield chunk
+            if not track_usage:
+                yield chunk
+                continue
+            buffer.extend(chunk)
+            while True:
+                idx = buffer.find(b"\n\n")
+                idx_crlf = buffer.find(b"\r\n\r\n")
+                if idx == -1 and idx_crlf == -1:
+                    break
+                if idx == -1 or (idx_crlf != -1 and idx_crlf < idx):
+                    boundary, sep_len = idx_crlf, 4
+                else:
+                    boundary, sep_len = idx, 2
+                event_bytes = bytes(buffer[:boundary + sep_len])
+                del buffer[:boundary + sep_len]
+                forward, usage = _process_sse_event(
+                    event_bytes, client_asked_for_usage,
+                )
+                if usage is not None:
+                    last_usage = usage
+                if forward:
+                    yield event_bytes
+        if track_usage and buffer:
+            # Stream ended without a trailing event terminator — forward
+            # the tail verbatim so the client doesn't see truncation.
+            yield bytes(buffer)
     finally:
         _runtime.inflight -= 1
         _runtime.last_used_at = time.time()
         _runtime.request_count_delta += 1
+        if track_usage and last_usage is not None:
+            try:
+                if request_start_monotonic is not None:
+                    response_ms = (time.monotonic() - request_start_monotonic) * 1000.0
+                else:
+                    response_ms = 0.0
+                _append_usage_row(
+                    requested_model=requested_model,
+                    alias=alias,
+                    backend=backend,
+                    usage=last_usage,
+                    endpoint=f"/{path}" if not path.startswith("/") else path,
+                    streamed=True,
+                    response_ms=response_ms,
+                    status_code=status_code,
+                )
+            except Exception as e:
+                logger.warning("Failed to queue streaming usage row: %s", e)
         with contextlib.suppress(Exception):
             await response.aclose()
         with contextlib.suppress(Exception):
@@ -1824,6 +2446,7 @@ async def _proxy(request: Request, path: str, body: bytes):
       - Single deadline computed at arrival, gates lock-wait, event-wait,
         and _start_vllm itself.
     """
+    request_start_monotonic = time.monotonic()
     requested = _peek_model_field(body)
     if requested is None and _runtime.resident_alias is None:
         raise HTTPException(
@@ -1862,11 +2485,23 @@ async def _proxy(request: Request, path: str, body: bytes):
         finally:
             _swap_lock.release()
 
+    # Snapshot the model context used to tag any usage row we record. After
+    # the inflight increment, eviction cannot fire (it bails when inflight>0),
+    # so reading `_runtime.resident_profile` is safe for the request lifetime.
+    if profile is not None:
+        usage_alias: Optional[str] = profile.alias
+        usage_backend: Optional[str] = profile.backend
+    else:
+        resident = _runtime.resident_profile
+        usage_alias = resident.alias if resident else None
+        usage_backend = resident.backend if resident else None
+
     is_streaming = False
     upstream_ok = False
     client: Optional[httpx.AsyncClient] = None
     response: Optional[httpx.Response] = None
     upstream_body = _canonicalize_model_field(body, profile)
+    upstream_body, client_asked_for_usage = _ensure_stream_usage(upstream_body)
     try:
         client, response = await _open_upstream(request, f"{path}", upstream_body)
         upstream_ok = True
@@ -1877,7 +2512,17 @@ async def _proxy(request: Request, path: str, body: bytes):
             wrapped_client, wrapped_response = client, response
             client, response = None, None  # don't close in this finally
             return StreamingResponse(
-                _wrap_stream(wrapped_client, wrapped_response),
+                _wrap_stream(
+                    wrapped_client,
+                    wrapped_response,
+                    requested_model=requested,
+                    alias=usage_alias,
+                    backend=usage_backend,
+                    status_code=wrapped_response.status_code,
+                    client_asked_for_usage=client_asked_for_usage,
+                    path=path,
+                    request_start_monotonic=request_start_monotonic,
+                ),
                 status_code=wrapped_response.status_code,
                 headers=dict(wrapped_response.headers),
                 media_type="text/event-stream",
@@ -1887,6 +2532,27 @@ async def _proxy(request: Request, path: str, body: bytes):
             body_json = json.loads(content)
         except Exception:
             body_json = {"raw": content.decode(errors="replace")}
+        if (
+            200 <= response.status_code < 300
+            and path in _USAGE_ENDPOINTS
+            and isinstance(body_json, dict)
+        ):
+            usage = body_json.get("usage")
+            if isinstance(usage, dict):
+                try:
+                    response_ms = (time.monotonic() - request_start_monotonic) * 1000.0
+                    _append_usage_row(
+                        requested_model=requested,
+                        alias=usage_alias,
+                        backend=usage_backend,
+                        usage=usage,
+                        endpoint=f"/{path}",
+                        streamed=False,
+                        response_ms=response_ms,
+                        status_code=response.status_code,
+                    )
+                except Exception as e:
+                    logger.warning("Failed to queue usage row: %s", e)
         return JSONResponse(content=body_json, status_code=response.status_code)
     finally:
         if not is_streaming:

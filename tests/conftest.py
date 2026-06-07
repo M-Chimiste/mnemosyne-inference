@@ -114,6 +114,11 @@ def _reset_globals():
     vllm_manager._load_error = None
     vllm_manager._eviction_task = None
     vllm_manager._flush_task = None
+    vllm_manager._pg_flush_task = None
+    vllm_manager._pg_writer = None
+    vllm_manager._pg_last_flush_at = None
+    vllm_manager._pg_last_flush_count = 0
+    vllm_manager._pg_last_error = None
     vllm_manager._legacy_alias_warned.clear()
     # Reset the lock so a new event loop's primitives don't tangle with
     # one held over from a prior test.
@@ -259,7 +264,8 @@ class StubDownloader:
         self.fail_with_error: str | None = None
 
     def __call__(self, *, alias, model_id, revision, cache_dir, ignore_patterns,
-                 hf_token, catalog, storage_location):
+                 hf_token, catalog, storage_location,
+                 gguf_primary_filename=None):
         self.calls.append({
             "alias": alias,
             "model_id": model_id,
@@ -268,6 +274,7 @@ class StubDownloader:
             "ignore_patterns": ignore_patterns,
             "hf_token": hf_token,
             "storage_location": storage_location,
+            "gguf_primary_filename": gguf_primary_filename,
         })
 
         class Handle:
@@ -294,7 +301,25 @@ class StubDownloader:
 def stub_downloader(monkeypatch):
     """Replace downloader.start_install with a sync stub that records
     invocation args. Yields the StubDownloader so tests can inspect
-    captured calls and toggle auto_complete / fail_with_error."""
+    captured calls and toggle auto_complete / fail_with_error.
+
+    Also stubs `hf_search.fetch_repo_files` so /manager/install (which now
+    probes the repo before queueing) doesn't try to reach huggingface.co.
+    The default stub mimics a healthy vLLM-style repo. Tests that need
+    GGUF-aware probe results (e.g. `test_install.py`) override it again
+    with their own monkeypatch.setattr — last-write-wins.
+    """
+    import hf_search
+
+    def _default_probe(model_id, revision=None):
+        return {
+            "has_gguf": False,
+            "has_transformer_weights": True,
+            "recommended_backend": "vllm",
+            "gguf_candidates": [],
+        }
+
     stub = StubDownloader()
     monkeypatch.setattr(vllm_manager.downloader, "start_install", stub)
+    monkeypatch.setattr(hf_search, "fetch_repo_files", _default_probe)
     yield stub

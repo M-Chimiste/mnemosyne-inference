@@ -43,6 +43,22 @@ export default function Dashboard() {
             <div className="flex items-center gap-2 text-xs uppercase text-stone-500"><Server className="h-4 w-4" /> Resident</div>
             <div className="mt-2 text-base font-semibold">{status.data?.alias ?? "none"}</div>
             <div className="mt-1 break-all text-sm text-stone-600">{status.data?.loaded_model ?? "No model loaded"}</div>
+            {status.data?.backend && (
+              <div className="mt-1 text-xs">
+                <span className={
+                  status.data.backend === "llama.cpp"
+                    ? "inline-flex rounded border border-amber/40 bg-amber/10 px-1.5 py-0.5 font-medium uppercase tracking-wide text-amber"
+                    : "inline-flex rounded border border-line bg-stone-50 px-1.5 py-0.5 font-medium uppercase tracking-wide text-stone-600"
+                }>
+                  {status.data.backend === "llama.cpp" ? "llama.cpp" : "vLLM"}
+                </span>
+                {status.data.gguf_filename && (
+                  <span className="ml-2 break-all text-stone-600" title={status.data.gguf_filename}>
+                    {status.data.gguf_filename}
+                  </span>
+                )}
+              </div>
+            )}
           </div>
           <div className="bg-white p-4">
             <div className="flex items-center gap-2 text-xs uppercase text-stone-500"><LoaderCircle className="h-4 w-4" /> Swap</div>

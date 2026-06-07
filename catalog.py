@@ -14,14 +14,15 @@ import sqlite3
 import threading
 import time
 from dataclasses import dataclass
-from typing import Optional
+from typing import Iterable, Optional
 
 from config import ModelProfile
+from repo_probe import expand_shard_filenames
 
 logger = logging.getLogger("vllm-manager.catalog")
 
 DEFAULT_DB_PATH = "/state/mnemosyne.db"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 3
 
 _RESERVED_PREFIX_COLON = "__cache__:"
 _RESERVED_PREFIX_SLASH = "__cache__/"
@@ -72,13 +73,57 @@ def _newest_snapshot(cache_dir: str) -> Optional[str]:
     return entries[0][1]
 
 
-def _has_weights(snapshot_dir: str) -> bool:
+def _has_any_weights(snapshot_dir: str) -> bool:
+    """Permissive check used by cache-discovery paths (e.g. synthetic
+    `__cache__:*` rows): returns True when any recognizable weight file is
+    present, regardless of which one. Reconcile of aliased rows uses the
+    backend-aware `_has_expected_weights` instead."""
     try:
         for name in os.listdir(snapshot_dir):
             if name.endswith((".safetensors", ".bin", ".gguf")):
                 return True
     except OSError:
         pass
+    return False
+
+
+# Back-compat shim: callers under tests / external helpers may still import
+# `_has_weights`. New code should use `_has_any_weights` (cache discovery)
+# or `_has_expected_weights` (reconcile of aliased rows).
+_has_weights = _has_any_weights
+
+
+def _has_expected_weights(
+    snapshot_dir: str,
+    backend: str,
+    gguf_filename: Optional[str],
+) -> bool:
+    """Backend-aware existence check used by reconcile.
+
+    For vLLM rows: any `.safetensors` / `.bin` sibling is enough (mirrors
+    the legacy behavior).
+    For llama.cpp rows: the row's specific `gguf_filename` must be on disk;
+    sharded models must have *all* shards present. Prevents promoting an
+    alias to `installed` when its specific quant is missing, even if some
+    other quant in the same repo is present (mixed-quant repos shared
+    between aliases).
+    """
+    try:
+        names = os.listdir(snapshot_dir)
+    except OSError:
+        return False
+    if backend == "llama.cpp":
+        if not gguf_filename:
+            return False
+        expected = expand_shard_filenames(gguf_filename, names)
+        # Re-list against actual files to confirm presence (case-sensitive,
+        # exact filename match).
+        on_disk = set(names)
+        return all(name in on_disk for name in expected)
+    # vLLM (or absent backend on legacy rows treated as vLLM).
+    for name in names:
+        if name.endswith((".safetensors", ".bin")):
+            return True
     return False
 
 
@@ -165,6 +210,8 @@ class CatalogRow:
     extra_args: str     # JSON
     revision: str = "main"
     resolved_sha: Optional[str] = None
+    backend: str = "vllm"               # "vllm" | "llama.cpp"
+    gguf_filename: Optional[str] = None  # primary shard for llama.cpp rows
 
     def to_api_dict(self) -> dict:
         return {
@@ -184,6 +231,8 @@ class CatalogRow:
             "extra_args": json.loads(self.extra_args) if self.extra_args else [],
             "revision": self.revision,
             "resolved_sha": self.resolved_sha,
+            "backend": self.backend,
+            "gguf_filename": self.gguf_filename,
         }
 
 
@@ -266,22 +315,26 @@ class Catalog:
                   version INTEGER PRIMARY KEY
                 );
                 CREATE TABLE IF NOT EXISTS models (
-                  alias              TEXT PRIMARY KEY,
-                  hf_model_id        TEXT NOT NULL,
-                  source             TEXT NOT NULL,
-                  quantization       TEXT,
-                  gpus               TEXT NOT NULL,
-                  max_model_len      INTEGER,
-                  storage_location   TEXT NOT NULL,
-                  cache_path         TEXT,
-                  size_bytes         INTEGER,
-                  status             TEXT NOT NULL,
-                  installed_at       INTEGER,
-                  last_used_at       INTEGER,
-                  request_count      INTEGER DEFAULT 0,
-                  extra_args         TEXT,
-                  revision           TEXT NOT NULL DEFAULT 'main',
-                  resolved_sha       TEXT
+                  alias                   TEXT PRIMARY KEY,
+                  hf_model_id             TEXT NOT NULL,
+                  source                  TEXT NOT NULL,
+                  quantization            TEXT,
+                  gpus                    TEXT NOT NULL,
+                  max_model_len           INTEGER,
+                  storage_location        TEXT NOT NULL,
+                  cache_path              TEXT,
+                  size_bytes              INTEGER,
+                  status                  TEXT NOT NULL,
+                  installed_at            INTEGER,
+                  last_used_at            INTEGER,
+                  request_count           INTEGER DEFAULT 0,
+                  extra_args              TEXT,
+                  revision                TEXT NOT NULL DEFAULT 'main',
+                  resolved_sha            TEXT,
+                  backend                 TEXT NOT NULL DEFAULT 'vllm',
+                  gguf_filename           TEXT,
+                  total_prompt_tokens     INTEGER NOT NULL DEFAULT 0,
+                  total_completion_tokens INTEGER NOT NULL DEFAULT 0
                 );
                 CREATE TABLE IF NOT EXISTS downloads (
                   id                 INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -294,9 +347,36 @@ class Catalog:
                   total_bytes        INTEGER,
                   error              TEXT
                 );
-                CREATE INDEX IF NOT EXISTS idx_downloads_alias  ON downloads(alias);
-                CREATE INDEX IF NOT EXISTS idx_models_last_used ON models(last_used_at);
-                CREATE INDEX IF NOT EXISTS idx_models_hf_id     ON models(hf_model_id);
+                CREATE TABLE IF NOT EXISTS request_usage (
+                  id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+                  ts                 REAL NOT NULL,
+                  requested_model    TEXT,
+                  alias              TEXT,
+                  backend            TEXT,
+                  prompt_tokens      INTEGER NOT NULL DEFAULT 0,
+                  completion_tokens  INTEGER NOT NULL DEFAULT 0,
+                  total_tokens       INTEGER NOT NULL DEFAULT 0,
+                  usage_json         TEXT
+                );
+                CREATE TABLE IF NOT EXISTS pg_usage_outbox (
+                  id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+                  event_id           TEXT    NOT NULL UNIQUE,
+                  ts                 REAL    NOT NULL,
+                  requested_model    TEXT,
+                  alias              TEXT,
+                  backend            TEXT,
+                  endpoint           TEXT    NOT NULL,
+                  streamed           INTEGER NOT NULL DEFAULT 0,
+                  prompt_tokens      INTEGER NOT NULL DEFAULT 0,
+                  completion_tokens  INTEGER NOT NULL DEFAULT 0,
+                  total_tokens       INTEGER NOT NULL DEFAULT 0,
+                  response_ms        REAL    NOT NULL DEFAULT 0,
+                  status_code        INTEGER NOT NULL DEFAULT 200
+                );
+                CREATE INDEX IF NOT EXISTS idx_downloads_alias       ON downloads(alias);
+                CREATE INDEX IF NOT EXISTS idx_models_last_used      ON models(last_used_at);
+                CREATE INDEX IF NOT EXISTS idx_models_hf_id          ON models(hf_model_id);
+                CREATE INDEX IF NOT EXISTS idx_request_usage_alias_ts ON request_usage(alias, ts);
                 """
             )
             existing = self._conn.execute("SELECT version FROM schema_version").fetchone()
@@ -304,10 +384,17 @@ class Catalog:
                 self._conn.execute(
                     "INSERT INTO schema_version(version) VALUES (?)", (SCHEMA_VERSION,)
                 )
-            # Future: elif existing["version"] < SCHEMA_VERSION: run migrations.
+            elif int(existing["version"]) < SCHEMA_VERSION:
+                # All additions through v3 are additive (CREATE TABLE IF NOT
+                # EXISTS / additive ALTERs above), so the only step here is
+                # bumping the stored version once the bootstrap script has
+                # ensured every needed table exists.
+                self._conn.execute(
+                    "UPDATE schema_version SET version = ?", (SCHEMA_VERSION,)
+                )
 
     def _migrate_revision_column(self) -> None:
-        """Additive ALTER for legacy DBs predating Phase 4. On a fresh DB,
+        """Additive ALTER for legacy DBs predating later phases. On a fresh DB,
         _bootstrap creates these columns directly and both branches no-op."""
         with self._lock, self._conn:
             cols = {
@@ -321,6 +408,24 @@ class Catalog:
             if "resolved_sha" not in cols:
                 self._conn.execute(
                     "ALTER TABLE models ADD COLUMN resolved_sha TEXT"
+                )
+            if "backend" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE models ADD COLUMN backend TEXT NOT NULL DEFAULT 'vllm'"
+                )
+            if "gguf_filename" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE models ADD COLUMN gguf_filename TEXT"
+                )
+            if "total_prompt_tokens" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE models ADD COLUMN total_prompt_tokens "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
+            if "total_completion_tokens" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE models ADD COLUMN total_completion_tokens "
+                    "INTEGER NOT NULL DEFAULT 0"
                 )
 
     # ── sync ──────────────────────────────────────────────────────────
@@ -383,7 +488,8 @@ class Catalog:
             extra_json = json.dumps(m.extra_args)
 
             row = self._conn.execute(
-                "SELECT source, hf_model_id, storage_location, revision "
+                "SELECT source, hf_model_id, storage_location, revision, "
+                "backend, gguf_filename "
                 "FROM models WHERE alias=?", (m.alias,)
             ).fetchone()
 
@@ -394,12 +500,13 @@ class Catalog:
                       alias, hf_model_id, source, quantization, gpus,
                       max_model_len, storage_location, cache_path, size_bytes,
                       status, installed_at, last_used_at, request_count,
-                      extra_args, revision
+                      extra_args, revision, backend, gguf_filename
                     ) VALUES (?, ?, 'config', ?, ?, ?, ?, NULL, NULL,
-                              'partial', NULL, NULL, 0, ?, ?)
+                              'partial', NULL, NULL, 0, ?, ?, ?, ?)
                     """,
                     (m.alias, m.model, m.quantization, gpus_json,
-                     m.max_model_len, storage_loc, extra_json, m.revision),
+                     m.max_model_len, storage_loc, extra_json, m.revision,
+                     m.backend, m.gguf_filename),
                 )
                 added += 1
             else:
@@ -409,11 +516,17 @@ class Catalog:
                         m.alias,
                     )
                     ui_overwritten += 1
+                # Backend/file changes also imply a different on-disk layout,
+                # so wipe the cached snapshot pin when they shift.
+                row_backend = row["backend"] if "backend" in row.keys() else "vllm"
+                row_gguf = row["gguf_filename"] if "gguf_filename" in row.keys() else None
                 clears_cached_snapshot = (
                     row["source"] == "ui_install"
                     or row["hf_model_id"] != m.model
                     or row["storage_location"] != storage_loc
                     or row["revision"] != m.revision
+                    or row_backend != m.backend
+                    or row_gguf != m.gguf_filename
                 )
                 cache_reset_sql = (
                     "cache_path = NULL, status = 'partial', resolved_sha = NULL,"
@@ -431,11 +544,14 @@ class Catalog:
                       storage_location = ?,
                       {cache_reset_sql}
                       extra_args       = ?,
-                      revision         = ?
+                      revision         = ?,
+                      backend          = ?,
+                      gguf_filename    = ?
                     WHERE alias = ?
                     """,
                     (m.model, m.quantization, gpus_json, m.max_model_len,
-                     storage_loc, extra_json, m.revision, m.alias),
+                     storage_loc, extra_json, m.revision,
+                     m.backend, m.gguf_filename, m.alias),
                 )
                 updated += 1
 
@@ -465,8 +581,8 @@ class Catalog:
         loc_missing = 0
         rows = list(
             self._conn.execute(
-                "SELECT alias, hf_model_id, storage_location, status, revision "
-                "FROM models"
+                "SELECT alias, hf_model_id, storage_location, status, revision, "
+                "backend, gguf_filename FROM models"
             )
         )
         for row in rows:
@@ -488,14 +604,25 @@ class Catalog:
 
             cache_dir = os.path.join(loc_path, "hub", _hf_dir_name(row["hf_model_id"]))
             revision = row["revision"] if "revision" in row.keys() else None
+            backend = (row["backend"] if "backend" in row.keys() else "vllm") or "vllm"
+            gguf_filename = (
+                row["gguf_filename"] if "gguf_filename" in row.keys() else None
+            )
             snap = _snapshot_for_revision(cache_dir, revision)
             if snap is None:
                 # Fall back to newest-mtime for legacy rows with no revision
                 # set (shouldn't happen post-migration, but defensive).
                 if not revision:
                     snap_fallback = _newest_snapshot(cache_dir)
-                    if snap_fallback and _has_weights(snap_fallback):
+                    if snap_fallback and _has_any_weights(snap_fallback):
                         snap = snap_fallback
+            # Backend-aware presence check: llama.cpp rows must have their
+            # specific gguf_filename (and all shards) present, not just any
+            # GGUF in a shared snapshot.
+            if snap is not None and not _has_expected_weights(
+                snap, backend, gguf_filename,
+            ):
+                snap = None
             if snap:
                 sha = _snapshot_sha(snap)
                 self._conn.execute(
@@ -668,10 +795,133 @@ class Catalog:
                 (int(last_used_at), delta, alias),
             )
 
+    def record_usage_batch(self, rows: Iterable[tuple]) -> None:
+        """Drain pending token-usage rows from the proxy hot path.
+
+        Each tuple: (ts, requested_model, alias, backend,
+                     prompt_tokens, completion_tokens, total_tokens, usage_json).
+        Inserts one row per request into request_usage and bumps per-alias
+        aggregate columns on models in a single transaction. Aliases with
+        no matching models row (raw HF id passthrough) are still logged in
+        request_usage; the UPDATE silently matches zero rows.
+        """
+        rows = list(rows)
+        if not rows:
+            return
+        agg: dict[str, tuple[int, int, float]] = {}
+        for ts, _req, alias, _backend, prompt, completion, _total, _uj in rows:
+            if not alias:
+                continue
+            p_sum, c_sum, last_ts = agg.get(alias, (0, 0, 0.0))
+            agg[alias] = (p_sum + prompt, c_sum + completion, max(last_ts, ts))
+        with self._lock, self._conn:
+            self._conn.executemany(
+                "INSERT INTO request_usage "
+                "(ts, requested_model, alias, backend, prompt_tokens, "
+                " completion_tokens, total_tokens, usage_json) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                rows,
+            )
+            for alias, (p_sum, c_sum, last_ts) in agg.items():
+                self._conn.execute(
+                    "UPDATE models SET "
+                    "total_prompt_tokens = COALESCE(total_prompt_tokens, 0) + ?, "
+                    "total_completion_tokens = COALESCE(total_completion_tokens, 0) + ?, "
+                    "last_used_at = MAX(COALESCE(last_used_at, 0), ?) "
+                    "WHERE alias = ?",
+                    (p_sum, c_sum, int(last_ts), alias),
+                )
+
     def schema_version(self) -> int:
         with self._lock:
             row = self._conn.execute("SELECT version FROM schema_version").fetchone()
         return int(row["version"]) if row else -1
+
+    # ── token-sidecar outbox (v3) ─────────────────────────────────────
+    #
+    # Mirror of the postgres token_usage table, used as a local cache so a
+    # postgres outage or container restart doesn't drop usage data. The
+    # background pg-flush loop drains this table in event_id-order.
+
+    def enqueue_pg_outbox(self, rows: Iterable[tuple]) -> None:
+        """Append a batch to the postgres outbox.
+
+        Each row is a 12-tuple:
+          (event_id, ts, requested_model, alias, backend, endpoint,
+           streamed, prompt, completion, total, response_ms, status_code)
+        Caller is responsible for stable, unique event_ids (UUIDs); the
+        UNIQUE index plus INSERT OR IGNORE drops accidental dupes silently.
+        """
+        rows = list(rows)
+        if not rows:
+            return
+        with self._lock, self._conn:
+            self._conn.executemany(
+                "INSERT OR IGNORE INTO pg_usage_outbox "
+                "(event_id, ts, requested_model, alias, backend, endpoint, "
+                " streamed, prompt_tokens, completion_tokens, total_tokens, "
+                " response_ms, status_code) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                rows,
+            )
+
+    def peek_pg_outbox(self, limit: int) -> list[sqlite3.Row]:
+        """Return up to `limit` oldest outbox rows in insertion order.
+
+        Caller passes `r["event_id"]` etc. through the postgres writer, then
+        calls `delete_pg_outbox([r["id"] for r in rows])` after a successful
+        write. The SQLite `id` column is the durable handle for deletion;
+        `event_id` is the de-dup key on the postgres side.
+        """
+        if limit <= 0:
+            return []
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT id, event_id, ts, requested_model, alias, backend, "
+                " endpoint, streamed, prompt_tokens, completion_tokens, "
+                " total_tokens, response_ms, status_code "
+                "FROM pg_usage_outbox ORDER BY id LIMIT ?",
+                (int(limit),),
+            )
+            return cur.fetchall()
+
+    def delete_pg_outbox(self, ids: Iterable[int]) -> int:
+        """Delete the named outbox rows. Returns the count actually removed."""
+        ids = [int(i) for i in ids]
+        if not ids:
+            return 0
+        with self._lock, self._conn:
+            # Use a single DELETE with an IN-list to keep this atomic.
+            placeholders = ",".join("?" * len(ids))
+            cur = self._conn.execute(
+                f"DELETE FROM pg_usage_outbox WHERE id IN ({placeholders})", ids,
+            )
+            return cur.rowcount
+
+    def count_pg_outbox(self) -> int:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS c FROM pg_usage_outbox"
+            ).fetchone()
+        return int(row["c"]) if row else 0
+
+    def prune_pg_outbox(self, keep: int) -> int:
+        """Drop oldest outbox rows until at most `keep` remain.
+
+        Called when the outbox is over `max_outbox_rows` so a long postgres
+        outage can't fill the SQLite catalog indefinitely. Returns the
+        number of rows actually dropped.
+        """
+        keep = max(0, int(keep))
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "DELETE FROM pg_usage_outbox WHERE id IN ("
+                "  SELECT id FROM pg_usage_outbox "
+                "  ORDER BY id DESC LIMIT -1 OFFSET ?"
+                ")",
+                (keep,),
+            )
+            return cur.rowcount
 
     # ── install / download transitions (Phase 4 §3b) ──────────────────
 
@@ -688,6 +938,8 @@ class Catalog:
         storage_location: str,
         extra_args: Optional[list[str]] = None,
         total_bytes_hint: Optional[int] = None,
+        backend: str = "vllm",
+        gguf_filename: Optional[str] = None,
     ) -> int:
         """Atomically: insert/upsert the models row at status='queued' and
         insert a new downloads row at status='queued'. Returns the new
@@ -706,12 +958,13 @@ class Catalog:
                       alias, hf_model_id, source, quantization, gpus,
                       max_model_len, storage_location, cache_path, size_bytes,
                       status, installed_at, last_used_at, request_count,
-                      extra_args, revision, resolved_sha
+                      extra_args, revision, resolved_sha, backend, gguf_filename
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL,
-                              'queued', NULL, NULL, 0, ?, ?, NULL)
+                              'queued', NULL, NULL, 0, ?, ?, NULL, ?, ?)
                     """,
                     (alias, hf_model_id, source, quantization, gpus_json,
-                     max_model_len, storage_location, extra_json, revision),
+                     max_model_len, storage_location, extra_json, revision,
+                     backend, gguf_filename),
                 )
             else:
                 self._conn.execute(
@@ -727,12 +980,14 @@ class Catalog:
                       status           = 'queued',
                       extra_args       = ?,
                       revision         = ?,
-                      resolved_sha     = NULL
+                      resolved_sha     = NULL,
+                      backend          = ?,
+                      gguf_filename    = ?
                     WHERE alias = ?
                     """,
                     (hf_model_id, source, quantization, gpus_json,
                      max_model_len, storage_location, extra_json, revision,
-                     alias),
+                     backend, gguf_filename, alias),
                 )
             cursor = self._conn.execute(
                 "INSERT INTO downloads (alias, pid, status, started_at, "
@@ -771,7 +1026,13 @@ class Catalog:
         resolved_sha: Optional[str],
     ) -> None:
         """Worker exited 0 with a complete event. Atomic: models→installed,
-        downloads→complete, resolved_sha pinned to the snapshot's actual SHA."""
+        downloads→complete, resolved_sha pinned to the snapshot's actual SHA.
+
+        Also reconciles `bytes_downloaded` to the on-disk size and bumps
+        `total_bytes` to match — the worker's 1-Hz progress emitter can drop
+        the final sample, leaving the UI showing 93%-ish on a fully-complete
+        row. Trusting `size_bytes` here keeps the row honest after restart.
+        """
         now = int(time.time())
         with self._lock, self._conn:
             self._conn.execute(
@@ -779,11 +1040,20 @@ class Catalog:
                 "size_bytes=?, installed_at=?, resolved_sha=? WHERE alias=?",
                 (cache_path, size_bytes, now, resolved_sha, alias),
             )
-            self._conn.execute(
-                "UPDATE downloads SET status='complete', finished_at=? "
-                "WHERE alias=? AND status IN ('queued','downloading')",
-                (now, alias),
-            )
+            if size_bytes is not None:
+                self._conn.execute(
+                    "UPDATE downloads SET status='complete', finished_at=?, "
+                    "bytes_downloaded=?, "
+                    "total_bytes=COALESCE(total_bytes, ?) "
+                    "WHERE alias=? AND status IN ('queued','downloading')",
+                    (now, size_bytes, size_bytes, alias),
+                )
+            else:
+                self._conn.execute(
+                    "UPDATE downloads SET status='complete', finished_at=? "
+                    "WHERE alias=? AND status IN ('queued','downloading')",
+                    (now, alias),
+                )
 
     def mark_error(self, alias: str, message: str) -> None:
         """Hard worker failure → models='error', downloads='error'.
@@ -936,6 +1206,8 @@ class Catalog:
         extra_args: str = "[]",
         revision: str = "main",
         resolved_sha: Optional[str] = None,
+        backend: str = "vllm",
+        gguf_filename: Optional[str] = None,
     ) -> None:
         """Direct insert bypassing config validation. Used by Phase 4 for
         ui_install rows and by tests for synthetic-alias rows."""
@@ -946,13 +1218,13 @@ class Catalog:
                   alias, hf_model_id, source, quantization, gpus,
                   max_model_len, storage_location, cache_path, size_bytes,
                   status, installed_at, last_used_at, request_count,
-                  extra_args, revision, resolved_sha
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  extra_args, revision, resolved_sha, backend, gguf_filename
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (alias, hf_model_id, source, quantization, gpus,
                  max_model_len, storage_location, cache_path, size_bytes,
                  status, installed_at, last_used_at, request_count,
-                 extra_args, revision, resolved_sha),
+                 extra_args, revision, resolved_sha, backend, gguf_filename),
             )
 
     def _raw_insert_download(
@@ -999,6 +1271,8 @@ class Catalog:
             extra_args=row["extra_args"] or "[]",
             revision=(row["revision"] if "revision" in keys and row["revision"] else "main"),
             resolved_sha=(row["resolved_sha"] if "resolved_sha" in keys else None),
+            backend=(row["backend"] if "backend" in keys and row["backend"] else "vllm"),
+            gguf_filename=(row["gguf_filename"] if "gguf_filename" in keys else None),
         )
 
     def _to_download_row(self, row) -> DownloadRow:
