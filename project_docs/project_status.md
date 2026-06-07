@@ -406,7 +406,7 @@ Workstation/GPU smoke validation is still outstanding:
   warns when `--size-gb` is not supplied; the Phase 6 UI sets it from search
   results when available, so the warning should primarily appear on
   hand-crafted curl/CLI calls or search rows without a size estimate.
-- **llama.cpp tag pin.** The Dockerfile pins `LLAMA_CPP_TAG=b6500`. Refresh
+- **llama.cpp tag pin.** The Dockerfile pins `LLAMA_CPP_TAG=b9548`. Refresh
   deliberately after checking llama.cpp release notes (CLI flags can shift
   on minor bumps). The argv builders cover the documented stable flags;
   rare additions land via `extra_args` in the catalog row.

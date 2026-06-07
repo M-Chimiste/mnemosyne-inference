@@ -3,10 +3,10 @@
 ## What this is
 
 Mnemosyne Inference gives a single workstation Ollama/LMStudio-style ergonomics
-on top of [vLLM](https://docs.vllm.ai/): one container supervises a vLLM
-subprocess, exposes an OpenAI-compatible API, and keeps the rest of the
-machine — installs, model swaps, multi-drive storage — driven by a YAML config
-and a small CLI/UI.
+on top of upstream inference engines: one container supervises either
+[vLLM](https://docs.vllm.ai/) or llama.cpp's `llama-server`, exposes an
+OpenAI-compatible API, and keeps the rest of the machine — installs, model
+swaps, multi-drive storage — driven by a YAML config and a small CLI/UI.
 
 The container runs **two HTTP planes** in one process:
 
@@ -18,10 +18,11 @@ load if the requested model is not the resident one; concurrent callers for
 the same target piggyback on a single load.
 
 Hardware target: a CUDA 12.8+ host with a Blackwell-class NVIDIA GPU (RTX 50
-or workstation Blackwell). The image bakes in PyTorch cu129 and a pinned vLLM
-stable release. Ampere/Hopper cards generally also work — see [Refreshing
-architecture support](#refreshing-architecture-support) if you need to bump or
-change the pinned vLLM build.
+or workstation Blackwell). The image bakes in PyTorch cu129, a pinned vLLM
+stable release, and a CUDA-built pinned llama.cpp `llama-server`.
+Ampere/Hopper cards generally also work — see [Refreshing architecture
+support](#refreshing-architecture-support) if you need to bump or change the
+pinned engine builds.
 
 Design context: [project_docs/PRD.md](project_docs/PRD.md) and
 [project_docs/implementation_plan.md](project_docs/implementation_plan.md).
@@ -245,8 +246,8 @@ families.
 
 The maintenance workflow:
 
-1. **Bump the pinned vLLM** in [Dockerfile](Dockerfile) line 56 after checking
-   the upstream release notes and install guidance. Update the `Last
+1. **Bump the pinned vLLM** in [Dockerfile](Dockerfile) after checking the
+   upstream release notes and install guidance. Update the nearby `Last
    refreshed:` comment.
 2. **Rebuild and restart** so the new vLLM is loaded:
    ```bash
@@ -269,6 +270,16 @@ The maintenance workflow:
    ```bash
    vllm-ctl restart
    ```
+
+If you bump llama.cpp's `LLAMA_CPP_TAG` in the same Dockerfile, check the
+`llama-server` CLI flags used by `runtime.py`, keep
+`CMAKE_CUDA_ARCHITECTURES` appropriate for the deployment GPU, and run a
+CUDA-backed smoke such as:
+
+```bash
+docker run --rm --gpus all --entrypoint /usr/local/bin/llama-server \
+  <rebuilt-image-tag> --version
+```
 
 ## Security and LAN exposure
 
@@ -414,9 +425,10 @@ curl -u admin:"$ADMIN_PASSWORD" -X POST \
 - **`504` from `/v1/*` during a swap.** The caller waited longer than
   `server.swap_queue_timeout_seconds` for another model to finish loading.
   Either bump the timeout, retry, or queue your traffic differently.
-- **`503` from `/v1/*` mid-load.** The vLLM child died (OOM, kernel mismatch,
-  etc.). The next request retriggers a fresh load — there is no auto-restart
-  loop by design (PRD §5.3). Check `vllm-ctl logs` for the underlying error.
+- **`503` from `/v1/*` mid-load.** The active engine child died (OOM, kernel
+  mismatch, bad model file, etc.). The next request retriggers a fresh load —
+  there is no auto-restart loop by design (PRD §5.3). Check `vllm-ctl logs`
+  for the underlying error.
 - **`vllm-ctl reload` reports `partial` rows after editing `config.yaml`.**
   Cache reconcile has spotted aliased installs whose cache directories are
   missing — usually because a storage location is no longer mounted, or
@@ -431,9 +443,9 @@ These are deliberate v1 scope cuts. The canonical decision log is
 [project_docs/PRD.md §8](project_docs/PRD.md); this list is the operator-facing
 summary so you don't go looking for features that aren't here.
 
-- **No multi-model concurrent serving.** One vLLM at a time. To switch, send
-  a request with the new alias — `_proxy` queues the swap and returns once
-  the new model is loaded.
+- **No multi-model concurrent serving.** One engine/model at a time. To
+  switch, send a request with the new alias — `_proxy` queues the swap and
+  returns once the new model is loaded.
 - **No chat playground in the UI.** The admin UI covers catalog, install,
   search, and dashboard surfaces. Use the OpenAI-compatible `/v1/*` endpoint
   from your IDE / `curl` / a separate client for actual conversations.
@@ -446,10 +458,10 @@ summary so you don't go looking for features that aren't here.
   exact HF repo (e.g. `Qwen/Qwen2.5-72B-Instruct-AWQ` vs the FP16 base) at
   install time. The HF Search view surfaces compatibility flags but does not
   auto-substitute quantized variants.
-- **No vLLM auto-restart on crash.** If the inner vLLM dies under a request,
-  the manager fails open with a `503` and the next `/v1/*` request triggers a
-  fresh load (PRD §5.3). No supervisor loop tries to keep the previous model
-  resident.
+- **No engine auto-restart on crash.** If the inner engine dies under a
+  request, the manager fails open with a `503` and the next `/v1/*` request
+  triggers a fresh load (PRD §5.3). No supervisor loop tries to keep the
+  previous model resident.
 - **No runtime hard-fail when `gpus='all'` finds no GPUs.** The manager logs
   a warning and falls back to `VLLM_DEFAULT_TP`. On a real CUDA host this
   only happens if the nvidia-container-toolkit is misconfigured — fix the

@@ -88,7 +88,7 @@ pip install -r requirements-dev.txt    # one-time on dev host
 python -m pytest -q                    # full suite (pytest.ini sets asyncio_mode=auto)
 python -m pytest -q tests/test_proxy.py::test_streaming_passthrough   # single test
 python -m py_compile vllm_manager.py config.py catalog.py profiles.py runtime.py \
-  downloader.py download_worker.py hf_search.py repo_probe.py logsetup.py
+  downloader.py download_worker.py hf_search.py repo_probe.py pg_writer.py logsetup.py
 bash -n vllm-ctl
 ```
 

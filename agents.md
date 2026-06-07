@@ -144,7 +144,7 @@ For docs-only changes, a readback or diff check is enough.
 
 For Python or CLI changes, prefer at least:
 
-- `python -m py_compile vllm_manager.py config.py catalog.py profiles.py runtime.py downloader.py download_worker.py hf_search.py repo_probe.py logsetup.py`
+- `python -m py_compile vllm_manager.py config.py catalog.py profiles.py runtime.py downloader.py download_worker.py hf_search.py repo_probe.py pg_writer.py logsetup.py`
 - `bash -n vllm-ctl`
 - `python -m pytest -q`
 
@@ -165,8 +165,8 @@ When behavior touches process launch, ports, engine argv construction, Docker mo
 - Do not let admin auth, inference bearer handling, cookies, or authorization headers leak to the inner engine.
 - If `ADMIN_PASSWORD` is unset, admin bind must continue to fail safe to container loopback.
 - Keep multimodal request payloads opaque through the proxy.
-- If vLLM is bumped, regenerate `vllm_supported_architectures.json`.
-- If llama.cpp is bumped, check `llama-server` CLI compatibility and CUDA architecture build args.
+- If vLLM is bumped, rebuild the image and regenerate `vllm_supported_architectures.json` from the new runtime registry.
+- If llama.cpp is bumped, rebuild the image, check `llama-server` CLI compatibility, and verify the CUDA-linked binary with GPU passthrough.
 
 ## Useful Reading Order
 
