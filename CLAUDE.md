@@ -99,7 +99,7 @@ npm test          # vitest run
 npm run build     # tsc + vite build → dist/ (Dockerfile copies this into /app/static)
 ```
 
-When behavior touches process launch, ports, engine argv, Docker mounts, or GPU code, add or run a targeted test in `tests/` and call out any Docker smoke check that still needs a CUDA host.
+When behavior touches process launch, ports, engine argv, Docker mounts, or GPU code, add or run a targeted test in `tests/` and call out any Docker smoke check that still needs a CUDA host. [project_docs/smoke_checks.md](project_docs/smoke_checks.md) is the maintained checklist of routes that only a live container + GPU can exercise.
 
 ## Conventions worth noticing
 

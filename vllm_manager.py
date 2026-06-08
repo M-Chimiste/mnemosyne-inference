@@ -2319,7 +2319,7 @@ def _append_usage_row(
 async def _open_upstream(
     request: Request, path: str, body: bytes
 ) -> tuple[httpx.AsyncClient, httpx.Response]:
-    """Open a streaming request against the inner vLLM. Returns the client
+    """Open a streaming request against the inner engine. Returns the client
     (kept open for the lifetime of the response) and the response object.
     Caller is responsible for closing the client when finished."""
     # Phase 3: strip auth headers so admin Basic creds and the inference
@@ -2430,7 +2430,7 @@ async def _wrap_stream(
 
 async def _proxy(request: Request, path: str, body: bytes):
     """
-    Forward a request to the inner vLLM server.
+    Forward a request to the inner OpenAI-compatible engine.
 
     Phase 2 semantics (plans/phase_2.md §5.4):
       - The request body's `model` field is resolved through the managed
@@ -2445,6 +2445,11 @@ async def _proxy(request: Request, path: str, body: bytes):
         proxied request — pre-stream upstream errors don't count.
       - Single deadline computed at arrival, gates lock-wait, event-wait,
         and _start_vllm itself.
+      - Aside from canonicalizing `model` and forcing streaming usage for
+        accounting, the JSON body is forwarded as-is. This preserves
+        provider-specific request knobs such as llama.cpp's
+        `chat_template_kwargs`, `reasoning_format`, `grammar`, and
+        schema-bearing `response_format`.
     """
     request_start_monotonic = time.monotonic()
     requested = _peek_model_field(body)
@@ -2568,6 +2573,59 @@ async def _proxy(request: Request, path: str, body: bytes):
                     await client.aclose()
 
 
+def _models_list_payload() -> dict:
+    """Synthesize an OpenAI-compatible `/v1/models` list from the catalog.
+
+    Unlike a blind proxy to the inner engine (which only knows the one resident
+    model, and 503s when nothing is loaded), this lists every fully-downloaded
+    model — `status == "installed"` — across both vLLM and llama.cpp backends.
+    Each entry is keyed by its catalog `alias`, the stable handle a client sends
+    back as the request `model` field to trigger an auto-swap load.
+
+    `served_model_name` follows the profiles.py rule: HF id for vLLM, alias for
+    llama.cpp (what the inner engine actually reports once loaded).
+    """
+    data: list[dict] = []
+    seen: set[str] = set()
+    if _catalog is not None:
+        for row in _catalog.list_models():
+            if row.status != "installed":
+                continue
+            served = row.alias if row.backend == "llama.cpp" else row.hf_model_id
+            data.append({
+                "id": row.alias,
+                "object": "model",
+                "created": row.installed_at or 0,
+                "owned_by": "mnemosyne",
+                "backend": row.backend,
+                "served_model_name": served,
+                "hf_model_id": row.hf_model_id,
+                "status": "installed",
+            })
+            seen.add(row.alias)
+
+    # Keep the resident model visible even if it has no installed catalog row
+    # (e.g. loaded via a raw HF-id / absolute-path fallback).
+    resident_alias = _runtime.resident_alias
+    if resident_alias is not None and resident_alias not in seen:
+        profile = _runtime.resident_profile
+        data.append({
+            "id": resident_alias,
+            "object": "model",
+            "created": 0,
+            "owned_by": "mnemosyne",
+            "backend": profile.backend if profile else "vllm",
+            "served_model_name": (
+                profile.served_model_name if profile else resident_alias
+            ),
+            "hf_model_id": profile.engine_model_path if profile else resident_alias,
+            "status": "installed",
+        })
+
+    data.sort(key=lambda m: m["id"])
+    return {"object": "list", "data": data}
+
+
 @inference_router.api_route(
     "/v1/{path:path}",
     methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
@@ -2581,7 +2639,13 @@ async def openai_proxy(path: str, request: Request):
     If the request includes a `model` field that differs from the currently
     loaded model, the manager will automatically swap to it before serving
     the request. No need to call /manager/load explicitly.
+
+    `GET /v1/models` is the exception: it is served locally from the catalog so
+    clients can discover every installed (loadable) model, not just the resident
+    one — and it never 503s when nothing is loaded.
     """
+    if path == "models" and request.method == "GET":
+        return JSONResponse(_models_list_payload())
     body = await request.body()
     return await _proxy(request, f"v1/{path}", body)
 

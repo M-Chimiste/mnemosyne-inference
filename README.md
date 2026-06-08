@@ -17,6 +17,13 @@ There is **one model resident at a time**. `/v1/*` requests trigger a lazy
 load if the requested model is not the resident one; concurrent callers for
 the same target piggyback on a single load.
 
+`GET /v1/models` lists **every fully-downloaded model** (both vLLM and
+llama.cpp backends), not just the resident one — it is served locally from the
+catalog rather than proxied to the engine, so it returns the full menu even
+when nothing is loaded. Each entry's `id` is the stable alias; send that alias
+back as the `model` field in a `/v1/*` request to trigger a load. Only models
+whose weights are present on disk (`status: installed`) are listed.
+
 Hardware target: a CUDA 12.8+ host with a Blackwell-class NVIDIA GPU (RTX 50
 or workstation Blackwell). The image bakes in PyTorch cu129, a pinned vLLM
 stable release, and a CUDA-built pinned llama.cpp `llama-server`.
@@ -103,8 +110,36 @@ Top-level blocks:
   `max_model_len`.
 - **`models`** — list of profiles. Each profile is a stable alias plus the HF
   model id and per-model knobs: `gpus` (`all`, `[0]`, `[0,1]`),
-  `quantization`, `max_model_len`, `storage`, and `extra_args` for raw vLLM
-  flags appended verbatim.
+  `quantization`, `max_model_len`, `storage`, `backend`, `gguf_filename`, and
+  `extra_args` for raw engine flags appended verbatim.
+
+For llama.cpp/GGUF profiles, `extra_args` is the place for startup defaults
+such as `--reasoning off`, `--reasoning-format none`, `--temp 0.2`, or
+`--chat-template-kwargs '{"enable_thinking":false}'`. Per-request controls are
+passed through the `/v1/*` proxy unchanged, so clients can send llama.cpp
+fields like `temperature`, `top_p`, `chat_template_kwargs`,
+`reasoning_format`, `grammar`, `json_schema`, and `response_format` directly
+in the request body.
+
+Example llama.cpp chat request with thinking disabled and schema output:
+
+```json
+{
+  "model": "local-gguf",
+  "messages": [{"role": "user", "content": "Return a user profile"}],
+  "temperature": 0.1,
+  "chat_template_kwargs": {"enable_thinking": false},
+  "reasoning_format": "none",
+  "response_format": {
+    "type": "json_schema",
+    "schema": {
+      "type": "object",
+      "properties": {"name": {"type": "string"}},
+      "required": ["name"]
+    }
+  }
+}
+```
 
 `config.yaml` is hot-reloadable. Three equivalent triggers:
 
@@ -405,6 +440,7 @@ Direct API equivalents (Basic auth required for admin):
 ```bash
 ADMIN_PASSWORD="$(grep -E '^ADMIN_PASSWORD=' ~/vllm-manager/.env | head -1 | cut -d= -f2-)"
 curl http://localhost:8000/health
+curl http://localhost:8000/v1/models          # all installed (loadable) models
 curl -u admin:"$ADMIN_PASSWORD" http://localhost:8001/manager/status
 curl -u admin:"$ADMIN_PASSWORD" -X POST \
   http://localhost:8001/manager/load \

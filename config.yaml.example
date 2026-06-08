@@ -63,3 +63,20 @@ models:
     extra_args:
       - --limit-mm-per-prompt
       - image=4
+
+  # GGUF via llama.cpp. `extra_args` are llama-server startup defaults;
+  # per-request sampler/reasoning/structured-output options pass through
+  # the /v1/* proxy in the JSON body.
+  - alias: local-gguf
+    model: org/repo-gguf
+    backend: llama.cpp
+    gguf_filename: model.Q4_K_M.gguf
+    gpus: [0]
+    max_model_len: 32768
+    extra_args:
+      - --reasoning
+      - off
+      - --reasoning-format
+      - none
+      - --temp
+      - "0.2"

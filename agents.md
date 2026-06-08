@@ -12,7 +12,7 @@ This repository contains **Mnemosyne Inference**, a containerized single-worksta
 - `vllm-ctl` is the Bash CLI for Docker lifecycle, admin API calls, model loading, installs, cache deletion, status, logs, and one-shot chat.
 - `Dockerfile` defines the CUDA/Python runtime, builds the UI, builds a pinned `llama-server`, installs PyTorch cu129, and installs pinned vLLM plus manager dependencies. Runtime dependencies live here, not in a runtime `requirements.txt` or `pyproject.toml`.
 - `requirements-dev.txt`, `pytest.ini`, `tests/`, and `ui/package.json` define the host-side Python and UI test/build workflows.
-- `project_docs/PRD.md` and `project_docs/implementation_plan.md` are still useful product and sequencing context, but the code has progressed beyond several older phase notes.
+- `project_docs/project_status.md` records the current milestone/feature state, and `project_docs/smoke_checks.md` is the manual GPU-host release checklist for routes pytest can't exercise.
 - `CLAUDE.md` contains Claude-specific repository guidance. Keep it in sync with this file when architecture or common commands change.
 
 The live `docker-compose.yml` is intentionally machine-specific and may live outside this repo. The CLI expects it under `$VLLM_COMPOSE_DIR`, defaulting to `~/vllm-manager`. Use `docker-compose.example.yml` as the maintained template. If a change affects ports, env vars, volumes, container names, build args, or mounts, call out the required external compose changes.
@@ -171,12 +171,11 @@ When behavior touches process launch, ports, engine argv construction, Docker mo
 ## Useful Reading Order
 
 1. `README.md`
-2. `project_docs/PRD.md`
-3. `project_docs/implementation_plan.md`
-4. `vllm_manager.py`
-5. `config.py`, `catalog.py`, `profiles.py`, `runtime.py`
-6. `downloader.py`, `download_worker.py`
-7. `hf_search.py`, `repo_probe.py`
-8. `vllm-ctl`
-9. `Dockerfile` and `docker-compose.example.yml`
-10. `ui/src/`
+2. `project_docs/project_status.md`
+3. `vllm_manager.py`
+4. `config.py`, `catalog.py`, `profiles.py`, `runtime.py`
+5. `downloader.py`, `download_worker.py`
+6. `hf_search.py`, `repo_probe.py`
+7. `vllm-ctl`
+8. `Dockerfile` and `docker-compose.example.yml`
+9. `ui/src/`

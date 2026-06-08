@@ -163,7 +163,7 @@ export function InstallForm({
       </div>
       <label className="block text-sm font-medium">
         Extra Args
-        <textarea className="focus-ring mt-1 h-20 w-full border border-line bg-white px-2 py-1.5 font-mono text-xs" value={extraArgs} onChange={(e) => setExtraArgs(e.target.value)} placeholder={backend === "llama.cpp" ? "--ctx-size&#10;131072" : "--max-num-seqs&#10;8"} />
+        <textarea className="focus-ring mt-1 h-20 w-full border border-line bg-white px-2 py-1.5 font-mono text-xs" value={extraArgs} onChange={(e) => setExtraArgs(e.target.value)} placeholder={backend === "llama.cpp" ? "--reasoning&#10;off&#10;--reasoning-format&#10;none&#10;--temp&#10;0.2" : "--max-num-seqs&#10;8"} />
       </label>
       <div className="border border-line bg-white p-3 text-sm text-stone-700">
         Size estimate: <strong>{formatGb(sizeEstimateGb)}</strong>
