@@ -80,17 +80,48 @@ def derive_tp_size(
     return default_tp
 
 
+# Architecture families whose vLLM CUDA-graph capture is pathologically slow.
+# These are state-space / hybrid-SSM models (Mamba and friends): a cold load
+# spends minutes in "profile, create kv cache, warmup model" capturing graphs
+# (measured: LiquidAI/LFM2.5-8B-A1B took 431s, → 5s with --enforce-eager).
+# For an interactive, one-model-at-a-time swapping server that startup latency
+# dominates the user experience, so we default these to eager mode. Matched
+# case-insensitively as substrings against config.json `architectures` class
+# names and `model_type` (underscores stripped). Dense transformers (Granite,
+# Gemma, Laguna, Qwen, …) never match and keep their CUDA graphs.
+_SLOW_CAPTURE_ARCH_SUBSTRINGS = (
+    "lfm2", "mamba", "jamba", "zamba", "bamba",
+    "falconh1", "nemotronh", "plamo2", "hybrid",
+)
+
+
+def vllm_wants_eager_default(
+    architectures: Optional[list[str]],
+    model_type: Optional[str] = None,
+) -> bool:
+    """True when the model's architecture is a known slow-graph-capture
+    (SSM/hybrid) family that should default to `--enforce-eager`. Pure: the
+    caller reads `architectures`/`model_type` from the cached config.json."""
+    tokens = [a.lower() for a in (architectures or []) if isinstance(a, str)]
+    if model_type:
+        tokens.append(str(model_type).lower().replace("_", ""))
+    return any(sub in tok for tok in tokens for sub in _SLOW_CAPTURE_ARCH_SUBSTRINGS)
+
+
 def build_vllm_argv(
     profile: ResolvedProfile,
     *,
     host: str,
     port: int,
     tp_size: int,
+    enforce_eager: bool = False,
 ) -> list[str]:
     """Translate a ResolvedProfile into the vLLM CLI invocation.
 
-    extra_args is appended last so users can re-state our flags to override
-    them — preserves Phase 0 behavior."""
+    `enforce_eager` (set by the caller for slow-graph-capture architectures —
+    see `vllm_wants_eager_default`) appends `--enforce-eager` unless the profile
+    already states it. extra_args is appended last so users can re-state our
+    flags to override them — preserves Phase 0 behavior."""
     import sys
     argv: list[str] = [
         sys.executable, "-m", "vllm.entrypoints.openai.api_server",
@@ -109,6 +140,8 @@ def build_vllm_argv(
         argv += ["--max-model-len", str(profile.max_model_len)]
     if profile.revision and profile.revision != "main":
         argv += ["--revision", profile.revision]
+    if enforce_eager and "--enforce-eager" not in profile.extra_args:
+        argv.append("--enforce-eager")
     argv += list(profile.extra_args)
     return argv
 

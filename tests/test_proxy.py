@@ -926,6 +926,38 @@ def test_v1_models_lists_installed_both_backends(rich_client):
     assert by_id["gguf-installed"]["hf_model_id"] == "org/gguf-repo"
 
 
+def test_v1_models_listed_alias_swaps_resident_model(rich_client, monkeypatch):
+    """End-to-end: an alias returned by GET /v1/models, sent back as the
+    `model` field, loads that model and swaps out any previously resident one."""
+    client, stub = rich_client
+    for alias, hf in (("alpha", "org/alpha"), ("beta", "org/beta")):
+        vllm_manager._catalog._raw_insert_model(
+            alias=alias,
+            hf_model_id=hf,
+            source="ui_install",
+            storage_location="tmp",
+            status="installed",
+        )
+    _patch_upstream(monkeypatch, _FakeResponse())
+
+    # Both aliases are advertised as loadable.
+    listed = {m["id"] for m in client.get("/v1/models").json()["data"]}
+    assert {"alpha", "beta"} <= listed
+
+    # Load alpha by alias.
+    r = client.post("/v1/chat/completions", json={"model": "alpha", "messages": []})
+    assert r.status_code == 200
+    assert vllm_manager._runtime.resident_alias == "alpha"
+    kills_after_alpha = stub.kill_calls
+
+    # Now request beta by alias → swap. _start_vllm kills the resident first.
+    r = client.post("/v1/chat/completions", json={"model": "beta", "messages": []})
+    assert r.status_code == 200
+    assert vllm_manager._runtime.resident_alias == "beta"
+    assert [p.alias for p in stub.calls] == ["alpha", "beta"]
+    assert stub.kill_calls > kills_after_alpha  # the swap evicted alpha
+
+
 def test_v1_models_excludes_unready(rich_client):
     client, _stub = rich_client
     vllm_manager._catalog._raw_insert_model(

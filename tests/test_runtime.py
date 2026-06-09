@@ -22,6 +22,7 @@ from runtime import (
     build_vllm_argv,
     build_vllm_env,
     derive_tp_size,
+    vllm_wants_eager_default,
 )
 
 
@@ -61,6 +62,73 @@ def _profile(
         backend=backend,
         gguf_filename=gguf_filename,
     )
+
+
+# ── slow-graph-capture eager default ──────────────────────────────────
+
+
+@pytest.mark.parametrize("arch", [
+    "Lfm2MoeForCausalLM",      # LiquidAI LFM2.5 (measured 431s → 5s)
+    "JambaForCausalLM",
+    "Zamba2ForCausalLM",
+    "BambaForCausalLM",
+    "FalconH1ForCausalLM",
+    "NemotronHForCausalLM",
+    "GraniteMoeHybridForCausalLM",
+    "MambaForCausalLM",
+])
+def test_eager_default_matches_ssm_hybrid_archs(arch):
+    assert vllm_wants_eager_default([arch]) is True
+
+
+@pytest.mark.parametrize("arch", [
+    "GraniteForCausalLM",      # dense Granite 4.1 — keeps CUDA graphs
+    "Gemma4ForCausalLM",
+    "LagunaForCausalLM",
+    "Qwen3ForCausalLM",
+    "LlamaForCausalLM",
+])
+def test_eager_default_skips_dense_transformers(arch):
+    assert vllm_wants_eager_default([arch]) is False
+
+
+def test_eager_default_matches_via_model_type():
+    # model_type underscores are stripped: lfm2_moe → "lfm2moe" contains "lfm2".
+    assert vllm_wants_eager_default([], model_type="lfm2_moe") is True
+    assert vllm_wants_eager_default([], model_type="granite") is False
+
+
+def test_eager_default_empty_is_false():
+    assert vllm_wants_eager_default(None) is False
+    assert vllm_wants_eager_default([]) is False
+
+
+def test_argv_enforce_eager_appended_when_requested():
+    argv = build_vllm_argv(_profile(), host="h", port=1, tp_size=1, enforce_eager=True)
+    assert "--enforce-eager" in argv
+
+
+def test_argv_no_enforce_eager_by_default():
+    argv = build_vllm_argv(_profile(), host="h", port=1, tp_size=1)
+    assert "--enforce-eager" not in argv
+
+
+def test_argv_enforce_eager_not_duplicated_when_in_extra_args():
+    argv = build_vllm_argv(
+        _profile(extra_args=("--enforce-eager",)),
+        host="h", port=1, tp_size=1, enforce_eager=True,
+    )
+    assert argv.count("--enforce-eager") == 1
+
+
+def test_argv_auto_eager_precedes_extra_args():
+    # Our injected flag comes before extra_args so user flags stay last (the
+    # documented override position).
+    argv = build_vllm_argv(
+        _profile(extra_args=("--seed", "7")),
+        host="h", port=1, tp_size=1, enforce_eager=True,
+    )
+    assert argv.index("--enforce-eager") < argv.index("--seed")
 
 
 # ── build_vllm_argv ───────────────────────────────────────────────────

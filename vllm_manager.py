@@ -59,6 +59,7 @@ from runtime import (
     build_vllm_argv,
     build_vllm_env,
     derive_tp_size,
+    vllm_wants_eager_default,
 )
 
 # ──────────────────────────────────────────────
@@ -218,6 +219,32 @@ def _kill_engine():
 _kill_vllm = _kill_engine
 
 
+def _vllm_model_architectures(
+    profile: ResolvedProfile,
+) -> tuple[list[str], Optional[str]]:
+    """Best-effort read of `architectures` + `model_type` from the model's
+    cached config.json. Returns ([], None) when it can't be read — callers
+    treat that as "apply no eager default". vLLM profiles only: for HF-id
+    targets we reconstruct the HF cache snapshot path; for absolute local
+    paths we read config.json directly."""
+    path = profile.engine_model_path
+    try:
+        if os.path.isdir(path):
+            cfg_path = os.path.join(path, "config.json")
+        else:
+            safe = "models--" + path.replace("/", "--")
+            sha = profile.revision or "main"
+            cfg_path = os.path.join(
+                profile.storage_path, "hub", safe, "snapshots", sha, "config.json"
+            )
+        with open(cfg_path) as f:
+            data = json.load(f)
+        arch = data.get("architectures")
+        return (arch if isinstance(arch, list) else []), data.get("model_type")
+    except Exception:
+        return [], None
+
+
 async def _start_vllm(profile: ResolvedProfile) -> None:
     """Launch vLLM for `profile`. Cleans up half-launched subprocesses on any
     failure, including asyncio.CancelledError from a deadline-induced wait_for
@@ -234,7 +261,19 @@ async def _start_vllm(profile: ResolvedProfile) -> None:
             DEFAULT_TP,
         )
 
-    argv = build_vllm_argv(profile, host=VLLM_INNER_HOST, port=VLLM_INNER_PORT, tp_size=tp_size)
+    arch, model_type = _vllm_model_architectures(profile)
+    enforce_eager = vllm_wants_eager_default(arch, model_type)
+    if enforce_eager and "--enforce-eager" not in profile.extra_args:
+        logger.info(
+            "Defaulting alias=%s to --enforce-eager: arch=%s is a slow-graph-capture "
+            "(SSM/hybrid) family; CUDA-graph capture would add minutes to cold load. "
+            "Add '--enforce-eager' (or override) in extra_args to silence.",
+            profile.alias, arch or model_type,
+        )
+    argv = build_vllm_argv(
+        profile, host=VLLM_INNER_HOST, port=VLLM_INNER_PORT,
+        tp_size=tp_size, enforce_eager=enforce_eager,
+    )
     env = build_vllm_env(profile, base_env=os.environ)
     logger.info("Launching vLLM (alias=%s tp=%d): %s", profile.alias, tp_size, " ".join(argv))
     vllm_process = subprocess.Popen(argv, env=env, stdout=sys.stdout, stderr=sys.stderr)
