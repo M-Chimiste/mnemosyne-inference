@@ -47,8 +47,13 @@ class ResolvedProfile:
     storage_path: str
     extra_args: tuple[str, ...]
     revision: str = "main"
-    backend: str = "vllm"   # "vllm" | "llama.cpp"
+    backend: str = "vllm"   # "vllm" | "llama.cpp" | "sglang-diffusion"
     gguf_filename: Optional[str] = None
+    kind: str = "language"
+    capabilities: tuple[str, ...] = (
+        "chat.completions", "completions", "embeddings", "responses",
+    )
+    image_defaults: Optional[dict] = None
 
     @property
     def model(self) -> str:
@@ -146,6 +151,13 @@ def resolve_profile(
             revision=config_profile.revision,
             backend=backend,
             gguf_filename=config_profile.gguf_filename,
+            kind=config_profile.kind,
+            capabilities=config_profile.capabilities,
+            image_defaults=(
+                config_profile.image.model_dump()
+                if config_profile.image is not None
+                else None
+            ),
         )
 
     if catalog is not None:
@@ -203,6 +215,11 @@ def resolve_profile(
                 revision=revision,
                 backend=backend,
                 gguf_filename=row.gguf_filename,
+                kind=row.model_kind,
+                capabilities=tuple(json.loads(row.capabilities)),
+                image_defaults=(
+                    json.loads(row.image_config) if row.image_config else None
+                ),
             )
 
     raise KeyError(alias)

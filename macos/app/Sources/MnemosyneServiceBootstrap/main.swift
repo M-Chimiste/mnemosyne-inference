@@ -9,7 +9,7 @@ private enum BootstrapError: Error, CustomStringConvertible {
     var description: String {
         switch self {
         case let .outerBundleNotFound(executable):
-            "could not locate the outer Mnemosyne.app from \(executable.path)"
+            "could not locate the outer Unified Inference.app from \(executable.path)"
         case let .pythonNotFound(resources):
             "bundled Python was not found below \(resources.path); rebuild without --bare"
         case let .sourceNotFound(resources):
@@ -85,7 +85,7 @@ private func bundledPython(in resources: URL) throws -> PythonRuntime {
     throw BootstrapError.pythonNotFound(resources)
 }
 
-private func sitePackages(in resources: URL) -> [String] {
+private func sitePackages(in resources: URL, layerName: String) -> [String] {
     let fileManager = FileManager.default
     let pythonRoot = resources.appending(path: "Python", directoryHint: .isDirectory)
     var paths: [String] = []
@@ -99,7 +99,7 @@ private func sitePackages(in resources: URL) -> [String] {
         includingPropertiesForKeys: nil,
         options: [.skipsHiddenFiles]
     )) ?? []
-    for layer in layers {
+    for layer in layers where layer.lastPathComponent == layerName {
         let lib = layer.appending(path: "lib", directoryHint: .isDirectory)
         let versions = (try? fileManager.contentsOfDirectory(
             at: lib,
@@ -175,11 +175,28 @@ private func execPython() throws -> Never {
         ?? "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
     var pythonPath = [serviceSource.path]
-    pythonPath.append(contentsOf: sitePackages(in: resources))
+    pythonPath.append(contentsOf: sitePackages(
+        in: resources,
+        layerName: "framework-mnemosyne-base"
+    ))
     if let existing = environment["PYTHONPATH"], !existing.isEmpty {
         pythonPath.append(existing)
     }
     environment["PYTHONPATH"] = pythonPath.joined(separator: ":")
+
+    let imageSource = resources.appending(path: "ImageWorker", directoryHint: .isDirectory)
+    let imagePython = resources
+        .appending(path: "Python", directoryHint: .isDirectory)
+        .appending(path: "framework-mnemosyne-image", directoryHint: .isDirectory)
+        .appending(path: "bin/python3")
+    if fileManager.fileExists(atPath: imageSource.appending(path: "mnemosyne_mflux_worker").path) {
+        environment["MNEMOSYNE_MFLUX_PYTHONPATH"] =
+            environment["MNEMOSYNE_MFLUX_PYTHONPATH"] ?? imageSource.path
+    }
+    if fileManager.isExecutableFile(atPath: imagePython.path) {
+        environment["MNEMOSYNE_MFLUX_PYTHON"] =
+            environment["MNEMOSYNE_MFLUX_PYTHON"] ?? imagePython.path
+    }
 
     var arguments = [
         python.executable.path,

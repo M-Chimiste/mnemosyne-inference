@@ -251,6 +251,33 @@ Failure modes worth distinguishing:
 
 This is the manual end-to-end check for vision-model request handling.
 
+---
+
+## 10. Text-to-image generation (SGLang Diffusion)
+
+Rebuild the CUDA image so the separately pinned `/opt/sglang` environment is
+present, then install or configure one of the example image aliases.
+
+```bash
+vllm-ctl install krea-2-turbo krea/Krea-2-Turbo \
+  --backend sglang-diffusion --gpus 0 \
+  --image-steps 8 --image-guidance 1
+vllm-ctl install-status krea-2-turbo
+
+curl -sX POST "$INF/v1/images/generations" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"krea-2-turbo","prompt":"A red canoe beside an alpine lake","size":"1024x1024","n":1,"response_format":"b64_json","seed":42}' \
+  | tee /tmp/mnemosyne-image-response.json \
+  | jq -r '.data[0].b64_json' | base64 --decode > /tmp/mnemosyne-krea.png
+file /tmp/mnemosyne-krea.png
+```
+
+Expect a valid PNG and `manager/status.backend == "sglang-diffusion"` with
+`model_kind == "image"`. Then request a language alias and verify the SGLang
+process exits before vLLM/llama.cpp becomes ready. Confirm the image request
+did not add a token-usage analytics row. Repeat with `qwen-image`; its public
+`guidance_scale` must reach SGLang as `true_cfg_scale`.
+
 ## Recording deltas
 
 If any step above behaves differently from the description on the current

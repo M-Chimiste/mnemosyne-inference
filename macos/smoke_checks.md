@@ -10,11 +10,12 @@ LaunchAgent behavior, or model quality.
 uv run --project macos/service mnemosyne-macos --check-config \
   --config "$HOME/Library/Application Support/Mnemosyne/config.yaml" \
   --env "$HOME/Library/Application Support/Mnemosyne/.env"
-lsof -nP -iTCP:17320 -iTCP:17321 -iTCP:17322 -iTCP:17323 -sTCP:LISTEN
+lsof -nP -iTCP:17320 -iTCP:17321 -iTCP:17322 -iTCP:17323 -iTCP:17324 -sTCP:LISTEN
 ```
 
 Confirm Mnemosyne owns `17320`/`17321`, oMLX owns `17322`, DS4 is absent while
 unloaded, and every listener is loopback-only. LM Studio should own `1234`.
+MFLUX should be absent from `17324` while no image model is resident.
 
 ## 2. Clean startup and LM Studio
 
@@ -72,18 +73,36 @@ curl -X POST http://127.0.0.1:17321/manager/reconcile | jq
 Mnemosyne must detect the drift, unload it, and never load another target while
 any enabled adapter has uncertain state.
 
-## 6. Usage outbox
+## 6. MFLUX image lifecycle
+
+Request each configured MFLUX alias through `POST :17320/v1/images/generations`.
+Confirm the worker appears only on loopback `:17324`, produces a valid base64
+PNG, and exactly one model process is resident. While a long image is running,
+cancel the client and verify the worker exits and Metal memory returns. Repeat
+for timeout, explicit unload, and a switch to LM Studio/oMLX/DS4. An unrelated
+listener on `17324` must cause fail-closed degraded state and must never be
+signaled. Confirm image calls do not appear in `/manager/usage`.
+
+## 7. Usage outbox
 
 With the Postgres DSN intentionally unreachable, complete streaming and
 non-streaming requests through each engine. Confirm local rows and a growing
 outbox through `GET /manager/usage`. Restore Postgres, wait one flush interval,
 and verify the outbox drains once with no duplicate `event_id` rows centrally.
 
-## 7. LaunchAgent and menu app
+## 8. LaunchAgent and menu app
 
 Stage and sign the app, move it to `/Applications`, enable **Background
 service**, and approve it in Login Items if requested. Confirm:
 
+- launching the installed app creates exactly one visible brain-profile status
+  item and logs `Unified Inference menu bar status item installed`;
+- **Configuration…** opens a separate resizable editor window with `config.yaml`
+  and `.env` tabs; closing or reloading with an unsaved edit asks before
+  discarding it, and validating an intentionally malformed YAML draft does not
+  overwrite the file on disk;
+- clicking the item opens the controller popover while the app remains absent
+  from the Dock;
 - the service survives **Quit Menu App**;
 - the menu app can list/load/unload configured aliases after reopening;
 - disabling the background service unregisters the LaunchAgent;

@@ -4,8 +4,10 @@ import ServiceManagement
 import SwiftUI
 
 struct MenuContentView: View {
+    let workstationName: String
     @ObservedObject var viewModel: MenuViewModel
     @ObservedObject var registration: LaunchAgentRegistration
+    let openConfiguration: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -64,7 +66,7 @@ struct MenuContentView: View {
             Image(systemName: connectionSymbol)
                 .foregroundStyle(connectionColor)
             VStack(alignment: .leading, spacing: 2) {
-                Text("Mnemosyne")
+                Text(workstationName)
                     .font(.headline)
                 Text(connectionLabel)
                     .font(.caption)
@@ -186,8 +188,8 @@ struct MenuContentView: View {
                 Button("Open Logs") {
                     openApplicationSupport(subdirectory: "logs")
                 }
-                Button("Open Configuration") {
-                    openApplicationSupport(subdirectory: nil)
+                Button("Configuration…") {
+                    openConfiguration()
                 }
                 Spacer()
                 Button("Quit Menu App") {

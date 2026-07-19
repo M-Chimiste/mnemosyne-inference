@@ -1,6 +1,6 @@
-# Template for the relocatable Python runtime embedded in Mnemosyne.app.
+# Template for the relocatable Python runtime embedded in Unified Inference.app.
 # `build_runtime.py` fills the framework requirements with exact production
-# pins exported from macos/service/uv.lock.
+# pins exported independently from the service and image-worker locks.
 # __MNEMOSYNE_LOCK_PROVENANCE__
 
 [[runtimes]]
@@ -14,6 +14,26 @@ name = "mnemosyne-base"
 runtime = "cpython-3.12"
 requirements = [] # __MNEMOSYNE_REQUIREMENTS__
 platforms = ["macosx_arm64"]
+
+[[frameworks]]
+name = "mnemosyne-image"
+runtime = "cpython-3.12"
+requirements = [] # __MNEMOSYNE_IMAGE_REQUIREMENTS__
+platforms = ["macosx_arm64"]
+# Pillow and OpenCV both carry private copies of these libraries and load them
+# through their own @loader_path/.dylibs directories. Prefer Pillow's copies
+# for venvstacks' shared fallback links while leaving OpenCV's private files in
+# place for cv2 itself.
+dynlib_exclude = [
+  "cv2/.dylibs/liblcms2.2.dylib",
+  "cv2/.dylibs/libpng16.16.dylib",
+  "cv2/.dylibs/libxcb.1.1.0.dylib",
+  "cv2/.dylibs/libfreetype.6.dylib",
+  "cv2/.dylibs/libharfbuzz.0.dylib",
+  "cv2/.dylibs/libXau.6.dylib",
+  "cv2/.dylibs/liblzma.5.dylib",
+  "cv2/.dylibs/libtiff.6.dylib",
+]
 
 [tool.uv]
 environments = ["sys_platform == 'darwin' and platform_machine == 'arm64'"]

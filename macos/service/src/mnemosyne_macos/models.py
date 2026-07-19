@@ -11,6 +11,7 @@ class EngineName(StrEnum):
     LMSTUDIO = "lmstudio"
     OMLX = "omlx"
     DS4 = "ds4"
+    MFLUX = "mflux"
 
 
 class Endpoint(StrEnum):
@@ -20,6 +21,12 @@ class Endpoint(StrEnum):
     MESSAGES = "messages"
     EMBEDDINGS = "embeddings"
     RERANK = "rerank"
+    IMAGES_GENERATIONS = "images/generations"
+
+
+class ModelKind(StrEnum):
+    LANGUAGE = "language"
+    IMAGE = "image"
 
 
 DEFAULT_CAPABILITIES: dict[EngineName, frozenset[Endpoint]] = {
@@ -50,6 +57,7 @@ DEFAULT_CAPABILITIES: dict[EngineName, frozenset[Endpoint]] = {
             Endpoint.MESSAGES,
         }
     ),
+    EngineName.MFLUX: frozenset({Endpoint.IMAGES_GENERATIONS}),
 }
 
 
@@ -77,6 +85,8 @@ class ResolvedTarget:
     wire_model: str
     capabilities: frozenset[Endpoint]
     load_options: Mapping[str, Any] = field(default_factory=dict)
+    kind: ModelKind = ModelKind.LANGUAGE
+    image_defaults: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -118,4 +128,3 @@ class ProxyRoute:
     headers: Mapping[str, str] = field(default_factory=dict)
     usage_dialect: str = "openai"
     supports_stream_usage: bool = True
-

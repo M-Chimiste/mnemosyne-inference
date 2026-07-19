@@ -98,6 +98,32 @@ def _adapters() -> dict[EngineName, FakeAdapter]:
     return {engine: FakeAdapter(engine) for engine in EngineName}
 
 
+def _image_config(tmp_path, *, timeout: float = 1800) -> MacConfig:
+    return MacConfig.model_validate(
+        {
+            "server": {
+                "idle_unload_seconds": None,
+                "image_request_timeout_seconds": timeout,
+            },
+            "engines": {"mflux": {"enabled": True}},
+            "paths": {"state_database": str(tmp_path / "state.db")},
+            "models": [
+                {
+                    "alias": "qwen-image",
+                    "engine": "mflux",
+                    "model": "Qwen/Qwen-Image",
+                    "kind": "image",
+                    "image": {
+                        "family": "qwen-image",
+                        "num_inference_steps": 12,
+                        "guidance_scale": 2.5,
+                    },
+                }
+            ],
+        }
+    )
+
+
 @pytest.mark.asyncio
 async def test_non_streaming_proxy_rewrites_model_strips_credentials_and_records_usage(
     tmp_path,
@@ -168,6 +194,92 @@ async def test_non_streaming_proxy_rewrites_model_strips_credentials_and_records
         await client.aclose()
         await runtime.stop()
         await upstream_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_image_proxy_normalizes_request_and_does_not_record_usage(tmp_path) -> None:
+    seen: dict = {}
+
+    def upstream_handler(request: httpx.Request) -> httpx.Response:
+        seen.update(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "created": 1,
+                "data": [{"b64_json": "cG5n"}],
+                "usage": {"prompt_tokens": 999, "total_tokens": 999},
+            },
+        )
+
+    upstream_client = httpx.AsyncClient(transport=httpx.MockTransport(upstream_handler))
+    runtime = NativeRuntime(
+        _image_config(tmp_path),
+        adapters=_adapters(),
+        proxy_client=upstream_client,
+    )
+    await runtime.start(raise_on_degraded=True)
+    client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=create_inference_app(runtime)),
+        base_url="http://mnemosyne.test",
+    )
+    try:
+        response = await client.post(
+            "/v1/images/generations",
+            json={"model": "qwen-image", "prompt": "a local image", "seed": 5},
+        )
+        assert response.status_code == 200
+        assert seen["model"] == "qwen-image"
+        assert seen["width"] == 1024
+        assert seen["height"] == 1024
+        assert seen["num_inference_steps"] == 12
+        assert seen["guidance_scale"] == 2.5
+        assert await runtime.usage.list_usage() == []
+    finally:
+        await client.aclose()
+        await runtime.stop()
+        await upstream_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_image_timeout_unloads_worker_and_releases_lease(tmp_path) -> None:
+    class SlowProxyClient:
+        def build_request(self, **kwargs) -> httpx.Request:
+            return httpx.Request(
+                kwargs["method"],
+                kwargs["url"],
+                headers=kwargs.get("headers"),
+                content=kwargs.get("content"),
+            )
+
+        async def send(self, _request: httpx.Request, *, stream: bool):
+            assert stream is True
+            await asyncio.sleep(60)
+            raise AssertionError("unreachable")
+
+    adapters = _adapters()
+    runtime = NativeRuntime(
+        _image_config(tmp_path, timeout=0.01),
+        adapters=adapters,
+        proxy_client=SlowProxyClient(),  # type: ignore[arg-type]
+    )
+    await runtime.start(raise_on_degraded=True)
+    client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=create_inference_app(runtime)),
+        base_url="http://mnemosyne.test",
+    )
+    try:
+        response = await client.post(
+            "/v1/images/generations",
+            json={"model": "qwen-image", "prompt": "timeout"},
+        )
+        assert response.status_code == 504
+        status = await runtime.coordinator.status()
+        assert status.inflight == 0
+        assert status.resident_alias is None
+        assert adapters[EngineName.MFLUX].residents == []
+    finally:
+        await client.aclose()
+        await runtime.stop()
 
 
 @pytest.mark.asyncio
@@ -386,6 +498,41 @@ async def test_control_plane_lists_loads_and_unloads_models(tmp_path) -> None:
         unloaded = await client.post("/manager/unload")
         assert unloaded.status_code == 200
         assert unloaded.json()["resident_alias"] is None
+    finally:
+        await client.aclose()
+        await runtime.stop()
+        await upstream_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_control_plane_validates_unsaved_configuration(tmp_path) -> None:
+    upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _r: httpx.Response(500))
+    )
+    runtime = NativeRuntime(
+        _config(tmp_path),
+        adapters=_adapters(),
+        proxy_client=upstream_client,
+    )
+    await runtime.start(raise_on_degraded=True)
+    client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=create_control_app(runtime)),
+        base_url="http://mnemosyne-control.test",
+    )
+    try:
+        valid = await client.post(
+            "/manager/config/validate",
+            json={"config_yaml": "models: []\n"},
+        )
+        assert valid.status_code == 200
+        assert valid.json() == {"valid": True, "model_count": 0}
+
+        invalid = await client.post(
+            "/manager/config/validate",
+            json={"config_yaml": "models: [\n"},
+        )
+        assert invalid.status_code == 400
+        assert "configuration editor" in invalid.json()["detail"]
     finally:
         await client.aclose()
         await runtime.stop()

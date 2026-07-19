@@ -5,7 +5,8 @@ Status: implemented native architecture; target-Mac acceptance remains pending.
 ## Purpose
 
 The macOS deployment provides one OpenAI/Anthropic-compatible endpoint for an
-existing LM Studio installation, oMLX, and DwarfStar (DS4). It preserves the
+existing LM Studio installation, oMLX, DwarfStar (DS4), and a managed MFLUX
+image worker. It preserves the
 single-resident-model behavior of the CUDA deployment while running natively so
 Apple Metal and unified memory remain available to the inference engines.
 
@@ -18,7 +19,7 @@ configuration, ports, dependencies, and CLI behavior.
 The production Mac runtime is native. Ordinary Docker Desktop containers run
 inside a Linux VM and cannot host arbitrary MLX/Metal processes. Docker Model
 Runner's Metal support is a host-side sandboxed runtime and does not provide a
-general container environment for oMLX or DS4.
+general container environment for oMLX, DS4, or MFLUX.
 
 Default ports are deliberately outside common development defaults:
 
@@ -29,7 +30,8 @@ Default ports are deliberately outside common development defaults:
 | 1234 | LM Studio | Existing native server | `127.0.0.1` |
 | 17322 | oMLX | Native MLX engine | `127.0.0.1` |
 | 17323 | DS4 | Managed native subprocess | `127.0.0.1` |
-| 17324-17329 | Reserved | Future local engines/diagnostics | unbound |
+| 17324 | MFLUX | Managed native image worker | `127.0.0.1` |
+| 17325-17329 | Reserved | Future local engines/diagnostics | unbound |
 
 All ports remain configurable. Startup validates that inference and control
 ports differ, all managed inner ports differ, and no configured inner port is
@@ -39,10 +41,10 @@ an unknown process to reclaim a port.
 The eventual application bundle has two cooperating components:
 
 1. **Mnemosyne Core** is a per-user background service. It owns the catalog,
-   global swap coordinator, proxy, usage outbox, and DS4 subprocess.
-2. **Mnemosyne.app** is a SwiftUI menu bar controller. It reads status and sends
-   commands through the control API. The UI may exit without interrupting an
-   inference request.
+   global swap coordinator, proxy, usage outbox, and DS4/MFLUX subprocesses.
+2. **Unified Inference.app** owns an explicit AppKit `NSStatusItem` and renders its
+   controller as a SwiftUI popover. It reads status and sends commands through
+   the control API. The UI may exit without interrupting an inference request.
 
 The background service is a user LaunchAgent rather than a system daemon because
 LM Studio belongs to the logged-in user's session. Distribution should bundle a
@@ -61,6 +63,9 @@ There is exactly one lifecycle owner: Mnemosyne Core.
 - DS4 is a model-specific process owned by Mnemosyne. Loading means spawning
   `ds4-server` with an explicit model and loopback port; unloading means graceful
   termination followed by a bounded forced kill if necessary.
+- MFLUX is a dependency-isolated worker process owned by Mnemosyne. It exists
+  only while an image profile is resident and is terminated on unload,
+  timeout, or cancellation so Metal memory release follows process exit.
 - Clients use Mnemosyne on port 17320. Direct client traffic to an inner engine
   can violate the single-resident invariant and is unsupported.
 
@@ -97,6 +102,10 @@ engines:
     binary: /Applications/DwarfStar/ds4-server
     working_directory: /Applications/DwarfStar
     process_state_path: ~/Library/Application Support/Mnemosyne/state/ds4-process.json
+  mflux:
+    enabled: true
+    host: 127.0.0.1
+    port: 17324
 
 models:
   - alias: local-qwen
@@ -116,6 +125,16 @@ models:
       context_length: 100000
       kv_disk_directory: /Volumes/ModelCache/ds4-kv
       kv_disk_space_mb: 8192
+
+  - alias: krea-2-turbo
+    engine: mflux
+    model: krea/Krea-2-Turbo
+    kind: image
+    image:
+      family: krea-2
+      quantize: 8
+      num_inference_steps: 8
+      guidance_scale: 1
 ```
 
 Engine-specific options live below `load`. Unknown options are rejected unless
@@ -158,9 +177,12 @@ trusting the coordinator's cache. `load` is idempotent for the exact target.
 engine name, operation, retryability, and actionable detail suitable for the
 control API and menu bar.
 
-Inference is proxied without translating between wire protocols. The gateway
+Language inference is proxied without translating between wire protocols. The gateway
 only canonicalizes the `model` field, injects usage opt-in where supported, and
 removes outer authorization/cookie headers before forwarding.
+Image generation uses a deliberately narrow OpenAI-compatible contract:
+`POST /v1/images/generations`, one base64 PNG, bounded dimensions, seed,
+steps, guidance, and negative prompt. It does not emit token-usage events.
 
 ## Global Residency State Machine
 
@@ -192,13 +214,14 @@ For each inference request:
    after the full response stream closes.
 
 Same-target callers piggyback on a single load. Different-target callers queue
-without starving a pending switch. A timeout never tears down an active
-generation. Manual unload, reconciliation, shutdown, and idle eviction use the
+without starving a pending switch. A swap-queue timeout never tears down an
+active generation; an image request timeout deliberately terminates its owned
+MFLUX worker. Manual unload, reconciliation, shutdown, and idle eviction use the
 same drain-and-verify lifecycle primitives. Any non-authoritative adapter state
 fails closed and leaves the coordinator degraded.
 
 At startup the default recovery policy is `unload_all`: reconcile LM Studio and
-oMLX, stop only a previously recorded/owned DS4 process, and establish a clean
+oMLX, stop only previously recorded/owned child processes, and establish a clean
 baseline. A future `adopt_single` policy may adopt one unambiguous loaded model.
 
 ## API Contract
@@ -212,6 +235,7 @@ The inference plane supports capability-gated pass-through routes:
 - `POST /v1/messages`
 - `POST /v1/embeddings`
 - `POST /v1/rerank`
+- `POST /v1/images/generations`
 - `GET /health`
 
 The aggregate model listing exposes stable aliases. Extended engine,
@@ -243,6 +267,9 @@ response/stream
   -> durable SQLite pg_usage_outbox
   -> retry-safe Postgres batch writer
 ```
+
+Image generation is outside this accounting path and creates no token-usage
+or Postgres-outbox row.
 
 The normalized local record retains event ID, timestamp, public alias, engine,
 endpoint, streamed flag, prompt/input tokens, completion/output tokens, total
@@ -296,7 +323,8 @@ package under compatibility imports. The macOS package must never import
 5. Inference proxy, endpoint capability checks, and usage normalization.
 6. SQLite analytics/outbox and existing Postgres schema integration.
 7. LaunchAgent templates and developer CLI.
-8. SwiftUI menu bar shell, bundled service supervision, and onboarding checks.
+8. AppKit status item, SwiftUI controller popover, bundled service supervision,
+   and onboarding checks.
 9. Native macOS smoke checklist for the remaining target-machine acceptance.
 
 ## External References
@@ -307,4 +335,4 @@ package under compatibility imports. The macOS package must never import
 - MLX unified memory: <https://ml-explore.github.io/mlx/build/html/usage/unified_memory.html>
 - Docker Model Runner execution model: <https://docs.docker.com/ai/model-runner/#execution-environment>
 - Apple `SMAppService`: <https://developer.apple.com/documentation/servicemanagement/smappservice>
-- SwiftUI `MenuBarExtra`: <https://developer.apple.com/documentation/swiftui/menubarextra>
+- AppKit `NSStatusItem`: <https://developer.apple.com/documentation/appkit/nsstatusitem>

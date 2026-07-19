@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -35,6 +36,28 @@ class LockedRequirementsTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "non-exact"):
             build_runtime.parse_locked_requirements("fastapi>=0.115,<1\n")
 
+    def test_parser_accepts_github_requirement_pinned_to_full_commit(self) -> None:
+        requirement = (
+            "mflux @ git+https://github.com/filipstrand/mflux.git@"
+            "97ac5e6280e8c65e48a609722229eb9d03ef2cbe"
+        )
+
+        self.assertEqual(
+            build_runtime.parse_locked_requirements(requirement),
+            (requirement,),
+        )
+
+    def test_parser_rejects_mutable_or_short_git_references(self) -> None:
+        for requirement in (
+            "mflux @ git+https://github.com/filipstrand/mflux.git@main",
+            "mflux @ git+https://github.com/filipstrand/mflux.git@97ac5e62",
+            "mflux @ git+ssh://github.com/filipstrand/mflux.git@"
+            "97ac5e6280e8c65e48a609722229eb9d03ef2cbe",
+        ):
+            with self.subTest(requirement=requirement):
+                with self.assertRaisesRegex(RuntimeError, "non-exact"):
+                    build_runtime.parse_locked_requirements(requirement)
+
     def test_locked_export_is_offline_and_requires_current_lock(self) -> None:
         completed = mock.Mock(returncode=0, stdout="fastapi==0.139.2\n", stderr="")
         with (
@@ -52,11 +75,42 @@ class LockedRequirementsTests(unittest.TestCase):
         self.assertIn("--no-dev", command)
         self.assertIn("--no-emit-project", command)
 
+    def test_materialize_vcs_wheels_builds_commit_keyed_file_requirement(self) -> None:
+        requirement = (
+            "mflux @ git+https://github.com/filipstrand/mflux.git@"
+            "97ac5e6280e8c65e48a609722229eb9d03ef2cbe"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            wheel_root = Path(temporary) / "wheels"
+
+            def fake_run(command: list[str]) -> None:
+                if len(command) > 1 and command[1] == "build":
+                    output = Path(command[command.index("--out-dir") + 1])
+                    output.mkdir(parents=True, exist_ok=True)
+                    (output / "mflux-0.18.0-py3-none-any.whl").write_bytes(b"wheel")
+
+            with (
+                mock.patch.object(build_runtime, "VCS_WHEEL_DIR", wheel_root),
+                mock.patch.object(build_runtime, "uv_driver", return_value="/bin/uv"),
+                mock.patch.object(build_runtime, "run", side_effect=fake_run) as run,
+            ):
+                materialized = build_runtime.materialize_vcs_wheels((requirement,))
+
+        self.assertEqual(len(materialized), 1)
+        self.assertTrue(materialized[0].startswith("mflux @ file://"))
+        self.assertIn("97ac5e6280e8c65e48a609722229eb9d03ef2cbe", materialized[0])
+        self.assertEqual(run.call_count, 5)
+
     def test_resolved_config_contains_only_supplied_pins_and_lock_digest(self) -> None:
-        rendered = build_runtime.resolved_config(("fastapi==0.139.2",))
+        rendered = build_runtime.resolved_config(
+            ("fastapi==0.139.2",),
+            ("mflux==0.18.0",),
+        )
 
         self.assertIn('  "fastapi==0.139.2",', rendered)
-        self.assertIn("# uv.lock sha256:", rendered)
+        self.assertIn('  "mflux==0.18.0",', rendered)
+        self.assertIn("# service uv.lock sha256:", rendered)
+        self.assertIn("# image-worker uv.lock sha256:", rendered)
         self.assertNotIn(">=0.115", rendered)
 
 

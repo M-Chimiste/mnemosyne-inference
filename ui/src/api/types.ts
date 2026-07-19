@@ -1,7 +1,15 @@
 export type GpuPlan = "all" | number[];
 
-export type Backend = "vllm" | "llama.cpp";
+export type Backend = "vllm" | "llama.cpp" | "sglang-diffusion";
 export type RecommendedBackend = Backend | "none";
+
+export interface ImageDefaults {
+  width: number;
+  height: number;
+  num_inference_steps: number;
+  guidance_scale: number;
+  guidance_parameter?: "guidance_scale" | "true_cfg_scale";
+}
 
 export interface ManagerStatus {
   loaded_model: string | null;
@@ -25,6 +33,8 @@ export interface ManagerStatus {
   swap_target: string | null;
   backend: Backend | null;
   gguf_filename: string | null;
+  model_kind?: "language" | "image" | null;
+  capabilities: string[];
   vllm_arch_count: number;
   vllm_arch_source: string;
 }
@@ -68,6 +78,9 @@ export interface CatalogRow {
   resolved_sha: string | null;
   backend: Backend;
   gguf_filename: string | null;
+  model_kind: "language" | "image";
+  capabilities: string[];
+  image_config: ImageDefaults | null;
 }
 
 export interface HfSearchResult {
@@ -106,7 +119,8 @@ export type HfPipelineTag =
   | "text-generation"
   | "image-text-to-text"
   | "audio-text-to-text"
-  | "any-to-any";
+  | "any-to-any"
+  | "text-to-image";
 
 export interface HfSearchEnvelope {
   query: string;
@@ -166,6 +180,8 @@ export interface InstallRequest {
   ignore_patterns?: string[] | null;
   backend?: Backend | null;
   gguf_filename?: string | null;
+  kind?: "language" | "image" | null;
+  image?: ImageDefaults | null;
 }
 
 export interface CatalogUpdateRequest {

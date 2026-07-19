@@ -15,6 +15,8 @@ server:
   idle_unload_seconds: 900          # 15 min default; null disables idle eviction
   startup_timeout_seconds: 600
   swap_queue_timeout_seconds: 300   # how long /v1 waits during a model swap before 504
+  image_request_timeout_seconds: 1800
+  image_max_pixels: 4194304         # 2048x2048; width/height must be multiples of 16
 
 storage:
   default: nvme-fast
@@ -80,3 +82,28 @@ models:
       - none
       - --temp
       - "0.2"
+
+  # Image generation uses the separately pinned SGLang Diffusion runtime.
+  # Public guidance_scale maps to Qwen's true_cfg_scale parameter.
+  - alias: qwen-image
+    model: Qwen/Qwen-Image
+    backend: sglang-diffusion
+    kind: image
+    gpus: [0]
+    image:
+      width: 1024
+      height: 1024
+      num_inference_steps: 30
+      guidance_scale: 4.0
+      guidance_parameter: true_cfg_scale
+
+  - alias: krea-2-turbo
+    model: krea/Krea-2-Turbo
+    backend: sglang-diffusion
+    kind: image
+    gpus: [0]
+    image:
+      width: 1024
+      height: 1024
+      num_inference_steps: 8
+      guidance_scale: 1.0

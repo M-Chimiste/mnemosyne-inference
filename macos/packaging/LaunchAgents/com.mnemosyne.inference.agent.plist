@@ -5,7 +5,7 @@
     <key>Label</key>
     <string>com.mnemosyne.inference.agent</string>
 
-    <!-- BundleProgram is resolved relative to the containing Mnemosyne.app. -->
+    <!-- BundleProgram is resolved relative to the containing Unified Inference.app. -->
     <key>BundleProgram</key>
     <string>Contents/Helpers/MnemosyneService.app/Contents/MacOS/mnemosyne-service-bootstrap</string>
     <key>ProgramArguments</key>

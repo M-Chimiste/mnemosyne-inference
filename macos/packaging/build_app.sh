@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Stage an ad-hoc-signed Mnemosyne.app for local development.
+# Stage an ad-hoc-signed Unified Inference.app for local development.
 
 set -euo pipefail
 
@@ -9,10 +9,7 @@ APP_PACKAGE="$REPO_ROOT/macos/app"
 CONFIG="release"
 BARE=0
 PYTHON_EXPORT="${MNEMOSYNE_PYTHON_EXPORT:-$SCRIPT_DIR/_export}"
-SWIFTPM_FLAGS=()
-if [[ "${MNEMOSYNE_SWIFTPM_DISABLE_SANDBOX:-0}" == "1" ]]; then
-    SWIFTPM_FLAGS+=(--disable-sandbox)
-fi
+SWIFTPM_DISABLE_SANDBOX="${MNEMOSYNE_SWIFTPM_DISABLE_SANDBOX:-0}"
 
 if [[ "${1:-}" == "debug" || "${1:-}" == "release" ]]; then
     CONFIG="$1"
@@ -37,32 +34,44 @@ while [[ $# -gt 0 ]]; do
     shift
 done
 
-swift build \
-    --package-path "$APP_PACKAGE" \
-    --configuration "$CONFIG" \
-    "${SWIFTPM_FLAGS[@]}"
-BIN_DIR="$(swift build \
-    --package-path "$APP_PACKAGE" \
-    --configuration "$CONFIG" \
-    --show-bin-path \
-    "${SWIFTPM_FLAGS[@]}")"
+if [[ "$SWIFTPM_DISABLE_SANDBOX" == "1" ]]; then
+    swift build \
+        --package-path "$APP_PACKAGE" \
+        --configuration "$CONFIG" \
+        --disable-sandbox
+    BIN_DIR="$(swift build \
+        --package-path "$APP_PACKAGE" \
+        --configuration "$CONFIG" \
+        --show-bin-path \
+        --disable-sandbox)"
+else
+    swift build \
+        --package-path "$APP_PACKAGE" \
+        --configuration "$CONFIG"
+    BIN_DIR="$(swift build \
+        --package-path "$APP_PACKAGE" \
+        --configuration "$CONFIG" \
+        --show-bin-path)"
+fi
 
 STAGE_DIR="$APP_PACKAGE/build/Stage"
-APP_DIR="$STAGE_DIR/Mnemosyne.app"
+APP_DIR="$STAGE_DIR/Unified Inference.app"
+LEGACY_APP_DIR="$STAGE_DIR/Mnemosyne.app"
 CONTENTS="$APP_DIR/Contents"
 RESOURCES="$CONTENTS/Resources"
 HELPER_APP="$CONTENTS/Helpers/MnemosyneService.app"
 HELPER_CONTENTS="$HELPER_APP/Contents"
 
-rm -rf "$APP_DIR"
+rm -rf "$APP_DIR" "$LEGACY_APP_DIR"
 mkdir -p \
     "$CONTENTS/MacOS" \
     "$CONTENTS/Library/LaunchAgents" \
     "$RESOURCES/Service" \
+    "$RESOURCES/ImageWorker" \
     "$HELPER_CONTENTS/MacOS"
 
 install -m 644 "$SCRIPT_DIR/Info.plist" "$CONTENTS/Info.plist"
-install -m 755 "$BIN_DIR/MnemosyneMenu" "$CONTENTS/MacOS/Mnemosyne"
+install -m 755 "$BIN_DIR/MnemosyneMenu" "$CONTENTS/MacOS/UnifiedInference"
 install -m 644 "$SCRIPT_DIR/MnemosyneService-Info.plist" "$HELPER_CONTENTS/Info.plist"
 install -m 755 \
     "$BIN_DIR/mnemosyne-service-bootstrap" \
@@ -72,6 +81,7 @@ install -m 644 \
     "$CONTENTS/Library/LaunchAgents/com.mnemosyne.inference.agent.plist"
 
 ditto "$REPO_ROOT/macos/service/src" "$RESOURCES/Service"
+ditto "$REPO_ROOT/macos/image-worker/src" "$RESOURCES/ImageWorker"
 install -m 644 "$REPO_ROOT/macos/config.yaml.example" "$RESOURCES/config.yaml.example"
 install -m 644 "$REPO_ROOT/macos/.env.example" "$RESOURCES/.env.example"
 
@@ -100,7 +110,7 @@ if [[ "$BARE" -eq 0 ]]; then
 fi
 codesign --force --sign - "$HELPER_CONTENTS/MacOS/mnemosyne-service-bootstrap"
 codesign --force --sign - "$HELPER_APP"
-codesign --force --sign - "$CONTENTS/MacOS/Mnemosyne"
+codesign --force --sign - "$CONTENTS/MacOS/UnifiedInference"
 codesign --force --sign - "$APP_DIR"
 
 plutil -lint \

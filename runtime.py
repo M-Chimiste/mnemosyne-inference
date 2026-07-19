@@ -4,7 +4,8 @@ Phase 2 substrate: turns a `ResolvedProfile` into the data needed to launch
 the inference engine (CLI argv, subprocess env), and holds the live runtime
 view that `/manager/status` and the eviction loop read.
 
-Two backends share this substrate: vLLM and llama.cpp's `llama-server`.
+Three backends share this substrate: vLLM, llama.cpp's `llama-server`, and
+SGLang Diffusion.
 The argv builders are pure functions; dispatch happens in `_start_engine`
 inside `vllm_manager.py`. Both backends bind the same loopback inner port
 sequentially because only one model is resident at a time.
@@ -230,3 +231,40 @@ def build_llama_env(
         env["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in profile.gpus)
     env["HF_HOME"] = profile.storage_path
     return env
+
+
+# ── SGLang Diffusion ────────────────────────────────────────────────
+
+SGLANG_BIN_DEFAULT = "/opt/sglang/bin/sglang"
+
+
+def build_sglang_diffusion_argv(
+    profile: ResolvedProfile,
+    *,
+    host: str,
+    port: int,
+    num_gpus: int,
+    bin_path: Optional[str] = None,
+) -> list[str]:
+    """Build a persistent SGLang Diffusion OpenAI server invocation."""
+    bin_ = bin_path or os.environ.get("SGLANG_BIN", SGLANG_BIN_DEFAULT)
+    argv = [
+        bin_, "serve",
+        "--model-path", profile.engine_model_path,
+        "--host", host,
+        "--port", str(port),
+        "--num-gpus", str(num_gpus),
+    ]
+    if profile.revision and profile.revision != "main":
+        argv += ["--revision", profile.revision]
+    argv += list(profile.extra_args)
+    return argv
+
+
+def build_sglang_diffusion_env(
+    profile: ResolvedProfile,
+    *,
+    base_env: Mapping[str, str],
+) -> dict[str, str]:
+    """Use the same GPU visibility and Hugging Face cache contract as vLLM."""
+    return build_vllm_env(profile, base_env=base_env)

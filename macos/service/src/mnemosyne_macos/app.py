@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import hmac
 import json
 import logging
@@ -16,9 +17,11 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict
 
+from .config import parse_config
 from .coordinator import CoordinatorError, QueueTimeout
 from .engines.base import AdapterError
-from .models import Endpoint
+from .image_api import ImageRequestError, normalize_image_request
+from .models import Endpoint, EngineName
 from .proxy import (
     InvalidProxyRequest,
     StreamingEventFilter,
@@ -36,6 +39,11 @@ logger = logging.getLogger("mnemosyne-macos.http")
 class LoadRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     model: str
+
+
+class ValidateConfigurationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    config_yaml: str
 
 
 async def _close_proxy_resources(
@@ -77,6 +85,19 @@ async def _audit_after_upstream_failure(runtime: NativeRuntime) -> None:
         logger.warning("residency audit after upstream failure did not converge")
 
 
+async def _abort_image_request(
+    runtime: NativeRuntime,
+    upstream: Any | None,
+    lease: Any | None,
+) -> None:
+    """Release the lease and terminate MFLUX so cancelled work frees memory."""
+    await _close_proxy_resources(upstream, lease)
+    try:
+        await runtime.coordinator.unload()
+    except Exception:
+        logger.exception("failed to unload image worker after request abort")
+
+
 def _json_model(body: bytes) -> str:
     try:
         payload = json.loads(body)
@@ -97,6 +118,10 @@ def _error_status(exc: Exception) -> int:
         return 404
     if isinstance(exc, InvalidProxyRequest):
         return 400
+    if isinstance(exc, ImageRequestError):
+        return 400
+    if isinstance(exc, TimeoutError):
+        return 504
     if isinstance(exc, RestartRequired):
         return 409
     if isinstance(exc, (CoordinatorError, AdapterError, RuntimeConfigurationError)):
@@ -221,12 +246,33 @@ def create_inference_app(runtime: NativeRuntime) -> FastAPI:
                 400,
                 f"model '{target.alias}' does not support /v1/{endpoint.value}",
             )
+        if endpoint == Endpoint.IMAGES_GENERATIONS:
+            try:
+                body = normalize_image_request(
+                    body,
+                    wire_model=target.wire_model,
+                    defaults=target.image_defaults,
+                    max_pixels=runtime.config.server.image_max_pixels,
+                )
+            except ImageRequestError as exc:
+                raise HTTPException(400, str(exc)) from exc
 
         started_at = time.monotonic()
         lease = None
         upstream: httpx.Response | None = None
         try:
-            lease = await runtime.coordinator.acquire(target)
+            lease_timeout = (
+                max(
+                    runtime.config.server.swap_queue_timeout_seconds,
+                    runtime.config.server.startup_timeout_seconds,
+                )
+                if endpoint == Endpoint.IMAGES_GENERATIONS
+                else None
+            )
+            lease = await runtime.coordinator.acquire(
+                target,
+                timeout_seconds=lease_timeout,
+            )
             route = lease.route(endpoint)
             prepared, requested_model, streamed, client_asked_usage = prepare_request_body(
                 body,
@@ -240,7 +286,30 @@ def create_inference_app(runtime: NativeRuntime) -> FastAPI:
                 content=prepared,
                 params=list(request.query_params.multi_items()),
             )
-            upstream = await runtime.proxy_client.send(upstream_request, stream=True)
+            if endpoint == Endpoint.IMAGES_GENERATIONS:
+                async with asyncio.timeout(
+                    runtime.config.server.image_request_timeout_seconds
+                ):
+                    upstream = await runtime.proxy_client.send(upstream_request, stream=True)
+            else:
+                upstream = await runtime.proxy_client.send(upstream_request, stream=True)
+        except asyncio.CancelledError:
+            if target.key.engine == EngineName.MFLUX:
+                cleanup = asyncio.create_task(
+                    _abort_image_request(runtime, upstream, lease),
+                    name="mnemosyne-abort-image-request",
+                )
+                with contextlib.suppress(asyncio.CancelledError):
+                    await asyncio.shield(cleanup)
+            else:
+                await _close_proxy_resources(upstream, lease)
+            raise
+        except TimeoutError as exc:
+            if target.key.engine == EngineName.MFLUX:
+                await _abort_image_request(runtime, upstream, lease)
+            else:
+                await _close_proxy_resources(upstream, lease)
+            raise HTTPException(504, "image generation timed out") from exc
         except HTTPException:
             await _close_proxy_resources(upstream, lease)
             raise
@@ -312,17 +381,18 @@ def create_inference_app(runtime: NativeRuntime) -> FastAPI:
                     decoded = candidate
             except (TypeError, ValueError):
                 pass
-            await _record_usage(
-                runtime,
-                decoded,
-                endpoint=endpoint,
-                engine=str(target.key.engine),
-                requested_model=requested_model,
-                alias=target.alias,
-                streamed=False,
-                started_at=started_at,
-                status_code=upstream.status_code,
-            )
+            if endpoint != Endpoint.IMAGES_GENERATIONS:
+                await _record_usage(
+                    runtime,
+                    decoded,
+                    endpoint=endpoint,
+                    engine=str(target.key.engine),
+                    requested_model=requested_model,
+                    alias=target.alias,
+                    streamed=False,
+                    started_at=started_at,
+                    status_code=upstream.status_code,
+                )
             return Response(
                 content=content,
                 status_code=upstream.status_code,
@@ -360,6 +430,10 @@ def create_inference_app(runtime: NativeRuntime) -> FastAPI:
     async def rerank(request: Request) -> Response:
         return await proxy(request, Endpoint.RERANK)
 
+    @app.post("/v1/images/generations")
+    async def images_generations(request: Request) -> Response:
+        return await proxy(request, Endpoint.IMAGES_GENERATIONS)
+
     return app
 
 
@@ -392,7 +466,17 @@ def create_control_app(runtime: NativeRuntime) -> FastAPI:
     async def load(payload: LoadRequest) -> dict:
         try:
             target = runtime.resolve(payload.model)
-            lease = await runtime.coordinator.acquire(target)
+            lease = await runtime.coordinator.acquire(
+                target,
+                timeout_seconds=(
+                    max(
+                        runtime.config.server.swap_queue_timeout_seconds,
+                        runtime.config.server.startup_timeout_seconds,
+                    )
+                    if target.key.engine == EngineName.MFLUX
+                    else None
+                ),
+            )
             await lease.release()
             return await runtime.status()
         except Exception as exc:
@@ -424,6 +508,17 @@ def create_control_app(runtime: NativeRuntime) -> FastAPI:
             return {"reloaded": True, "models": runtime.model_list()}
         except Exception as exc:
             raise HTTPException(_error_status(exc), str(exc)) from exc
+
+    @app.post("/manager/config/validate")
+    async def validate_configuration(payload: ValidateConfigurationRequest) -> dict:
+        try:
+            config = parse_config(
+                payload.config_yaml,
+                source="configuration editor",
+            )
+            return {"valid": True, "model_count": len(config.models)}
+        except Exception as exc:
+            raise HTTPException(400, str(exc)) from exc
 
     @app.get("/manager/usage")
     async def usage(limit: int = Query(default=100, ge=1, le=1000)) -> dict:

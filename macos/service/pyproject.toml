@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "mnemosyne-macos"
 version = "0.1.0"
-description = "Native macOS inference coordinator for LM Studio, oMLX, and DwarfStar"
+description = "Native macOS inference coordinator for LM Studio, oMLX, DwarfStar, and MFLUX"
 requires-python = ">=3.11"
 dependencies = [
   "fastapi>=0.115,<1",

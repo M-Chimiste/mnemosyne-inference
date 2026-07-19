@@ -42,6 +42,18 @@ class CoordinatorState(StrEnum):
     STOPPING = "stopping"
 
 
+_TRANSITION_STATES = frozenset(
+    {
+        CoordinatorState.UNLOADING,
+        CoordinatorState.VERIFYING_EMPTY,
+        CoordinatorState.LOADING,
+        CoordinatorState.VERIFYING_TARGET,
+        CoordinatorState.DRAINING,
+        CoordinatorState.STOPPING,
+    }
+)
+
+
 @dataclass(frozen=True)
 class CoordinatorStatus:
     state: CoordinatorState
@@ -735,6 +747,14 @@ class ResidencyCoordinator:
         Drift fails closed immediately. When no request or waiter is active,
         the default behavior also routes repair through :meth:`reconcile`.
         """
+        # A transition owns the operation lock for its full load/unload
+        # deadline. Treat its published state as authoritative-in-progress so
+        # a short periodic audit never times out behind a legitimate long model
+        # load. The post-timeout check below closes the race where a transition
+        # begins after this initial observation but before audit takes the lock.
+        async with self._condition:
+            if self._state in _TRANSITION_STATES:
+                return True
         try:
             deadline = Deadline.after(self.cleanup_timeout_seconds)
             async with asyncio.timeout(self.cleanup_timeout_seconds):
@@ -742,6 +762,8 @@ class ResidencyCoordinator:
                     snapshots = await self._inspect_all(deadline)
         except Exception as exc:
             async with self._condition:
+                if isinstance(exc, TimeoutError) and self._state in _TRANSITION_STATES:
+                    return True
                 self._initialized = False
                 self._accepting = False
                 self._state = CoordinatorState.DEGRADED
@@ -755,14 +777,7 @@ class ResidencyCoordinator:
         async with self._condition:
             # A transition can publish its verified handle just after it drops
             # the operation lock. Let the driver complete that publication.
-            if self._state in {
-                CoordinatorState.UNLOADING,
-                CoordinatorState.VERIFYING_EMPTY,
-                CoordinatorState.LOADING,
-                CoordinatorState.VERIFYING_TARGET,
-                CoordinatorState.DRAINING,
-                CoordinatorState.STOPPING,
-            }:
+            if self._state in _TRANSITION_STATES:
                 return True
             residents = [r for snapshot in snapshots for r in snapshot.residents]
             expected = self._resident

@@ -7,40 +7,41 @@
 **Active milestone:** M5 — Workstation-ready release
 
 The major v1 feature set is implemented: persistent installs and catalog
-state, two authenticated HTTP planes, lazy single-model swapping, vLLM and
-llama.cpp backends, the admin SPA, HuggingFace/GGUF discovery, token-usage
+state, two authenticated HTTP planes, lazy single-model swapping, vLLM,
+llama.cpp, and SGLang Diffusion backends, the admin SPA, HuggingFace/GGUF discovery, token-usage
 analytics, and the optional durable Postgres sidecar. `GET /v1/models` is
 served locally from the catalog so clients can discover every installed alias
 while no engine is resident. Known slow CUDA-graph-capture SSM/hybrid vLLM
 families now default to eager mode to keep cold swaps interactive.
 
-The image currently pins CUDA 13.0.2, PyTorch cu129, vLLM 0.22.1, and
-llama.cpp b9548. The bundled vLLM architecture snapshot was refreshed with
+The image currently pins CUDA 13.0.2, PyTorch cu129, vLLM 0.22.1,
+SGLang Diffusion 0.5.13 in a separate virtualenv, and llama.cpp b9548. The bundled vLLM architecture snapshot was refreshed with
 the engine-pin update. The remaining release work is workstation/CUDA smoke
 validation of the current pins and end-to-end backend swaps; see
 [smoke_checks.md](smoke_checks.md).
 
-An isolated native macOS track is implemented, with target-workstation
-acceptance still pending. It lives
-entirely below `macos/`, uses dedicated ports `17320-17323`, and does not alter
+An isolated native macOS track is implemented, with frontier text-engine and
+background-registration acceptance still pending. It lives
+entirely below `macos/`, uses dedicated ports `17320-17324`, and does not alter
 the CUDA image or its `8000-8002` topology. The first implementation includes:
 
 - a separately locked FastAPI service with inference and control planes;
 - a FIFO, epoch-lease coordinator that drains streams and verifies strict
   single-model residency across LM Studio, oMLX, and DS4;
-- native LM Studio/oMLX lifecycle adapters and a manager-owned DS4 subprocess;
+- native LM Studio/oMLX lifecycle adapters and manager-owned DS4/MFLUX subprocesses;
 - OpenAI/Responses/Anthropic usage normalization plus an atomic SQLite
   analytics/Postgres-outbox path;
-- a per-user LaunchAgent bundle, native Python bootstrap, and SwiftUI menu bar
-  controller; and
+- a per-user LaunchAgent bundle, native Python bootstrap, and explicit AppKit
+  status item with a SwiftUI controller popover; and
 - independent setup, architecture, and Apple Silicon smoke documentation.
 
-The Python suites, Swift production build, relocatable runtime export, and
-staged app signing checks run on the development host. Swift test sources
-compile here, but executing them requires a full Xcode installation rather
-than standalone Command Line Tools. Real LM Studio, oMLX, DS4/Metal,
-process-memory release, distribution signing, and `SMAppService` behavior
-remain target-Mac smoke gates; see [../macos/smoke_checks.md](../macos/smoke_checks.md).
+The Python suites, Swift production build, relocatable runtime export, staged
+app signing, embedded Python bootstrap, and Krea 2 Turbo MFLUX generation have
+run on the development M4 Max. Swift test sources compile here, but executing
+them requires a full Xcode installation rather than standalone Command Line
+Tools. Real oMLX and DS4 model loads, cancellation-driven Metal release,
+distribution signing, and `SMAppService` login/restart behavior remain
+target-Mac smoke gates; see [../macos/smoke_checks.md](../macos/smoke_checks.md).
 
 ## Phase status
 
@@ -56,8 +57,32 @@ remain target-Mac smoke gates; see [../macos/smoke_checks.md](../macos/smoke_che
 | 7 — Packaging, compose, docs | Multi-stage Dockerfile, compose mounts, ops docs | ✅ Docs/CLI landed; CUDA quickstart smoke pending |
 | 8 — Verification & hardening | Automated coverage and workstation acceptance | ⚠️ Code/docs landed; workstation acceptance pending |
 | 9 — llama.cpp backend for GGUF | Auto-detected llama-server dispatch alongside vLLM | ⚠️ Code landed; CUDA workstation smoke pending |
+| 10 — Local image generation | Unified Images API via CUDA SGLang Diffusion and macOS MFLUX | ⚠️ Mac Krea 2 smoke passed; CUDA model smoke pending |
 
 ## What has landed
+
+**Phase 10**
+
+- `POST /v1/images/generations` is capability-gated on both deployments and
+  initially supports `n=1`, base64 PNG, bounded width/height, seed, inference
+  steps, guidance, and negative prompts. Image calls do not enter token usage
+  analytics or the Postgres outbox.
+- CUDA image profiles use `kind: image` with `backend: sglang-diffusion`.
+  Qwen/Qwen-Image and krea/Krea-2-Turbo share the existing inner `:8002`
+  lifecycle, so loading an image model unloads vLLM/llama.cpp and vice versa.
+- SGLang Diffusion 0.5.13 is installed under `/opt/sglang`, isolated from the
+  vLLM environment. Catalog schema v4 persists model kind, capabilities, and
+  image defaults; the CLI, UI, and HF `text-to-image` search path can create
+  image installs.
+- Apple Silicon image profiles use a separately locked MFLUX 0.18.0 worker on
+  loopback `:17324`. Mnemosyne owns its process group and terminates it on
+  swaps, unload, timeout, and cancellation to release Metal memory.
+- The native app bundle contains separate `framework-mnemosyne-base` and
+  `framework-mnemosyne-image` export layers plus separate service/worker
+  source trees. No MLX runtime is added to Docker.
+- Automated request, routing, catalog, runtime, macOS adapter, worker, UI, and
+  packaging tests pass. A bundled-runtime Krea 2 Turbo generation passed on
+  an M4 Max; real Qwen/Krea CUDA generation remains a workstation smoke gate.
 
 **Phase 0**
 
@@ -364,7 +389,7 @@ Latest host verification on 2026-07-19:
 - Native service suite: `104 passed`.
 - Runtime-packaging suite: `4 passed`; the committed lock exported 21 exact
   production pins into a relocatable CPython 3.12 runtime.
-- The Swift production targets built, the complete `Mnemosyne.app` staged with
+- The Swift production targets built, the complete `Unified Inference.app` staged with
   that runtime, all three plists passed `plutil`, and deep strict code-signing
   verification passed for the ad-hoc development bundle.
 - Native and CUDA Python modules passed bytecode compilation, both shell

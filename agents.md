@@ -1,15 +1,16 @@
 # Agents Guide
 
 This repository contains **Mnemosyne Inference**, with two isolated
-single-workstation deployments. The CUDA deployment runs vLLM/llama.cpp in a
+single-workstation deployments. The CUDA deployment runs vLLM, llama.cpp, or
+SGLang Diffusion in a
 container; the native Apple Silicon deployment coordinates an existing LM
-Studio server, oMLX, and DS4 without Docker. Both remain thin managers around
+Studio server, oMLX, DS4, and a process-isolated MFLUX worker without Docker. Both remain thin managers around
 upstream engines and must not fork or embed their serving implementations.
 
 ## Repository Shape
 
 - `vllm_manager.py` is the FastAPI service entrypoint. It starts two uvicorn servers, owns manager state, launches the active inference engine, proxies `/v1/*`, serves the admin UI, and wires all HTTP routes.
-- `config.py`, `catalog.py`, `profiles.py`, and `runtime.py` hold the core substrate: YAML/.env loading, SQLite catalog state, profile resolution, and pure argv/env builders for vLLM and llama.cpp.
+- `config.py`, `catalog.py`, `profiles.py`, `runtime.py`, and `image_api.py` hold the core substrate: YAML/.env loading, SQLite catalog state, profile resolution, pure engine argv/env builders, and bounded Images API normalization.
 - `downloader.py` and `download_worker.py` implement install/download orchestration. Installs run as killable subprocesses and persist state in SQLite.
 - `hf_search.py`, `repo_probe.py`, `vllm_supported_architectures.json`, and `scripts/refresh_arch_list.py` support HuggingFace discovery, vLLM architecture filtering, and GGUF probing.
 - `ui/` contains the React/Vite/TypeScript/Tailwind admin UI that is built into `/app/static` by the Dockerfile and served from the admin plane.
@@ -19,6 +20,7 @@ upstream engines and must not fork or embed their serving implementations.
 - `pg_writer.py` and `scripts/probe_token_sidecar_schema.py` implement and inspect the optional Postgres token-usage sink; SQLite remains the local system of record and durable outbox.
 - `project_docs/project_status.md` records current release status and feature history; `project_docs/smoke_checks.md` is the manual GPU-host checklist for behavior pytest cannot exercise.
 - `macos/service/` is an independent Python package for the native inference/control planes, engine adapters, lease-based global residency coordinator, and durable usage outbox. Its dependencies and lock file stay below that directory.
+- `macos/image-worker/` is the separately locked MFLUX runtime. It is launched only as a manager-owned child, binds loopback `:17324`, and must remain dependency-isolated from the macOS coordinator service.
 - `macos/app/` is the SwiftPM menu bar controller and native service bootstrap. `macos/packaging/` stages the signed app, embedded LaunchAgent plist, and relocatable Python runtime.
 - `macos/config.yaml.example`, `macos/.env.example`, `macos/README.md`, and `macos/smoke_checks.md` are the native deployment's setup and validation surface. Mac settings must not be added to the external CUDA compose file.
 - `agents.md` is the single repository guide for coding assistants and contributors. Keep it aligned with code, examples, and verification commands when architecture or workflows change.
@@ -37,13 +39,14 @@ The live `docker-compose.yml` is intentionally machine-specific and may live out
 - Inference bearer auth is optional. If `INFERENCE_API_KEY` is set, `/v1/*` on the inference plane requires `Authorization: Bearer <key>`.
 - Only one model is resident at a time. `_swap_lock` serializes load/unload transitions; same-target callers can piggyback on a single lazy load; different targets queue until `swap_queue_timeout_seconds`.
 - Proxied `/v1/*` requests peek at the JSON `model` field, resolve it through config aliases, UI-installed catalog aliases, legacy aliases, installed HF IDs, raw HF IDs, or absolute paths, then rewrite the model field to the engine-served name. Streaming requests may also receive `stream_options.include_usage=true` for accounting; synthetic usage events are hidden unless the client requested them. All other request fields, including multimodal content and backend-specific extensions, stay opaque.
-- `GET /v1/models` is the deliberate proxy exception: the manager serves it locally from the catalog so it lists every installed alias across both backends even while idle. A raw/resident model without an installed catalog row is included as a fallback.
-- Supported backends are `vllm` and `llama.cpp`.
+- `GET /v1/models` is the deliberate proxy exception: the manager serves it locally from the catalog so it lists every installed alias across all backends even while idle. A raw/resident model without an installed catalog row is included as a fallback.
+- Supported backends are `vllm`, `llama.cpp`, and `sglang-diffusion`.
   - vLLM launches `vllm.entrypoints.openai.api_server`.
   - llama.cpp launches `llama-server` with a selected GGUF file and serves under the alias.
+  - SGLang Diffusion launches the separately pinned `/opt/sglang` runtime and serves image profiles through `POST /v1/images/generations` on the same sequential inner port.
   - vLLM profiles in known slow CUDA-graph-capture SSM/hybrid families default to `--enforce-eager`, based on the cached model `config.json`. Keep the detection in `runtime.vllm_wants_eager_default`; profile `extra_args` remain the final override layer.
 - Runtime configuration lives in YAML, default `/config/config.yaml`, with secrets in `/config/.env`.
-- Persistent catalog state lives in SQLite, default `/state/mnemosyne.db`. It stores config-synced rows, UI-installed rows, download rows, resolved revisions, usage counters, backend, and selected GGUF filename.
+- Persistent catalog state lives in SQLite, default `/state/mnemosyne.db`. It stores config-synced rows, UI-installed rows, download rows, resolved revisions, usage counters, backend, selected GGUF filename, model kind, capabilities, and image defaults.
 - Config reload is supported by `POST /manager/reload`, `vllm-ctl reload`, or SIGHUP. Reload re-syncs config into the catalog and reconciles caches; it does not change Docker mounts or published ports.
 - Idle eviction is enabled by `server.idle_unload_seconds` unless set to `null`. Usage deltas are flushed periodically and during unload/shutdown.
 - Installs use a subprocess worker (`python -m download_worker`) rather than in-process HuggingFace downloads. Interrupted installs are recovered as `partial` on startup and can be retried.
@@ -53,13 +56,14 @@ The live `docker-compose.yml` is intentionally machine-specific and may live out
 
 ### Native macOS deployment
 
-- Inference is on `127.0.0.1:17320`, control is on `127.0.0.1:17321`, LM Studio remains on `:1234`, oMLX uses `:17322`, and the manager-owned DS4 child uses `:17323`. Reserve `17324-17329` for later native services.
-- A per-user LaunchAgent owns Mnemosyne Core. The SwiftUI `MenuBarExtra` app is a client; quitting it must not terminate inference. `SMAppService.agent` registers the embedded plist and the bootstrap must `execve` the bundled Python without daemonizing.
+- Inference is on `127.0.0.1:17320`, control is on `127.0.0.1:17321`, LM Studio remains on `:1234`, oMLX uses `:17322`, the manager-owned DS4 child uses `:17323`, and the manager-owned MFLUX worker uses `:17324`. Reserve `17325-17329` for later native services.
+- A per-user LaunchAgent owns Mnemosyne Core. The controller uses an explicit AppKit `NSStatusItem` with a SwiftUI popover; quitting it must not terminate inference. `SMAppService.agent` registers the embedded plist and the bootstrap must `execve` the bundled Python without daemonizing.
 - `ResidencyCoordinator` owns the cross-engine invariant. A request holds an epoch-tagged model lease through its complete stream. FIFO queuing stops old-target admission once a switch is pending, drains active leases, proves all enabled adapters empty, loads one target, and proves exactly one ready manager-owned resident.
 - LM Studio and oMLX are external loopback services controlled through native lifecycle APIs. DS4 is a model-specific process group started by Mnemosyne. Never kill an unknown PID or listener; persisted DS4 identity must match before recovery or signaling.
 - Adapter-observed state is authoritative. An unreachable/unauthorized/incompatible adapter is not implicitly empty. Startup defaults to `unload_all`; uncertain state fails closed until `/manager/reconcile` succeeds.
-- The Mac proxy supports capability-gated Chat/Completions, Responses, Messages, Embeddings, and Rerank routes. Aside from model canonicalization and OpenAI stream-usage opt-in, payload fields stay opaque.
+- The Mac proxy supports capability-gated Chat/Completions, Responses, Messages, Embeddings, Rerank, and Images Generations routes. MFLUX is terminated on unload/abort so Metal memory is released at the process boundary.
 - Mac usage events normalize OpenAI, Responses, and Anthropic token shapes and atomically write local analytics plus the SQLite Postgres outbox. The central schema and retry/idempotency behavior match the CUDA deployment.
+- Image requests intentionally do not emit token-usage records. Do not add image prompt/output policy hooks; this repository is a local homelab tool.
 
 ## Configuration
 
@@ -149,6 +153,7 @@ Install and cache operations:
 ./vllm-ctl install qwen-coder Qwen/Qwen2.5-Coder-7B-Instruct --storage nvme-fast
 ./vllm-ctl install TheBloke/Some-GGUF --list-gguf
 ./vllm-ctl install local-gguf org/repo-gguf --backend llama.cpp --gguf-filename model.Q4_K_M.gguf
+./vllm-ctl install qwen-image Qwen/Qwen-Image --backend sglang-diffusion --gpus 0
 ./vllm-ctl install-status
 ./vllm-ctl install-status qwen-coder
 ./vllm-ctl install-cancel qwen-coder
@@ -181,6 +186,8 @@ Native macOS development and verification:
 ```bash
 uv sync --project macos/service --extra dev
 uv run --project macos/service --extra dev python -m pytest macos/service/tests
+uv sync --project macos/image-worker --extra dev
+uv run --project macos/image-worker --extra dev python -m pytest macos/image-worker/tests
 uv run --project macos/service mnemosyne-macos --check-config \
   --config "$HOME/Library/Application Support/Mnemosyne/config.yaml" \
   --env "$HOME/Library/Application Support/Mnemosyne/.env"
@@ -205,8 +212,9 @@ npm run build
 ```
 
 For native service changes, run
-`uv run --project macos/service --extra dev python -m pytest macos/service/tests`. For
-menu/bootstrap changes, run `swift build` and `swift test` from `macos/app`.
+`uv run --project macos/service --extra dev python -m pytest macos/service/tests`.
+For MFLUX worker changes, run its independent suite under `macos/image-worker`.
+For menu/bootstrap changes, run `swift build` and `swift test` from `macos/app`.
 LaunchAgent registration, Metal memory release, and real engine swapping still
 require the target Mac and `macos/smoke_checks.md`; full Xcode is required for
 the packaged `SMAppService` smoke.

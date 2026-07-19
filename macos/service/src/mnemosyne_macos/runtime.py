@@ -17,6 +17,7 @@ from .coordinator import CoordinatorStatus, ResidencyCoordinator
 from .engines.base import EngineAdapter
 from .engines.ds4 import DS4Adapter
 from .engines.lmstudio import LMStudioAdapter
+from .engines.mflux import MFluxAdapter
 from .engines.omlx import OMLXAdapter
 from .models import EngineName, ResolvedTarget
 from .usage import UsageEvent
@@ -63,6 +64,8 @@ def build_adapters(config: MacConfig) -> dict[EngineName, EngineAdapter]:
         adapters[EngineName.OMLX] = OMLXAdapter(config.engines.omlx)
     if config.engines.ds4.enabled:
         adapters[EngineName.DS4] = DS4Adapter(config.engines.ds4)
+    if config.engines.mflux.enabled:
+        adapters[EngineName.MFLUX] = MFluxAdapter(config.engines.mflux)
     return adapters
 
 
@@ -203,6 +206,7 @@ class NativeRuntime:
                 "engine": target.key.engine,
                 "upstream_model": target.key.canonical_model_id,
                 "capabilities": sorted(endpoint.value for endpoint in target.capabilities),
+                "model_kind": target.kind,
                 "load_config_digest": target.key.load_config_digest,
             }
             for target in self.profiles.values()

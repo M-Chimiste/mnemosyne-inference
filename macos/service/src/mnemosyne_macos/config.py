@@ -8,13 +8,20 @@ import json
 import os
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlsplit
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from .models import DEFAULT_CAPABILITIES, Endpoint, EngineName, ResolvedTarget, TargetKey
+from .models import (
+    DEFAULT_CAPABILITIES,
+    Endpoint,
+    EngineName,
+    ModelKind,
+    ResolvedTarget,
+    TargetKey,
+)
 
 
 _ALIAS_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
@@ -37,6 +44,8 @@ class ServerConfig(BaseModel):
     swap_queue_timeout_seconds: float = Field(default=300, gt=0)
     shutdown_grace_seconds: float = Field(default=30, gt=0)
     reconcile_interval_seconds: float = Field(default=30, ge=5)
+    image_request_timeout_seconds: float = Field(default=1800, gt=0)
+    image_max_pixels: int = Field(default=4_194_304, ge=4096)
     startup_policy: str = "unload_all"
     inference_api_key_env: str = "INFERENCE_API_KEY"
     control_password_env: str = "ADMIN_PASSWORD"
@@ -103,12 +112,37 @@ class DS4Config(BaseModel):
         return value
 
 
+class MFluxConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    host: str = "127.0.0.1"
+    port: int = Field(default=17324, ge=1024, le=65535)
+    python: str | None = None
+    python_env: str = "MNEMOSYNE_MFLUX_PYTHON"
+    source_path_env: str = "MNEMOSYNE_MFLUX_PYTHONPATH"
+    request_timeout_seconds: float = Field(default=30, gt=0)
+    shutdown_grace_seconds: float = Field(default=30, gt=0)
+
+    @field_validator("host")
+    @classmethod
+    def _loopback_only(cls, value: str) -> str:
+        try:
+            if not ipaddress.ip_address(value).is_loopback:
+                raise ValueError("MFLUX must bind to a loopback address")
+        except ValueError as exc:
+            if value != "localhost":
+                raise ValueError("MFLUX host must be a loopback address") from exc
+        return value
+
+
 class EnginesConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     lmstudio: LMStudioConfig = Field(default_factory=LMStudioConfig)
     omlx: OMLXConfig = Field(default_factory=OMLXConfig)
     ds4: DS4Config = Field(default_factory=DS4Config)
+    mflux: MFluxConfig = Field(default_factory=MFluxConfig)
 
 
 class ModelLoadConfig(BaseModel):
@@ -124,6 +158,17 @@ class ModelLoadConfig(BaseModel):
     extra_args: list[str] = Field(default_factory=list)
 
 
+class ImageProfileConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    family: Literal["qwen-image", "krea-2"]
+    quantize: Literal[3, 4, 5, 6, 8] | None = 8
+    width: int = Field(default=1024, ge=64, le=4096, multiple_of=16)
+    height: int = Field(default=1024, ge=64, le=4096, multiple_of=16)
+    num_inference_steps: int = Field(default=30, ge=1, le=200)
+    guidance_scale: float = Field(default=4.0, ge=0, le=50)
+
+
 class ModelProfile(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -133,6 +178,8 @@ class ModelProfile(BaseModel):
     served_model_name: str | None = None
     capabilities: set[Endpoint] | None = None
     load: ModelLoadConfig = Field(default_factory=ModelLoadConfig)
+    kind: ModelKind = ModelKind.LANGUAGE
+    image: ImageProfileConfig | None = None
     enabled: bool = True
 
     @field_validator("alias")
@@ -160,6 +207,19 @@ class ModelProfile(BaseModel):
 
     @model_validator(mode="after")
     def _validate_engine_options(self) -> "ModelProfile":
+        if self.engine == EngineName.MFLUX:
+            if self.kind != ModelKind.IMAGE or self.image is None:
+                raise ValueError("MFLUX profiles require kind='image' and image settings")
+            if self.load != ModelLoadConfig():
+                raise ValueError("MFLUX profiles use image settings, not language load settings")
+            if self.capabilities is not None and self.capabilities != {
+                Endpoint.IMAGES_GENERATIONS
+            }:
+                raise ValueError("MFLUX profiles only support images/generations")
+        elif self.kind == ModelKind.IMAGE or self.image is not None:
+            raise ValueError("image profiles require engine='mflux'")
+        elif self.capabilities is not None and Endpoint.IMAGES_GENERATIONS in self.capabilities:
+            raise ValueError("images/generations capability requires engine='mflux'")
         if self.engine != EngineName.DS4 and (
             self.load.kv_disk_directory is not None
             or self.load.kv_disk_space_mb is not None
@@ -192,12 +252,26 @@ class ModelProfile(BaseModel):
         return self
 
     def resolve(self) -> ResolvedTarget:
-        load_options = self.load.model_dump(exclude_none=True, exclude_defaults=True)
+        if self.engine == EngineName.MFLUX:
+            assert self.image is not None
+            load_options = {
+                "family": self.image.family,
+                "quantize": self.image.quantize,
+            }
+            image_defaults = {
+                "width": self.image.width,
+                "height": self.image.height,
+                "num_inference_steps": self.image.num_inference_steps,
+                "guidance_scale": self.image.guidance_scale,
+            }
+        else:
+            load_options = self.load.model_dump(exclude_none=True, exclude_defaults=True)
+            image_defaults = {}
         canonical = str(Path(self.model).expanduser()) if self.engine == EngineName.DS4 else self.model
         payload = json.dumps(load_options, sort_keys=True, separators=(",", ":"))
         digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
         wire_model = self.served_model_name or (
-            self.alias if self.engine == EngineName.DS4 else self.model
+            self.alias if self.engine in {EngineName.DS4, EngineName.MFLUX} else self.model
         )
         capabilities = (
             frozenset(self.capabilities)
@@ -214,6 +288,8 @@ class ModelProfile(BaseModel):
             wire_model=wire_model,
             capabilities=capabilities,
             load_options=load_options,
+            kind=self.kind,
+            image_defaults=image_defaults,
         )
 
 
@@ -261,6 +337,7 @@ class MacConfig(BaseModel):
             EngineName.LMSTUDIO: self.engines.lmstudio.enabled,
             EngineName.OMLX: self.engines.omlx.enabled,
             EngineName.DS4: self.engines.ds4.enabled,
+            EngineName.MFLUX: self.engines.mflux.enabled,
         }
         disabled_references = sorted(
             profile.alias
@@ -273,6 +350,17 @@ class MacConfig(BaseModel):
                 f"{disabled_references}"
             )
 
+        for profile in self.models:
+            if (
+                profile.image is not None
+                and profile.image.width * profile.image.height
+                > self.server.image_max_pixels
+            ):
+                raise ValueError(
+                    f"model '{profile.alias}' image defaults exceed "
+                    f"server.image_max_pixels={self.server.image_max_pixels}"
+                )
+
         ports = {
             "inference": self.server.inference_port,
             "control": self.server.control_port,
@@ -283,6 +371,8 @@ class MacConfig(BaseModel):
             ports["omlx"] = _url_port(self.engines.omlx.base_url)
         if self.engines.ds4.enabled:
             ports["ds4"] = self.engines.ds4.port
+        if self.engines.mflux.enabled:
+            ports["mflux"] = self.engines.mflux.port
         by_port: dict[int, list[str]] = {}
         for name, port in ports.items():
             by_port.setdefault(port, []).append(name)
@@ -339,14 +429,24 @@ def load_config(path: str | Path, *, env_path: str | Path | None = None) -> MacC
         load_env(env_path)
     config_path = Path(path).expanduser()
     try:
-        raw: Any = yaml.safe_load(config_path.read_text(encoding="utf-8"))
-    except (OSError, yaml.YAMLError) as exc:
+        contents = config_path.read_text(encoding="utf-8")
+    except OSError as exc:
         raise ConfigError(f"failed to load {config_path}: {exc}") from exc
+    return parse_config(contents, source=str(config_path))
+
+
+def parse_config(contents: str, *, source: str = "configuration") -> MacConfig:
+    """Validate an in-memory YAML document with the runtime schema."""
+
+    try:
+        raw: Any = yaml.safe_load(contents)
+    except yaml.YAMLError as exc:
+        raise ConfigError(f"failed to load {source}: {exc}") from exc
     if raw is None:
         raw = {}
     if not isinstance(raw, dict):
-        raise ConfigError(f"{config_path} must contain a YAML mapping")
+        raise ConfigError(f"{source} must contain a YAML mapping")
     try:
         return MacConfig.model_validate(raw)
     except Exception as exc:
-        raise ConfigError(f"invalid config {config_path}: {exc}") from exc
+        raise ConfigError(f"invalid config {source}: {exc}") from exc

@@ -11,6 +11,8 @@ server:
   swap_queue_timeout_seconds: 300
   shutdown_grace_seconds: 30
   reconcile_interval_seconds: 30
+  image_request_timeout_seconds: 1800
+  image_max_pixels: 4194304
   startup_policy: unload_all
   inference_api_key_env: INFERENCE_API_KEY
   control_password_env: ADMIN_PASSWORD
@@ -47,6 +49,15 @@ engines:
     request_timeout_seconds: 30
     shutdown_grace_seconds: 30
 
+  # MFLUX runs in a separately locked, process-isolated worker bundled with
+  # the menu app. The main service owns the worker and port 17324.
+  mflux:
+    enabled: true
+    host: 127.0.0.1
+    port: 17324
+    request_timeout_seconds: 30
+    shutdown_grace_seconds: 30
+
 paths:
   state_database: ~/Library/Application Support/Mnemosyne/state/mnemosyne.db
   log_directory: ~/Library/Application Support/Mnemosyne/logs
@@ -71,6 +82,30 @@ models:
       kv_disk_directory: /Volumes/ModelCache/ds4-kv
       kv_disk_space_mb: 8192
       extra_args: []
+
+  - alias: qwen-image
+    engine: mflux
+    model: Qwen/Qwen-Image
+    kind: image
+    image:
+      family: qwen-image
+      quantize: 8
+      width: 1024
+      height: 1024
+      num_inference_steps: 30
+      guidance_scale: 4.0
+
+  - alias: krea-2-turbo
+    engine: mflux
+    model: krea/Krea-2-Turbo
+    kind: image
+    image:
+      family: krea-2
+      quantize: 8
+      width: 1024
+      height: 1024
+      num_inference_steps: 8
+      guidance_scale: 1.0
 
 # The DSN is secret and belongs in the environment file as
 # TOKEN_SIDECAR_POSTGRES_DSN=postgresql://...

@@ -11,7 +11,8 @@ const MODALITY_OPTIONS: { tag: HfPipelineTag; label: string }[] = [
   { tag: "text-generation", label: "Text" },
   { tag: "image-text-to-text", label: "Vision" },
   { tag: "audio-text-to-text", label: "Audio" },
-  { tag: "any-to-any", label: "Omni" }
+  { tag: "any-to-any", label: "Omni" },
+  { tag: "text-to-image", label: "Image generation" }
 ];
 
 const SORT_OPTIONS: { value: HfSortOption; label: string }[] = [
@@ -145,7 +146,7 @@ export default function Search() {
             </span>
           </div>
           {noTagsSelected && (
-            <p className="text-xs text-brick">Select at least one modality — the server falls back to all four otherwise.</p>
+            <p className="text-xs text-brick">Select at least one modality — the server falls back to all five otherwise.</p>
           )}
         </form>
         {search.error && <ErrorBox error={search.error} />}
@@ -180,6 +181,11 @@ export default function Search() {
                     {row.recommended_backend === "llama.cpp" && (
                       <span className="ml-2 inline-flex rounded border border-amber/40 bg-amber/10 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-amber">
                         llama.cpp
+                      </span>
+                    )}
+                    {row.recommended_backend === "sglang-diffusion" && (
+                      <span className="ml-2 inline-flex rounded border border-pine/40 bg-pine/10 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-pine">
+                        SGLang image
                       </span>
                     )}
                   </td>

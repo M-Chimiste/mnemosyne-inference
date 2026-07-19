@@ -377,6 +377,29 @@ async def test_failed_audit_rejects_queued_switch_and_stops_driver() -> None:
 
 
 @pytest.mark.asyncio
+async def test_audit_skips_long_running_transition() -> None:
+    events: list[str] = []
+    coordinator, adapters = _coordinator(events)
+    studio, _glm = _targets()
+    await coordinator.initialize()
+    load_gate = asyncio.Event()
+    adapters[EngineName.LMSTUDIO].load_gate = load_gate
+
+    acquire_task = asyncio.create_task(coordinator.acquire(studio))
+    await asyncio.wait_for(adapters[EngineName.LMSTUDIO].load_started.wait(), timeout=1)
+
+    assert (await coordinator.status()).state == CoordinatorState.LOADING
+    assert await asyncio.wait_for(coordinator.audit(), timeout=0.1) is True
+    assert (await coordinator.status()).state == CoordinatorState.LOADING
+    assert not acquire_task.done()
+
+    load_gate.set()
+    lease = await asyncio.wait_for(acquire_task, timeout=1)
+    assert (await coordinator.status()).state == CoordinatorState.READY
+    await lease.release()
+
+
+@pytest.mark.asyncio
 async def test_idle_eviction_uses_verified_global_unload() -> None:
     events: list[str] = []
     coordinator, adapters = _coordinator(events)

@@ -6,7 +6,8 @@ Mnemosyne Inference gives a single workstation Ollama/LMStudio-style ergonomics
 on top of upstream inference engines. The repository now contains two sibling
 deployments with independent dependencies and packaging:
 
-- The established CUDA deployment runs vLLM or llama.cpp in Docker.
+- The established CUDA deployment runs vLLM, llama.cpp, or SGLang Diffusion
+  in Docker, including local text-to-image generation.
 - The native Apple Silicon deployment coordinates an existing LM Studio
   installation, oMLX, and DwarfStar (DS4) through one local API. It does not
   use Docker, so MLX and Metal remain available to the host processes. Start
@@ -14,6 +15,18 @@ deployments with independent dependencies and packaging:
 
 The remainder of this README describes the CUDA deployment unless a section is
 explicitly labeled macOS.
+
+## Current state
+
+| Deployment | Runtime and engines | Status |
+| --- | --- | --- |
+| CUDA/Linux | Docker, vLLM, llama.cpp, SGLang Diffusion | Feature-complete implementation and automated coverage; current engine pins and cross-backend swaps still need a CUDA-workstation release smoke. |
+| Apple Silicon | Native service, existing LM Studio, optional oMLX/DS4, isolated MFLUX worker | App packaging and Krea 2 Turbo generation have been exercised end to end on an M4 Max. Real oMLX and DS4 model acceptance remains outstanding. |
+
+Both deployments expose one stable API, keep at most one model resident, and
+use the same `/v1/images/generations` contract. Language-model usage can be
+written to SQLite and optionally forwarded through the durable Postgres
+outbox. Image requests are deliberately excluded from token accounting.
 
 The container runs **two HTTP planes** in one process:
 
@@ -24,8 +37,8 @@ There is **one model resident at a time**. `/v1/*` requests trigger a lazy
 load if the requested model is not the resident one; concurrent callers for
 the same target piggyback on a single load.
 
-`GET /v1/models` lists **every fully-downloaded model** (both vLLM and
-llama.cpp backends), not just the resident one — it is served locally from the
+`GET /v1/models` lists **every fully-downloaded model** across all backends,
+not just the resident one — it is served locally from the
 catalog rather than proxied to the engine, so it returns the full menu even
 when nothing is loaded. Each entry's `id` is the stable alias; send that alias
 back as the `model` field in a `/v1/*` request to trigger a load. Only models
@@ -33,7 +46,8 @@ whose weights are present on disk (`status: installed`) are listed.
 
 Hardware target: a CUDA 13-capable host with a Blackwell-class NVIDIA GPU
 (RTX 50 or workstation Blackwell). The image bakes in PyTorch cu129, a pinned
-vLLM stable release, and a CUDA-built pinned llama.cpp `llama-server`. The
+vLLM stable release, a dependency-isolated pinned SGLang Diffusion runtime,
+and a CUDA-built pinned llama.cpp `llama-server`. The
 default llama.cpp build targets `sm_120`; for Ampere or Hopper, override
 `CMAKE_CUDA_ARCHITECTURES` when rebuilding as described under [Refreshing
 architecture support](#refreshing-architecture-support).
@@ -46,15 +60,67 @@ checks live in [project_docs/smoke_checks.md](project_docs/smoke_checks.md).
 The native service listens on `127.0.0.1:17320` for inference and
 `127.0.0.1:17321` for control. It enforces one resident model globally across
 LM Studio (`:1234`), oMLX (`:17322`), and a manager-owned DS4 process
-(`:17323`). A per-user LaunchAgent keeps inference alive when the SwiftUI menu
-bar app quits.
+(`:17323`) or MFLUX image worker (`:17324`). After it is enabled from the menu
+app, a per-user LaunchAgent keeps inference alive when the controller quits.
+
+`Unified Inference.app` is a menu-bar-only controller: it intentionally has no Dock
+icon or ordinary window. Launching it creates a brain-profile status icon on
+the right side of the macOS menu bar. Its popover shows service health, the
+resident model, model load/unload controls, usage-outbox depth, background
+service registration, and login-item controls. **Configuration…** opens a
+native editor window for `config.yaml` and `.env`; it validates YAML with the
+running service before an atomic private-file save, hot-applies model-profile
+changes, and prompts for a service restart when other settings require one.
+
+The controller title is the Mac's Computer Name from System Settings. The same
+bundle therefore appears as **Theseus**, **Metis**, or **Athena** on those
+machines while the portable product and installed bundle remain Unified
+Inference and `Unified Inference.app`. `MNEMOSYNE_WORKSTATION_NAME` can override the
+detected name when the app is launched from a configured process environment.
 
 The Python core, locked dependencies, native app, packaging scripts, example
 configuration, setup guide, and Mac-only smoke checks all live under
 [`macos/`](macos/README.md). None of those paths are copied into the CUDA image,
 and the Mac service never imports vLLM or CUDA modules.
 
-## Quickstart
+### Native macOS source-build quickstart
+
+LM Studio must already be installed and serving on loopback `:1234`; Mnemosyne
+does not install or bundle it. From an Apple Silicon checkout:
+
+```bash
+mkdir -p "$HOME/Library/Application Support/Mnemosyne/state"
+cp macos/config.yaml.example \
+  "$HOME/Library/Application Support/Mnemosyne/config.yaml"
+cp macos/.env.example \
+  "$HOME/Library/Application Support/Mnemosyne/.env"
+chmod 600 \
+  "$HOME/Library/Application Support/Mnemosyne/config.yaml" \
+  "$HOME/Library/Application Support/Mnemosyne/.env"
+
+# Edit config.yaml to enable only the engines and aliases present on this Mac.
+python3 macos/packaging/build_runtime.py
+macos/packaging/build_app.sh release
+ditto "macos/app/build/Stage/Unified Inference.app" \
+  "/Applications/Unified Inference.app"
+open "/Applications/Unified Inference.app"
+```
+
+Click the brain-profile menu-bar icon and choose **Enable Service**. Approve
+the background item in System Settings if macOS asks, then verify:
+
+```bash
+curl http://127.0.0.1:17320/health
+curl http://127.0.0.1:17320/v1/models
+curl http://127.0.0.1:17321/manager/status
+```
+
+The first image request downloads the configured Hugging Face model into the
+normal user cache. The app contains the runtime and worker code, not model
+weights. See [macos/README.md](macos/README.md) for engine preparation,
+configuration, development mode, and signing details.
+
+## CUDA quickstart
 
 This is the canonical "fresh machine to a working API" flow. It assumes
 Docker + the NVIDIA container toolkit are already installed on the host.
@@ -131,7 +197,38 @@ Top-level blocks:
 - **`models`** — list of profiles. Each profile is a stable alias plus the HF
   model id and per-model knobs: `gpus` (`all`, `[0]`, `[0,1]`),
   `quantization`, `max_model_len`, `storage`, `backend`, `gguf_filename`, and
-  `extra_args` for raw engine flags appended verbatim.
+  `extra_args` for raw engine flags appended verbatim. Image profiles use
+  `backend: sglang-diffusion`, `kind: image`, and an `image:` defaults block.
+
+## Image generation
+
+CUDA profiles use SGLang Diffusion; Apple Silicon profiles use the bundled,
+separately locked MFLUX worker. Both expose the same endpoint and participate
+in the same one-resident-model lifecycle as language models:
+
+```bash
+curl -sX POST http://localhost:8000/v1/images/generations \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model":"qwen-image",
+    "prompt":"A small observatory above a sea of clouds",
+    "size":"1024x1024",
+    "n":1,
+    "response_format":"b64_json",
+    "seed":42,
+    "num_inference_steps":30,
+    "guidance_scale":4
+  }' | jq -r '.data[0].b64_json' | base64 --decode > image.png
+```
+
+On macOS, use `http://127.0.0.1:17320` and a configured MFLUX alias such as
+`krea-2-turbo`. The private worker on `:17324` is manager-owned and must not be
+called directly.
+
+The initial contract supports one base64 PNG, dimensions from 64–4096 in
+multiples of 16 within `server.image_max_pixels`, and optional seed, steps,
+guidance, and negative prompt. Image requests are intentionally excluded from
+token accounting. See the example configs for Qwen Image and Krea 2 Turbo.
 
 For llama.cpp/GGUF profiles, `extra_args` is the place for startup defaults
 such as `--reasoning off`, `--reasoning-format none`, `--temp 0.2`, or
@@ -491,6 +588,16 @@ curl -u admin:"$ADMIN_PASSWORD" -X POST \
   downloads](#recovering-partial-downloads).
 - **`docker compose build` cannot find the Dockerfile.** `MNEMOSYNE_REPO_DIR`
   is unset (or wrong). Export it to the absolute path of your checkout.
+- **The macOS menu icon is missing.** `Unified Inference.app` is menu-bar-only, so it
+  never appears in the Dock. Start the installed copy with
+  `open "/Applications/Unified Inference.app"` and look for the brain-profile icon on the
+  active display. If the menu bar is crowded around a MacBook notch, macOS may
+  move status items out of view; close unused menu extras or use the external
+  display's menu bar. A source build logs `Unified Inference menu bar status item
+  installed` once its AppKit status item is created.
+- **The Mac API stops after the terminal closes.** A developer-mode service
+  belongs to that terminal. Open the installed menu app and choose **Enable
+  Service** to register its per-user background helper.
 
 ## Known v1 limitations
 
@@ -516,6 +623,10 @@ for features that are not implemented.
   request, the manager fails open with a `503` and the next `/v1/*` request
   triggers a fresh load. No supervisor loop tries to keep the
   previous model resident.
+- **Native frontier-engine hardware coverage is incomplete.** The installed
+  app and MFLUX/Krea 2 image path have passed a real Apple Silicon smoke. oMLX
+  and DS4 adapters are implemented and tested against fixtures, but their
+  target models still need workstation acceptance.
 - **No runtime hard-fail when `gpus='all'` finds no GPUs.** The manager logs
   a warning and falls back to `VLLM_DEFAULT_TP`. On a real CUDA host this
   only happens if the nvidia-container-toolkit is misconfigured — fix the

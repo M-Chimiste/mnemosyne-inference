@@ -22,10 +22,16 @@ from repo_probe import expand_shard_filenames
 logger = logging.getLogger("vllm-manager.catalog")
 
 DEFAULT_DB_PATH = "/state/mnemosyne.db"
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 _RESERVED_PREFIX_COLON = "__cache__:"
 _RESERVED_PREFIX_SLASH = "__cache__/"
+
+
+def _default_capabilities(model_kind: str) -> tuple[str, ...]:
+    if model_kind == "image":
+        return ("images.generations",)
+    return ("chat.completions", "completions", "embeddings", "responses")
 
 
 class CatalogCorruptionError(Exception):
@@ -100,8 +106,8 @@ def _has_expected_weights(
 ) -> bool:
     """Backend-aware existence check used by reconcile.
 
-    For vLLM rows: any `.safetensors` / `.bin` sibling is enough (mirrors
-    the legacy behavior).
+    For vLLM rows: any top-level `.safetensors` / `.bin` sibling is enough.
+    SGLang Diffusion also searches nested Diffusers component directories.
     For llama.cpp rows: the row's specific `gguf_filename` must be on disk;
     sharded models must have *all* shards present. Prevents promoting an
     alias to `installed` when its specific quant is missing, even if some
@@ -120,7 +126,14 @@ def _has_expected_weights(
         # exact filename match).
         on_disk = set(names)
         return all(name in on_disk for name in expected)
-    # vLLM (or absent backend on legacy rows treated as vLLM).
+    if backend == "sglang-diffusion":
+        # Diffusers repositories place component weights below directories
+        # such as transformer/, text_encoder/, and vae/.
+        for _root, _dirs, files in os.walk(snapshot_dir):
+            if any(name.endswith((".safetensors", ".bin")) for name in files):
+                return True
+        return False
+    # vLLM, or absent backend on legacy rows.
     for name in names:
         if name.endswith((".safetensors", ".bin")):
             return True
@@ -210,8 +223,11 @@ class CatalogRow:
     extra_args: str     # JSON
     revision: str = "main"
     resolved_sha: Optional[str] = None
-    backend: str = "vllm"               # "vllm" | "llama.cpp"
+    backend: str = "vllm"               # vllm | llama.cpp | sglang-diffusion
     gguf_filename: Optional[str] = None  # primary shard for llama.cpp rows
+    model_kind: str = "language"
+    capabilities: str = '["chat.completions","completions","embeddings","responses"]'
+    image_config: Optional[str] = None
 
     def to_api_dict(self) -> dict:
         return {
@@ -233,6 +249,9 @@ class CatalogRow:
             "resolved_sha": self.resolved_sha,
             "backend": self.backend,
             "gguf_filename": self.gguf_filename,
+            "model_kind": self.model_kind,
+            "capabilities": json.loads(self.capabilities),
+            "image_config": json.loads(self.image_config) if self.image_config else None,
         }
 
 
@@ -333,6 +352,9 @@ class Catalog:
                   resolved_sha            TEXT,
                   backend                 TEXT NOT NULL DEFAULT 'vllm',
                   gguf_filename           TEXT,
+                  model_kind              TEXT NOT NULL DEFAULT 'language',
+                  capabilities            TEXT NOT NULL DEFAULT '["chat.completions","completions","embeddings","responses"]',
+                  image_config            TEXT,
                   total_prompt_tokens     INTEGER NOT NULL DEFAULT 0,
                   total_completion_tokens INTEGER NOT NULL DEFAULT 0
                 );
@@ -385,7 +407,7 @@ class Catalog:
                     "INSERT INTO schema_version(version) VALUES (?)", (SCHEMA_VERSION,)
                 )
             elif int(existing["version"]) < SCHEMA_VERSION:
-                # All additions through v3 are additive (CREATE TABLE IF NOT
+                # All additions through v4 are additive (CREATE TABLE IF NOT
                 # EXISTS / additive ALTERs above), so the only step here is
                 # bumping the stored version once the bootstrap script has
                 # ensured every needed table exists.
@@ -416,6 +438,19 @@ class Catalog:
             if "gguf_filename" not in cols:
                 self._conn.execute(
                     "ALTER TABLE models ADD COLUMN gguf_filename TEXT"
+                )
+            if "model_kind" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE models ADD COLUMN model_kind TEXT NOT NULL DEFAULT 'language'"
+                )
+            if "capabilities" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE models ADD COLUMN capabilities TEXT NOT NULL "
+                    "DEFAULT '[\"chat.completions\",\"completions\",\"embeddings\",\"responses\"]'"
+                )
+            if "image_config" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE models ADD COLUMN image_config TEXT"
                 )
             if "total_prompt_tokens" not in cols:
                 self._conn.execute(
@@ -486,10 +521,12 @@ class Catalog:
             storage_loc = m.storage if m.storage is not None else default_storage
             gpus_json = json.dumps(m.gpus)
             extra_json = json.dumps(m.extra_args)
+            capabilities_json = json.dumps(m.capabilities)
+            image_json = json.dumps(m.image.model_dump()) if m.image is not None else None
 
             row = self._conn.execute(
                 "SELECT source, hf_model_id, storage_location, revision, "
-                "backend, gguf_filename "
+                "backend, gguf_filename, model_kind, capabilities, image_config "
                 "FROM models WHERE alias=?", (m.alias,)
             ).fetchone()
 
@@ -500,13 +537,15 @@ class Catalog:
                       alias, hf_model_id, source, quantization, gpus,
                       max_model_len, storage_location, cache_path, size_bytes,
                       status, installed_at, last_used_at, request_count,
-                      extra_args, revision, backend, gguf_filename
+                      extra_args, revision, backend, gguf_filename,
+                      model_kind, capabilities, image_config
                     ) VALUES (?, ?, 'config', ?, ?, ?, ?, NULL, NULL,
-                              'partial', NULL, NULL, 0, ?, ?, ?, ?)
+                              'partial', NULL, NULL, 0, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (m.alias, m.model, m.quantization, gpus_json,
                      m.max_model_len, storage_loc, extra_json, m.revision,
-                     m.backend, m.gguf_filename),
+                     m.backend, m.gguf_filename, m.kind, capabilities_json,
+                     image_json),
                 )
                 added += 1
             else:
@@ -520,6 +559,7 @@ class Catalog:
                 # so wipe the cached snapshot pin when they shift.
                 row_backend = row["backend"] if "backend" in row.keys() else "vllm"
                 row_gguf = row["gguf_filename"] if "gguf_filename" in row.keys() else None
+                row_kind = row["model_kind"] if "model_kind" in row.keys() else "language"
                 clears_cached_snapshot = (
                     row["source"] == "ui_install"
                     or row["hf_model_id"] != m.model
@@ -527,6 +567,7 @@ class Catalog:
                     or row["revision"] != m.revision
                     or row_backend != m.backend
                     or row_gguf != m.gguf_filename
+                    or row_kind != m.kind
                 )
                 cache_reset_sql = (
                     "cache_path = NULL, status = 'partial', resolved_sha = NULL,"
@@ -546,12 +587,16 @@ class Catalog:
                       extra_args       = ?,
                       revision         = ?,
                       backend          = ?,
-                      gguf_filename    = ?
+                      gguf_filename    = ?,
+                      model_kind       = ?,
+                      capabilities     = ?,
+                      image_config     = ?
                     WHERE alias = ?
                     """,
                     (m.model, m.quantization, gpus_json, m.max_model_len,
                      storage_loc, extra_json, m.revision,
-                     m.backend, m.gguf_filename, m.alias),
+                     m.backend, m.gguf_filename, m.kind, capabilities_json,
+                     image_json, m.alias),
                 )
                 updated += 1
 
@@ -940,12 +985,17 @@ class Catalog:
         total_bytes_hint: Optional[int] = None,
         backend: str = "vllm",
         gguf_filename: Optional[str] = None,
+        model_kind: str = "language",
+        capabilities: Optional[list[str] | tuple[str, ...]] = None,
+        image_config: Optional[dict] = None,
     ) -> int:
         """Atomically: insert/upsert the models row at status='queued' and
         insert a new downloads row at status='queued'. Returns the new
         downloads.id. Clears any stale resolved_sha pin on retry."""
         gpus_json = json.dumps(gpus)
         extra_json = json.dumps(extra_args or [])
+        capabilities_json = json.dumps(capabilities or _default_capabilities(model_kind))
+        image_json = json.dumps(image_config) if image_config is not None else None
         now = int(time.time())
         with self._lock, self._conn:
             existing = self._conn.execute(
@@ -958,13 +1008,15 @@ class Catalog:
                       alias, hf_model_id, source, quantization, gpus,
                       max_model_len, storage_location, cache_path, size_bytes,
                       status, installed_at, last_used_at, request_count,
-                      extra_args, revision, resolved_sha, backend, gguf_filename
+                      extra_args, revision, resolved_sha, backend, gguf_filename,
+                      model_kind, capabilities, image_config
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL,
-                              'queued', NULL, NULL, 0, ?, ?, NULL, ?, ?)
+                              'queued', NULL, NULL, 0, ?, ?, NULL, ?, ?, ?, ?, ?)
                     """,
                     (alias, hf_model_id, source, quantization, gpus_json,
                      max_model_len, storage_location, extra_json, revision,
-                     backend, gguf_filename),
+                     backend, gguf_filename, model_kind, capabilities_json,
+                     image_json),
                 )
             else:
                 self._conn.execute(
@@ -982,12 +1034,16 @@ class Catalog:
                       revision         = ?,
                       resolved_sha     = NULL,
                       backend          = ?,
-                      gguf_filename    = ?
+                      gguf_filename    = ?,
+                      model_kind       = ?,
+                      capabilities     = ?,
+                      image_config     = ?
                     WHERE alias = ?
                     """,
                     (hf_model_id, source, quantization, gpus_json,
                      max_model_len, storage_location, extra_json, revision,
-                     backend, gguf_filename, alias),
+                     backend, gguf_filename, model_kind, capabilities_json,
+                     image_json, alias),
                 )
             cursor = self._conn.execute(
                 "INSERT INTO downloads (alias, pid, status, started_at, "
@@ -1208,6 +1264,9 @@ class Catalog:
         resolved_sha: Optional[str] = None,
         backend: str = "vllm",
         gguf_filename: Optional[str] = None,
+        model_kind: str = "language",
+        capabilities: Optional[str] = None,
+        image_config: Optional[str] = None,
     ) -> None:
         """Direct insert bypassing config validation. Used by Phase 4 for
         ui_install rows and by tests for synthetic-alias rows."""
@@ -1218,13 +1277,17 @@ class Catalog:
                   alias, hf_model_id, source, quantization, gpus,
                   max_model_len, storage_location, cache_path, size_bytes,
                   status, installed_at, last_used_at, request_count,
-                  extra_args, revision, resolved_sha, backend, gguf_filename
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  extra_args, revision, resolved_sha, backend, gguf_filename,
+                  model_kind, capabilities, image_config
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (alias, hf_model_id, source, quantization, gpus,
                  max_model_len, storage_location, cache_path, size_bytes,
                  status, installed_at, last_used_at, request_count,
-                 extra_args, revision, resolved_sha, backend, gguf_filename),
+                 extra_args, revision, resolved_sha, backend, gguf_filename,
+                 model_kind,
+                 capabilities or json.dumps(_default_capabilities(model_kind)),
+                 image_config),
             )
 
     def _raw_insert_download(
@@ -1273,6 +1336,17 @@ class Catalog:
             resolved_sha=(row["resolved_sha"] if "resolved_sha" in keys else None),
             backend=(row["backend"] if "backend" in keys and row["backend"] else "vllm"),
             gguf_filename=(row["gguf_filename"] if "gguf_filename" in keys else None),
+            model_kind=(
+                row["model_kind"]
+                if "model_kind" in keys and row["model_kind"]
+                else "language"
+            ),
+            capabilities=(
+                row["capabilities"]
+                if "capabilities" in keys and row["capabilities"]
+                else json.dumps(_default_capabilities("language"))
+            ),
+            image_config=(row["image_config"] if "image_config" in keys else None),
         )
 
     def _to_download_row(self, row) -> DownloadRow:

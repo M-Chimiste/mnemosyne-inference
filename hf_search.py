@@ -180,14 +180,18 @@ _WEIGHT_EXTENSIONS = (".safetensors", ".bin", ".gguf", ".pt")
 _TRANSFORMER_WEIGHT_EXTENSIONS = (".safetensors", ".bin")
 
 # Modalities the search exposes. The Hub uses pipeline_tag values to bucket
-# repos; these four cover the LLM-shaped surface vLLM can serve.
+# repos; text-to-image is included for the SGLang Diffusion install path.
 _DEFAULT_PIPELINE_TAGS: tuple[str, ...] = (
     "text-generation",
     "image-text-to-text",
     "audio-text-to-text",
     "any-to-any",
+    "text-to-image",
 )
 _VALID_PIPELINE_TAGS: frozenset[str] = frozenset(_DEFAULT_PIPELINE_TAGS)
+_SGLANG_DIFFUSION_MODEL_IDS = frozenset(
+    {"qwen/qwen-image", "krea/krea-2-turbo"}
+)
 
 # Maps the API-facing sort name to the `huggingface_hub` 1.x sort literal.
 # The library converts these snake_case names to the Hub API's camelCase
@@ -726,6 +730,16 @@ def _row_for_model(
     recommended_backend = (
         probe.recommended_backend if probe is not None else BACKEND_VLLM
     )
+    pipeline_tag = getattr(m, "pipeline_tag", None)
+    if pipeline_tag == "text-to-image":
+        if repo_id.casefold() in _SGLANG_DIFFUSION_MODEL_IDS:
+            is_compatible = True
+            compat_reason = "supported by SGLang Diffusion"
+            recommended_backend = "sglang-diffusion"
+        else:
+            is_compatible = False
+            compat_reason = "image architecture is not in the validated SGLang set"
+            recommended_backend = "none"
     last_modified = getattr(m, "last_modified", None)
     if last_modified is not None and not isinstance(last_modified, str):
         # ModelInfo emits datetime objects; serialize for JSON.
@@ -743,7 +757,7 @@ def _row_for_model(
         "likes": getattr(m, "likes", None),
         "last_modified": last_modified,
         "tags": list(getattr(m, "tags", []) or []),
-        "pipeline_tag": getattr(m, "pipeline_tag", None),
+        "pipeline_tag": pipeline_tag,
         "has_gguf": has_gguf,
         "recommended_backend": recommended_backend,
     }
@@ -758,7 +772,7 @@ def _resolve_pipeline_tags(
     Precedence:
       1. Explicit `pipeline_tags` (CSV from the route, list internally).
       2. Legacy `include_vision`: True → text + vision; False → text only.
-      3. Neither: full default (text + vision + audio + omni).
+      3. Neither: full default (text + vision + audio + omni + image generation).
     """
     if pipeline_tags is not None:
         seen: list[str] = []

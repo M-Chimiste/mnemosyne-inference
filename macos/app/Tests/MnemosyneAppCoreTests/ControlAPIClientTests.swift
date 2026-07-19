@@ -32,6 +32,24 @@ func loadRequestEncoding() throws {
     #expect(payload == LoadModelRequest(model: "glm-5-2"))
 }
 
+@Test("Configuration validation uses the control endpoint and exact YAML")
+func configurationValidationRequestEncoding() throws {
+    let client = ControlAPIClient(
+        baseURL: URL(string: "http://localhost:17321")!,
+        adminPassword: "secret"
+    )
+    let yaml = "models:\n  - alias: local-model\n"
+    let request = try client.configurationValidationRequest(configYAML: yaml)
+
+    #expect(request.url?.absoluteString == "http://localhost:17321/manager/config/validate")
+    #expect(request.httpMethod == "POST")
+    #expect(request.value(forHTTPHeaderField: "Content-Type") == "application/json")
+    #expect(request.value(forHTTPHeaderField: "Authorization") == "Basic YWRtaW46c2VjcmV0")
+    let body = try #require(request.httpBody)
+    let payload = try JSONDecoder().decode(ConfigurationValidationRequest.self, from: body)
+    #expect(payload == ConfigurationValidationRequest(configYAML: yaml))
+}
+
 @Test("The status decoder ignores future fields")
 func statusDecodeIsForwardCompatible() throws {
     let payload = #"""

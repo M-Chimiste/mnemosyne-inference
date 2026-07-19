@@ -10,7 +10,9 @@ function parseGpuPlan(value: string): "all" | number[] {
 }
 
 function defaultBackendFromResult(result: HfSearchResult): Backend {
+  if (result.pipeline_tag === "text-to-image") return "sglang-diffusion";
   if (result.recommended_backend === "llama.cpp") return "llama.cpp";
+  if (result.recommended_backend === "sglang-diffusion") return "sglang-diffusion";
   // "none" still defaults to vLLM in the form; install validation will reject.
   return "vllm";
 }
@@ -36,6 +38,11 @@ export function InstallForm({
   const [maxModelLen, setMaxModelLen] = useState("");
   const [extraArgs, setExtraArgs] = useState("");
   const [ggufPrimary, setGgufPrimary] = useState<string>("");
+  const isKrea = result.model_id.toLowerCase().includes("krea-2");
+  const [imageWidth, setImageWidth] = useState("1024");
+  const [imageHeight, setImageHeight] = useState("1024");
+  const [imageSteps, setImageSteps] = useState(isKrea ? "8" : "30");
+  const [imageGuidance, setImageGuidance] = useState(isKrea ? "1" : "4");
   const gpuValue = gpuMode === "custom" ? customGpus : gpuMode;
   const chosenStorage = useMemo(() => storages.find((s) => s.name === storage), [storage, storages]);
 
@@ -74,7 +81,17 @@ export function InstallForm({
       extra_args: extraArgs.split("\n").map((arg) => arg.trim()).filter(Boolean),
       size_estimate_gb: sizeEstimateGb ?? undefined,
       backend,
-      gguf_filename: backend === "llama.cpp" ? ggufPrimary : null
+      gguf_filename: backend === "llama.cpp" ? ggufPrimary : null,
+      kind: backend === "sglang-diffusion" ? "image" : "language",
+      image: backend === "sglang-diffusion" ? {
+        width: Number(imageWidth),
+        height: Number(imageHeight),
+        num_inference_steps: Number(imageSteps),
+        guidance_scale: Number(imageGuidance),
+        guidance_parameter: result.model_id.toLowerCase().includes("qwen-image")
+          ? "true_cfg_scale"
+          : "guidance_scale"
+      } : null
     });
   }
 
@@ -94,6 +111,7 @@ export function InstallForm({
           >
             <option value="vllm">vLLM</option>
             <option value="llama.cpp">llama.cpp (GGUF)</option>
+            <option value="sglang-diffusion">SGLang Diffusion (image)</option>
           </select>
         </label>
         {backend === "llama.cpp" && (
@@ -156,10 +174,28 @@ export function InstallForm({
             ))}
           </select>
         </label>
-        <label className="text-sm font-medium">
-          Max Context
-          <input className="focus-ring mt-1 w-full border border-line bg-white px-2 py-1.5" type="number" min="1" value={maxModelLen} onChange={(e) => setMaxModelLen(e.target.value)} />
-        </label>
+        {backend !== "sglang-diffusion" && (
+          <label className="text-sm font-medium">
+            Max Context
+            <input className="focus-ring mt-1 w-full border border-line bg-white px-2 py-1.5" type="number" min="1" value={maxModelLen} onChange={(e) => setMaxModelLen(e.target.value)} />
+          </label>
+        )}
+        {backend === "sglang-diffusion" && (
+          <>
+            <label className="text-sm font-medium">Width
+              <input className="focus-ring mt-1 w-full border border-line bg-white px-2 py-1.5" type="number" min="64" max="4096" step="16" value={imageWidth} onChange={(e) => setImageWidth(e.target.value)} required />
+            </label>
+            <label className="text-sm font-medium">Height
+              <input className="focus-ring mt-1 w-full border border-line bg-white px-2 py-1.5" type="number" min="64" max="4096" step="16" value={imageHeight} onChange={(e) => setImageHeight(e.target.value)} required />
+            </label>
+            <label className="text-sm font-medium">Inference steps
+              <input className="focus-ring mt-1 w-full border border-line bg-white px-2 py-1.5" type="number" min="1" max="200" value={imageSteps} onChange={(e) => setImageSteps(e.target.value)} required />
+            </label>
+            <label className="text-sm font-medium">Guidance scale
+              <input className="focus-ring mt-1 w-full border border-line bg-white px-2 py-1.5" type="number" min="0" max="50" step="0.1" value={imageGuidance} onChange={(e) => setImageGuidance(e.target.value)} required />
+            </label>
+          </>
+        )}
       </div>
       <label className="block text-sm font-medium">
         Extra Args

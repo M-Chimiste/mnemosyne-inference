@@ -90,6 +90,26 @@ def test_compatible_row(client, monkeypatch):
     assert "filter" not in api.list_calls[0]
 
 
+def test_validated_image_model_uses_sglang_compatibility(client, monkeypatch):
+    _build_response(
+        monkeypatch,
+        list_results={
+            "text-to-image": [
+                FakeModelInfo("Qwen/Qwen-Image", pipeline_tag="text-to-image")
+            ]
+        },
+        configs={"Qwen/Qwen-Image": {}},
+    )
+    response = client.get(
+        "/manager/hf/search?q=qwen-image&pipeline_tags=text-to-image"
+    )
+    assert response.status_code == 200
+    row = response.json()["results"][0]
+    assert row["is_compatible"] is True
+    assert row["recommended_backend"] == "sglang-diffusion"
+    assert "SGLang Diffusion" in row["compat_reason"]
+
+
 def test_default_sort_is_trending_and_overridable(client, monkeypatch):
     api = _build_response(
         monkeypatch,
@@ -109,7 +129,7 @@ def test_default_sort_is_trending_and_overridable(client, monkeypatch):
     assert api.list_calls[-1]["sort"] == "last_modified"
 
 
-def test_default_modalities_query_all_four(client, monkeypatch):
+def test_default_modalities_include_image_generation(client, monkeypatch):
     api = _build_response(
         monkeypatch,
         list_results={"text-generation": [FakeModelInfo("x/y")]},
@@ -122,6 +142,7 @@ def test_default_modalities_query_all_four(client, monkeypatch):
         "image-text-to-text",
         "audio-text-to-text",
         "any-to-any",
+        "text-to-image",
     ]
 
 
