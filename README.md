@@ -3,10 +3,17 @@
 ## What this is
 
 Mnemosyne Inference gives a single workstation Ollama/LMStudio-style ergonomics
-on top of upstream inference engines: one container supervises either
-[vLLM](https://docs.vllm.ai/) or llama.cpp's `llama-server`, exposes an
-OpenAI-compatible API, and keeps the rest of the machine — installs, model
-swaps, multi-drive storage — driven by a YAML config and a small CLI/UI.
+on top of upstream inference engines. The repository now contains two sibling
+deployments with independent dependencies and packaging:
+
+- The established CUDA deployment runs vLLM or llama.cpp in Docker.
+- The native Apple Silicon deployment coordinates an existing LM Studio
+  installation, oMLX, and DwarfStar (DS4) through one local API. It does not
+  use Docker, so MLX and Metal remain available to the host processes. Start
+  with [macos/README.md](macos/README.md).
+
+The remainder of this README describes the CUDA deployment unless a section is
+explicitly labeled macOS.
 
 The container runs **two HTTP planes** in one process:
 
@@ -24,15 +31,28 @@ when nothing is loaded. Each entry's `id` is the stable alias; send that alias
 back as the `model` field in a `/v1/*` request to trigger a load. Only models
 whose weights are present on disk (`status: installed`) are listed.
 
-Hardware target: a CUDA 12.8+ host with a Blackwell-class NVIDIA GPU (RTX 50
-or workstation Blackwell). The image bakes in PyTorch cu129, a pinned vLLM
-stable release, and a CUDA-built pinned llama.cpp `llama-server`.
-Ampere/Hopper cards generally also work — see [Refreshing architecture
-support](#refreshing-architecture-support) if you need to bump or change the
-pinned engine builds.
+Hardware target: a CUDA 13-capable host with a Blackwell-class NVIDIA GPU
+(RTX 50 or workstation Blackwell). The image bakes in PyTorch cu129, a pinned
+vLLM stable release, and a CUDA-built pinned llama.cpp `llama-server`. The
+default llama.cpp build targets `sm_120`; for Ampere or Hopper, override
+`CMAKE_CUDA_ARCHITECTURES` when rebuilding as described under [Refreshing
+architecture support](#refreshing-architecture-support).
 
-Design context: [project_docs/PRD.md](project_docs/PRD.md) and
-[project_docs/implementation_plan.md](project_docs/implementation_plan.md).
+Contributor guidance lives in [agents.md](agents.md), and CUDA-host release
+checks live in [project_docs/smoke_checks.md](project_docs/smoke_checks.md).
+
+## Native macOS deployment
+
+The native service listens on `127.0.0.1:17320` for inference and
+`127.0.0.1:17321` for control. It enforces one resident model globally across
+LM Studio (`:1234`), oMLX (`:17322`), and a manager-owned DS4 process
+(`:17323`). A per-user LaunchAgent keeps inference alive when the SwiftUI menu
+bar app quits.
+
+The Python core, locked dependencies, native app, packaging scripts, example
+configuration, setup guide, and Mac-only smoke checks all live under
+[`macos/`](macos/README.md). None of those paths are copied into the CUDA image,
+and the Mac service never imports vLLM or CUDA modules.
 
 ## Quickstart
 
@@ -158,9 +178,8 @@ properties. For those, edit `docker-compose.yml` and run
 
 ## Adding a drive
 
-PRD §5.12 declares multi-drive storage as config-only — no code changes — but
-adding a *new* drive is a host-level workflow because Docker has to learn
-about the bind-mount. The flow:
+Multi-drive storage is config-driven, but adding a *new* drive is also a
+host-level workflow because Docker has to learn about the bind-mount. The flow:
 
 1. **Bind-mount the host path under the container** (`docker-compose.yml`):
    ```yaml
@@ -262,7 +281,7 @@ start over from scratch.
   ```
   This wipes the cache directory before re-spawning the worker.
 - **`cache-delete` on an aliased install demotes the row to `partial`**
-  rather than removing the alias (PRD §9, 2026-04-27 decision). The
+  rather than removing the alias. The
   user-visible effect is that the row stays in the catalog with a Retry
   button — one click to recover. To remove the alias entirely, pass
   `--remove-row`:
@@ -319,7 +338,7 @@ docker run --rm --gpus all --entrypoint /usr/local/bin/llama-server \
 ## Security and LAN exposure
 
 This is a single-workstation tool, but the published ports reach the LAN
-unless you say otherwise. Translate PRD §5.10 / §5.13 into rules:
+unless you say otherwise. Follow these rules:
 
 - **Always set `ADMIN_PASSWORD`** in `~/vllm-manager/.env` before exposing
   `:8001`. With `ADMIN_PASSWORD` unset, the admin app binds to `127.0.0.1`
@@ -463,7 +482,7 @@ curl -u admin:"$ADMIN_PASSWORD" -X POST \
   Either bump the timeout, retry, or queue your traffic differently.
 - **`503` from `/v1/*` mid-load.** The active engine child died (OOM, kernel
   mismatch, bad model file, etc.). The next request retriggers a fresh load —
-  there is no auto-restart loop by design (PRD §5.3). Check `vllm-ctl logs`
+  there is no auto-restart loop by design. Check `vllm-ctl logs`
   for the underlying error.
 - **`vllm-ctl reload` reports `partial` rows after editing `config.yaml`.**
   Cache reconcile has spotted aliased installs whose cache directories are
@@ -475,9 +494,8 @@ curl -u admin:"$ADMIN_PASSWORD" -X POST \
 
 ## Known v1 limitations
 
-These are deliberate v1 scope cuts. The canonical decision log is
-[project_docs/PRD.md §8](project_docs/PRD.md); this list is the operator-facing
-summary so you don't go looking for features that aren't here.
+These are deliberate v1 scope cuts, summarized here so you do not go looking
+for features that are not implemented.
 
 - **No multi-model concurrent serving.** One engine/model at a time. To
   switch, send a request with the new alias — `_proxy` queues the swap and
@@ -496,7 +514,7 @@ summary so you don't go looking for features that aren't here.
   auto-substitute quantized variants.
 - **No engine auto-restart on crash.** If the inner engine dies under a
   request, the manager fails open with a `503` and the next `/v1/*` request
-  triggers a fresh load (PRD §5.3). No supervisor loop tries to keep the
+  triggers a fresh load. No supervisor loop tries to keep the
   previous model resident.
 - **No runtime hard-fail when `gpus='all'` finds no GPUs.** The manager logs
   a warning and falls back to `VLLM_DEFAULT_TP`. On a real CUDA host this
@@ -507,8 +525,7 @@ summary so you don't go looking for features that aren't here.
 
 - [agents.md](agents.md) — guidance for AI coding assistants and external
   contributors.
-- [CLAUDE.md](CLAUDE.md) — Claude Code repository conventions; complements
-  `agents.md`.
-- [project_docs/PRD.md](project_docs/PRD.md) — design intent for v1.
-- [project_docs/implementation_plan.md](project_docs/implementation_plan.md) —
-  phased build plan; the "current state" of features in flight.
+- [project_docs/smoke_checks.md](project_docs/smoke_checks.md) — manual
+  container and CUDA-host release checks.
+- [project_docs/project_status.md](project_docs/project_status.md) — current
+  release status, feature history, and outstanding workstation validation.

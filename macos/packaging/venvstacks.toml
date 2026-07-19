@@ -1,0 +1,19 @@
+# Template for the relocatable Python runtime embedded in Mnemosyne.app.
+# `build_runtime.py` fills the framework requirements with exact production
+# pins exported from macos/service/uv.lock.
+# __MNEMOSYNE_LOCK_PROVENANCE__
+
+[[runtimes]]
+name = "cpython-3.12"
+python_implementation = "cpython@3.12.10"
+requirements = []
+platforms = ["macosx_arm64"]
+
+[[frameworks]]
+name = "mnemosyne-base"
+runtime = "cpython-3.12"
+requirements = [] # __MNEMOSYNE_REQUIREMENTS__
+platforms = ["macosx_arm64"]
+
+[tool.uv]
+environments = ["sys_platform == 'darwin' and platform_machine == 'arm64'"]

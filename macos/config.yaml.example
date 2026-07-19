@@ -1,0 +1,83 @@
+# Mnemosyne native macOS configuration.
+# Copy to ~/Library/Application Support/Mnemosyne/config.yaml.
+
+server:
+  inference_bind: 127.0.0.1
+  inference_port: 17320
+  control_bind: 127.0.0.1
+  control_port: 17321
+  idle_unload_seconds: 900
+  startup_timeout_seconds: 900
+  swap_queue_timeout_seconds: 300
+  shutdown_grace_seconds: 30
+  reconcile_interval_seconds: 30
+  startup_policy: unload_all
+  inference_api_key_env: INFERENCE_API_KEY
+  control_password_env: ADMIN_PASSWORD
+
+engines:
+  # LM Studio is assumed to be installed separately with its local API enabled.
+  lmstudio:
+    enabled: true
+    base_url: http://127.0.0.1:1234
+    api_key_env: LMSTUDIO_API_KEY
+    request_timeout_seconds: 30
+
+  # Install and run oMLX natively. Keep its port loopback-only. For strict
+  # lifecycle control, disable oMLX model pinning/TTL and either disable its
+  # inner admin auth or provide a working admin session via OMLX_ADMIN_SESSION.
+  omlx:
+    enabled: true
+    base_url: http://127.0.0.1:17322
+    api_key_env: OMLX_API_KEY
+    admin_session_env: OMLX_ADMIN_SESSION
+    request_timeout_seconds: 30
+
+  # DS4 is launched and terminated by Mnemosyne. It is not a general GGUF
+  # runtime; use only GGUFs supported by the installed DwarfStar build.
+  ds4:
+    enabled: true
+    host: 127.0.0.1
+    port: 17323
+    binary: /Applications/DwarfStar/ds4-server
+    working_directory: /Applications/DwarfStar
+    # Mnemosyne uses this identity record to prove that a recovered PID and
+    # process group are its own before it ever sends a signal.
+    process_state_path: ~/Library/Application Support/Mnemosyne/state/ds4-process.json
+    request_timeout_seconds: 30
+    shutdown_grace_seconds: 30
+
+paths:
+  state_database: ~/Library/Application Support/Mnemosyne/state/mnemosyne.db
+  log_directory: ~/Library/Application Support/Mnemosyne/logs
+
+models:
+  - alias: local-qwen
+    engine: lmstudio
+    model: publisher/model-key
+    load:
+      context_length: 32768
+
+  - alias: glm-5-2
+    engine: omlx
+    model: GLM-5.2-4bit
+
+  - alias: deepseek-v4-flash
+    engine: ds4
+    model: /Volumes/Models/ds4flash.gguf
+    served_model_name: deepseek-v4-flash
+    load:
+      context_length: 100000
+      kv_disk_directory: /Volumes/ModelCache/ds4-kv
+      kv_disk_space_mb: 8192
+      extra_args: []
+
+# The DSN is secret and belongs in the environment file as
+# TOKEN_SIDECAR_POSTGRES_DSN=postgresql://...
+token_sidecar:
+  enabled: false
+  node_id: mnemosyne-mac
+  flush_interval_seconds: 30
+  batch_size: 500
+  max_outbox_rows: 100000
+  connect_timeout_seconds: 5

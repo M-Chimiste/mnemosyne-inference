@@ -4,9 +4,9 @@
 which the pytest harness cannot exercise. Together with the pytest contract
 snapshot, this is the workstation-side release checklist.
 
-**When to run:** before marking Phase 8 / v1 acceptance complete, and before
-merging any future phase that touches request paths, process lifecycle, install
-workflows, or plane separation.
+**When to run:** before a workstation release, and before merging changes that
+touch request paths, process lifecycle, installs, engine builds, GPU behavior,
+or plane separation.
 
 **Setup:**
 
@@ -249,12 +249,9 @@ Failure modes worth distinguishing:
 - The first call after a fresh install pays the lazy-load latency. A second
   call should be quick.
 
-This smoke check satisfies the manual side of PRD §7's "vision model
-end-to-end" criterion. Phase 8's
-[phase_8_acceptance.md](phase_8_acceptance.md) records pass/fail.
+This is the manual end-to-end check for vision-model request handling.
 
 ## Recording deltas
 
 If any step above behaves differently from the description on the current
-branch, record it in [phase_8_acceptance.md](phase_8_acceptance.md) or open a
-follow-up issue before marking v1 accepted.
+branch, update this checklist or open a follow-up issue before release.

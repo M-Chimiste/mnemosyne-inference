@@ -1,30 +1,46 @@
 # Mnemosyne Inference — Project Status
 
-**Last updated:** 2026-05-07
+**Last updated:** 2026-07-19
 
 ## Current state
 
 **Active milestone:** M5 — Workstation-ready release
-**Active phase:** Phase 9 (llama.cpp backend) code landed; Phase 8 verification
-and Phase 5 snapshot gate still open.
 
-M3 is implemented: `/manager/install` is end-to-end functional with
-killable subprocess downloads, restart-recoverable state, multi-drive
-storage routing, and a catalog-backed legacy `/manager/download` shim.
-Phase 5 code has landed: `GET /manager/hf/search` returns compatibility-
-flagged results sourced from runtime registry introspection (with a bundled
-JSON snapshot fallback), and `/manager/status` reports `vllm_arch_count` /
-`vllm_arch_source` so operators can see when the fallback is active. Phase 6
-code has landed: the admin port now serves a React/Vite SPA, exposes live
-best-effort GPU telemetry via `/manager/gpu`, and keeps `/ui/*` off the
-inference plane. Phase 7 docs/CLI packaging work has landed with a top-level
-README, executable `vllm-ctl`, and corrected admin auth examples. Phase 9
-adds `llama-server` as a parallel backend so GGUF-only repos install and
-serve without vLLM in the loop; auto-detection runs at install time, the
-catalog persists per-row backend + chosen GGUF filename, and reconcile
-validates the specific shard set. Phase 5 is still not marked complete
-until the bundled architecture snapshot is regenerated inside the pinned
-vLLM container and committed.
+The major v1 feature set is implemented: persistent installs and catalog
+state, two authenticated HTTP planes, lazy single-model swapping, vLLM and
+llama.cpp backends, the admin SPA, HuggingFace/GGUF discovery, token-usage
+analytics, and the optional durable Postgres sidecar. `GET /v1/models` is
+served locally from the catalog so clients can discover every installed alias
+while no engine is resident. Known slow CUDA-graph-capture SSM/hybrid vLLM
+families now default to eager mode to keep cold swaps interactive.
+
+The image currently pins CUDA 13.0.2, PyTorch cu129, vLLM 0.22.1, and
+llama.cpp b9548. The bundled vLLM architecture snapshot was refreshed with
+the engine-pin update. The remaining release work is workstation/CUDA smoke
+validation of the current pins and end-to-end backend swaps; see
+[smoke_checks.md](smoke_checks.md).
+
+An isolated native macOS track is implemented, with target-workstation
+acceptance still pending. It lives
+entirely below `macos/`, uses dedicated ports `17320-17323`, and does not alter
+the CUDA image or its `8000-8002` topology. The first implementation includes:
+
+- a separately locked FastAPI service with inference and control planes;
+- a FIFO, epoch-lease coordinator that drains streams and verifies strict
+  single-model residency across LM Studio, oMLX, and DS4;
+- native LM Studio/oMLX lifecycle adapters and a manager-owned DS4 subprocess;
+- OpenAI/Responses/Anthropic usage normalization plus an atomic SQLite
+  analytics/Postgres-outbox path;
+- a per-user LaunchAgent bundle, native Python bootstrap, and SwiftUI menu bar
+  controller; and
+- independent setup, architecture, and Apple Silicon smoke documentation.
+
+The Python suites, Swift production build, relocatable runtime export, and
+staged app signing checks run on the development host. Swift test sources
+compile here, but executing them requires a full Xcode installation rather
+than standalone Command Line Tools. Real LM Studio, oMLX, DS4/Metal,
+process-memory release, distribution signing, and `SMAppService` behavior
+remain target-Mac smoke gates; see [../macos/smoke_checks.md](../macos/smoke_checks.md).
 
 ## Phase status
 
@@ -35,11 +51,11 @@ vLLM container and committed.
 | 2 — Runtime lifecycle, lazy load, queue, idle eviction | Profile-driven `_start_vllm`, swap queue, idle eviction | ✅ Done (2026-04-28) |
 | 3 — Plane separation & auth | Two FastAPI apps (inference :8000, admin :8001), HTTP Basic | ✅ Done (2026-04-28) |
 | 4 — Install, download, cache, multi-drive | `/manager/install` + cancellable subprocess downloads | ✅ Done; review fixes landed (2026-04-28) |
-| 5 — HF search & vLLM compatibility filter | `GET /manager/hf/search`, runtime registry introspection | ⚠️ Code landed; generated snapshot pending |
+| 5 — HF search & vLLM compatibility filter | `GET /manager/hf/search`, runtime registry introspection | ✅ Done; bundled snapshot refreshed (2026-06-07) |
 | 6 — Admin UI | React + Vite SPA on the admin port | ✅ Done; host verification complete (2026-04-29) |
 | 7 — Packaging, compose, docs | Multi-stage Dockerfile, compose mounts, ops docs | ✅ Docs/CLI landed; CUDA quickstart smoke pending |
-| 8 — Verification & hardening | PRD acceptance scenarios | ⚠️ Code/docs landed; workstation acceptance pending |
-| 9 — llama.cpp backend for GGUF | Auto-detected llama-server dispatch alongside vLLM | ⚠️ Code landed (2026-05-07); CUDA workstation smoke pending |
+| 8 — Verification & hardening | Automated coverage and workstation acceptance | ⚠️ Code/docs landed; workstation acceptance pending |
+| 9 — llama.cpp backend for GGUF | Auto-detected llama-server dispatch alongside vLLM | ⚠️ Code landed; CUDA workstation smoke pending |
 
 ## What has landed
 
@@ -47,7 +63,6 @@ vLLM container and committed.
 
 - Baseline test harness, smoke checklist, example config/env files, and pinned
   Docker vLLM dependency.
-- Archived plan: [plans/phase_0.md](plans/phase_0.md).
 
 **Phase 1**
 
@@ -58,7 +73,6 @@ vLLM container and committed.
 - `profiles.py` resolves config/catalog aliases into `ResolvedProfile`.
 - Manager endpoints now expose reload, configured profiles, storage locations,
   and catalog rows.
-- Archived plan: [plans/phase_1.md](plans/phase_1.md).
 
 **Phase 2**
 
@@ -76,7 +90,6 @@ vLLM container and committed.
 - `/manager/status` is additive: legacy keys remain, with alias, GPU plan,
   quantization, idle countdown, in-flight count, and swap target added.
 - `vllm-ctl status` prints the new fields when present.
-- Archived plan: [plans/phase_2.md](plans/phase_2.md).
 
 **Phase 3**
 
@@ -92,7 +105,6 @@ vLLM container and committed.
   reject overrides that re-collide.
 - Single SIGTERM handler at the asyncio gather level shuts down both
   uvicorn instances atomically.
-- Archived plan: [plans/phase_3.md](plans/phase_3.md).
 
 **Phase 4**
 
@@ -152,7 +164,6 @@ vLLM container and committed.
 - `vllm-ctl` adds `install`, `install-cancel`, `install-retry`,
   `install-status`, and `cache-delete` commands; `download` and
   `download-status` continue to work through the catalog-backed shim.
-- Archived plan: [plans/phase_4.md](plans/phase_4.md).
 
 **Phase 5**
 
@@ -175,7 +186,7 @@ vLLM container and committed.
   vllm_arch_source, vllm_arch_count, results}`. Each result row carries
   `model_id, architectures, is_compatible, compat_reason, size_estimate_gb,
   downloads, likes, last_modified, tags, pipeline_tag`. `include_vision`
-  defaults `false` per PRD §5.9 but exposes a flag the UI can flip on for
+  defaults `false` but exposes a flag the UI can flip on for
   vision-LLM searches (Qwen-VL, Llava, etc.).
 - Bounded daemon search workers cap `huggingface_hub` thread pile-up without
   blocking process exit; outer `asyncio.wait_for(timeout=30)` raises 504 on
@@ -191,7 +202,6 @@ vLLM container and committed.
   `size_estimate_gb: null` without flipping `is_compatible`.
 - `/manager/status` gains `vllm_arch_count` and `vllm_arch_source` so
   operators can see when the bundled fallback is active.
-- Archived plan: [plans/phase_5.md](plans/phase_5.md).
 
 **Phase 6**
 
@@ -224,7 +234,6 @@ vLLM container and committed.
   when present.
 - Downloads view polls `/manager/downloads` plus selected
   `/manager/install/{alias}` detail and exposes cancel/retry/clear actions.
-- Archived plan: [plans/phase_6.md](plans/phase_6.md).
 
 **Phase 7**
 
@@ -242,7 +251,6 @@ vLLM container and committed.
   making copy-paste API examples authenticate correctly.
 - README terminology now matches the shipped UI navigation (`Search`, not
   `Discover`).
-- Archived plan: [plans/phase_7.md](plans/phase_7.md).
 
 **Phase 8**
 
@@ -261,13 +269,9 @@ vLLM container and committed.
   reconcile then repopulate config rows and recover storage state.
 - New tests: multimodal proxy passthrough, JSON log formatter shape + text
   fallback, SQLite corruption quarantine.
-- Docs: README "Known v1 limitations" section, smoke checks Section 8
-  (vision-model multimodal smoke), and a new
-  [phase_8_acceptance.md](phase_8_acceptance.md) acceptance log mapping each
-  PRD §7 criterion to its test reference and smoke section.
-- Workstation acceptance pass remains pending (CUDA host required); Phase 8
-  flips ✅ once `phase_8_acceptance.md` is filled in on the workstation.
-- Archived plan: [plans/phase_8.md](plans/phase_8.md).
+- Docs: README "Known v1 limitations" section and smoke checks Section 9
+  (vision-model multimodal smoke).
+- Workstation acceptance pass remains pending because it requires a CUDA host.
 
 **Phase 9**
 
@@ -335,22 +339,39 @@ vLLM container and committed.
   extended with engine-dispatch tests, llama.cpp argv/env coverage,
   GGUF-vs-vLLM compat tests, install-validation rejections, and
   reconcile assertions for sharded / mixed-quant repos.
-- Plan: [plans/llamacpp_plan.md](plans/llamacpp_plan.md). Workstation
-  smoke (build + install + load + swap a real GGUF repo) remains pending.
+- Workstation smoke (build + install + load + swap a real GGUF repo) remains
+  pending.
+
+## Post-phase maintenance
+
+- Added per-request token usage rows for streaming and non-streaming chat,
+  completions, and embeddings. SQLite stores local analytics; an optional
+  SQLite outbox drains idempotently to `public.token_usage` through
+  `pg_writer.py` when the Postgres sidecar is enabled.
+- Added local, OpenAI-compatible `GET /v1/models` synthesis from installed
+  catalog rows across both backends, with a resident raw-model fallback.
+- Added automatic `--enforce-eager` defaults for known slow graph-capture
+  SSM/hybrid vLLM families by inspecting cached `config.json` metadata.
+- Updated the container pins to CUDA 13.0.2, PyTorch cu129, vLLM 0.22.1, and
+  llama.cpp b9548; refreshed `vllm_supported_architectures.json`.
 
 ## Verification
 
-Latest host verification on macOS, no CUDA required:
+Latest host verification on 2026-07-19:
 
-- `python -m pytest -q` → `318 passed`.
-- `cd ui && ./node_modules/.bin/tsc --noEmit` → clean.
-- `cd ui && ./node_modules/.bin/vite build` → Vite production build succeeded.
-- `python -m py_compile vllm_manager.py runtime.py config.py catalog.py profiles.py downloader.py download_worker.py hf_search.py logsetup.py repo_probe.py scripts/refresh_arch_list.py`
-- `bash -n vllm-ctl`
-- `./vllm-ctl help`
-- `git ls-files -s vllm-ctl` → `100755`
-- `python scripts/refresh_arch_list.py --help` (does not require vLLM import)
-- `git diff --check`
+- CUDA manager regression suite: `381 passed` with one dependency deprecation
+  warning.
+- Native service suite: `104 passed`.
+- Runtime-packaging suite: `4 passed`; the committed lock exported 21 exact
+  production pins into a relocatable CPython 3.12 runtime.
+- The Swift production targets built, the complete `Mnemosyne.app` staged with
+  that runtime, all three plists passed `plutil`, and deep strict code-signing
+  verification passed for the ad-hoc development bundle.
+- Native and CUDA Python modules passed bytecode compilation, both shell
+  entrypoints passed `bash -n`, and `git diff --check` passed.
+- Swift test sources compile on this host, but standalone Command Line Tools
+  cannot launch the Testing framework bundle; execute the tests with full
+  Xcode during target-Mac acceptance.
 
 Workstation/GPU smoke validation is still outstanding:
 
@@ -369,14 +390,14 @@ Workstation/GPU smoke validation is still outstanding:
   reachable on `:8001` behind Basic auth.
 - Confirm `HUGGING_FACE_HUB_TOKEN` from the legacy `/manager/download` body
   does not appear in `docker exec vllm-manager env`.
-- Phase 6 container UI smoke: authenticated admin `/ui/` returns 200,
+- Admin UI smoke: authenticated admin `/ui/` returns 200,
   unauthenticated admin `/ui/` returns 401, inference `/ui/` returns 404, and
   refreshing `/ui/catalog` serves the SPA.
-- Phase 7 CUDA quickstart smoke: copy examples into a clean compose dir,
+- CUDA quickstart smoke: copy examples into a clean compose dir,
   set `ADMIN_PASSWORD`, build/start on the workstation, confirm `/health`,
   authenticated `/manager/status`, and authenticated `/ui/`.
-- Phase 9 GGUF / llama.cpp smoke: rebuild image and confirm
-  `docker run --rm <img> which llama-server`. Search a known GGUF repo
+- GGUF / llama.cpp smoke: rebuild the image and confirm
+  `docker run --rm --entrypoint which <img> llama-server`. Search a known GGUF repo
   (e.g. `bartowski/Qwen2.5-7B-Instruct-GGUF`) and verify
   `recommended_backend == "llama.cpp"` and `has_gguf == true`. Install via
   the UI dropdown, confirm `/manager/status` shows `backend: llama.cpp`
@@ -390,15 +411,9 @@ Workstation/GPU smoke validation is still outstanding:
 ## Open follow-ups
 
 - **External `docker-compose.yml`.** Lives outside the repo at
-  `~/vllm-manager/`. Phase 4 expects each `storage.locations[].path` from
-  `config.yaml` to be bind-mounted; the example file gets a multi-drive
-  comment block update. Phase 7 documents the final canonical layout.
-- **Phase 5 bundled architecture snapshot.** The committed
-  `vllm_supported_architectures.json` is a temporary fallback. This host
-  cannot import vLLM, so after the next workstation rebuild run
-  `docker exec vllm-manager python scripts/refresh_arch_list.py` once and
-  commit the regenerated file so the fallback exactly matches the pinned
-  vLLM release.
+  `~/vllm-manager/`. Every `storage.locations[].path` from `config.yaml` must
+  be bind-mounted there; `docker-compose.example.yml` documents the canonical
+  layout.
 - **vLLM pin staleness.** Refresh the pinned release deliberately after
   checking upstream release notes. After bumping vLLM, rerun
   `scripts/refresh_arch_list.py` to keep the bundled fallback aligned.
@@ -410,23 +425,11 @@ Workstation/GPU smoke validation is still outstanding:
   deliberately after checking llama.cpp release notes (CLI flags can shift
   on minor bumps). The argv builders cover the documented stable flags;
   rare additions land via `extra_args` in the catalog row.
-- **Phase 9 workstation smoke.** Phase 9 flips ✅ once the GGUF / llama.cpp
-  smoke (above) is run on a CUDA host and a real install + chat round-trip
-  is logged.
+- **llama.cpp workstation smoke.** Run the GGUF / llama.cpp checks above on a
+  CUDA host and record a real install + chat round-trip before release.
 
 ## Quick links
 
-- [PRD](PRD.md) — product requirements and decision log.
-- [Implementation plan](implementation_plan.md) — phase breakdown and milestones.
-- [Phase 0 plan](plans/phase_0.md)
-- [Phase 1 plan](plans/phase_1.md)
-- [Phase 2 plan](plans/phase_2.md)
-- [Phase 3 plan](plans/phase_3.md)
-- [Phase 4 plan](plans/phase_4.md)
-- [Phase 5 plan](plans/phase_5.md)
-- [Phase 6 plan](plans/phase_6.md)
-- [Phase 7 plan](plans/phase_7.md)
-- [Phase 8 plan](plans/phase_8.md)
-- [Phase 8 acceptance log](phase_8_acceptance.md)
-- [Phase 9 plan (llama.cpp backend)](plans/llamacpp_plan.md)
-- [Smoke checks](smoke_checks.md)
+- [README](../README.md)
+- [Contributor guide](../agents.md)
+- [Workstation smoke checks](smoke_checks.md)
