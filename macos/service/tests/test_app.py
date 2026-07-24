@@ -527,7 +527,7 @@ async def test_cancelled_stream_with_close_failure_releases_model_lease(tmp_path
             "query_string": b"",
             "headers": [(b"content-type", b"application/json")],
             "client": ("127.0.0.1", 50000),
-            "server": ("127.0.0.1", 17320),
+            "server": ("127.0.0.1", 1240),
         },
         receive,
     )

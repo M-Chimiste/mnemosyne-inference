@@ -9,13 +9,14 @@ from mnemosyne_macos.config import (
     load_config,
     parse_config,
     save_config,
+    suggested_model_alias,
 )
 from mnemosyne_macos.models import Endpoint, EngineName, ModelKind
 
 
-def test_defaults_use_dedicated_port_block() -> None:
+def test_defaults_replace_the_legacy_sidecar_port() -> None:
     config = MacConfig()
-    assert config.server.inference_port == 17320
+    assert config.server.inference_port == 1240
     assert config.server.control_port == 17321
     assert config.engines.lmstudio.base_url.endswith(":1234")
     assert config.engines.lmstudio.enabled is False
@@ -111,6 +112,36 @@ def test_profiles_resolve_engine_specific_wire_names() -> None:
     assert Endpoint.RESPONSES in profiles["deepseek-v4"].capabilities
 
 
+def test_profiles_allow_safe_dotted_legacy_aliases() -> None:
+    config = MacConfig.model_validate(
+        {
+            "models": [
+                {
+                    "alias": "lfm2.5-8b-a1b",
+                    "engine": "llama.cpp",
+                    "model": "/models/lfm.gguf",
+                    "served_model_name": "lfm2.5-8b-a1b",
+                },
+            ]
+        }
+    )
+    profiles = config.profiles()
+
+    assert profiles["lfm2.5-8b-a1b"].wire_model == "lfm2.5-8b-a1b"
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("LFM2.5-8B-A1B-GGUF", "lfm2.5-8b-a1b"),
+        ("Qwen3-Coder-Next_MLX", "qwen3-coder-next"),
+        ("gemma-4-26B-A4B-it.safetensors", "gemma-4-26b-a4b-it"),
+    ],
+)
+def test_suggested_alias_omits_weight_format(name: str, expected: str) -> None:
+    assert suggested_model_alias(name) == expected
+
+
 def test_load_digest_changes_with_effective_options() -> None:
     base = {
         "alias": "deepseek-v4",
@@ -129,7 +160,7 @@ def test_load_digest_changes_with_effective_options() -> None:
 def test_duplicate_or_conflicting_ports_are_rejected() -> None:
     with pytest.raises(ValueError, match="ports must be distinct"):
         MacConfig.model_validate(
-            {"engines": {"omlx": {"base_url": "http://127.0.0.1:17320"}}}
+            {"engines": {"omlx": {"base_url": "http://127.0.0.1:1240"}}}
         )
 
 

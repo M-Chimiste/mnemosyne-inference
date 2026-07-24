@@ -12,12 +12,12 @@ uv run --project macos/service mnemosyne-macos --check-config \
   --env "$HOME/Library/Application Support/Mnemosyne/.env"
 lsof -nP \
   -iTCP:1234 \
-  -iTCP:17320 -iTCP:17321 -iTCP:17322 -iTCP:17323 \
+  -iTCP:1240 -iTCP:17321 -iTCP:17322 -iTCP:17323 \
   -iTCP:17324 -iTCP:17325 \
   -sTCP:LISTEN
 ```
 
-Confirm Unified Inference owns `17320`/`17321` and every inner listener is
+Confirm Unified Inference owns `1240`/`17321` and every inner listener is
 loopback-only. oMLX owns `17322` when that optional engine is enabled.
 Manager-owned DS4, MFLUX, and llama.cpp should be absent from `17323`,
 `17324`, and `17325` while unloaded. An older migration installation may still
@@ -29,7 +29,7 @@ catalog remain available:
 
 ```bash
 curl -s http://127.0.0.1:17321/manager/status | jq
-curl -s http://127.0.0.1:17320/v1/models | jq
+curl -s http://127.0.0.1:1240/v1/models | jq
 ```
 
 ## 2. Local-library adoption
@@ -100,7 +100,7 @@ Install llama.cpp from **Settings → Runtime Updates**, then request an adopted
 GGUF alias through the unified API:
 
 ```bash
-curl -s http://127.0.0.1:17320/v1/chat/completions \
+curl -s http://127.0.0.1:1240/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{"model":"local-qwen","messages":[{"role":"user","content":"Reply with one short sentence."}]}' \
   | jq
@@ -185,7 +185,7 @@ any enabled adapter has uncertain state.
 
 ## 8. MFLUX image lifecycle
 
-Request each configured MFLUX alias through `POST :17320/v1/images/generations`.
+Request each configured MFLUX alias through `POST :1240/v1/images/generations`.
 Confirm the worker appears only on loopback `:17324`, produces a valid base64
 PNG, and exactly one model process is resident. While a long image is running,
 cancel the client and verify the worker exits and Metal memory returns. Repeat
@@ -330,11 +330,12 @@ unload, both `/manager/status` and the LM Studio inventory must report no
 resident model. Verify the resulting local usage rows identify backend
 `lmstudio` and the durable reporting outbox drains normally.
 
-If the previous token sidecar is still present during migration, its health and
-existing `:1240` inference behavior may be checked separately. Unified
-Inference must continue to reach LM Studio directly on `:1234` and account for
-requests received on `:17320`; do not make the previous sidecar a permanent
-dependency of the new service.
+Before switching Unified Inference to `:1240`, boot out the previous token
+sidecar LaunchAgent, persistently disable its launchd label, and prove the port
+is free. Merely unloading it is insufficient because it can return at the next
+login. Unified Inference then owns the same client-facing endpoint and must
+account for requests itself; the previous sidecar is never chained in front of
+or behind the new service.
 
 Adopt the existing model library with
 **Add Existing Models…**, verify matching aliases and compatible settings were

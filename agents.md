@@ -85,7 +85,7 @@ The live `docker-compose.yml` is intentionally machine-specific and may live out
 
 ### Native macOS deployment
 
-- Inference is on `127.0.0.1:17320`, control is on `127.0.0.1:17321`, oMLX uses `:17322`, the manager-owned DS4 child uses `:17323`, the manager-owned MFLUX worker uses `:17324`, and manager-owned llama.cpp uses `:17325`. Reserve `17326-17329` for later native services. Legacy migration configs may explicitly keep LM Studio on `:1234`; fresh configs disable it.
+- Inference is on `127.0.0.1:1240` so Unified Inference is a drop-in replacement for the previous token sidecar; control is on `127.0.0.1:17321`, oMLX uses `:17322`, the manager-owned DS4 child uses `:17323`, the manager-owned MFLUX worker uses `:17324`, and manager-owned llama.cpp uses `:17325`. Reserve `17320` and `17326-17329` for later native services. The legacy sidecar must be booted out and persistently disabled or removed before Unified Inference binds `:1240`; merely unloading it lets it return at the next login. Legacy migration configs may explicitly keep LM Studio on `:1234`; fresh configs disable it.
 - A per-user LaunchAgent owns Mnemosyne Core. The controller uses an explicit AppKit `NSStatusItem` with a SwiftUI popover; quitting it must not terminate inference. `SMAppService.agent` registers the embedded plist and the bootstrap must `execve` the bundled Python without daemonizing.
 - `ResidencyCoordinator` owns the cross-engine invariant. A request holds an epoch-tagged model lease through its complete stream. FIFO queuing stops old-target admission once a switch is pending, drains active leases, proves all enabled adapters empty, loads one target, and proves exactly one ready manager-owned resident.
 - oMLX is an external loopback service controlled through its native lifecycle APIs. llama.cpp and DS4 are model-specific process groups started by Mnemosyne. Never kill an unknown PID or listener; persisted managed-process identity must match executable, argv, start identity, and process group before recovery or signaling.
@@ -268,7 +268,7 @@ Install and cache operations:
 ```bash
 ./vllm-ctl install qwen-coder Qwen/Qwen2.5-Coder-7B-Instruct --storage nvme-fast
 ./vllm-ctl install TheBloke/Some-GGUF --list-gguf
-./vllm-ctl install local-gguf org/repo-gguf --backend llama.cpp --gguf-filename model.Q4_K_M.gguf
+./vllm-ctl install local-model org/repo-gguf --backend llama.cpp --gguf-filename model.Q4_K_M.gguf
 ./vllm-ctl install qwen-image Qwen/Qwen-Image --backend sglang-diffusion --gpus 0
 ./vllm-ctl install-status
 ./vllm-ctl install-status qwen-coder

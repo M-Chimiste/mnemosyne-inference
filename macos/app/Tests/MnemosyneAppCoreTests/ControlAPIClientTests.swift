@@ -237,7 +237,7 @@ func lmStudioInventoryDecoding() throws {
 func configurationDecoding() throws {
     let payload = #"""
     {
-      "server": {"inference_bind":"127.0.0.1","inference_port":17320,"control_bind":"127.0.0.1","control_port":17321,"idle_unload_seconds":900,"startup_timeout_seconds":900,"swap_queue_timeout_seconds":300,"shutdown_grace_seconds":30,"reconcile_interval_seconds":30,"image_request_timeout_seconds":1800,"image_max_pixels":4194304,"startup_policy":"unload_all","inference_api_key_env":"INFERENCE_API_KEY","control_password_env":"ADMIN_PASSWORD"},
+      "server": {"inference_bind":"127.0.0.1","inference_port":1240,"control_bind":"127.0.0.1","control_port":17321,"idle_unload_seconds":900,"startup_timeout_seconds":900,"swap_queue_timeout_seconds":300,"shutdown_grace_seconds":30,"reconcile_interval_seconds":30,"image_request_timeout_seconds":1800,"image_max_pixels":4194304,"startup_policy":"unload_all","inference_api_key_env":"INFERENCE_API_KEY","control_password_env":"ADMIN_PASSWORD"},
       "engines": {
         "lmstudio":{"enabled":true,"base_url":"http://127.0.0.1:1234","api_key_env":"LMSTUDIO_API_KEY","request_timeout_seconds":30},
         "llama_cpp":{"enabled":true,"host":"127.0.0.1","port":17325,"binary":"/runtime/llama-server","working_directory":"/runtime","process_state_path":"/state/llama.json","request_timeout_seconds":30,"shutdown_grace_seconds":30},
@@ -334,7 +334,7 @@ func localModelRequestEncoding() throws {
         selections: [
             LocalModelImportSelection(
                 candidateId: "candidate-1",
-                alias: "qwen-gguf",
+                alias: "qwen-local",
                 projectorId: "projector-1"
             ),
         ]

@@ -23,6 +23,7 @@ from .config import (
     StorageLocationConfig,
     load_config,
     save_config,
+    suggested_model_alias,
 )
 from .coordinator import CoordinatorStatus, ResidencyCoordinator
 from .engines.base import EngineAdapter
@@ -691,9 +692,10 @@ class NativeRuntime:
                 requested_alias = str(selection.get("alias") or "").strip()
                 alias = requested_alias or (existing.alias if existing else "")
                 if not alias:
-                    alias = re.sub(
-                        r"[^a-z0-9]+", "-", candidate.display_name.casefold()
-                    ).strip("-") or "local-model"
+                    alias = suggested_model_alias(
+                        candidate.display_name,
+                        fallback="local-model",
+                    )
                     base_alias = alias
                     suffix = 2
                     while alias in planned_aliases:

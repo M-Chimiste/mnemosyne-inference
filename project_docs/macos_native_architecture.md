@@ -26,7 +26,7 @@ Default ports are deliberately outside common development defaults:
 
 | Port | Owner | Purpose | Default bind |
 | ---: | --- | --- | --- |
-| 17320 | Mnemosyne Core | Unified inference API | `127.0.0.1` |
+| 1240 | Mnemosyne Core | Unified inference API and legacy-sidecar replacement | `127.0.0.1` |
 | 17321 | Mnemosyne Core | Control/admin API | `127.0.0.1` |
 | 17322 | oMLX | Native MLX engine | `127.0.0.1` |
 | 17323 | DS4 | Managed native subprocess | `127.0.0.1` |
@@ -86,7 +86,7 @@ There is exactly one lifecycle owner: Mnemosyne Core.
   maintenance barrier. The signed app's MFLUX layer and configured DS4 paths
   remain fallbacks. oMLX remains externally installed and uses its official
   update mechanism.
-- Clients use Mnemosyne on port 17320. Direct client traffic to an inner engine
+- Clients use Mnemosyne on port 1240. Direct client traffic to an inner engine
   can violate the single-resident invariant and is unsupported.
 
 During the migration soak, LM Studio JIT loading and oMLX pinning/automatic
@@ -107,7 +107,7 @@ schema_version: 1
 
 server:
   inference_bind: 127.0.0.1
-  inference_port: 17320
+  inference_port: 1240
   control_bind: 127.0.0.1
   control_port: 17321
   idle_unload_seconds: 900

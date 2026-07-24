@@ -42,7 +42,7 @@ service plus on-demand manager-owned engine processes:
   `framework-mnemosyne-image` Python export layer.
 
 The LaunchAgent owns the service lifetime, so **Quit Menu App** does not stop
-inference on port `17320`. Disabling the background service unregisters it and
+inference on port `1240`. Disabling the background service unregisters it and
 causes macOS to terminate the job. `KeepAlive=true` handles unexpected exits.
 
 ## Development

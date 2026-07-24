@@ -17,7 +17,7 @@ MLX/Metal processes. Mnemosyne Core and all engines run natively.
 
 The relocatable runtime, signed local app bundle, embedded service bootstrap,
 and embedded MFLUX worker have been exercised on an M4 Max. A real
-`krea/Krea-2-Turbo` request through `POST :17320/v1/images/generations`
+`krea/Krea-2-Turbo` request through `POST :1240/v1/images/generations`
 returned a valid 512×512 PNG, and the request was correctly absent from token
 usage. The official llama.cpp `b10091` arm64 asset passed published-size and
 SHA-256 verification, its runtime contract was validated, and it generated a
@@ -37,7 +37,7 @@ explicitly enabled migration fallback until the native-model soak is accepted.
 
 | Port | Process | Role |
 | ---: | --- | --- |
-| `17320` | Mnemosyne Core | Unified OpenAI/Anthropic-compatible inference |
+| `1240` | Mnemosyne Core | Unified OpenAI/Anthropic-compatible inference; drop-in replacement for the previous token sidecar |
 | `17321` | Mnemosyne Core | Control API used by the menu bar app |
 | `17322` | oMLX | Native MLX inference and admin API |
 | `17323` | `ds4-server` | Mnemosyne-owned model process |
@@ -84,7 +84,7 @@ available llama.cpp runtime. Unified Inference downloads the official
 `ggml-org/llama.cpp` Apple Silicon release, verifies GitHub's published size
 and SHA-256, checks the executable and required server flags, and activates it
 only after the coordinator proves every engine empty. The private server binds
-`127.0.0.1:17325`; clients continue to use the unified API on `17320`.
+`127.0.0.1:17325`; clients continue to use the unified API on `1240`.
 
 Unified Inference records usage for all language engines and central reporting
 defaults on. During migration, it reads the previous sidecar's stable `node.id`
@@ -97,6 +97,15 @@ neither a migrated identity nor the old sidecar is available, identity falls
 back to the normalized macOS Computer Name. The identifier is displayed
 read-only in Settings, while the DSN remains secret and is never returned by
 the API.
+
+After the identity and DSN have been persisted, retire the old job before
+moving Unified Inference to `:1240`. Boot it out if it is loaded, then disable
+the label so it cannot reclaim the port on the next login:
+
+```bash
+launchctl bootout gui/"$(id -u)"/com.athena.token-sidecar
+launchctl disable gui/"$(id -u)"/com.athena.token-sidecar
+```
 
 Install oMLX from its official `.dmg` or Homebrew package, configure its server
 port as `17322`, and start it. For a CLI/Homebrew installation this can be done
@@ -330,9 +339,9 @@ and call `POST /manager/reconcile`.
 Smoke the API with a configured alias:
 
 ```bash
-curl http://127.0.0.1:17320/health
-curl http://127.0.0.1:17320/v1/models
-curl -X POST http://127.0.0.1:17320/v1/chat/completions \
+curl http://127.0.0.1:1240/health
+curl http://127.0.0.1:1240/v1/models
+curl -X POST http://127.0.0.1:1240/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{"model":"local-qwen","messages":[{"role":"user","content":"Hello"}]}'
 curl http://127.0.0.1:17321/manager/status
@@ -341,7 +350,7 @@ curl http://127.0.0.1:17321/manager/status
 With either example MFLUX profile enabled:
 
 ```bash
-curl -sX POST http://127.0.0.1:17320/v1/images/generations \
+curl -sX POST http://127.0.0.1:1240/v1/images/generations \
   -H 'Content-Type: application/json' \
   -d '{"model":"krea-2-turbo","prompt":"A glass greenhouse in snowfall","size":"1024x1024","n":1,"response_format":"b64_json"}' \
   | jq -r '.data[0].b64_json' | base64 --decode > image.png

@@ -26,7 +26,12 @@ from .models import (
 from .sidecar_discovery import LEGACY_AUTOMATIC_NODE_IDS
 
 
-_ALIAS_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+_ALIAS_RE = re.compile(r"^[a-z0-9]+(?:[.-][a-z0-9]+)*$")
+_IMAGE_FAMILY_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+_MODEL_FORMAT_SUFFIX_RE = re.compile(
+    r"(?:[._\s-]+(?:gguf|mlx|safetensors))+$",
+    re.IGNORECASE,
+)
 _STORAGE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 _APP_SUPPORT = Path.home() / "Library" / "Application Support" / "Mnemosyne"
 
@@ -35,11 +40,28 @@ class ConfigError(RuntimeError):
     pass
 
 
+def suggested_model_alias(
+    name: str,
+    *,
+    fallback: str = "model",
+    max_length: int = 64,
+) -> str:
+    """Build a client-facing alias without leaking the weight format."""
+
+    without_format = _MODEL_FORMAT_SUFFIX_RE.sub("", name.strip())
+    alias = re.sub(r"[^a-z0-9.]+", "-", without_format.casefold())
+    alias = re.sub(r"-+", "-", alias)
+    alias = re.sub(r"\.+", ".", alias)
+    alias = re.sub(r"(?:\.-|-\.)+", "-", alias).strip(".-")
+    alias = alias[:max_length].rstrip(".-")
+    return alias if alias and _ALIAS_RE.fullmatch(alias) else fallback
+
+
 class ServerConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     inference_bind: str = "127.0.0.1"
-    inference_port: int = Field(default=17320, ge=1024, le=65535)
+    inference_port: int = Field(default=1240, ge=1024, le=65535)
     control_bind: str = "127.0.0.1"
     control_port: int = Field(default=17321, ge=1024, le=65535)
     idle_unload_seconds: int | None = Field(default=900, ge=1)
@@ -224,7 +246,7 @@ class ImageProfileConfig(BaseModel):
     @field_validator("family")
     @classmethod
     def _valid_family(cls, value: str) -> str:
-        if not _ALIAS_RE.fullmatch(value):
+        if not _IMAGE_FAMILY_RE.fullmatch(value):
             raise ValueError(
                 "image family must contain lowercase letters, digits, and hyphens"
             )
@@ -250,7 +272,7 @@ class ModelProfile(BaseModel):
     def _valid_alias(cls, value: str) -> str:
         if not _ALIAS_RE.fullmatch(value):
             raise ValueError(
-                "alias must contain lowercase letters, digits, and hyphens and start with alphanumeric"
+                "alias must contain lowercase letters, digits, dots, and hyphens in alphanumeric segments"
             )
         return value
 

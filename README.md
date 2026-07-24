@@ -58,7 +58,7 @@ checks live in [project_docs/smoke_checks.md](project_docs/smoke_checks.md).
 
 ## Native macOS deployment
 
-The native service listens on `127.0.0.1:17320` for inference and
+The native service listens on `127.0.0.1:1240` for inference and
 `127.0.0.1:17321` for control. It is the workstation's token sidecar and
 enforces one resident model globally across a manager-owned llama.cpp process
 (`:17325`), oMLX (`:17322`), a manager-owned DS4 process (`:17323`), and the
@@ -161,8 +161,8 @@ Click the brain-profile menu-bar icon and choose **Enable Service**. Approve
 the background item in System Settings if macOS asks, then verify:
 
 ```bash
-curl http://127.0.0.1:17320/health
-curl http://127.0.0.1:17320/v1/models
+curl http://127.0.0.1:1240/health
+curl http://127.0.0.1:1240/v1/models
 curl http://127.0.0.1:17321/manager/status
 ```
 
@@ -287,7 +287,7 @@ curl -sX POST http://localhost:8000/v1/images/generations \
   }' | jq -r '.data[0].b64_json' | base64 --decode > image.png
 ```
 
-On macOS, use `http://127.0.0.1:17320` and a configured MFLUX alias such as
+On macOS, use `http://127.0.0.1:1240` and a configured MFLUX alias such as
 `krea-2-turbo`. The private worker on `:17324` is manager-owned and must not be
 called directly.
 
@@ -314,7 +314,7 @@ Example llama.cpp chat request with thinking disabled and schema output:
 
 ```json
 {
-  "model": "local-gguf",
+  "model": "local-model",
   "messages": [{"role": "user", "content": "Return a user profile"}],
   "temperature": 0.1,
   "chat_template_kwargs": {"enable_thinking": false},

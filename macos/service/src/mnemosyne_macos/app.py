@@ -10,7 +10,6 @@ import json
 import logging
 import os
 from pathlib import Path
-import re
 import time
 from typing import Any, Mapping
 
@@ -19,7 +18,7 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
-from .config import MacConfig
+from .config import MacConfig, suggested_model_alias
 from .coordinator import CoordinatorError, QueueTimeout
 from .engines.base import AdapterError, Deadline
 from .engines.lmstudio import LMStudioAdapter
@@ -1089,8 +1088,7 @@ def create_control_app(runtime: NativeRuntime) -> FastAPI:
 
 
 def _available_alias(name: str, existing: set[str]) -> str:
-    base = re.sub(r"[^a-z0-9]+", "-", name.casefold()).strip("-") or "model"
-    base = base[:64].rstrip("-") or "model"
+    base = suggested_model_alias(name)
     candidate = base
     number = 2
     while candidate in existing:

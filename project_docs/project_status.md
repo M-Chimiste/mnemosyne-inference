@@ -1,6 +1,6 @@
 # Mnemosyne Inference — Project Status
 
-**Last updated:** 2026-07-23
+**Last updated:** 2026-07-24
 
 ## Current state
 
@@ -22,7 +22,8 @@ validation of the current pins and end-to-end backend swaps; see
 
 An isolated native macOS track is implemented, with frontier text-engine,
 protected-storage, and migration-soak acceptance still pending. It lives
-entirely below `macos/`, uses dedicated ports `17320-17325`, and does not alter
+entirely below `macos/`, replaces the previous sidecar on `1240`, uses
+`17321-17325` for control and inner engines, and does not alter
 the CUDA image or its `8000-8002` topology. The first implementation includes:
 
 - a separately locked FastAPI service with inference and control planes;
@@ -66,16 +67,22 @@ under `theseus`. The Developer ID-signed packaged service is installed on
 Theseus and its direct `Contents/MacOS/mnemosyne-service-bootstrap`
 LaunchAgent is running successfully through `SMAppService`.
 
-The explicitly enabled LM Studio migration bridge has also passed a live
-Theseus fallback check against the existing `:1234` server. Its native
-inventory exposed all 13 downloaded models without loading them (eight GGUF,
-five MLX, including one embedding model). Representative existing language
-and embedding profiles then passed non-streaming, streaming-with-usage,
-768-dimensional embeddings, same-engine swap, repeat load, and explicit
-unload through Unified Inference. The previous `:1240` sidecar remained
-healthy and served the already-resident language model, while Unified
-Inference recorded its own calls under backend `lmstudio` and drained the
-central-reporting outbox. No weights were downloaded or copied for this check.
+The temporary LM Studio migration bridge also passed a live Theseus fallback
+check against the existing `:1234` server. Its native inventory exposed all 13
+downloaded models without loading them (eight GGUF and five MLX, including one
+embedding model), and representative language and embedding profiles passed
+non-streaming, streaming-with-usage, embeddings, swap, repeat-load, and unload
+checks without copying weights.
+
+The final native handoff is now live on Theseus. The previous
+`com.athena.token-sidecar` job is unloaded, Unified Inference owns the public
+loopback API on `:1240`, and the unchanged TheseusInsight client successfully
+returned content through both `lfm2.5-8b-a1b` and
+`gemma-4-26b-a4b-qat`. Imported GGUF aliases no longer expose a `-gguf`
+format suffix, central reporting is healthy under node `theseus`, and the
+Developer ID-signed menu app is installed in `/Applications`. The unavailable
+external oMLX service and its profiles are disabled on this host; oMLX is also
+disabled in fresh defaults until its separately installed service is running.
 The registered background service also passed a direct restart check while
 idle: `launchctl` advanced from run 2/PID 87693 to run 3/PID 94187, both native
 HTTP planes returned, `/health` reported `ok`, residency remained empty, and
@@ -84,9 +91,9 @@ restart, the existing `lfm2-1b-mlx` alias streamed `restart-ok` through the
 native proxy with 17 prompt and 4 completion tokens, flushed one usage row,
 then explicitly unloaded; the coordinator and authoritative oMLX inventory
 both returned empty.
-GUI Finder-confirmed migration, durable oMLX login startup, login-cycle
-validation, and the LM Studio-disabled soak remain in progress.
-The native service and package-layout suites pass all 268 tests on the target
+GUI Finder-confirmed migration, durable oMLX login startup, and login-cycle
+validation remain in progress.
+The native service and package-layout suites pass all 270 tests on the target
 host (the two
 real-bookmark tests skip in restricted runners), and the isolated MFLUX worker
 passes 23 tests with real Metal

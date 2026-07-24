@@ -5,7 +5,7 @@ schema_version: 1
 
 server:
   inference_bind: 127.0.0.1
-  inference_port: 17320
+  inference_port: 1240
   control_bind: 127.0.0.1
   control_port: 17321
   idle_unload_seconds: 900
@@ -42,11 +42,12 @@ engines:
     request_timeout_seconds: 30
     shutdown_grace_seconds: 30
 
-  # Install and run oMLX natively. Keep its port loopback-only. For strict
-  # lifecycle control, disable oMLX model pinning/TTL and either disable its
-  # inner admin auth or provide a working admin session via OMLX_ADMIN_SESSION.
+  # Optional externally owned service. Enable this only after oMLX is installed
+  # and listening on the configured loopback port. For strict lifecycle
+  # control, disable oMLX model pinning/TTL and either disable its inner admin
+  # auth or provide a working admin session via OMLX_ADMIN_SESSION.
   omlx:
-    enabled: true
+    enabled: false
     base_url: http://127.0.0.1:17322
     api_key_env: OMLX_API_KEY
     admin_session_env: OMLX_ADMIN_SESSION
@@ -95,11 +96,11 @@ storage:
     #   volume_uuid: 00000000-0000-0000-0000-000000000000
 
 models:
-  - alias: local-qwen-gguf
+  - alias: local-qwen
     engine: llama.cpp
     model: ~/Library/Application Support/Mnemosyne/models/llama.cpp/publisher/model/model-Q4_K_M.gguf
     storage: internal
-    served_model_name: local-qwen-gguf
+    served_model_name: local-qwen
     load:
       context_length: 32768
       # Vision GGUFs select an exact, compatible projector in the GUI.

@@ -782,8 +782,7 @@ final class SettingsViewModel: ObservableObject {
                 }
                 let base = suggestedAlias(
                     for: candidate.displayName,
-                    fallback: candidate.engine == .llamaCpp
-                        ? "local-gguf" : "local-mlx"
+                    fallback: "local-model"
                 )
                 var alias = base
                 var suffix = 2
@@ -1061,17 +1060,7 @@ final class SettingsViewModel: ObservableObject {
     }
 
     private func uniqueAlias(for modelKey: String, existing: inout Set<String>) -> String {
-        let lowered = modelKey.lowercased()
-        var alias = lowered
-            .map { character -> Character in
-                character.isASCII && (character.isLetter || character.isNumber)
-                    ? character : "-"
-            }
-            .reduce(into: "") { result, character in
-                if character != "-" || result.last != "-" { result.append(character) }
-            }
-            .trimmingCharacters(in: CharacterSet(charactersIn: "-"))
-        if alias.isEmpty { alias = "lmstudio-model" }
+        var alias = suggestedAlias(for: modelKey, fallback: "lmstudio-model")
         let base = alias
         var suffix = 2
         while existing.contains(alias) {
@@ -1083,15 +1072,26 @@ final class SettingsViewModel: ObservableObject {
     }
 
     private func suggestedAlias(for name: String, fallback: String) -> String {
-        var alias = name.lowercased()
+        var source = name.lowercased()
+        for suffix in ["-safetensors", ".safetensors", "_safetensors", "-gguf", ".gguf", "_gguf", "-mlx", ".mlx", "_mlx"] {
+            if source.hasSuffix(suffix) {
+                source.removeLast(suffix.count)
+                break
+            }
+        }
+        var alias = source
             .map { character -> Character in
-                character.isASCII && (character.isLetter || character.isNumber)
-                    ? character : "-"
+                if character.isASCII && (character.isLetter || character.isNumber) {
+                    return character
+                }
+                return character == "." ? "." : "-"
             }
             .reduce(into: "") { result, character in
-                if character != "-" || result.last != "-" { result.append(character) }
+                if (character != "-" && character != ".") || result.last != character {
+                    result.append(character)
+                }
             }
-            .trimmingCharacters(in: CharacterSet(charactersIn: "-"))
+            .trimmingCharacters(in: CharacterSet(charactersIn: ".-"))
         if alias.isEmpty { alias = fallback }
         return alias
     }
