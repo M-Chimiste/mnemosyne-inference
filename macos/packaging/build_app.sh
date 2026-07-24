@@ -70,6 +70,7 @@ mkdir -p \
     "$RESOURCES/ImageWorker"
 
 install -m 644 "$SCRIPT_DIR/Info.plist" "$CONTENTS/Info.plist"
+install -m 644 "$SCRIPT_DIR/AppIcon.icns" "$RESOURCES/AppIcon.icns"
 install -m 755 "$BIN_DIR/MnemosyneMenu" "$CONTENTS/MacOS/UnifiedInference"
 install -m 755 \
     "$BIN_DIR/mnemosyne-service-bootstrap" \

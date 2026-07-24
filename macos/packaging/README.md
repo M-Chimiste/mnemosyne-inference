@@ -114,6 +114,12 @@ macos/packaging/build_app.sh release
 open "macos/app/build/Stage/Unified Inference.app"
 ```
 
+The source artwork for the Finder, Settings, and Login Items icon is
+`AppIcon.png`; `AppIcon.icns` is the generated multi-resolution bundle asset
+that `build_app.sh` stages under `Contents/Resources`. The menu-bar status item
+remains a monochrome template symbol so it follows the current macOS tint and
+contrast settings.
+
 For a stable signature, set an identity available in the login keychain:
 
 ```bash
@@ -175,6 +181,7 @@ Unified Inference.app/Contents/
   MacOS/mnemosyne-service-bootstrap
   Library/LaunchAgents/com.mnemosyne.inference.agent.plist
   Resources/
+    AppIcon.icns
     Python/                 # venvstacks export
     Service/mnemosyne_macos/
     ImageWorker/mnemosyne_mflux_worker/

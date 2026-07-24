@@ -12,6 +12,8 @@ AGENT_PLIST = (
     / "com.mnemosyne.inference.agent.plist"
 )
 BUILD_SCRIPT = PACKAGING_ROOT / "build_app.sh"
+INFO_PLIST = PACKAGING_ROOT / "Info.plist"
+APP_ICON = PACKAGING_ROOT / "AppIcon.icns"
 
 
 class AppLayoutTests(unittest.TestCase):
@@ -40,6 +42,19 @@ class AppLayoutTests(unittest.TestCase):
         self.assertNotIn("MnemosyneService.app", script)
         self.assertFalse(
             (PACKAGING_ROOT / "MnemosyneService-Info.plist").exists()
+        )
+
+    def test_bundle_declares_and_stages_the_app_icon(self) -> None:
+        with INFO_PLIST.open("rb") as stream:
+            info = plistlib.load(stream)
+        script = BUILD_SCRIPT.read_text(encoding="utf-8")
+
+        self.assertEqual(info["CFBundleIconFile"], "AppIcon.icns")
+        self.assertTrue(APP_ICON.is_file())
+        self.assertEqual(APP_ICON.read_bytes()[:4], b"icns")
+        self.assertIn(
+            'install -m 644 "$SCRIPT_DIR/AppIcon.icns" "$RESOURCES/AppIcon.icns"',
+            script,
         )
 
 
