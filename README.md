@@ -3,10 +3,31 @@
 ## What this is
 
 Mnemosyne Inference gives a single workstation Ollama/LMStudio-style ergonomics
-on top of upstream inference engines: one container supervises either
-[vLLM](https://docs.vllm.ai/) or llama.cpp's `llama-server`, exposes an
-OpenAI-compatible API, and keeps the rest of the machine — installs, model
-swaps, multi-drive storage — driven by a YAML config and a small CLI/UI.
+on top of upstream inference engines. The repository now contains two sibling
+deployments with independent dependencies and packaging:
+
+- The established CUDA deployment runs vLLM, llama.cpp, or SGLang Diffusion
+  in Docker, including local text-to-image generation.
+- The native Apple Silicon deployment owns an official llama.cpp runtime for
+  GGUF models, coordinates oMLX for MLX models and DwarfStar (DS4) for its
+  specialized DeepSeek weights, and runs MFLUX in an isolated worker. It does
+  not use Docker, so MLX and Metal remain available to the host processes.
+  Start with [macos/README.md](macos/README.md).
+
+The remainder of this README describes the CUDA deployment unless a section is
+explicitly labeled macOS.
+
+## Current state
+
+| Deployment | Runtime and engines | Status |
+| --- | --- | --- |
+| CUDA/Linux | Docker, vLLM, llama.cpp, SGLang Diffusion | Feature-complete implementation and automated coverage; current engine pins and cross-backend swaps still need a CUDA-workstation release smoke. |
+| Apple Silicon | Managed llama.cpp, external oMLX, optional DS4, isolated MFLUX worker | Official llama.cpp arm64 download/integrity checks plus real GGUF and oMLX/MLX generations with token accounting have passed on Theseus. GUI migration, packaged-service soak, durable external-oMLX startup, and DS4 acceptance remain in progress; LM Studio is retained only as an explicitly enabled migration fallback until that soak is accepted. |
+
+Both deployments expose one stable API, keep at most one model resident, and
+use the same `/v1/images/generations` contract. Language-model usage can be
+written to SQLite and optionally forwarded through the durable Postgres
+outbox. Image requests are deliberately excluded from token accounting.
 
 The container runs **two HTTP planes** in one process:
 
@@ -17,17 +38,155 @@ There is **one model resident at a time**. `/v1/*` requests trigger a lazy
 load if the requested model is not the resident one; concurrent callers for
 the same target piggyback on a single load.
 
-Hardware target: a CUDA 12.8+ host with a Blackwell-class NVIDIA GPU (RTX 50
-or workstation Blackwell). The image bakes in PyTorch cu129, a pinned vLLM
-stable release, and a CUDA-built pinned llama.cpp `llama-server`.
-Ampere/Hopper cards generally also work — see [Refreshing architecture
-support](#refreshing-architecture-support) if you need to bump or change the
-pinned engine builds.
+`GET /v1/models` lists **every fully-downloaded model** across all backends,
+not just the resident one — it is served locally from the
+catalog rather than proxied to the engine, so it returns the full menu even
+when nothing is loaded. Each entry's `id` is the stable alias; send that alias
+back as the `model` field in a `/v1/*` request to trigger a load. Only models
+whose weights are present on disk (`status: installed`) are listed.
 
-Design context: [project_docs/PRD.md](project_docs/PRD.md) and
-[project_docs/implementation_plan.md](project_docs/implementation_plan.md).
+Hardware target: a CUDA 13-capable host with a Blackwell-class NVIDIA GPU
+(RTX 50 or workstation Blackwell). The image bakes in PyTorch cu129, a pinned
+vLLM stable release, a dependency-isolated pinned SGLang Diffusion runtime,
+and a CUDA-built pinned llama.cpp `llama-server`. The
+default llama.cpp build targets `sm_120`; for Ampere or Hopper, override
+`CMAKE_CUDA_ARCHITECTURES` when rebuilding as described under [Refreshing
+architecture support](#refreshing-architecture-support).
 
-## Quickstart
+Contributor guidance lives in [agents.md](agents.md), and CUDA-host release
+checks live in [project_docs/smoke_checks.md](project_docs/smoke_checks.md).
+
+## Native macOS deployment
+
+The native service listens on `127.0.0.1:17320` for inference and
+`127.0.0.1:17321` for control. It is the workstation's token sidecar and
+enforces one resident model globally across a manager-owned llama.cpp process
+(`:17325`), oMLX (`:17322`), a manager-owned DS4 process (`:17323`), and the
+MFLUX image worker (`:17324`). LM Studio (`:1234`) is disabled on fresh
+configurations and remains available only as an explicit migration/soak
+fallback. After the service is enabled from the menu app, a per-user
+LaunchAgent keeps inference alive when the controller quits.
+
+`Unified Inference.app` is a menu-bar-only controller: it intentionally has no Dock
+icon or ordinary window. Launching it creates a brain-profile status icon on
+the right side of the macOS menu bar. Its popover shows service health, the
+resident model, model load/unload controls, usage-outbox depth, background
+service registration, and login-item controls. **Settings…** opens a dedicated
+native settings window with pages for general behavior, engines, runtime
+updates, storage, a Hugging Face model library, model profiles, usage
+reporting, and credentials.
+Storage is chosen with the native macOS folder picker, including exact nested
+paths such as `/Volumes/Athena/models`; it is never entered as a raw path.
+While the picker grant is live, the menu app creates an ordinary Finder
+bookmark whose implicit extension is Apple's supported single interprocess
+handoff. The receiving service explicitly consumes that grant, creates its own
+durable security-scoped bookmark, stores only that receiver-owned bookmark
+below `state/security-scopes/` next to the active `config.yaml`, and persists
+its SHA-256 `scope_id` in YAML. This location is intentionally independent of
+the configurable SQLite path. The current bundle does not ship App Sandbox
+bookmark entitlements; the real protected-folder restart/child-`exec` path
+still requires packaged-Mac smoke.
+
+Configuration saves preflight every referenced grant before writing YAML.
+Bookmark receipt and reactivation run in bounded, killable subprocess groups;
+startup revalidates the referenced bookmarks and then prunes obsolete private
+bookmark files. Scoped filesystem helpers and manager-owned model/download
+children reactivate the durable bookmark in their own process and then `exec`
+the upstream command, so a background LaunchAgent can continue to use an
+approved protected or removable folder after the menu app exits.
+The Models page uses a Finder directory picker to scan an existing library in
+place. It groups GGUF shard sets, excludes projector files as primary models,
+offers explicit multimodal-projector pairing, recognizes MLX folders, and
+migrates matching aliases without copying or loading any weights. The Model
+Library provides an explicit GGUF quant/file picker before a Hugging Face
+download begins.
+Bookmark registration/preflight, filesystem inspection, model-path resolution,
+directory creation/measurement, and GGUF/projector validation run in killable
+subprocess groups off the asyncio event loop behind bounded deadlines. A
+protected folder that is unavailable or awaiting authorization therefore
+produces an actionable timeout, and timeout, client cancellation, or service
+shutdown terminates the complete helper process group without freezing
+inference or control status.
+Configuration is validated by the running service before an atomic
+private-file save. The Settings window must return the revision from its
+configuration snapshot; a stale revision receives `409 Conflict`, so it cannot
+overwrite profiles added by a completed download or local import.
+Model-profile-only changes are hot-applied, while other changes offer a service
+restart. Saved credential values are never displayed back to the user.
+Managed llama.cpp survivor metadata includes the storage root, `scope_id`, and
+volume UUID as well as its process identity, allowing restart recovery to
+revalidate protected storage before trusting or signaling the recorded child.
+The settings window is presented once on first launch so the menu-bar-only app
+has an obvious onboarding path; later login launches stay out of the way.
+
+The controller title is the Mac's Computer Name from System Settings. The same
+bundle therefore appears as **Theseus**, **Metis**, or **Athena** on those
+machines while the portable product and installed bundle remain Unified
+Inference and `Unified Inference.app`. `MNEMOSYNE_WORKSTATION_NAME` can override the
+detected name when the app is launched from a configured process environment.
+
+The Python core, locked dependencies, native app, packaging scripts, example
+configuration, setup guide, and Mac-only smoke checks all live under
+[`macos/`](macos/README.md). None of those paths are copied into the CUDA image,
+and the Mac service never imports vLLM or CUDA modules.
+
+### Native macOS source-build quickstart
+
+From an Apple Silicon checkout:
+
+```bash
+mkdir -p "$HOME/Library/Application Support/Mnemosyne/state"
+cp macos/config.yaml.example \
+  "$HOME/Library/Application Support/Mnemosyne/config.yaml"
+cp macos/.env.example \
+  "$HOME/Library/Application Support/Mnemosyne/.env"
+chmod 600 \
+  "$HOME/Library/Application Support/Mnemosyne/config.yaml" \
+  "$HOME/Library/Application Support/Mnemosyne/.env"
+
+# Edit config.yaml to enable only the engines and aliases present on this Mac.
+python3 macos/packaging/build_runtime.py
+macos/packaging/build_app.sh release
+ditto "macos/app/build/Stage/Unified Inference.app" \
+  "/Applications/Unified Inference.app"
+open "/Applications/Unified Inference.app"
+```
+
+`build_app.sh` uses ad-hoc signing by default. Set `CODESIGN_IDENTITY` to a
+valid identity in the login keychain for a stable local signature. Theseus
+currently has no valid code-signing identity, so its local build is ad hoc and
+a rebuild may require reselecting protected model folders in Settings.
+
+Click the brain-profile menu-bar icon and choose **Enable Service**. Approve
+the background item in System Settings if macOS asks, then verify:
+
+```bash
+curl http://127.0.0.1:17320/health
+curl http://127.0.0.1:17320/v1/models
+curl http://127.0.0.1:17321/manager/status
+```
+
+The Model Library page can search engine-compatible Hugging Face models and
+download them into a GUI-selected internal or external folder before first
+use. Downloads are process-isolated, resumable, cancellable, and do not load
+the model. The app contains the runtime and worker code, not model weights.
+See [macos/README.md](macos/README.md) for engine preparation, storage,
+configuration, development mode, and signing details.
+
+The Runtime Updates page compares llama.cpp, oMLX, MFLUX, and DS4 with their
+official upstream projects. Unified Inference downloads the official
+`ggml-org/llama.cpp` Apple Silicon archive, verifies the asset size and
+GitHub-published SHA-256, and validates the server contract before activation.
+oMLX remains externally owned and opens its official update path. MFLUX comes
+from its official PyPI project; DS4 is downloaded at an exact commit from
+`antirez/ds4` and built locally with the Apple toolchain. Managed updates are
+staged without replacing `Unified Inference.app`. Activation drains requests
+and unloads the resident model; the previous runtime remains available for
+one-click rollback. Managed runtimes live
+under `~/Library/Application Support/Mnemosyne/runtimes/` and never modify the
+configured model library.
+
+## CUDA quickstart
 
 This is the canonical "fresh machine to a working API" flow. It assumes
 Docker + the NVIDIA container toolkit are already installed on the host.
@@ -103,8 +262,73 @@ Top-level blocks:
   `max_model_len`.
 - **`models`** — list of profiles. Each profile is a stable alias plus the HF
   model id and per-model knobs: `gpus` (`all`, `[0]`, `[0,1]`),
-  `quantization`, `max_model_len`, `storage`, and `extra_args` for raw vLLM
-  flags appended verbatim.
+  `quantization`, `max_model_len`, `storage`, `backend`, `gguf_filename`, and
+  `extra_args` for raw engine flags appended verbatim. Image profiles use
+  `backend: sglang-diffusion`, `kind: image`, and an `image:` defaults block.
+
+## Image generation
+
+CUDA profiles use SGLang Diffusion; Apple Silicon profiles use the bundled,
+separately locked MFLUX worker. Both expose the same endpoint and participate
+in the same one-resident-model lifecycle as language models:
+
+```bash
+curl -sX POST http://localhost:8000/v1/images/generations \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model":"qwen-image",
+    "prompt":"A small observatory above a sea of clouds",
+    "size":"1024x1024",
+    "n":1,
+    "response_format":"b64_json",
+    "seed":42,
+    "num_inference_steps":30,
+    "guidance_scale":4
+  }' | jq -r '.data[0].b64_json' | base64 --decode > image.png
+```
+
+On macOS, use `http://127.0.0.1:17320` and a configured MFLUX alias such as
+`krea-2-turbo`. The private worker on `:17324` is manager-owned and must not be
+called directly.
+
+The Mac Model Library exposes every text-to-image configuration in the pinned
+MFLUX runtime: FLUX.1, FLUX.2 Klein, Qwen Image, Krea 2 Turbo, FIBO, Z-Image,
+ERNIE Image, and Ideogram 4. Each download creates a profile with that model's
+recommended steps and guidance defaults. Krea 2 Raw is visible but disabled
+until upstream MFLUX supports its different `raw.safetensors` layout.
+
+The initial contract supports one base64 PNG, dimensions from 64–4096 in
+multiples of 16 within `server.image_max_pixels`, and optional seed, steps,
+guidance, and negative prompt. Image requests are intentionally excluded from
+token accounting. See the example configs for Qwen Image and Krea 2 Turbo.
+
+For llama.cpp/GGUF profiles, `extra_args` is the place for startup defaults
+such as `--reasoning off`, `--reasoning-format none`, `--temp 0.2`, or
+`--chat-template-kwargs '{"enable_thinking":false}'`. Per-request controls are
+passed through the `/v1/*` proxy unchanged, so clients can send llama.cpp
+fields like `temperature`, `top_p`, `chat_template_kwargs`,
+`reasoning_format`, `grammar`, `json_schema`, and `response_format` directly
+in the request body.
+
+Example llama.cpp chat request with thinking disabled and schema output:
+
+```json
+{
+  "model": "local-gguf",
+  "messages": [{"role": "user", "content": "Return a user profile"}],
+  "temperature": 0.1,
+  "chat_template_kwargs": {"enable_thinking": false},
+  "reasoning_format": "none",
+  "response_format": {
+    "type": "json_schema",
+    "schema": {
+      "type": "object",
+      "properties": {"name": {"type": "string"}},
+      "required": ["name"]
+    }
+  }
+}
+```
 
 `config.yaml` is hot-reloadable. Three equivalent triggers:
 
@@ -123,9 +347,8 @@ properties. For those, edit `docker-compose.yml` and run
 
 ## Adding a drive
 
-PRD §5.12 declares multi-drive storage as config-only — no code changes — but
-adding a *new* drive is a host-level workflow because Docker has to learn
-about the bind-mount. The flow:
+Multi-drive storage is config-driven, but adding a *new* drive is also a
+host-level workflow because Docker has to learn about the bind-mount. The flow:
 
 1. **Bind-mount the host path under the container** (`docker-compose.yml`):
    ```yaml
@@ -227,7 +450,7 @@ start over from scratch.
   ```
   This wipes the cache directory before re-spawning the worker.
 - **`cache-delete` on an aliased install demotes the row to `partial`**
-  rather than removing the alias (PRD §9, 2026-04-27 decision). The
+  rather than removing the alias. The
   user-visible effect is that the row stays in the catalog with a Retry
   button — one click to recover. To remove the alias entirely, pass
   `--remove-row`:
@@ -284,7 +507,7 @@ docker run --rm --gpus all --entrypoint /usr/local/bin/llama-server \
 ## Security and LAN exposure
 
 This is a single-workstation tool, but the published ports reach the LAN
-unless you say otherwise. Translate PRD §5.10 / §5.13 into rules:
+unless you say otherwise. Follow these rules:
 
 - **Always set `ADMIN_PASSWORD`** in `~/vllm-manager/.env` before exposing
   `:8001`. With `ADMIN_PASSWORD` unset, the admin app binds to `127.0.0.1`
@@ -405,6 +628,7 @@ Direct API equivalents (Basic auth required for admin):
 ```bash
 ADMIN_PASSWORD="$(grep -E '^ADMIN_PASSWORD=' ~/vllm-manager/.env | head -1 | cut -d= -f2-)"
 curl http://localhost:8000/health
+curl http://localhost:8000/v1/models          # all installed (loadable) models
 curl -u admin:"$ADMIN_PASSWORD" http://localhost:8001/manager/status
 curl -u admin:"$ADMIN_PASSWORD" -X POST \
   http://localhost:8001/manager/load \
@@ -427,7 +651,7 @@ curl -u admin:"$ADMIN_PASSWORD" -X POST \
   Either bump the timeout, retry, or queue your traffic differently.
 - **`503` from `/v1/*` mid-load.** The active engine child died (OOM, kernel
   mismatch, bad model file, etc.). The next request retriggers a fresh load —
-  there is no auto-restart loop by design (PRD §5.3). Check `vllm-ctl logs`
+  there is no auto-restart loop by design. Check `vllm-ctl logs`
   for the underlying error.
 - **`vllm-ctl reload` reports `partial` rows after editing `config.yaml`.**
   Cache reconcile has spotted aliased installs whose cache directories are
@@ -436,12 +660,21 @@ curl -u admin:"$ADMIN_PASSWORD" -X POST \
   downloads](#recovering-partial-downloads).
 - **`docker compose build` cannot find the Dockerfile.** `MNEMOSYNE_REPO_DIR`
   is unset (or wrong). Export it to the absolute path of your checkout.
+- **The macOS menu icon is missing.** `Unified Inference.app` is menu-bar-only, so it
+  never appears in the Dock. Start the installed copy with
+  `open "/Applications/Unified Inference.app"` and look for the brain-profile icon on the
+  active display. If the menu bar is crowded around a MacBook notch, macOS may
+  move status items out of view; close unused menu extras or use the external
+  display's menu bar. A source build logs `Unified Inference menu bar status item
+  installed` once its AppKit status item is created.
+- **The Mac API stops after the terminal closes.** A developer-mode service
+  belongs to that terminal. Open the installed menu app and choose **Enable
+  Service** to register its per-user background helper.
 
 ## Known v1 limitations
 
-These are deliberate v1 scope cuts. The canonical decision log is
-[project_docs/PRD.md §8](project_docs/PRD.md); this list is the operator-facing
-summary so you don't go looking for features that aren't here.
+These are deliberate v1 scope cuts, summarized here so you do not go looking
+for features that are not implemented.
 
 - **No multi-model concurrent serving.** One engine/model at a time. To
   switch, send a request with the new alias — `_proxy` queues the swap and
@@ -460,8 +693,15 @@ summary so you don't go looking for features that aren't here.
   auto-substitute quantized variants.
 - **No engine auto-restart on crash.** If the inner engine dies under a
   request, the manager fails open with a `503` and the next `/v1/*` request
-  triggers a fresh load (PRD §5.3). No supervisor loop tries to keep the
+  triggers a fresh load. No supervisor loop tries to keep the
   previous model resident.
+- **Native frontier-engine hardware coverage is incomplete.** The installed
+  app and MFLUX/Krea 2 image path have passed a real Apple Silicon smoke. An
+  official managed llama.cpp arm64 runtime has also generated successfully
+  from an existing GGUF on Theseus, and an external oMLX 0.5.3 service
+  generated from an MLX model with usage delivery. The packaged Finder
+  migration, LM-Studio-disabled soak, durable external-oMLX login startup, and
+  real DS4 target acceptance remain in progress.
 - **No runtime hard-fail when `gpus='all'` finds no GPUs.** The manager logs
   a warning and falls back to `VLLM_DEFAULT_TP`. On a real CUDA host this
   only happens if the nvidia-container-toolkit is misconfigured — fix the
@@ -471,8 +711,7 @@ summary so you don't go looking for features that aren't here.
 
 - [agents.md](agents.md) — guidance for AI coding assistants and external
   contributors.
-- [CLAUDE.md](CLAUDE.md) — Claude Code repository conventions; complements
-  `agents.md`.
-- [project_docs/PRD.md](project_docs/PRD.md) — design intent for v1.
-- [project_docs/implementation_plan.md](project_docs/implementation_plan.md) —
-  phased build plan; the "current state" of features in flight.
+- [project_docs/smoke_checks.md](project_docs/smoke_checks.md) — manual
+  container and CUDA-host release checks.
+- [project_docs/project_status.md](project_docs/project_status.md) — current
+  release status, feature history, and outstanding workstation validation.

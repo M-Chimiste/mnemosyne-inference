@@ -21,7 +21,7 @@ function installSearchFetch() {
         has_next: false,
         next_page: null,
         include_vision: true,
-        pipeline_tags: ["text-generation", "image-text-to-text", "audio-text-to-text", "any-to-any"],
+        pipeline_tags: ["text-generation", "image-text-to-text", "audio-text-to-text", "any-to-any", "text-to-image"],
         sort: "trending",
         vllm_arch_source: "snapshot",
         vllm_arch_count: 12,
@@ -72,7 +72,7 @@ describe("Search", () => {
 
     expect(await screen.findByText("Org/Good")).toBeInTheDocument();
     expect(fetchMock).toHaveBeenCalledWith(
-      "/manager/hf/search?q=qwen&page=1&limit=20&sort=trending&pipeline_tags=text-generation%2Cimage-text-to-text%2Caudio-text-to-text%2Cany-to-any&filter_compat=false",
+      "/manager/hf/search?q=qwen&page=1&limit=20&sort=trending&pipeline_tags=text-generation%2Cimage-text-to-text%2Caudio-text-to-text%2Cany-to-any%2Ctext-to-image&filter_compat=false",
       expect.objectContaining({ credentials: "include" })
     );
     expect(screen.getByRole("button", { name: "Install Org/Bad" })).toBeDisabled();

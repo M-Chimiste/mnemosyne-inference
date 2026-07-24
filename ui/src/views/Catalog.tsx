@@ -228,6 +228,10 @@ export default function Catalog() {
                         <span className="inline-flex rounded border border-amber/40 bg-amber/10 px-1.5 py-0.5 font-medium uppercase tracking-wide text-amber">
                           llama.cpp
                         </span>
+                      ) : row.backend === "sglang-diffusion" ? (
+                        <span className="inline-flex rounded border border-pine/40 bg-pine/10 px-1.5 py-0.5 font-medium uppercase tracking-wide text-pine">
+                          SGLang image
+                        </span>
                       ) : (
                         <span className="inline-flex rounded border border-line bg-stone-50 px-1.5 py-0.5 font-medium uppercase tracking-wide text-stone-600">
                           vLLM
@@ -242,7 +246,9 @@ export default function Catalog() {
                     <td className="max-w-sm break-all px-3 py-2 text-stone-700">{row.hf_model_id}</td>
                     <td className="px-3 py-2"><StatusBadge status={row.status} /></td>
                     <td className="px-3 py-2">{formatGpuPlan(row.gpus)}</td>
-                    <td className="px-3 py-2 tabular-nums">{row.max_model_len ?? "derived"}</td>
+                    <td className="px-3 py-2 tabular-nums">
+                      {row.model_kind === "image" ? "n/a" : row.max_model_len ?? "derived"}
+                    </td>
                     <td className="px-3 py-2 tabular-nums">{formatBytes(row.size_bytes)}</td>
                     <td className="px-3 py-2 tabular-nums">{row.request_count}</td>
                     <td className="px-3 py-2">

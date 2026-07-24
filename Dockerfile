@@ -116,6 +116,15 @@ RUN pip install --no-cache-dir \
       "vllm==0.22.1" \
       --extra-index-url https://download.pytorch.org/whl/cu129
 
+# SGLang Diffusion is dependency-isolated from vLLM. Both projects pin deep
+# Torch/kernel stacks and must not share site-packages even though only one
+# manager-owned engine process is resident at a time.
+RUN python3 -m venv /opt/sglang \
+ && /opt/sglang/bin/pip install --no-cache-dir \
+      "sglang[diffusion]==0.5.13" \
+      --extra-index-url https://download.pytorch.org/whl/cu129
+ENV SGLANG_BIN=/opt/sglang/bin/sglang
+
 # Manager API deps
 RUN pip install --no-cache-dir \
       fastapi \
@@ -128,7 +137,7 @@ RUN pip install --no-cache-dir \
 
 # ── App ────────────────────────────────────────────────────────────
 WORKDIR /app
-COPY vllm_manager.py config.py catalog.py profiles.py runtime.py \
+COPY vllm_manager.py config.py catalog.py profiles.py runtime.py image_api.py \
      downloader.py download_worker.py hf_search.py logsetup.py \
      pg_writer.py repo_probe.py vllm_supported_architectures.json ./
 COPY scripts/ ./scripts/

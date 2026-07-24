@@ -177,6 +177,55 @@ def test_v1_rewrites_case_insensitive_hf_id_to_served_model(rich_client, monkeyp
     assert captured["body"]["model"] == "Qwen/Qwen3.6-27B"
 
 
+def test_v1_preserves_llamacpp_specific_request_options(rich_client, monkeypatch):
+    """The manager is a thin proxy: optional engine/body params must survive.
+
+    llama.cpp's OpenAI-compatible chat endpoint accepts a mix of standard
+    OpenAI fields, sampler extensions, reasoning controls, and structured
+    output controls. The proxy should only rewrite `model` and leave the
+    rest alone.
+    """
+    client, _stub = rich_client
+    captured: dict[str, dict] = {}
+
+    async def _open_upstream(_request, _path, body):
+        captured["body"] = json.loads(body)
+        return _FakeClient(), _FakeResponse()
+
+    monkeypatch.setattr(vllm_manager, "_open_upstream", _open_upstream)
+
+    request_body = {
+        "model": "a-model",
+        "messages": [{"role": "user", "content": "Return a user profile"}],
+        "temperature": 0.1,
+        "top_p": 0.9,
+        "max_tokens": 128,
+        "response_format": {
+            "type": "json_schema",
+            "schema": {
+                "type": "object",
+                "properties": {"name": {"type": "string"}},
+                "required": ["name"],
+            },
+        },
+        "grammar": "root ::= \"ok\"",
+        "chat_template_kwargs": {"enable_thinking": False},
+        "reasoning_format": "none",
+        "reasoning_control": True,
+        "parse_tool_calls": True,
+        "parallel_tool_calls": False,
+        "mirostat": 2,
+    }
+
+    r = client.post("/v1/chat/completions", json=request_body)
+
+    assert r.status_code == 200
+    assert captured["body"]["model"] == "org/a-model"
+    for key, value in request_body.items():
+        if key != "model":
+            assert captured["body"][key] == value
+
+
 def test_v1_installed_hf_id_not_ready_returns_409(rich_client, monkeypatch):
     client, stub = rich_client
     vllm_manager._catalog._raw_insert_model(
@@ -818,3 +867,114 @@ def test_ensure_stream_usage_preserves_when_client_set():
     assert payload["stream_options"]["include_usage"] is True
     assert payload["stream_options"]["other"] == 1
     assert opted is True
+
+
+# ── GET /v1/models — local catalog listing ───────────────────────────
+
+
+def test_v1_models_lists_no_503_when_idle(rich_client, monkeypatch):
+    """GET /v1/models must return a 200 list even with nothing loaded — and
+    must never touch the inner engine."""
+    client, _stub = rich_client
+
+    def _boom(*_a, **_kw):
+        raise AssertionError("/v1/models must be served locally, not proxied")
+
+    monkeypatch.setattr(vllm_manager, "_open_upstream", _boom)
+    assert vllm_manager._runtime.resident_alias is None
+
+    r = client.get("/v1/models")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["object"] == "list"
+    assert isinstance(body["data"], list)
+
+
+def test_v1_models_lists_installed_both_backends(rich_client):
+    client, _stub = rich_client
+    vllm_manager._catalog._raw_insert_model(
+        alias="vllm-installed",
+        hf_model_id="org/vllm-model",
+        source="ui_install",
+        storage_location="tmp",
+        status="installed",
+        installed_at=1700000000,
+    )
+    vllm_manager._catalog._raw_insert_model(
+        alias="gguf-installed",
+        hf_model_id="org/gguf-repo",
+        source="ui_install",
+        storage_location="tmp",
+        status="installed",
+        backend="llama.cpp",
+        gguf_filename="model.Q4_K_M.gguf",
+    )
+
+    r = client.get("/v1/models")
+    assert r.status_code == 200
+    by_id = {m["id"]: m for m in r.json()["data"]}
+
+    assert by_id["vllm-installed"]["backend"] == "vllm"
+    # vLLM is served under its HF id.
+    assert by_id["vllm-installed"]["served_model_name"] == "org/vllm-model"
+    assert by_id["vllm-installed"]["created"] == 1700000000
+    assert by_id["vllm-installed"]["object"] == "model"
+
+    assert by_id["gguf-installed"]["backend"] == "llama.cpp"
+    # llama.cpp is served under its alias.
+    assert by_id["gguf-installed"]["served_model_name"] == "gguf-installed"
+    assert by_id["gguf-installed"]["hf_model_id"] == "org/gguf-repo"
+
+
+def test_v1_models_listed_alias_swaps_resident_model(rich_client, monkeypatch):
+    """End-to-end: an alias returned by GET /v1/models, sent back as the
+    `model` field, loads that model and swaps out any previously resident one."""
+    client, stub = rich_client
+    for alias, hf in (("alpha", "org/alpha"), ("beta", "org/beta")):
+        vllm_manager._catalog._raw_insert_model(
+            alias=alias,
+            hf_model_id=hf,
+            source="ui_install",
+            storage_location="tmp",
+            status="installed",
+        )
+    _patch_upstream(monkeypatch, _FakeResponse())
+
+    # Both aliases are advertised as loadable.
+    listed = {m["id"] for m in client.get("/v1/models").json()["data"]}
+    assert {"alpha", "beta"} <= listed
+
+    # Load alpha by alias.
+    r = client.post("/v1/chat/completions", json={"model": "alpha", "messages": []})
+    assert r.status_code == 200
+    assert vllm_manager._runtime.resident_alias == "alpha"
+    kills_after_alpha = stub.kill_calls
+
+    # Now request beta by alias → swap. _start_vllm kills the resident first.
+    r = client.post("/v1/chat/completions", json={"model": "beta", "messages": []})
+    assert r.status_code == 200
+    assert vllm_manager._runtime.resident_alias == "beta"
+    assert [p.alias for p in stub.calls] == ["alpha", "beta"]
+    assert stub.kill_calls > kills_after_alpha  # the swap evicted alpha
+
+
+def test_v1_models_excludes_unready(rich_client):
+    client, _stub = rich_client
+    vllm_manager._catalog._raw_insert_model(
+        alias="partial-model",
+        hf_model_id="org/partial",
+        source="ui_install",
+        storage_location="tmp",
+        status="partial",
+    )
+    vllm_manager._catalog._raw_insert_model(
+        alias="ready-model",
+        hf_model_id="org/ready",
+        source="ui_install",
+        storage_location="tmp",
+        status="installed",
+    )
+
+    ids = {m["id"] for m in client.get("/v1/models").json()["data"]}
+    assert "ready-model" in ids
+    assert "partial-model" not in ids

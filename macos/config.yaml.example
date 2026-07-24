@@ -1,0 +1,166 @@
+# Mnemosyne native macOS configuration.
+# Copy to ~/Library/Application Support/Mnemosyne/config.yaml.
+
+schema_version: 1
+
+server:
+  inference_bind: 127.0.0.1
+  inference_port: 17320
+  control_bind: 127.0.0.1
+  control_port: 17321
+  idle_unload_seconds: 900
+  startup_timeout_seconds: 900
+  swap_queue_timeout_seconds: 300
+  shutdown_grace_seconds: 30
+  reconcile_interval_seconds: 30
+  image_request_timeout_seconds: 1800
+  image_max_pixels: 4194304
+  startup_policy: unload_all
+  inference_api_key_env: INFERENCE_API_KEY
+  control_password_env: ADMIN_PASSWORD
+
+engines:
+  # Legacy migration/soak fallback only. Fresh installs leave this disabled;
+  # an existing installation may temporarily enable it until its aliases have
+  # been adopted and validated through Models > Add Existing Models.
+  lmstudio:
+    enabled: false
+    base_url: http://127.0.0.1:1234
+    api_key_env: LMSTUDIO_API_KEY
+    request_timeout_seconds: 30
+
+  # Unified Inference downloads an official Apple Silicon llama.cpp release,
+  # verifies GitHub's published size and SHA-256, and owns one llama-server
+  # process at a time. The managed active runtime overrides binary/working_directory.
+  llama_cpp:
+    enabled: true
+    host: 127.0.0.1
+    port: 17325
+    binary: ~/Library/Application Support/Mnemosyne/runtimes/llama.cpp/not-installed/llama-server
+    working_directory: ~/Library/Application Support/Mnemosyne
+    process_state_path: ~/Library/Application Support/Mnemosyne/state/llama-cpp-process.json
+    request_timeout_seconds: 30
+    shutdown_grace_seconds: 30
+
+  # Install and run oMLX natively. Keep its port loopback-only. For strict
+  # lifecycle control, disable oMLX model pinning/TTL and either disable its
+  # inner admin auth or provide a working admin session via OMLX_ADMIN_SESSION.
+  omlx:
+    enabled: true
+    base_url: http://127.0.0.1:17322
+    api_key_env: OMLX_API_KEY
+    admin_session_env: OMLX_ADMIN_SESSION
+    request_timeout_seconds: 30
+    # Finder-selected MLX library roots are added here by the import flow.
+    model_directories: []
+
+  # DS4 is launched and terminated by Mnemosyne. It is not a general GGUF
+  # runtime; use only GGUFs supported by the installed DwarfStar build.
+  ds4:
+    enabled: true
+    host: 127.0.0.1
+    port: 17323
+    binary: /Applications/DwarfStar/ds4-server
+    working_directory: /Applications/DwarfStar
+    # Mnemosyne uses this identity record to prove that a recovered PID and
+    # process group are its own before it ever sends a signal.
+    process_state_path: ~/Library/Application Support/Mnemosyne/state/ds4-process.json
+    request_timeout_seconds: 30
+    shutdown_grace_seconds: 30
+
+  # MFLUX runs in a separately locked, process-isolated worker bundled with
+  # the menu app. The main service owns the worker and port 17324.
+  mflux:
+    enabled: true
+    host: 127.0.0.1
+    port: 17324
+    request_timeout_seconds: 30
+    shutdown_grace_seconds: 30
+
+paths:
+  state_database: ~/Library/Application Support/Mnemosyne/state/mnemosyne.db
+  log_directory: ~/Library/Application Support/Mnemosyne/logs
+
+# Model downloads use these exact folders. The menu app's native folder
+# chooser records the containing volume UUID for removable drives, so a
+# missing drive or a different disk mounted at the same path fails closed.
+storage:
+  default: internal
+  locations:
+    - name: internal
+      path: ~/Library/Application Support/Mnemosyne/models
+    # Nested folders on external volumes are supported directly:
+    # - name: athena-models
+    #   path: /Volumes/Athena/models
+    #   volume_uuid: 00000000-0000-0000-0000-000000000000
+
+models:
+  - alias: local-qwen-gguf
+    engine: llama.cpp
+    model: ~/Library/Application Support/Mnemosyne/models/llama.cpp/publisher/model/model-Q4_K_M.gguf
+    storage: internal
+    served_model_name: local-qwen-gguf
+    load:
+      context_length: 32768
+      # Vision GGUFs select an exact, compatible projector in the GUI.
+      # projector_path: ~/Library/Application Support/Mnemosyne/models/llama.cpp/publisher/model/mmproj-BF16.gguf
+      # gpu_layers: 999
+      # ubatch_size: 512
+      # threads: 12
+      # parallel: 2
+      extra_args: []
+
+  - alias: glm-5-2
+    engine: omlx
+    model: GLM-5.2-4bit
+    storage: internal
+
+  - alias: deepseek-v4-flash
+    engine: ds4
+    model: /Volumes/Models/ds4flash.gguf
+    served_model_name: deepseek-v4-flash
+    load:
+      context_length: 100000
+      kv_disk_directory: /Volumes/ModelCache/ds4-kv
+      kv_disk_space_mb: 8192
+      extra_args: []
+
+  - alias: qwen-image
+    engine: mflux
+    model: Qwen/Qwen-Image
+    kind: image
+    image:
+      family: qwen-image
+      quantize: 8
+      width: 1024
+      height: 1024
+      num_inference_steps: 30
+      guidance_scale: 4.0
+
+  # The Settings Model Library also creates profiles for the other exact
+  # text-to-image configurations bundled with MFLUX (FLUX.1, FLUX.2 Klein,
+  # FIBO, Z-Image, ERNIE Image, and Ideogram 4) with model-specific defaults.
+  - alias: krea-2-turbo
+    engine: mflux
+    model: krea/Krea-2-Turbo
+    kind: image
+    image:
+      family: krea-2
+      quantize: 8
+      width: 1024
+      height: 1024
+      num_inference_steps: 8
+      guidance_scale: 1.0
+
+# The DSN is secret and belongs in the environment file as
+# TOKEN_SIDECAR_POSTGRES_DSN=postgresql://...
+token_sidecar:
+  enabled: true
+  # Empty migrates node.id from the previous sidecar's active LaunchAgent
+  # config (for example theseus, metis, or athena), then falls back to the
+  # normalized macOS computer name. Set a value only as an explicit override.
+  node_id: ""
+  flush_interval_seconds: 30
+  batch_size: 500
+  max_outbox_rows: 100000
+  connect_timeout_seconds: 5

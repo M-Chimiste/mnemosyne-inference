@@ -45,6 +45,8 @@ class Server(BaseModel):
     idle_unload_seconds: int | None = 900
     startup_timeout_seconds: int = 600
     swap_queue_timeout_seconds: int = 300
+    image_request_timeout_seconds: int = 1800
+    image_max_pixels: int = 4_194_304
 
     @model_validator(mode="after")
     def _ports_distinct(self) -> "Server":
@@ -53,6 +55,10 @@ class Server(BaseModel):
                 f"server.inference_port and server.admin_port must differ "
                 f"(both = {self.inference_port})"
             )
+        if self.image_request_timeout_seconds <= 0:
+            raise ValueError("server.image_request_timeout_seconds must be positive")
+        if self.image_max_pixels < 4096:
+            raise ValueError("server.image_max_pixels must be at least 4096")
         return self
 
 
@@ -96,6 +102,23 @@ class Defaults(BaseModel):
     max_model_len: int | None = None
 
 
+class ImageDefaults(BaseModel):
+    """Engine-neutral defaults applied to image-generation requests."""
+
+    model_config = ConfigDict(extra="forbid")
+    width: int = Field(default=1024, ge=64, le=4096)
+    height: int = Field(default=1024, ge=64, le=4096)
+    num_inference_steps: int = Field(default=30, ge=1, le=200)
+    guidance_scale: float = Field(default=4.0, ge=0, le=50)
+    guidance_parameter: Literal["guidance_scale", "true_cfg_scale"] = "guidance_scale"
+
+    @model_validator(mode="after")
+    def _dimensions_are_pipeline_safe(self) -> "ImageDefaults":
+        if self.width % 16 or self.height % 16:
+            raise ValueError("image width and height must be multiples of 16")
+        return self
+
+
 class ModelProfile(BaseModel):
     model_config = ConfigDict(extra="forbid")
     alias: str
@@ -109,7 +132,9 @@ class ModelProfile(BaseModel):
     # Backend dispatch. Defaults to vLLM so existing configs round-trip.
     # llama.cpp requires gguf_filename to be set (the primary shard for
     # sharded models, the lone file otherwise).
-    backend: Literal["vllm", "llama.cpp"] = "vllm"
+    backend: Literal["vllm", "llama.cpp", "sglang-diffusion"] = "vllm"
+    kind: Literal["language", "image"] = "language"
+    image: ImageDefaults | None = None
     gguf_filename: str | None = None
 
     @model_validator(mode="after")
@@ -118,11 +143,36 @@ class ModelProfile(BaseModel):
             raise ValueError(
                 f"model '{self.alias}' has backend='llama.cpp' but no gguf_filename"
             )
-        if self.backend == "vllm" and self.gguf_filename:
+        if self.backend != "llama.cpp" and self.gguf_filename:
             raise ValueError(
-                f"model '{self.alias}' has gguf_filename set but backend is 'vllm'"
+                f"model '{self.alias}' has gguf_filename set but backend is '{self.backend}'"
+            )
+        if self.kind == "image" and self.backend != "sglang-diffusion":
+            raise ValueError(
+                f"image model '{self.alias}' requires backend='sglang-diffusion'"
+            )
+        if self.backend == "sglang-diffusion" and self.kind != "image":
+            raise ValueError(
+                f"model '{self.alias}' uses sglang-diffusion but kind is not 'image'"
+            )
+        if self.kind == "image" and self.image is None:
+            self.image = ImageDefaults()
+        if self.kind != "image" and self.image is not None:
+            raise ValueError(
+                f"model '{self.alias}' has image defaults but kind is not 'image'"
             )
         return self
+
+    @property
+    def capabilities(self) -> tuple[str, ...]:
+        if self.kind == "image":
+            return ("images.generations",)
+        return (
+            "chat.completions",
+            "completions",
+            "embeddings",
+            "responses",
+        )
 
     @field_validator("alias")
     @classmethod
@@ -203,6 +253,14 @@ class Config(BaseModel):
                 raise ValueError(
                     f"model '{m.alias}' references unknown storage '{m.storage}' "
                     f"(known: {sorted(loc_names)})"
+                )
+            if (
+                m.image is not None
+                and m.image.width * m.image.height > self.server.image_max_pixels
+            ):
+                raise ValueError(
+                    f"model '{m.alias}' image defaults exceed "
+                    f"server.image_max_pixels={self.server.image_max_pixels}"
                 )
         return self
 

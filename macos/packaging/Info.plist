@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+    <key>CFBundleDisplayName</key>
+    <string>Unified Inference</string>
+    <key>CFBundleExecutable</key>
+    <string>UnifiedInference</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.mnemosyne.inference.menu</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon.icns</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>Unified Inference</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.1.0</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>15.0</string>
+    <key>LSUIElement</key>
+    <true/>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSDocumentsFolderUsageDescription</key>
+    <string>Unified Inference uses model folders you select to discover, download, and run local models.</string>
+    <key>NSDesktopFolderUsageDescription</key>
+    <string>Unified Inference uses Desktop model folders only after you select their exact folder.</string>
+    <key>NSDownloadsFolderUsageDescription</key>
+    <string>Unified Inference uses Downloads model folders only after you select their exact folder.</string>
+    <key>NSNetworkVolumesUsageDescription</key>
+    <string>Unified Inference uses network model folders only after you select them.</string>
+    <key>NSRemovableVolumesUsageDescription</key>
+    <string>Unified Inference uses external model drives only after you select their exact folder.</string>
+</dict>
+</plist>

@@ -50,15 +50,19 @@ from catalog import (
 )
 from config import Config, ConfigError, GpuPlan, load_config, load_env
 from downloader import ConflictError, repo_cache_dir
+from image_api import ImageRequestError, normalize_image_request
 from profiles import ProfileNotReady, ResolvedProfile, resolve_profile
 from runtime import (
     RuntimeState,
     UsageEntry,
     build_llama_argv,
     build_llama_env,
+    build_sglang_diffusion_argv,
+    build_sglang_diffusion_env,
     build_vllm_argv,
     build_vllm_env,
     derive_tp_size,
+    vllm_wants_eager_default,
 )
 
 # ──────────────────────────────────────────────
@@ -186,6 +190,12 @@ async def _wait_for_llama_cpp(timeout: int = STARTUP_TIMEOUT) -> bool:
     )
 
 
+async def _wait_for_sglang_diffusion(timeout: int = STARTUP_TIMEOUT) -> bool:
+    return await _wait_for_health(
+        f"http://{VLLM_INNER_HOST}:{VLLM_INNER_PORT}/v1/models", timeout,
+    )
+
+
 def _kill_engine():
     """Stop the resident engine subprocess (idempotent) and reset runtime
     state. Backend-agnostic — flushes buffered usage to the catalog before
@@ -218,6 +228,32 @@ def _kill_engine():
 _kill_vllm = _kill_engine
 
 
+def _vllm_model_architectures(
+    profile: ResolvedProfile,
+) -> tuple[list[str], Optional[str]]:
+    """Best-effort read of `architectures` + `model_type` from the model's
+    cached config.json. Returns ([], None) when it can't be read — callers
+    treat that as "apply no eager default". vLLM profiles only: for HF-id
+    targets we reconstruct the HF cache snapshot path; for absolute local
+    paths we read config.json directly."""
+    path = profile.engine_model_path
+    try:
+        if os.path.isdir(path):
+            cfg_path = os.path.join(path, "config.json")
+        else:
+            safe = "models--" + path.replace("/", "--")
+            sha = profile.revision or "main"
+            cfg_path = os.path.join(
+                profile.storage_path, "hub", safe, "snapshots", sha, "config.json"
+            )
+        with open(cfg_path) as f:
+            data = json.load(f)
+        arch = data.get("architectures")
+        return (arch if isinstance(arch, list) else []), data.get("model_type")
+    except Exception:
+        return [], None
+
+
 async def _start_vllm(profile: ResolvedProfile) -> None:
     """Launch vLLM for `profile`. Cleans up half-launched subprocesses on any
     failure, including asyncio.CancelledError from a deadline-induced wait_for
@@ -234,7 +270,19 @@ async def _start_vllm(profile: ResolvedProfile) -> None:
             DEFAULT_TP,
         )
 
-    argv = build_vllm_argv(profile, host=VLLM_INNER_HOST, port=VLLM_INNER_PORT, tp_size=tp_size)
+    arch, model_type = _vllm_model_architectures(profile)
+    enforce_eager = vllm_wants_eager_default(arch, model_type)
+    if enforce_eager and "--enforce-eager" not in profile.extra_args:
+        logger.info(
+            "Defaulting alias=%s to --enforce-eager: arch=%s is a slow-graph-capture "
+            "(SSM/hybrid) family; CUDA-graph capture would add minutes to cold load. "
+            "Add '--enforce-eager' (or override) in extra_args to silence.",
+            profile.alias, arch or model_type,
+        )
+    argv = build_vllm_argv(
+        profile, host=VLLM_INNER_HOST, port=VLLM_INNER_PORT,
+        tp_size=tp_size, enforce_eager=enforce_eager,
+    )
     env = build_vllm_env(profile, base_env=os.environ)
     logger.info("Launching vLLM (alias=%s tp=%d): %s", profile.alias, tp_size, " ".join(argv))
     vllm_process = subprocess.Popen(argv, env=env, stdout=sys.stdout, stderr=sys.stderr)
@@ -321,12 +369,67 @@ async def _start_llama_cpp(profile: ResolvedProfile) -> None:
     )
 
 
+async def _start_sglang_diffusion(profile: ResolvedProfile) -> None:
+    """Launch one persistent SGLang Diffusion image server."""
+    global vllm_process
+
+    _kill_engine()
+    visible = config_mod.gpu_indices_or_none()
+    num_gpus = derive_tp_size(profile, visible_gpus=visible, default_tp=DEFAULT_TP)
+    if profile.gpus == "all" and not visible:
+        logger.warning(
+            "gpus='all' but nvidia-smi probe returned no GPUs; falling back to "
+            "DEFAULT_TP=%d for SGLang Diffusion",
+            DEFAULT_TP,
+        )
+    argv = build_sglang_diffusion_argv(
+        profile,
+        host=VLLM_INNER_HOST,
+        port=VLLM_INNER_PORT,
+        num_gpus=num_gpus,
+    )
+    env = build_sglang_diffusion_env(profile, base_env=os.environ)
+    logger.info(
+        "Launching SGLang Diffusion (alias=%s gpus=%d): %s",
+        profile.alias, num_gpus, " ".join(argv),
+    )
+    vllm_process = subprocess.Popen(argv, env=env, stdout=sys.stdout, stderr=sys.stderr)
+    try:
+        startup_timeout = (
+            _config.server.startup_timeout_seconds
+            if _config is not None
+            else STARTUP_TIMEOUT
+        )
+        if not await _wait_for_sglang_diffusion(timeout=startup_timeout):
+            exit_code = vllm_process.poll() if vllm_process else None
+            raise RuntimeError(
+                f"SGLang Diffusion failed to become ready for alias '{profile.alias}' "
+                f"(exit_code={exit_code}; see container logs for OOM or model errors)"
+            )
+    except (Exception, asyncio.CancelledError):
+        _kill_engine()
+        raise
+
+    _runtime.resident_alias = profile.alias
+    _runtime.resident_profile = profile
+    _runtime.resident_tp_size = num_gpus
+    now = time.time()
+    _runtime.model_load_time = now
+    _runtime.last_used_at = now
+    logger.info(
+        "✓ Loaded image alias='%s' model='%s' via SGLang Diffusion",
+        profile.alias, profile.served_model_name,
+    )
+
+
 async def _start_engine(profile: ResolvedProfile) -> None:
     """Backend dispatch — selects vLLM or llama-server based on
     `profile.backend`. The shared `vllm_process` global holds whichever
     subprocess wins the lock, since only one model is resident at a time."""
     if profile.backend == "llama.cpp":
         await _start_llama_cpp(profile)
+    elif profile.backend == "sglang-diffusion":
+        await _start_sglang_diffusion(profile)
     else:
         await _start_vllm(profile)
 
@@ -373,7 +476,7 @@ async def ensure_loaded(profile: ResolvedProfile, deadline: float) -> None:
             except asyncio.TimeoutError:
                 raise HTTPException(504, f"swap queue timeout waiting for '{target}'")
             if _load_error is not None:
-                raise HTTPException(503, f"vLLM load failed: {_load_error}")
+                raise HTTPException(503, f"engine load failed: {_load_error}")
             continue  # re-check resident
         try:
             await _run_until(_swap_lock.acquire, deadline)
@@ -400,7 +503,7 @@ async def ensure_loaded(profile: ResolvedProfile, deadline: float) -> None:
                 raise
             except Exception as e:
                 _load_error = e
-                raise HTTPException(503, f"vLLM load failed: {e}")
+                raise HTTPException(503, f"engine load failed: {e}")
             finally:
                 _loading_target = None
                 _load_event.set()
@@ -1078,6 +1181,8 @@ async def status():
         "swap_target":       _loading_target,
         # Backend dispatch surface
         "backend":           profile.backend if profile else None,
+        "model_kind":        profile.kind if profile else None,
+        "capabilities":      list(profile.capabilities) if profile else [],
         "gguf_filename": (
             profile.gguf_filename
             if profile and profile.backend == "llama.cpp"
@@ -1238,8 +1343,8 @@ async def hf_search_route(
         None,
         description=(
             "CSV of pipeline tags to include "
-            "(text-generation, image-text-to-text, audio-text-to-text, any-to-any). "
-            "Defaults to all four."
+            "(text-generation, image-text-to-text, audio-text-to-text, any-to-any, text-to-image). "
+            "Defaults to all five."
         ),
     ),
     include_vision: Optional[bool] = Query(
@@ -1333,9 +1438,16 @@ async def load_model(request: Request):
     elif not is_aliased and legacy_params:
         profile = _apply_legacy_overrides(profile, legacy_params)
 
-    deadline = time.monotonic() + (
-        _config.server.swap_queue_timeout_seconds if _config else 300
-    )
+    if _config is None:
+        swap_budget = 300
+    elif profile.kind == "image":
+        swap_budget = max(
+            _config.server.swap_queue_timeout_seconds,
+            _config.server.startup_timeout_seconds,
+        )
+    else:
+        swap_budget = _config.server.swap_queue_timeout_seconds
+    deadline = time.monotonic() + swap_budget
     await ensure_loaded(profile, deadline)
     return {
         "status": "loaded",
@@ -1423,6 +1535,10 @@ class InstallRequest(BaseModel):
     # auto-detects from HF siblings. "none" cannot be persisted.
     backend: Optional[str] = None
     gguf_filename: Optional[str] = None
+    # SGLang Diffusion installs are image profiles.  `kind` is optional so
+    # older clients remain valid; backend='sglang-diffusion' implies image.
+    kind: Optional[str] = None
+    image: Optional[config_mod.ImageDefaults] = None
 
 
 class CatalogUpdateRequest(BaseModel):
@@ -1487,8 +1603,8 @@ def _resolve_install_backend(
 
     Returns (backend, gguf_filename). Raises HTTPException(400) on any
     inconsistency: backend=llama.cpp requires gguf_filename pointing at a
-    real candidate; backend=vllm forbids gguf_filename and requires
-    transformer weights when the probe runs.
+    real candidate; vLLM/SGLang forbid gguf_filename and require transformer
+    weights when the probe runs. SGLang Diffusion is image-only.
 
     Probe behavior:
       - Normal /manager/install always probes the repo so GGUF-only repos
@@ -1499,11 +1615,14 @@ def _resolve_install_backend(
     explicit_backend = request.backend
     requested_filename = request.gguf_filename
 
-    if explicit_backend not in (None, "vllm", "llama.cpp"):
+    if explicit_backend not in (None, "vllm", "llama.cpp", "sglang-diffusion"):
         raise HTTPException(
             400,
-            f"backend must be 'vllm' or 'llama.cpp', got {explicit_backend!r}",
+            "backend must be 'vllm', 'llama.cpp', or "
+            f"'sglang-diffusion', got {explicit_backend!r}",
         )
+    if request.kind not in (None, "language", "image"):
+        raise HTTPException(400, "kind must be 'language' or 'image'")
 
     if skip_probe:
         # Trust the caller (retry path / legacy /manager/download): honor
@@ -1515,10 +1634,18 @@ def _resolve_install_backend(
                 400,
                 "backend='llama.cpp' requires gguf_filename",
             )
-        if backend_choice == "vllm" and requested_filename:
+        if backend_choice != "llama.cpp" and requested_filename:
             raise HTTPException(
                 400,
                 "gguf_filename is only valid when backend='llama.cpp'",
+            )
+        if backend_choice == "sglang-diffusion":
+            if request.kind not in (None, "image"):
+                raise HTTPException(400, "sglang-diffusion profiles must use kind='image'")
+        elif request.kind == "image" or request.image is not None:
+            raise HTTPException(
+                400,
+                "image profiles require backend='sglang-diffusion'",
             )
         return backend_choice, requested_filename
     try:
@@ -1541,6 +1668,8 @@ def _resolve_install_backend(
         )
 
     if backend == "llama.cpp":
+        if request.kind == "image" or request.image is not None:
+            raise HTTPException(400, "image profiles require backend='sglang-diffusion'")
         if not has_gguf:
             raise HTTPException(
                 400,
@@ -1559,7 +1688,7 @@ def _resolve_install_backend(
             )
         return "llama.cpp", requested_filename
 
-    # backend == "vllm"
+    # Transformer-based backends.
     if requested_filename:
         raise HTTPException(
             400,
@@ -1571,6 +1700,12 @@ def _resolve_install_backend(
             f"repo '{request.model}' has no .safetensors / .bin siblings; "
             "use backend='llama.cpp' with a gguf_filename instead",
         )
+    if backend == "sglang-diffusion":
+        if request.kind not in (None, "image"):
+            raise HTTPException(400, "sglang-diffusion profiles must use kind='image'")
+        return backend, None
+    if request.kind == "image" or request.image is not None:
+        raise HTTPException(400, "image profiles require backend='sglang-diffusion'")
     return "vllm", None
 
 
@@ -1632,6 +1767,12 @@ async def _install_internal(
     backend, gguf_filename = _resolve_install_backend(
         request, hf_token=hf_token, skip_probe=skip_backend_probe,
     )
+    model_kind = "image" if backend == "sglang-diffusion" else "language"
+    image_config = (
+        (request.image or config_mod.ImageDefaults()).model_dump()
+        if model_kind == "image"
+        else None
+    )
 
     gpus_for_catalog = _gpus_to_json(request.gpus)
 
@@ -1647,6 +1788,13 @@ async def _install_internal(
         extra_args=list(request.extra_args),
         backend=backend,
         gguf_filename=gguf_filename,
+        model_kind=model_kind,
+        capabilities=(
+            ["images.generations"]
+            if model_kind == "image"
+            else ["chat.completions", "completions", "embeddings", "responses"]
+        ),
+        image_config=image_config,
     )
 
     cache_dir = os.path.join(storage_path, "hub")
@@ -1749,6 +1897,12 @@ async def retry_install_route(alias: str, force: bool = False):
             extra_args=extra_args,
             backend=row.backend,
             gguf_filename=row.gguf_filename,
+            kind=row.model_kind,
+            image=(
+                config_mod.ImageDefaults.model_validate(json.loads(row.image_config))
+                if row.image_config
+                else None
+            ),
         ),
         # The row was validated when first installed; trust it on retry to
         # avoid an extra Hub round-trip and keep retries usable offline.
@@ -2317,9 +2471,9 @@ def _append_usage_row(
 
 
 async def _open_upstream(
-    request: Request, path: str, body: bytes
+    request: Request, path: str, body: bytes, *, timeout: float | None = None
 ) -> tuple[httpx.AsyncClient, httpx.Response]:
-    """Open a streaming request against the inner vLLM. Returns the client
+    """Open a streaming request against the inner engine. Returns the client
     (kept open for the lifetime of the response) and the response object.
     Caller is responsible for closing the client when finished."""
     # Phase 3: strip auth headers so admin Basic creds and the inference
@@ -2328,7 +2482,7 @@ async def _open_upstream(
         k: v for k, v in request.headers.items()
         if k.lower() not in ("host", "content-length", "authorization", "cookie")
     }
-    client = httpx.AsyncClient(timeout=None)
+    client = httpx.AsyncClient(timeout=timeout)
     try:
         req = client.build_request(
             method=request.method,
@@ -2430,7 +2584,7 @@ async def _wrap_stream(
 
 async def _proxy(request: Request, path: str, body: bytes):
     """
-    Forward a request to the inner vLLM server.
+    Forward a request to the inner OpenAI-compatible engine.
 
     Phase 2 semantics (plans/phase_2.md §5.4):
       - The request body's `model` field is resolved through the managed
@@ -2445,6 +2599,11 @@ async def _proxy(request: Request, path: str, body: bytes):
         proxied request — pre-stream upstream errors don't count.
       - Single deadline computed at arrival, gates lock-wait, event-wait,
         and _start_vllm itself.
+      - Aside from canonicalizing `model` and forcing streaming usage for
+        accounting, the JSON body is forwarded as-is. This preserves
+        provider-specific request knobs such as llama.cpp's
+        `chat_template_kwargs`, `reasoning_format`, `grammar`, and
+        schema-bearing `response_format`.
     """
     request_start_monotonic = time.monotonic()
     requested = _peek_model_field(body)
@@ -2461,9 +2620,55 @@ async def _proxy(request: Request, path: str, body: bytes):
         except KeyError:
             raise HTTPException(status_code=404, detail=f"Unknown alias '{requested}'")
 
-    deadline = time.monotonic() + (
-        _config.server.swap_queue_timeout_seconds if _config else 300
-    )
+    is_image_request = path == "v1/images/generations"
+    if profile is not None:
+        required_capability = (
+            "images.generations"
+            if is_image_request
+            else path.removeprefix("v1/").replace("/", ".")
+        )
+        if is_image_request and required_capability not in profile.capabilities:
+            raise HTTPException(
+                400,
+                f"model '{profile.alias}' does not support /v1/images/generations",
+            )
+        if not is_image_request and profile.kind == "image":
+            raise HTTPException(
+                400,
+                f"image model '{profile.alias}' only supports /v1/images/generations",
+            )
+
+    normalized_image_body: Optional[bytes] = None
+    if is_image_request:
+        active_profile = profile or _runtime.resident_profile
+        if (
+            active_profile is None
+            or active_profile.kind != "image"
+            or "images.generations" not in active_profile.capabilities
+        ):
+            raise HTTPException(400, "the selected model does not support image generation")
+        try:
+            normalized_image_body = normalize_image_request(
+                body,
+                wire_model=active_profile.served_model_name,
+                defaults=active_profile.image_defaults or {},
+                max_pixels=(
+                    _config.server.image_max_pixels if _config is not None else 4_194_304
+                ),
+            )
+        except ImageRequestError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    if _config is None:
+        swap_budget = 300
+    elif is_image_request:
+        swap_budget = max(
+            _config.server.swap_queue_timeout_seconds,
+            _config.server.startup_timeout_seconds,
+        )
+    else:
+        swap_budget = _config.server.swap_queue_timeout_seconds
+    deadline = time.monotonic() + swap_budget
 
     # Loop with one deadline, one lock-release path. continue triggers
     # a retry of ensure_loaded if eviction or another swap raced us.
@@ -2500,10 +2705,25 @@ async def _proxy(request: Request, path: str, body: bytes):
     upstream_ok = False
     client: Optional[httpx.AsyncClient] = None
     response: Optional[httpx.Response] = None
-    upstream_body = _canonicalize_model_field(body, profile)
-    upstream_body, client_asked_for_usage = _ensure_stream_usage(upstream_body)
+    if is_image_request:
+        assert normalized_image_body is not None
+        upstream_body = normalized_image_body
+        client_asked_for_usage = False
+    else:
+        upstream_body = _canonicalize_model_field(body, profile)
+        upstream_body, client_asked_for_usage = _ensure_stream_usage(upstream_body)
     try:
-        client, response = await _open_upstream(request, f"{path}", upstream_body)
+        upstream_timeout = (
+            float(_config.server.image_request_timeout_seconds)
+            if is_image_request and _config is not None
+            else None
+        )
+        if upstream_timeout is None:
+            client, response = await _open_upstream(request, f"{path}", upstream_body)
+        else:
+            client, response = await _open_upstream(
+                request, f"{path}", upstream_body, timeout=upstream_timeout,
+            )
         upstream_ok = True
         if "text/event-stream" in response.headers.get("content-type", ""):
             is_streaming = True
@@ -2554,6 +2774,10 @@ async def _proxy(request: Request, path: str, body: bytes):
                 except Exception as e:
                     logger.warning("Failed to queue usage row: %s", e)
         return JSONResponse(content=body_json, status_code=response.status_code)
+    except httpx.TimeoutException as exc:
+        if is_image_request:
+            raise HTTPException(504, "image generation timed out") from exc
+        raise
     finally:
         if not is_streaming:
             _runtime.inflight -= 1
@@ -2566,6 +2790,63 @@ async def _proxy(request: Request, path: str, body: bytes):
             if client is not None:
                 with contextlib.suppress(Exception):
                     await client.aclose()
+
+
+def _models_list_payload() -> dict:
+    """Synthesize an OpenAI-compatible `/v1/models` list from the catalog.
+
+    Unlike a blind proxy to the inner engine (which only knows the one resident
+    model, and 503s when nothing is loaded), this lists every fully-downloaded
+    model — `status == "installed"` — across both vLLM and llama.cpp backends.
+    Each entry is keyed by its catalog `alias`, the stable handle a client sends
+    back as the request `model` field to trigger an auto-swap load.
+
+    `served_model_name` follows the profiles.py rule: HF id for vLLM, alias for
+    llama.cpp (what the inner engine actually reports once loaded).
+    """
+    data: list[dict] = []
+    seen: set[str] = set()
+    if _catalog is not None:
+        for row in _catalog.list_models():
+            if row.status != "installed":
+                continue
+            served = row.alias if row.backend == "llama.cpp" else row.hf_model_id
+            data.append({
+                "id": row.alias,
+                "object": "model",
+                "created": row.installed_at or 0,
+                "owned_by": "mnemosyne",
+                "backend": row.backend,
+                "model_kind": row.model_kind,
+                "capabilities": json.loads(row.capabilities),
+                "served_model_name": served,
+                "hf_model_id": row.hf_model_id,
+                "status": "installed",
+            })
+            seen.add(row.alias)
+
+    # Keep the resident model visible even if it has no installed catalog row
+    # (e.g. loaded via a raw HF-id / absolute-path fallback).
+    resident_alias = _runtime.resident_alias
+    if resident_alias is not None and resident_alias not in seen:
+        profile = _runtime.resident_profile
+        data.append({
+            "id": resident_alias,
+            "object": "model",
+            "created": 0,
+            "owned_by": "mnemosyne",
+            "backend": profile.backend if profile else "vllm",
+            "model_kind": profile.kind if profile else "language",
+            "capabilities": list(profile.capabilities) if profile else [],
+            "served_model_name": (
+                profile.served_model_name if profile else resident_alias
+            ),
+            "hf_model_id": profile.engine_model_path if profile else resident_alias,
+            "status": "installed",
+        })
+
+    data.sort(key=lambda m: m["id"])
+    return {"object": "list", "data": data}
 
 
 @inference_router.api_route(
@@ -2581,7 +2862,13 @@ async def openai_proxy(path: str, request: Request):
     If the request includes a `model` field that differs from the currently
     loaded model, the manager will automatically swap to it before serving
     the request. No need to call /manager/load explicitly.
+
+    `GET /v1/models` is the exception: it is served locally from the catalog so
+    clients can discover every installed (loadable) model, not just the resident
+    one — and it never 503s when nothing is loaded.
     """
+    if path == "models" and request.method == "GET":
+        return JSONResponse(_models_list_payload())
     body = await request.body()
     return await _proxy(request, f"v1/{path}", body)
 

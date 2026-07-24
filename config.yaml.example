@@ -9,12 +9,14 @@
 
 server:
   inference_port: 8000              # LAN-facing OpenAI-compatible API
-  admin_port: 8001                  # /ui + /manager/* — see PRD §5.10
+  admin_port: 8001                  # /ui + /manager/*; protected by ADMIN_PASSWORD
   inference_bind: 0.0.0.0
   admin_bind: 0.0.0.0
   idle_unload_seconds: 900          # 15 min default; null disables idle eviction
   startup_timeout_seconds: 600
   swap_queue_timeout_seconds: 300   # how long /v1 waits during a model swap before 504
+  image_request_timeout_seconds: 1800
+  image_max_pixels: 4194304         # 2048x2048; width/height must be multiples of 16
 
 storage:
   default: nvme-fast
@@ -63,3 +65,45 @@ models:
     extra_args:
       - --limit-mm-per-prompt
       - image=4
+
+  # GGUF via llama.cpp. `extra_args` are llama-server startup defaults;
+  # per-request sampler/reasoning/structured-output options pass through
+  # the /v1/* proxy in the JSON body.
+  - alias: local-gguf
+    model: org/repo-gguf
+    backend: llama.cpp
+    gguf_filename: model.Q4_K_M.gguf
+    gpus: [0]
+    max_model_len: 32768
+    extra_args:
+      - --reasoning
+      - off
+      - --reasoning-format
+      - none
+      - --temp
+      - "0.2"
+
+  # Image generation uses the separately pinned SGLang Diffusion runtime.
+  # Public guidance_scale maps to Qwen's true_cfg_scale parameter.
+  - alias: qwen-image
+    model: Qwen/Qwen-Image
+    backend: sglang-diffusion
+    kind: image
+    gpus: [0]
+    image:
+      width: 1024
+      height: 1024
+      num_inference_steps: 30
+      guidance_scale: 4.0
+      guidance_parameter: true_cfg_scale
+
+  - alias: krea-2-turbo
+    model: krea/Krea-2-Turbo
+    backend: sglang-diffusion
+    kind: image
+    gpus: [0]
+    image:
+      width: 1024
+      height: 1024
+      num_inference_steps: 8
+      guidance_scale: 1.0

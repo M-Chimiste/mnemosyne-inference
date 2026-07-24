@@ -4,9 +4,9 @@
 which the pytest harness cannot exercise. Together with the pytest contract
 snapshot, this is the workstation-side release checklist.
 
-**When to run:** before marking Phase 8 / v1 acceptance complete, and before
-merging any future phase that touches request paths, process lifecycle, install
-workflows, or plane separation.
+**When to run:** before a workstation release, and before merging changes that
+touch request paths, process lifecycle, installs, engine builds, GPU behavior,
+or plane separation.
 
 **Setup:**
 
@@ -249,12 +249,36 @@ Failure modes worth distinguishing:
 - The first call after a fresh install pays the lazy-load latency. A second
   call should be quick.
 
-This smoke check satisfies the manual side of PRD §7's "vision model
-end-to-end" criterion. Phase 8's
-[phase_8_acceptance.md](phase_8_acceptance.md) records pass/fail.
+This is the manual end-to-end check for vision-model request handling.
+
+---
+
+## 10. Text-to-image generation (SGLang Diffusion)
+
+Rebuild the CUDA image so the separately pinned `/opt/sglang` environment is
+present, then install or configure one of the example image aliases.
+
+```bash
+vllm-ctl install krea-2-turbo krea/Krea-2-Turbo \
+  --backend sglang-diffusion --gpus 0 \
+  --image-steps 8 --image-guidance 1
+vllm-ctl install-status krea-2-turbo
+
+curl -sX POST "$INF/v1/images/generations" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"krea-2-turbo","prompt":"A red canoe beside an alpine lake","size":"1024x1024","n":1,"response_format":"b64_json","seed":42}' \
+  | tee /tmp/mnemosyne-image-response.json \
+  | jq -r '.data[0].b64_json' | base64 --decode > /tmp/mnemosyne-krea.png
+file /tmp/mnemosyne-krea.png
+```
+
+Expect a valid PNG and `manager/status.backend == "sglang-diffusion"` with
+`model_kind == "image"`. Then request a language alias and verify the SGLang
+process exits before vLLM/llama.cpp becomes ready. Confirm the image request
+did not add a token-usage analytics row. Repeat with `qwen-image`; its public
+`guidance_scale` must reach SGLang as `true_cfg_scale`.
 
 ## Recording deltas
 
 If any step above behaves differently from the description on the current
-branch, record it in [phase_8_acceptance.md](phase_8_acceptance.md) or open a
-follow-up issue before marking v1 accepted.
+branch, update this checklist or open a follow-up issue before release.

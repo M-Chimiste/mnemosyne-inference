@@ -598,7 +598,8 @@ else:
   if [[ -z "$alias" || -z "$model" ]]; then
     red "Usage: vllm-ctl install <alias> <model> [--revision REF] [--quant X] \\"
     red "         [--gpus all|0,1] [--max-len N] [--storage NAME] [--size-gb F] \\"
-    red "         [--backend vllm|llama.cpp] [--gguf-filename NAME] \\"
+    red "         [--backend vllm|llama.cpp|sglang-diffusion] [--gguf-filename NAME] \\"
+    red "         [--image-width N --image-height N --image-steps N --image-guidance F] \\"
     red "         [-- vllm extra args...]"
     red "       vllm-ctl install <model> --list-gguf [--revision REF]"
     exit 1
@@ -612,6 +613,10 @@ else:
   local size_gb=""
   local backend=""
   local gguf_file=""
+  local image_width="1024"
+  local image_height="1024"
+  local image_steps="30"
+  local image_guidance="4"
   local extra_args=()
   local pass_through=false
 
@@ -625,6 +630,10 @@ else:
       --size-gb)        size_gb="$2";   shift 2 ;;
       --backend)        backend="$2";   shift 2 ;;
       --gguf-filename)  gguf_file="$2"; shift 2 ;;
+      --image-width)    image_width="$2"; shift 2 ;;
+      --image-height)   image_height="$2"; shift 2 ;;
+      --image-steps)    image_steps="$2"; shift 2 ;;
+      --image-guidance) image_guidance="$2"; shift 2 ;;
       --)               pass_through=true; shift ;;
       *)
         if $pass_through; then extra_args+=("$1"); fi
@@ -666,6 +675,15 @@ if '${storage}':   d['storage']           = '${storage}'
 if '${size_gb}':   d['size_estimate_gb']  = float('${size_gb}')
 if '${backend}':   d['backend']           = '${backend}'
 if '${gguf_file}': d['gguf_filename']     = '${gguf_file}'
+if '${backend}' == 'sglang-diffusion':
+    d['kind'] = 'image'
+    d['image'] = {
+      'width': int('${image_width}'),
+      'height': int('${image_height}'),
+      'num_inference_steps': int('${image_steps}'),
+      'guidance_scale': float('${image_guidance}'),
+      'guidance_parameter': 'true_cfg_scale' if 'qwen-image' in '${model}'.lower() else 'guidance_scale',
+    }
 print(json.dumps(d))
 ")
 
@@ -835,8 +853,13 @@ $(bold "Installs (Phase 4):")
     --max-len N                   Override max_model_len
     --storage <name>              Storage location name (default: storage.default)
     --size-gb F                   Size estimate (drives free-space pre-check)
-    --backend vllm|llama.cpp      Force backend; default auto-detects from repo
+    --backend vllm|llama.cpp|sglang-diffusion
+                                  Force backend; SGLang Diffusion is image-only
     --gguf-filename NAME          Required for llama.cpp; primary shard filename
+    --image-width N               Image default width (default: 1024)
+    --image-height N              Image default height (default: 1024)
+    --image-steps N               Image default inference steps (default: 30)
+    --image-guidance F            Image default guidance scale (default: 4)
     -- <vllm extra args>          Extra args appended verbatim
   install <model> --list-gguf     List installable GGUF files in a repo
   install-cancel <alias>          SIGTERM the worker (resumable)

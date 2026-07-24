@@ -1,0 +1,6 @@
+/_build/
+/_artifacts/
+/_export/
+/_venvstacks.resolved.toml
+/requirements/
+__pycache__/
