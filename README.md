@@ -8,10 +8,11 @@ deployments with independent dependencies and packaging:
 
 - The established CUDA deployment runs vLLM, llama.cpp, or SGLang Diffusion
   in Docker, including local text-to-image generation.
-- The native Apple Silicon deployment coordinates an existing LM Studio
-  installation, oMLX, and DwarfStar (DS4) through one local API. It does not
-  use Docker, so MLX and Metal remain available to the host processes. Start
-  with [macos/README.md](macos/README.md).
+- The native Apple Silicon deployment owns an official llama.cpp runtime for
+  GGUF models, coordinates oMLX for MLX models and DwarfStar (DS4) for its
+  specialized DeepSeek weights, and runs MFLUX in an isolated worker. It does
+  not use Docker, so MLX and Metal remain available to the host processes.
+  Start with [macos/README.md](macos/README.md).
 
 The remainder of this README describes the CUDA deployment unless a section is
 explicitly labeled macOS.
@@ -21,7 +22,7 @@ explicitly labeled macOS.
 | Deployment | Runtime and engines | Status |
 | --- | --- | --- |
 | CUDA/Linux | Docker, vLLM, llama.cpp, SGLang Diffusion | Feature-complete implementation and automated coverage; current engine pins and cross-backend swaps still need a CUDA-workstation release smoke. |
-| Apple Silicon | Native service, existing LM Studio, optional oMLX/DS4, isolated MFLUX worker | App packaging and Krea 2 Turbo generation have been exercised end to end on an M4 Max. Real oMLX and DS4 model acceptance remains outstanding. |
+| Apple Silicon | Managed llama.cpp, external oMLX, optional DS4, isolated MFLUX worker | Official llama.cpp arm64 download/integrity checks plus real GGUF and oMLX/MLX generations with token accounting have passed on Theseus. GUI migration, packaged-service soak, durable external-oMLX startup, and DS4 acceptance remain in progress; LM Studio is retained only as an explicitly enabled migration fallback until that soak is accepted. |
 
 Both deployments expose one stable API, keep at most one model resident, and
 use the same `/v1/images/generations` contract. Language-model usage can be
@@ -58,19 +59,65 @@ checks live in [project_docs/smoke_checks.md](project_docs/smoke_checks.md).
 ## Native macOS deployment
 
 The native service listens on `127.0.0.1:17320` for inference and
-`127.0.0.1:17321` for control. It enforces one resident model globally across
-LM Studio (`:1234`), oMLX (`:17322`), and a manager-owned DS4 process
-(`:17323`) or MFLUX image worker (`:17324`). After it is enabled from the menu
-app, a per-user LaunchAgent keeps inference alive when the controller quits.
+`127.0.0.1:17321` for control. It is the workstation's token sidecar and
+enforces one resident model globally across a manager-owned llama.cpp process
+(`:17325`), oMLX (`:17322`), a manager-owned DS4 process (`:17323`), and the
+MFLUX image worker (`:17324`). LM Studio (`:1234`) is disabled on fresh
+configurations and remains available only as an explicit migration/soak
+fallback. After the service is enabled from the menu app, a per-user
+LaunchAgent keeps inference alive when the controller quits.
 
 `Unified Inference.app` is a menu-bar-only controller: it intentionally has no Dock
 icon or ordinary window. Launching it creates a brain-profile status icon on
 the right side of the macOS menu bar. Its popover shows service health, the
 resident model, model load/unload controls, usage-outbox depth, background
-service registration, and login-item controls. **Configuration…** opens a
-native editor window for `config.yaml` and `.env`; it validates YAML with the
-running service before an atomic private-file save, hot-applies model-profile
-changes, and prompts for a service restart when other settings require one.
+service registration, and login-item controls. **Settings…** opens a dedicated
+native settings window with pages for general behavior, engines, runtime
+updates, storage, a Hugging Face model library, model profiles, usage
+reporting, and credentials.
+Storage is chosen with the native macOS folder picker, including exact nested
+paths such as `/Volumes/Athena/models`; it is never entered as a raw path.
+While the picker grant is live, the menu app creates an ordinary Finder
+bookmark whose implicit extension is Apple's supported single interprocess
+handoff. The receiving service explicitly consumes that grant, creates its own
+durable security-scoped bookmark, stores only that receiver-owned bookmark
+below `state/security-scopes/` next to the active `config.yaml`, and persists
+its SHA-256 `scope_id` in YAML. This location is intentionally independent of
+the configurable SQLite path. The current bundle does not ship App Sandbox
+bookmark entitlements; the real protected-folder restart/child-`exec` path
+still requires packaged-Mac smoke.
+
+Configuration saves preflight every referenced grant before writing YAML.
+Bookmark receipt and reactivation run in bounded, killable subprocess groups;
+startup revalidates the referenced bookmarks and then prunes obsolete private
+bookmark files. Scoped filesystem helpers and manager-owned model/download
+children reactivate the durable bookmark in their own process and then `exec`
+the upstream command, so a background LaunchAgent can continue to use an
+approved protected or removable folder after the menu app exits.
+The Models page uses a Finder directory picker to scan an existing library in
+place. It groups GGUF shard sets, excludes projector files as primary models,
+offers explicit multimodal-projector pairing, recognizes MLX folders, and
+migrates matching aliases without copying or loading any weights. The Model
+Library provides an explicit GGUF quant/file picker before a Hugging Face
+download begins.
+Bookmark registration/preflight, filesystem inspection, model-path resolution,
+directory creation/measurement, and GGUF/projector validation run in killable
+subprocess groups off the asyncio event loop behind bounded deadlines. A
+protected folder that is unavailable or awaiting authorization therefore
+produces an actionable timeout, and timeout, client cancellation, or service
+shutdown terminates the complete helper process group without freezing
+inference or control status.
+Configuration is validated by the running service before an atomic
+private-file save. The Settings window must return the revision from its
+configuration snapshot; a stale revision receives `409 Conflict`, so it cannot
+overwrite profiles added by a completed download or local import.
+Model-profile-only changes are hot-applied, while other changes offer a service
+restart. Saved credential values are never displayed back to the user.
+Managed llama.cpp survivor metadata includes the storage root, `scope_id`, and
+volume UUID as well as its process identity, allowing restart recovery to
+revalidate protected storage before trusting or signaling the recorded child.
+The settings window is presented once on first launch so the menu-bar-only app
+has an obvious onboarding path; later login launches stay out of the way.
 
 The controller title is the Mac's Computer Name from System Settings. The same
 bundle therefore appears as **Theseus**, **Metis**, or **Athena** on those
@@ -85,8 +132,7 @@ and the Mac service never imports vLLM or CUDA modules.
 
 ### Native macOS source-build quickstart
 
-LM Studio must already be installed and serving on loopback `:1234`; Mnemosyne
-does not install or bundle it. From an Apple Silicon checkout:
+From an Apple Silicon checkout:
 
 ```bash
 mkdir -p "$HOME/Library/Application Support/Mnemosyne/state"
@@ -106,6 +152,11 @@ ditto "macos/app/build/Stage/Unified Inference.app" \
 open "/Applications/Unified Inference.app"
 ```
 
+`build_app.sh` uses ad-hoc signing by default. Set `CODESIGN_IDENTITY` to a
+valid identity in the login keychain for a stable local signature. Theseus
+currently has no valid code-signing identity, so its local build is ad hoc and
+a rebuild may require reselecting protected model folders in Settings.
+
 Click the brain-profile menu-bar icon and choose **Enable Service**. Approve
 the background item in System Settings if macOS asks, then verify:
 
@@ -115,10 +166,25 @@ curl http://127.0.0.1:17320/v1/models
 curl http://127.0.0.1:17321/manager/status
 ```
 
-The first image request downloads the configured Hugging Face model into the
-normal user cache. The app contains the runtime and worker code, not model
-weights. See [macos/README.md](macos/README.md) for engine preparation,
+The Model Library page can search engine-compatible Hugging Face models and
+download them into a GUI-selected internal or external folder before first
+use. Downloads are process-isolated, resumable, cancellable, and do not load
+the model. The app contains the runtime and worker code, not model weights.
+See [macos/README.md](macos/README.md) for engine preparation, storage,
 configuration, development mode, and signing details.
+
+The Runtime Updates page compares llama.cpp, oMLX, MFLUX, and DS4 with their
+official upstream projects. Unified Inference downloads the official
+`ggml-org/llama.cpp` Apple Silicon archive, verifies the asset size and
+GitHub-published SHA-256, and validates the server contract before activation.
+oMLX remains externally owned and opens its official update path. MFLUX comes
+from its official PyPI project; DS4 is downloaded at an exact commit from
+`antirez/ds4` and built locally with the Apple toolchain. Managed updates are
+staged without replacing `Unified Inference.app`. Activation drains requests
+and unloads the resident model; the previous runtime remains available for
+one-click rollback. Managed runtimes live
+under `~/Library/Application Support/Mnemosyne/runtimes/` and never modify the
+configured model library.
 
 ## CUDA quickstart
 
@@ -224,6 +290,12 @@ curl -sX POST http://localhost:8000/v1/images/generations \
 On macOS, use `http://127.0.0.1:17320` and a configured MFLUX alias such as
 `krea-2-turbo`. The private worker on `:17324` is manager-owned and must not be
 called directly.
+
+The Mac Model Library exposes every text-to-image configuration in the pinned
+MFLUX runtime: FLUX.1, FLUX.2 Klein, Qwen Image, Krea 2 Turbo, FIBO, Z-Image,
+ERNIE Image, and Ideogram 4. Each download creates a profile with that model's
+recommended steps and guidance defaults. Krea 2 Raw is visible but disabled
+until upstream MFLUX supports its different `raw.safetensors` layout.
 
 The initial contract supports one base64 PNG, dimensions from 64–4096 in
 multiples of 16 within `server.image_max_pixels`, and optional seed, steps,
@@ -624,9 +696,12 @@ for features that are not implemented.
   triggers a fresh load. No supervisor loop tries to keep the
   previous model resident.
 - **Native frontier-engine hardware coverage is incomplete.** The installed
-  app and MFLUX/Krea 2 image path have passed a real Apple Silicon smoke. oMLX
-  and DS4 adapters are implemented and tested against fixtures, but their
-  target models still need workstation acceptance.
+  app and MFLUX/Krea 2 image path have passed a real Apple Silicon smoke. An
+  official managed llama.cpp arm64 runtime has also generated successfully
+  from an existing GGUF on Theseus, and an external oMLX 0.5.3 service
+  generated from an MLX model with usage delivery. The packaged Finder
+  migration, LM-Studio-disabled soak, durable external-oMLX login startup, and
+  real DS4 target acceptance remain in progress.
 - **No runtime hard-fail when `gpus='all'` finds no GPUs.** The manager logs
   a warning and falls back to `VLLM_DEFAULT_TP`. On a real CUDA host this
   only happens if the nvidia-container-toolkit is misconfigured — fix the

@@ -16,6 +16,10 @@ import uvicorn
 from .app import create_control_app, create_inference_app
 from .config import MacConfig, load_config
 from .runtime import NativeRuntime, validate_exposure
+from .sidecar_discovery import (
+    ReportingMigrationError,
+    persist_legacy_reporting_environment,
+)
 
 
 _APP_SUPPORT = Path.home() / "Library" / "Application Support" / "Mnemosyne"
@@ -143,6 +147,17 @@ def main() -> None:
         )
         return
     _configure_logging(config, args.log_level)
+    try:
+        # Make the previous sidecar a one-time migration source rather than a
+        # permanent startup dependency. Failure remains non-fatal because the
+        # read-only legacy fallback can still serve the current process, but it
+        # must be visible before an operator retires that LaunchAgent.
+        persist_legacy_reporting_environment(args.env)
+    except ReportingMigrationError as exc:
+        logging.getLogger("mnemosyne-macos").error(
+            "legacy token-sidecar reporting values were not persisted: %s",
+            exc,
+        )
     asyncio.run(_serve(args, config))
 
 

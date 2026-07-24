@@ -4,7 +4,7 @@ import SwiftUI
 @MainActor
 final class ConfigurationWindowController: NSObject, NSWindowDelegate {
     private let registration: LaunchAgentRegistration
-    private let viewModel = ConfigurationEditorViewModel()
+    private let viewModel = SettingsViewModel()
     private var window: NSWindow?
 
     init(registration: LaunchAgentRegistration) {
@@ -15,7 +15,7 @@ final class ConfigurationWindowController: NSObject, NSWindowDelegate {
     func show() {
         let window = window ?? makeWindow()
         if !window.isVisible, !viewModel.hasUnsavedChanges {
-            viewModel.loadFromDisk()
+            Task { await viewModel.load() }
         }
         NSApplication.shared.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
@@ -28,33 +28,37 @@ final class ConfigurationWindowController: NSObject, NSWindowDelegate {
         alert.alertStyle = .warning
         alert.messageText = "Discard unsaved configuration changes?"
         alert.informativeText =
-            "Changes to config.yaml or .env have not been saved."
+            "Changes in the settings window have not been saved."
         alert.addButton(withTitle: "Cancel")
         alert.addButton(withTitle: "Discard Changes")
         let response = alert.runModal()
         guard response == .alertSecondButtonReturn else { return false }
-        viewModel.loadFromDisk()
+        viewModel.discardChanges()
         return true
     }
 
     private func makeWindow() -> NSWindow {
-        let content = ConfigurationEditorView(
+        let content = SettingsView(
             viewModel: viewModel,
             restartService: { [weak self] in
                 guard let self else { return }
-                let succeeded = self.registration.restartAgent()
-                self.viewModel.serviceRestartRequested(
-                    succeeded: succeeded,
-                    error: self.registration.lastError
-                )
+                guard self.viewModel.serviceRestartStarted() else { return }
+                Task {
+                    let succeeded = await self.registration.restartAgent()
+                    let error = self.registration.lastError
+                    await self.viewModel.serviceRestartRequested(
+                        succeeded: succeeded,
+                        error: error
+                    )
+                }
             }
         )
         let controller = NSHostingController(rootView: content)
         let window = NSWindow(contentViewController: controller)
-        window.title = "Unified Inference Configuration"
+        window.title = "Unified Inference Settings"
         window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
-        window.setContentSize(NSSize(width: 780, height: 620))
-        window.minSize = NSSize(width: 680, height: 480)
+        window.setContentSize(NSSize(width: 980, height: 720))
+        window.minSize = NSSize(width: 900, height: 650)
         window.isReleasedWhenClosed = false
         window.tabbingMode = .disallowed
         window.delegate = self

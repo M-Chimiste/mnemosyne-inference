@@ -9,19 +9,33 @@ import hmac
 import json
 import logging
 import os
+from pathlib import Path
+import re
 import time
 from typing import Any, Mapping
 
 import httpx
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
-from .config import parse_config
+from .config import MacConfig
 from .coordinator import CoordinatorError, QueueTimeout
-from .engines.base import AdapterError
+from .engines.base import AdapterError, Deadline
+from .engines.lmstudio import LMStudioAdapter
+from .filesystem import FilesystemProbeError
 from .image_api import ImageRequestError, normalize_image_request
-from .models import Endpoint, EngineName
+from .local_models import LocalModelError
+from .local_sources import discover_local_model_sources
+from .model_library import (
+    download_size,
+    gguf_files,
+    image_profile_defaults,
+    recommended_models,
+    search_models,
+    validate_install_candidate,
+)
+from .models import DEFAULT_CAPABILITIES, Endpoint, EngineName
 from .proxy import (
     InvalidProxyRequest,
     StreamingEventFilter,
@@ -29,11 +43,25 @@ from .proxy import (
     prepare_request_body,
     upstream_headers,
 )
-from .runtime import NativeRuntime, RestartRequired, RuntimeConfigurationError
+from .runtime import (
+    ConfigurationConflict,
+    NativeRuntime,
+    RestartRequired,
+    RuntimeConfigurationError,
+)
+from .runtime_updates import RuntimeUpdateError
+from .security_scopes import SecurityScopeError
+from .storage import install_destination
 from .usage import StreamingUsageParser, UsageEvent, usage_event_from_payload
 
 
 logger = logging.getLogger("mnemosyne-macos.http")
+
+
+def _lexical_path(value: str) -> str:
+    return os.path.normcase(
+        os.path.normpath(os.path.abspath(os.path.expanduser(value)))
+    )
 
 
 class LoadRequest(BaseModel):
@@ -41,9 +69,112 @@ class LoadRequest(BaseModel):
     model: str
 
 
-class ValidateConfigurationRequest(BaseModel):
+class SaveConfigurationRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    config_yaml: str
+    config: dict[str, Any]
+    revision: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+
+
+class InstallModelRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    repo_id: str
+    engine: EngineName
+    storage: str | None = None
+    alias: str | None = None
+    revision: str | None = None
+    filename: str | None = None
+    projector_filename: str | None = None
+    capabilities: set[Endpoint] | None = None
+
+
+_INSTALL_ROLE_CAPABILITIES: dict[str, frozenset[Endpoint]] = {
+    "generation": DEFAULT_CAPABILITIES[EngineName.LLAMA_CPP],
+    "embeddings": frozenset({Endpoint.EMBEDDINGS}),
+    "rerank": frozenset({Endpoint.RERANK}),
+    "image": frozenset({Endpoint.IMAGES_GENERATIONS}),
+}
+
+
+def _validated_install_capabilities(
+    *,
+    engine: EngineName,
+    requested: set[Endpoint] | None,
+    suggested_role: str | None,
+    has_projector: bool,
+) -> frozenset[Endpoint]:
+    if requested is None:
+        role = (
+            "image"
+            if engine == EngineName.MFLUX
+            else "generation"
+            if engine == EngineName.DS4
+            else suggested_role or "generation"
+        )
+        capabilities = _INSTALL_ROLE_CAPABILITIES.get(role)
+        if capabilities is None:
+            raise ValueError("model metadata suggested an unsupported role")
+    else:
+        capabilities = frozenset(requested)
+
+    allowed_roles: dict[EngineName, set[str]] = {
+        EngineName.LLAMA_CPP: {"generation", "embeddings", "rerank"},
+        EngineName.OMLX: {"generation", "embeddings", "rerank"},
+        EngineName.DS4: {"generation"},
+        EngineName.MFLUX: {"image"},
+    }
+    matching_role = next(
+        (
+            role
+            for role, role_capabilities in _INSTALL_ROLE_CAPABILITIES.items()
+            if capabilities == role_capabilities
+        ),
+        None,
+    )
+    if matching_role is None or matching_role not in allowed_roles.get(engine, set()):
+        allowed = ", ".join(sorted(allowed_roles.get(engine, set()))) or "none"
+        raise ValueError(
+            f"{engine.value} installs require one supported model role: {allowed}"
+        )
+    if has_projector and matching_role != "generation":
+        raise ValueError("a llama.cpp vision projector requires the Generation role")
+    return capabilities
+
+
+class InstallRuntimeUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    version: str | None = None
+
+
+class LocalModelScanRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    path: str
+    bookmark_data: str | None = Field(default=None, max_length=2 * 1024 * 1024)
+
+
+class LocalModelImportSelection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    candidate_id: str
+    alias: str | None = None
+    projector_id: str | None = None
+
+
+class LocalModelImportRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    path: str
+    scope_id: str | None = Field(default=None, pattern=r"^[0-9a-fA-F]{64}$")
+    selections: list[LocalModelImportSelection]
+
+
+class StorageInspectRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    path: str
+    bookmark_data: str | None = Field(default=None, max_length=2 * 1024 * 1024)
 
 
 async def _close_proxy_resources(
@@ -122,8 +253,10 @@ def _error_status(exc: Exception) -> int:
         return 400
     if isinstance(exc, TimeoutError):
         return 504
-    if isinstance(exc, RestartRequired):
+    if isinstance(exc, (RestartRequired, ConfigurationConflict)):
         return 409
+    if isinstance(exc, RuntimeUpdateError):
+        return 400
     if isinstance(exc, (CoordinatorError, AdapterError, RuntimeConfigurationError)):
         return 503
     return 502
@@ -201,6 +334,18 @@ def _control_authorized(runtime: NativeRuntime, request: Request) -> bool:
     return username == "admin" and hmac.compare_digest(password, expected)
 
 
+async def _resolve_target(runtime: NativeRuntime, model: str) -> Any:
+    """Resolve storage-backed profiles without blocking either HTTP plane."""
+
+    try:
+        return await runtime.resolve_target(model)
+    except FilesystemProbeError as exc:
+        raise HTTPException(
+            503,
+            str(exc),
+        ) from exc
+
+
 def create_inference_app(runtime: NativeRuntime) -> FastAPI:
     app = FastAPI(
         title="Mnemosyne macOS Inference",
@@ -238,7 +383,7 @@ def create_inference_app(runtime: NativeRuntime) -> FastAPI:
         body = await request.body()
         requested_model = _json_model(body)
         try:
-            target = runtime.resolve(requested_model)
+            target = await _resolve_target(runtime, requested_model)
         except KeyError as exc:
             raise HTTPException(404, str(exc)) from exc
         if endpoint not in target.capabilities:
@@ -462,10 +607,368 @@ def create_control_app(runtime: NativeRuntime) -> FastAPI:
             "resident_alias": status_value.resident_alias,
         }
 
+    @app.get("/manager/engines/lmstudio/models")
+    async def lmstudio_models() -> dict:
+        adapter = runtime.adapters.get(EngineName.LMSTUDIO)
+        if not isinstance(adapter, LMStudioAdapter):
+            raise HTTPException(409, "LM Studio is not enabled")
+        try:
+            models = await adapter.inventory(
+                deadline=Deadline.after(
+                    runtime.config.engines.lmstudio.request_timeout_seconds
+                )
+            )
+            return {"models": models}
+        except Exception as exc:
+            raise HTTPException(_error_status(exc), str(exc)) from exc
+
+    @app.get("/manager/storage")
+    async def storage_locations() -> dict:
+        statuses = await asyncio.gather(
+            *(
+                runtime.filesystem.inspect(
+                    location.path,
+                    name=location.name,
+                    expected_volume_uuid=location.volume_uuid,
+                    scope_id=location.scope_id,
+                )
+                for location in runtime.config.storage.locations
+            )
+        )
+        return {
+            "default": runtime.config.storage.default,
+            "locations": [status.to_dict() for status in statuses],
+        }
+
+    @app.get("/manager/storage/inspect")
+    async def inspect_storage_path(path: str = Query(..., min_length=1)) -> dict:
+        scoped = runtime.storage_scope_for_path(path)
+        status = await runtime.filesystem.inspect(
+            path,
+            scope_id=scoped[0] if scoped else None,
+            scope_path=scoped[1] if scoped else None,
+        )
+        return status.to_dict()
+
+    @app.post("/manager/storage/inspect")
+    async def inspect_selected_storage(payload: StorageInspectRequest) -> dict:
+        try:
+            scope_id = (
+                await runtime.register_security_scope(
+                    payload.path,
+                    payload.bookmark_data,
+                )
+                if payload.bookmark_data is not None
+                else None
+            )
+            status = await runtime.filesystem.inspect(
+                payload.path,
+                scope_id=scope_id,
+            )
+            value = status.to_dict()
+            value["scope_id"] = scope_id
+            return value
+        except (FilesystemProbeError, ValueError, SecurityScopeError) as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @app.get("/manager/model-library/recommendations")
+    async def library_recommendations(engine: EngineName | None = None) -> dict:
+        return {"models": [model.to_dict() for model in recommended_models(engine)]}
+
+    @app.get("/manager/model-library/local-sources")
+    def local_model_sources() -> dict:
+        # This is deliberately independent of the LM Studio adapter. It reads
+        # only LM Studio's configured download root and conventional legacy
+        # roots; Finder still grants access before any model files are scanned.
+        return {
+            "schema_version": 1,
+            "sources": [
+                source.to_dict() for source in discover_local_model_sources()
+            ],
+        }
+
+    @app.post("/manager/model-library/local-scan")
+    async def local_model_scan(payload: LocalModelScanRequest) -> dict:
+        try:
+            scope_id = (
+                await runtime.register_security_scope(
+                    payload.path,
+                    payload.bookmark_data,
+                )
+                if payload.bookmark_data is not None
+                else None
+            )
+            candidates = await runtime.discover_local_models(
+                payload.path,
+                scope_id=scope_id,
+            )
+            status = await runtime.filesystem.inspect(
+                payload.path,
+                scope_id=scope_id,
+            )
+            rows: list[dict[str, Any]] = []
+            for candidate in candidates:
+                value = candidate.to_dict()
+                existing = next(
+                    (
+                        profile
+                        for profile in runtime.config.models
+                        if (
+                            profile.engine == EngineName.LMSTUDIO
+                            and profile.model == candidate.source_key
+                        )
+                        or (
+                            profile.engine == EngineName.LLAMA_CPP
+                            and _lexical_path(profile.model)
+                            == _lexical_path(candidate.model_path)
+                        )
+                        or (
+                            profile.engine == EngineName.OMLX
+                            and os.path.basename(profile.model)
+                            == os.path.basename(candidate.model_path)
+                        )
+                    ),
+                    None,
+                )
+                value["existing_alias"] = existing.alias if existing else None
+                value["already_imported"] = bool(
+                    existing is not None
+                    and existing.engine.value == candidate.engine
+                )
+                rows.append(value)
+            return {
+                "schema_version": 1,
+                "root": status.path,
+                "mount_path": status.mount_path,
+                "volume_uuid": status.volume_uuid,
+                "scope_id": scope_id,
+                "models": rows,
+            }
+        except (
+            FilesystemProbeError,
+            LocalModelError,
+            ValueError,
+            SecurityScopeError,
+        ) as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @app.post("/manager/model-library/imports")
+    async def import_local_models(payload: LocalModelImportRequest) -> dict:
+        try:
+            return await runtime.adopt_local_models(
+                payload.path,
+                [item.model_dump(mode="json") for item in payload.selections],
+                scope_id=payload.scope_id,
+            )
+        except (LocalModelError, ValueError) as exc:
+            raise HTTPException(400, str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(_error_status(exc), str(exc)) from exc
+
+    @app.get("/manager/model-library/search")
+    async def library_search(
+        engine: EngineName,
+        q: str = Query(default="", max_length=200),
+        limit: int = Query(default=20, ge=1, le=50),
+    ) -> dict:
+        if engine == EngineName.LMSTUDIO:
+            raise HTTPException(
+                400,
+                "LM Studio downloads stay in LM Studio; use its discovered-model inventory",
+            )
+        try:
+            models = await asyncio.to_thread(
+                search_models,
+                q,
+                engine=engine,
+                limit=limit,
+            )
+            return {"models": [model.to_dict() for model in models]}
+        except Exception as exc:
+            raise HTTPException(502, f"Hugging Face search failed: {exc}") from exc
+
+    @app.get("/manager/model-library/files")
+    async def library_files(
+        engine: EngineName,
+        repo_id: str = Query(..., min_length=3, max_length=300),
+        revision: str | None = Query(default=None, max_length=200),
+    ) -> dict:
+        if engine != EngineName.LLAMA_CPP:
+            raise HTTPException(400, "file selection is currently supported for llama.cpp")
+        try:
+            models = await asyncio.to_thread(
+                gguf_files,
+                repo_id,
+                revision=revision,
+            )
+            return {"models": [model.to_dict() for model in models]}
+        except Exception as exc:
+            raise HTTPException(502, f"Hugging Face file discovery failed: {exc}") from exc
+
+    @app.get("/manager/model-library/installs")
+    async def library_installs(
+        limit: int = Query(default=100, ge=1, le=500),
+    ) -> dict:
+        records = await runtime.installer.list(limit=limit)
+        return {"installs": [record.to_dict() for record in records]}
+
+    @app.get("/manager/model-library/installs/{install_id}")
+    async def library_install(install_id: str) -> dict:
+        try:
+            return (await runtime.installer.get(install_id)).to_dict()
+        except KeyError as exc:
+            raise HTTPException(404, str(exc)) from exc
+
+    @app.post("/manager/model-library/installs", status_code=202)
+    async def library_install_start(payload: InstallModelRequest) -> dict:
+        if payload.engine == EngineName.LMSTUDIO:
+            raise HTTPException(
+                400,
+                "LM Studio models must be downloaded and managed by LM Studio",
+            )
+        try:
+            candidate = await asyncio.to_thread(
+                validate_install_candidate,
+                engine=payload.engine,
+                repo_id=payload.repo_id,
+                filename=payload.filename,
+                projector_filename=payload.projector_filename,
+                revision=payload.revision,
+            )
+            capabilities = _validated_install_capabilities(
+                engine=payload.engine,
+                requested=payload.capabilities,
+                suggested_role=candidate.suggested_role,
+                has_projector=candidate.projector_filename is not None,
+            )
+            storage_name = payload.storage or runtime.config.storage.default
+            location = next(
+                (
+                    item
+                    for item in runtime.config.storage.locations
+                    if item.name == storage_name
+                ),
+                None,
+            )
+            if location is None:
+                raise ValueError(f"unknown storage location '{storage_name}'")
+            storage_status = await runtime.filesystem.inspect(
+                location.path,
+                name=location.name,
+                expected_volume_uuid=location.volume_uuid,
+                scope_id=location.scope_id,
+            )
+            if (
+                not storage_status.exists
+                or not storage_status.is_directory
+                or not storage_status.writable
+                or not storage_status.volume_matches
+            ):
+                raise ValueError(
+                    storage_status.diagnostic
+                    or f"storage '{storage_name}' is unavailable"
+                )
+            root = Path(storage_status.path)
+            total_bytes = await asyncio.to_thread(
+                download_size,
+                payload.repo_id,
+                filename=payload.filename,
+                filenames=candidate.download_files,
+                revision=candidate.resolved_revision or payload.revision,
+            )
+            if (
+                total_bytes is not None
+                and storage_status.free_bytes is not None
+                and total_bytes > storage_status.free_bytes
+            ):
+                raise ValueError(
+                    "the selected model requires more space than the storage folder has free"
+                )
+            destination = install_destination(root, payload.engine, payload.repo_id)
+            alias = payload.alias or _available_alias(
+                payload.repo_id.rsplit("/", 1)[-1], set(runtime.profiles)
+            )
+            if alias in runtime.profiles:
+                raise ValueError(f"model alias '{alias}' already exists")
+            # Reuse the profile validator so API callers cannot bypass alias rules.
+            from .config import ModelProfile
+
+            if payload.engine == EngineName.MFLUX:
+                ModelProfile(
+                    alias=alias,
+                    engine=payload.engine,
+                    model=str(destination),
+                    kind="image",
+                    image=image_profile_defaults(candidate),
+                )
+            elif payload.engine == EngineName.LLAMA_CPP:
+                if not candidate.filename:
+                    raise ValueError("select an exact GGUF file")
+                load: dict[str, str] = {}
+                if candidate.projector_filename:
+                    load["projector_path"] = str(
+                        destination / candidate.projector_filename
+                    )
+                ModelProfile(
+                    alias=alias,
+                    engine=payload.engine,
+                    model=str(destination / candidate.filename),
+                    storage=payload.storage or runtime.config.storage.default,
+                    served_model_name=alias,
+                    capabilities=set(capabilities),
+                    load=load,
+                )
+            else:
+                ModelProfile(
+                    alias=alias,
+                    engine=payload.engine,
+                    model=payload.repo_id,
+                    capabilities=set(capabilities),
+                )
+            record = await runtime.installer.create(
+                repo_id=payload.repo_id,
+                engine=payload.engine.value,
+                storage=storage_name,
+                alias=alias,
+                destination=str(destination),
+                revision=candidate.resolved_revision or payload.revision,
+                filename=payload.filename,
+                projector_filename=candidate.projector_filename,
+                download_files=candidate.download_files,
+                capabilities=tuple(
+                    sorted(endpoint.value for endpoint in capabilities)
+                ),
+                family=candidate.family,
+                total_bytes=total_bytes,
+            )
+            return record.to_dict()
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(502, f"model install could not start: {exc}") from exc
+
+    @app.post("/manager/model-library/installs/{install_id}/cancel")
+    async def library_install_cancel(install_id: str) -> dict:
+        try:
+            return (await runtime.installer.cancel(install_id)).to_dict()
+        except KeyError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+
+    @app.post("/manager/model-library/installs/{install_id}/retry", status_code=202)
+    async def library_install_retry(install_id: str) -> dict:
+        try:
+            return (await runtime.installer.retry(install_id)).to_dict()
+        except KeyError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+
     @app.post("/manager/load")
     async def load(payload: LoadRequest) -> dict:
         try:
-            target = runtime.resolve(payload.model)
+            target = await _resolve_target(runtime, payload.model)
             lease = await runtime.coordinator.acquire(
                 target,
                 timeout_seconds=(
@@ -509,16 +1012,71 @@ def create_control_app(runtime: NativeRuntime) -> FastAPI:
         except Exception as exc:
             raise HTTPException(_error_status(exc), str(exc)) from exc
 
-    @app.post("/manager/config/validate")
-    async def validate_configuration(payload: ValidateConfigurationRequest) -> dict:
+    @app.get("/manager/runtime-updates")
+    async def runtime_updates(refresh: bool = Query(default=False)) -> dict:
         try:
-            config = parse_config(
-                payload.config_yaml,
-                source="configuration editor",
-            )
-            return {"valid": True, "model_count": len(config.models)}
+            return await runtime.check_runtime_updates(refresh=refresh)
         except Exception as exc:
-            raise HTTPException(400, str(exc)) from exc
+            raise HTTPException(_error_status(exc), str(exc)) from exc
+
+    @app.post("/manager/runtime-updates/check")
+    async def check_runtime_updates() -> dict:
+        try:
+            return await runtime.check_runtime_updates(refresh=True)
+        except Exception as exc:
+            raise HTTPException(_error_status(exc), str(exc)) from exc
+
+    @app.post("/manager/runtime-updates/{engine}/install")
+    async def install_runtime_update(
+        engine: str, payload: InstallRuntimeUpdateRequest
+    ) -> dict:
+        try:
+            return await runtime.install_runtime_update(
+                engine, version=payload.version
+            )
+        except Exception as exc:
+            raise HTTPException(_error_status(exc), str(exc)) from exc
+
+    @app.post("/manager/runtime-updates/{engine}/rollback")
+    async def rollback_runtime_update(engine: str) -> dict:
+        try:
+            return await runtime.rollback_runtime_update(engine)
+        except Exception as exc:
+            raise HTTPException(_error_status(exc), str(exc)) from exc
+
+    @app.get("/manager/config")
+    async def get_configuration() -> dict:
+        config, revision, applied_revision, restart_required = (
+            await runtime.configuration_snapshot()
+        )
+        return {
+            "config": config.model_dump(mode="json"),
+            "revision": revision,
+            "applied_revision": applied_revision,
+            "restart_required": restart_required,
+        }
+
+    @app.put("/manager/config")
+    async def save_configuration(payload: SaveConfigurationRequest) -> dict:
+        if runtime.config_path is None:
+            raise HTTPException(503, "runtime has no configured YAML path")
+        try:
+            config = MacConfig.model_validate(payload.config)
+            restart_required, revision = await runtime.save_configuration(
+                config,
+                expected_revision=payload.revision,
+            )
+            return {
+                "saved": True,
+                "applied": not restart_required,
+                "restart_required": restart_required,
+                "model_count": len(config.models),
+                "revision": revision,
+                "config": config.model_dump(mode="json"),
+            }
+        except Exception as exc:
+            status = 409 if isinstance(exc, ConfigurationConflict) else 400
+            raise HTTPException(status, str(exc)) from exc
 
     @app.get("/manager/usage")
     async def usage(limit: int = Query(default=100, ge=1, le=1000)) -> dict:
@@ -528,6 +1086,18 @@ def create_control_app(runtime: NativeRuntime) -> FastAPI:
         }
 
     return app
+
+
+def _available_alias(name: str, existing: set[str]) -> str:
+    base = re.sub(r"[^a-z0-9]+", "-", name.casefold()).strip("-") or "model"
+    base = base[:64].rstrip("-") or "model"
+    candidate = base
+    number = 2
+    while candidate in existing:
+        suffix = f"-{number}"
+        candidate = f"{base[: 64 - len(suffix)].rstrip('-')}{suffix}"
+        number += 1
+    return candidate
 
 
 __all__ = ["create_control_app", "create_inference_app"]

@@ -9,6 +9,7 @@ from typing import Any, Mapping
 
 class EngineName(StrEnum):
     LMSTUDIO = "lmstudio"
+    LLAMA_CPP = "llama.cpp"
     OMLX = "omlx"
     DS4 = "ds4"
     MFLUX = "mflux"
@@ -37,6 +38,14 @@ DEFAULT_CAPABILITIES: dict[EngineName, frozenset[Endpoint]] = {
             Endpoint.RESPONSES,
             Endpoint.MESSAGES,
             Endpoint.EMBEDDINGS,
+        }
+    ),
+    EngineName.LLAMA_CPP: frozenset(
+        {
+            Endpoint.CHAT_COMPLETIONS,
+            Endpoint.COMPLETIONS,
+            Endpoint.RESPONSES,
+            Endpoint.MESSAGES,
         }
     ),
     EngineName.OMLX: frozenset(
@@ -87,6 +96,9 @@ class ResolvedTarget:
     load_options: Mapping[str, Any] = field(default_factory=dict)
     kind: ModelKind = ModelKind.LANGUAGE
     image_defaults: Mapping[str, Any] = field(default_factory=dict)
+    storage_path: str | None = None
+    scope_id: str | None = None
+    storage_volume_uuid: str | None = None
 
 
 @dataclass(frozen=True)

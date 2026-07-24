@@ -108,6 +108,7 @@ class FakeAdapter(EngineAdapter):
 def _targets() -> tuple[ResolvedTarget, ResolvedTarget]:
     profiles = MacConfig.model_validate(
         {
+            "engines": {"lmstudio": {"enabled": True}},
             "models": [
                 {"alias": "studio", "engine": "lmstudio", "model": "org/studio"},
                 {"alias": "glm", "engine": "omlx", "model": "org/glm"},
@@ -177,6 +178,77 @@ async def test_different_target_waits_for_stream_lease_to_drain() -> None:
     )
     assert unload_index < load_index
     await glm_lease.release()
+
+
+@pytest.mark.asyncio
+async def test_empty_maintenance_drains_leases_and_reopens_admission() -> None:
+    events: list[str] = []
+    coordinator, adapters = _coordinator(events)
+    studio, _glm = _targets()
+    await coordinator.initialize()
+    lease = await coordinator.acquire(studio)
+    maintenance_ran = asyncio.Event()
+
+    async def operation(_deadline: Deadline) -> None:
+        assert all(not adapter.residents for adapter in adapters.values())
+        events.append("maintenance")
+        maintenance_ran.set()
+
+    task = asyncio.create_task(
+        coordinator.run_empty_maintenance(operation, name="inventory refresh")
+    )
+    await asyncio.sleep(0)
+    assert not maintenance_ran.is_set()
+    await lease.release()
+    await task
+
+    assert "maintenance" in events
+    assert (await coordinator.status()).state == CoordinatorState.IDLE
+    new_lease = await coordinator.acquire(studio)
+    await new_lease.release()
+
+
+@pytest.mark.asyncio
+async def test_empty_maintenance_drain_timeout_fails_closed_and_reconciles() -> None:
+    events: list[str] = []
+    coordinator, _adapters = _coordinator(events)
+    studio, _glm = _targets()
+    await coordinator.initialize()
+    lease = await coordinator.acquire(studio)
+    coordinator.transition_timeout_seconds = 0.01
+    maintenance_ran = False
+
+    async def operation(_deadline: Deadline) -> None:
+        nonlocal maintenance_ran
+        maintenance_ran = True
+
+    with pytest.raises(QueueTimeout, match="timed out draining leases"):
+        await coordinator.run_empty_maintenance(
+            operation,
+            name="runtime activation",
+        )
+
+    status = await coordinator.status()
+    assert maintenance_ran is False
+    assert status.state == CoordinatorState.DEGRADED
+    assert status.resident_alias == "studio"
+    assert status.inflight == 1
+    assert status.diagnostic == (
+        "timed out draining leases for runtime activation"
+    )
+    with pytest.raises(CoordinatorError, match="not initialized"):
+        await coordinator.acquire(studio)
+
+    await lease.release()
+    coordinator.transition_timeout_seconds = 2
+    assert await coordinator.reconcile() is True
+    recovered = await coordinator.status()
+    assert recovered.state == CoordinatorState.READY
+    assert recovered.resident_alias == "studio"
+    assert recovered.diagnostic is None
+
+    new_lease = await coordinator.acquire(studio)
+    await new_lease.release()
 
 
 @pytest.mark.asyncio
@@ -420,6 +492,7 @@ async def test_same_alias_with_changed_load_digest_reloads() -> None:
     await coordinator.initialize()
     first = MacConfig.model_validate(
         {
+            "engines": {"lmstudio": {"enabled": True}},
             "models": [
                 {
                     "alias": "studio",
@@ -432,6 +505,7 @@ async def test_same_alias_with_changed_load_digest_reloads() -> None:
     ).profiles()["studio"]
     second = MacConfig.model_validate(
         {
+            "engines": {"lmstudio": {"enabled": True}},
             "models": [
                 {
                     "alias": "studio",

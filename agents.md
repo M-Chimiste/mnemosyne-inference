@@ -3,8 +3,10 @@
 This repository contains **Mnemosyne Inference**, with two isolated
 single-workstation deployments. The CUDA deployment runs vLLM, llama.cpp, or
 SGLang Diffusion in a
-container; the native Apple Silicon deployment coordinates an existing LM
-Studio server, oMLX, DS4, and a process-isolated MFLUX worker without Docker. Both remain thin managers around
+container; the native Apple Silicon deployment owns an official llama.cpp
+server for GGUF, coordinates oMLX and DS4, and uses a process-isolated MFLUX
+worker without Docker. LM Studio remains only as an explicitly enabled
+migration/soak fallback. Both remain thin managers around
 upstream engines and must not fork or embed their serving implementations.
 
 ## Repository Shape
@@ -20,8 +22,35 @@ upstream engines and must not fork or embed their serving implementations.
 - `pg_writer.py` and `scripts/probe_token_sidecar_schema.py` implement and inspect the optional Postgres token-usage sink; SQLite remains the local system of record and durable outbox.
 - `project_docs/project_status.md` records current release status and feature history; `project_docs/smoke_checks.md` is the manual GPU-host checklist for behavior pytest cannot exercise.
 - `macos/service/` is an independent Python package for the native inference/control planes, engine adapters, lease-based global residency coordinator, and durable usage outbox. Its dependencies and lock file stay below that directory.
+- `macos/service/storage.py`, `model_library.py`, `install_store.py`, `installer.py`, and `download_worker.py` implement exact nested-folder/volume validation, engine-aware Hugging Face discovery, and process-isolated durable native downloads. Managed downloads must remain residency-neutral.
+- `macos/service/local_models.py` scans Finder-selected GGUF/MLX libraries without loading or copying weights. `macos/service/engines/llamacpp.py` translates typed profiles into a manager-owned upstream `llama-server` process while reusing the hardened managed-process ownership proof.
+- `macos/service/security_scopes.py` consumes Finder-created transfer
+  bookmarks and creates receiver-owned durable bookmarks for protected model
+  folders. `scope_process.py` and `scope_worker.py` perform receipt and
+  reactivation in bounded, killable process groups; startup revalidates
+  configured grants and prunes unreferenced private bookmarks. Bookmark bytes
+  remain private state; configuration carries only their SHA-256 `scope_id`.
+  Production scope storage is anchored beside the active config under
+  `state/security-scopes`, never derived from the user-configurable SQLite
+  path.
+- `macos/service/filesystem.py` and `fs_worker.py` keep protected-path
+  inspection, scans, containment/header validation, directory creation, and
+  size measurement in bounded, killable subprocess groups.
+  `scoped_process.py` and `scope_exec.py` reactivate a persisted grant in each
+  scoped helper/engine/download process and then `exec` the upstream command.
+- `macos/service/sidecar_discovery.py` migrates the previous token sidecar's
+  identity and ledger DSN through its user LaunchAgent, then atomically
+  persists missing values into Unified Inference's private `.env`. Unified
+  Inference is the native token sidecar; the legacy process is not in the
+  inference path and must not remain a permanent reporting dependency.
+- `macos/service/runtime_updates.py` discovers releases directly from the
+  official upstreams, verifies and installs official `ggml-org/llama.cpp`
+  Apple Silicon assets, installs MFLUX from PyPI, builds an exact DS4 GitHub
+  commit, and provides atomic activation/rollback. Runtime activation must use
+  the coordinator's all-engines-empty maintenance barrier; never introduce a
+  repository-owned dependency manifest.
 - `macos/image-worker/` is the separately locked MFLUX runtime. It is launched only as a manager-owned child, binds loopback `:17324`, and must remain dependency-isolated from the macOS coordinator service.
-- `macos/app/` is the SwiftPM menu bar controller and native service bootstrap. `macos/packaging/` stages the signed app, embedded LaunchAgent plist, and relocatable Python runtime.
+- `macos/app/` is the SwiftPM menu bar controller, typed native settings UI, secret-safe credential store, and native service bootstrap. `macos/packaging/` stages the signed app, embedded LaunchAgent plist, direct `Contents/MacOS/mnemosyne-service-bootstrap` executable, and relocatable Python runtime. Keep this unsandboxed `SMAppService` LaunchAgent's `BundleProgram` pointed at that direct helper; introducing a second bundle identity is unnecessary here and broke launch-requirement refresh during in-place updates. A future sandboxed or restricted-entitlement job would require its own deliberate wrapper architecture.
 - `macos/config.yaml.example`, `macos/.env.example`, `macos/README.md`, and `macos/smoke_checks.md` are the native deployment's setup and validation surface. Mac settings must not be added to the external CUDA compose file.
 - `agents.md` is the single repository guide for coding assistants and contributors. Keep it aligned with code, examples, and verification commands when architecture or workflows change.
 
@@ -56,12 +85,98 @@ The live `docker-compose.yml` is intentionally machine-specific and may live out
 
 ### Native macOS deployment
 
-- Inference is on `127.0.0.1:17320`, control is on `127.0.0.1:17321`, LM Studio remains on `:1234`, oMLX uses `:17322`, the manager-owned DS4 child uses `:17323`, and the manager-owned MFLUX worker uses `:17324`. Reserve `17325-17329` for later native services.
+- Inference is on `127.0.0.1:17320`, control is on `127.0.0.1:17321`, oMLX uses `:17322`, the manager-owned DS4 child uses `:17323`, the manager-owned MFLUX worker uses `:17324`, and manager-owned llama.cpp uses `:17325`. Reserve `17326-17329` for later native services. Legacy migration configs may explicitly keep LM Studio on `:1234`; fresh configs disable it.
 - A per-user LaunchAgent owns Mnemosyne Core. The controller uses an explicit AppKit `NSStatusItem` with a SwiftUI popover; quitting it must not terminate inference. `SMAppService.agent` registers the embedded plist and the bootstrap must `execve` the bundled Python without daemonizing.
 - `ResidencyCoordinator` owns the cross-engine invariant. A request holds an epoch-tagged model lease through its complete stream. FIFO queuing stops old-target admission once a switch is pending, drains active leases, proves all enabled adapters empty, loads one target, and proves exactly one ready manager-owned resident.
-- LM Studio and oMLX are external loopback services controlled through native lifecycle APIs. DS4 is a model-specific process group started by Mnemosyne. Never kill an unknown PID or listener; persisted DS4 identity must match before recovery or signaling.
+- oMLX is an external loopback service controlled through its native lifecycle APIs. llama.cpp and DS4 are model-specific process groups started by Mnemosyne. Never kill an unknown PID or listener; persisted managed-process identity must match executable, argv, start identity, and process group before recovery or signaling.
+- Persisted llama.cpp survivor metadata must also retain the exact storage
+  root, scope ID, and volume UUID so restart recovery can reconstruct and
+  revalidate the protected-path target before adopting or signaling a child.
+- Official oMLX model-directory reloads may synchronously preload pinned
+  models. Any directory rescan inside the all-engines-empty maintenance
+  barrier must therefore unload through oMLX's authoritative admin inventory
+  and prove emptiness before admission reopens. A maintenance drain timeout
+  must enter an explicit recoverable degraded state, never leave admission
+  silently wedged.
+- Unified Inference is the token sidecar for every language engine and central
+  reporting defaults on. During migration, it may inherit `node.id` and the
+  ledger DSN from the previous sidecar's LaunchAgent; explicit native values
+  win. Persist missing inherited values into the private native `.env` before
+  retiring that LaunchAgent. Keep the Settings identity read-only and never
+  expose or log the DSN.
+- The primary local migration surface is the read-only
+  `GET /manager/model-library/local-sources` hint list, followed by
+  Finder-driven `POST /manager/model-library/local-scan` and explicit
+  `POST /manager/model-library/imports`. Source hints read LM Studio's
+  configured download root and documented default without contacting its
+  server, probing model paths, or requiring its adapter to be enabled.
+  Finder must still confirm the exact folder before bookmark creation or
+  scanning. Scan again before persisting opaque candidate/projector IDs; never
+  preselect every candidate, load a model, copy weights, treat `mmproj` as a
+  primary model, or replace an exact nested/symlink path with its resolved
+  target or mount root. Preserve matching aliases and compatible load
+  settings. The LM Studio inventory endpoint remains only for the temporary
+  soak fallback.
+- The native Storage UI always uses the macOS directory picker. Preserve the exact selected folder (including paths such as `/Volumes/Athena/models`) separately from the containing mount and its UUID; never replace it with the volume root or make users type it.
+- The menu app must create an ordinary bookmark while its `NSOpenPanel` grant
+  is live. Its implicit extension is the Apple-supported single interprocess
+  handoff; the service must explicitly consume it and create its own durable
+  security-scoped bookmark. Do not claim or add App Sandbox bookmark
+  entitlements without a deliberate signing/sandbox architecture change.
+  Store only the receiver-owned bookmark below the mode-`0700` private
+  `state/security-scopes` directory beside the active config, with mode-`0600`
+  files. Store only its SHA-256 `scope_id` in YAML and never return or log
+  bookmark bytes. Preflight every referenced grant before saving config;
+  revalidate configured scopes before coordinator startup and prune
+  unreferenced private bookmarks only after loading persisted config. Receipt
+  and preflight must run in killable subprocess groups with deadlines. Scoped
+  helpers and manager-owned model/download children must reactivate the durable
+  bookmark in-process before `exec`.
+- macOS can block bookmark and filesystem calls while a protected-folder
+  decision is pending. Keep bookmark receipt/reactivation, storage inspection,
+  local scans, profile/path resolution, GGUF/projector header validation,
+  directory creation, and directory sizing in killable subprocess groups off
+  the asyncio event loop and behind bounded deadlines. Timeout, request
+  cancellation, and service shutdown must terminate the complete helper
+  process group and fail closed with an actionable permission/volume diagnostic
+  while both HTTP planes remain responsive.
+- Native Hugging Face installs are engine-aware and durable. llama.cpp search
+  requires explicit GGUF quant/shard selection and explicit optional projector
+  pairing, pins the resolved Hub revision, and downloads only that exact file
+  set. DS4 and MFLUX use verified curated candidates; oMLX search exposes
+  metadata-derived compatibility honestly and downloaded snapshots must be
+  classified before profile registration so they advertise only detected
+  generation, embeddings, or rerank routes. Downloads run out of process,
+  never load a model, and oMLX directory changes run only through the
+  coordinator's all-engines-empty maintenance barrier. Treat
+  downloaded-but-not-registered weights as a durable retryable state; retry
+  profile registration without redownloading them.
+- Runtime update checks are read-only. oMLX remains externally owned; never
+  replace its app or Homebrew files. llama.cpp must come from the official
+  `ggml-org/llama.cpp` macOS arm64 release asset and pass published size,
+  SHA-256, safe-extraction, executable, and CLI-contract checks. MFLUX must
+  come from its official PyPI project and DS4 from an exact commit in
+  `antirez/ds4`. Staging may happen
+  while a model is resident, but pointer activation and rollback must drain
+  leases, unload every engine, and prove global emptiness. Keep old runtimes
+  for recovery and never place model weights inside them.
+- Keep the native MFLUX catalog limited to text-to-image configurations the pinned worker can dispatch through `/v1/images/generations`, and persist each candidate's model-specific defaults when an install becomes a profile. An official Hub checkpoint is not installable merely because it shares a family name: keep unsupported layouts, such as Krea 2 Raw under the current Turbo-only loader, visibly unavailable rather than creating a broken profile.
+- A packaged installation must not persist a checkout virtualenv in
+  `engines.mflux.python`. Leave that override unset so the app bootstrap or
+  active managed runtime supplies the packaged MFLUX Python and worker source;
+  checkout paths and `MNEMOSYNE_MFLUX_*` overrides are development-only.
 - Adapter-observed state is authoritative. An unreachable/unauthorized/incompatible adapter is not implicitly empty. Startup defaults to `unload_all`; uncertain state fails closed until `/manager/reconcile` succeeds.
 - The Mac proxy supports capability-gated Chat/Completions, Responses, Messages, Embeddings, Rerank, and Images Generations routes. MFLUX is terminated on unload/abort so Metal memory is released at the process boundary.
+- The menu app reads and writes structured configuration through the control plane. The service remains the schema authority and atomically persists validated YAML; credential values are write-only in the UI and never returned by the API. Preserve `schema_version`; an older app must refuse to save a newer schema instead of dropping unknown fields. Config snapshots carry an optimistic revision that every save must echo. Serialize saves, download-completion profile creation, and local imports through the same mutation lock; reject a stale Settings save instead of overwriting a concurrent model addition.
+- The ordinary Mac Models page must not create profiles from raw model or
+  projector text fields. New profiles come from the engine-aware Model Library
+  or Finder discovery; imported engine/source/storage/served-name/projector
+  facts remain read-only, and users choose only engine-valid typed model roles
+  (Generation, Embeddings, Rerank, or Image).
+- `macos/packaging/build_app.sh` signs ad hoc by default and accepts
+  `CODESIGN_IDENTITY` for a stable signing identity. Do not imply
+  durable protected-folder grants survive arbitrary ad-hoc rebuilds; after a
+  code-identity change, the user may need to reselect the folder.
 - Mac usage events normalize OpenAI, Responses, and Anthropic token shapes and atomically write local analytics plus the SQLite Postgres outbox. The central schema and retry/idempotency behavior match the CUDA deployment.
 - Image requests intentionally do not emit token-usage records. Do not add image prompt/output policy hooks; this repository is a local homelab tool.
 
@@ -123,7 +238,8 @@ Model profiles support aliases, HF model IDs, revision, quantization, GPU plan, 
 
 ## Common Commands
 
-Most real runtime workflows happen through Docker because vLLM/CUDA and llama.cpp CUDA builds are container-host concerns.
+Most CUDA runtime workflows happen through Docker because vLLM and the
+CUDA-linked llama.cpp build are container-host concerns.
 
 ```bash
 ./vllm-ctl build
@@ -230,7 +346,10 @@ When behavior touches process launch, ports, engine argv construction, Docker mo
 - If `ADMIN_PASSWORD` is unset, admin bind must continue to fail safe to container loopback.
 - Keep multimodal request payloads opaque through the proxy.
 - If vLLM is bumped, rebuild the image and regenerate `vllm_supported_architectures.json` from the new runtime registry.
-- If llama.cpp is bumped, rebuild the image, check `llama-server` CLI compatibility, and verify the CUDA-linked binary with GPU passthrough.
+- If the CUDA llama.cpp pin is bumped, rebuild the image, check `llama-server`
+  CLI compatibility, and verify the CUDA-linked binary with GPU passthrough.
+  Native llama.cpp updates instead use the official-source integrity and
+  activation checks described above.
 
 ## Useful Reading Order
 

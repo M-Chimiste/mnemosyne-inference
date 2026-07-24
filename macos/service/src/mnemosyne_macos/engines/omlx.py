@@ -174,6 +174,104 @@ class OMLXAdapter(HttpEngineAdapter):
     async def validate_control(self, *, deadline: Deadline) -> EngineSnapshot:
         return await self.inspect(deadline=deadline)
 
+    async def register_model_directories(
+        self,
+        directories: list[str],
+        *,
+        deadline: Deadline,
+    ) -> None:
+        """Merge roots into oMLX, rescan, and authoritatively restore emptiness.
+
+        oMLX's official ``/admin/api/reload`` implementation unloads the
+        current pool, rediscovers models, and then preloads every pinned model
+        before returning. A directory update uses the related global-settings
+        path, which also rebuilds the pool. This method runs only inside the
+        coordinator's all-engines-empty maintenance barrier, so any residents
+        created by either operation must be removed through oMLX's own admin
+        unload API before the barrier may reopen admission.
+        """
+
+        payload = await self._request_json(
+            "GET",
+            "/admin/api/global-settings",
+            operation="read model directories",
+            deadline=deadline,
+            headers=self._admin_headers(),
+        )
+        model_settings = payload.get("model")
+        if not isinstance(model_settings, dict):
+            raise AdapterError(
+                self.engine,
+                "read model directories",
+                "oMLX global settings omitted the model section",
+            )
+        current = model_settings.get("effective_model_dirs") or model_settings.get("model_dirs")
+        if not isinstance(current, list) or not all(isinstance(item, str) for item in current):
+            raise AdapterError(
+                self.engine,
+                "read model directories",
+                "oMLX global settings omitted model directories",
+            )
+        merged = list(dict.fromkeys([*current, *directories]))
+        mutation_error: Exception | None = None
+        try:
+            if merged != current:
+                response = await self._request_json_response(
+                    "POST",
+                    "/admin/api/global-settings",
+                    operation="register model directories",
+                    deadline=deadline,
+                    headers=self._admin_headers(),
+                    json_body={"model_dirs": merged},
+                    ok_statuses=(200,),
+                )
+            else:
+                response = await self._request_json_response(
+                    "POST",
+                    "/admin/api/reload",
+                    operation="rescan model directories",
+                    deadline=deadline,
+                    headers=self._admin_headers(),
+                    ok_statuses=(200,),
+                )
+            status = response.payload.get("status")
+            if status not in {None, "ok", "success"}:
+                raise AdapterError(
+                    self.engine,
+                    "register model directories",
+                    f"oMLX returned unsupported status {status!r}",
+                )
+        except Exception as exc:
+            # A timed-out or malformed mutation response has an ambiguous
+            # outcome. Still inspect and clean through the authoritative admin
+            # inventory; never infer that the pre-maintenance empty state held.
+            mutation_error = exc
+
+        cleanup_error: Exception | None = None
+        try:
+            await self.unload_all(deadline=deadline)
+        except Exception as exc:
+            cleanup_error = exc
+
+        if cleanup_error is not None:
+            detail = (
+                "could not authoritatively restore empty residency after "
+                f"the model-directory refresh: {cleanup_error}"
+            )
+            if mutation_error is not None:
+                detail = f"refresh failed ({mutation_error}); {detail}"
+            raise AdapterError(
+                self.engine,
+                "register model directories",
+                detail,
+                retryable=(
+                    getattr(mutation_error, "retryable", False)
+                    or getattr(cleanup_error, "retryable", False)
+                ),
+            ) from cleanup_error
+        if mutation_error is not None:
+            raise mutation_error
+
     async def load(self, target: ResolvedTarget, *, deadline: Deadline) -> LoadedHandle:
         if target.key.engine != self.engine:
             raise AdapterError(self.engine, "load", "target belongs to another engine")

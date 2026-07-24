@@ -17,6 +17,7 @@ from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
+import re
 import shlex
 import signal
 import socket
@@ -31,6 +32,8 @@ import httpx
 
 from .base import AdapterError, Deadline, EngineAdapter
 from ..config import DS4Config
+from ..runtime_updates import resolve_active_runtime
+from ..scoped_process import wrap_scoped_argv
 from ..models import (
     Endpoint,
     EngineName,
@@ -66,6 +69,46 @@ class ProcessIdentity:
     argv: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class _TransientSpawnOwnership:
+    """Exact in-memory proof for a child between ``spawn`` and state commit.
+
+    A protected-folder launch first runs ``scope_exec`` and then replaces that
+    process with the upstream engine.  Both forms retain the same PID, process
+    group, and kernel start identity.  Remembering both exact argv forms lets
+    failed startup clean up a wrapper that stalls before ``exec`` without ever
+    treating an arbitrary process at the same PID as owned.
+    """
+
+    pid: int
+    process_group_id: int
+    start_identity: str
+    upstream_executable: str
+    upstream_argv: tuple[str, ...]
+    wrapper_executable: str | None
+    wrapper_argv: tuple[str, ...] | None
+
+    def matches(self, identity: ProcessIdentity) -> bool:
+        if (
+            identity.pid != self.pid
+            or identity.process_group_id != self.process_group_id
+            or identity.start_identity != self.start_identity
+        ):
+            return False
+        executable = _normalized_path(identity.executable)
+        if (
+            executable == self.upstream_executable
+            and identity.argv == self.upstream_argv
+        ):
+            return True
+        return (
+            self.wrapper_executable is not None
+            and self.wrapper_argv is not None
+            and executable == self.wrapper_executable
+            and identity.argv == self.wrapper_argv
+        )
+
+
 IdentityProbe = Callable[[int], Awaitable[ProcessIdentity | None]]
 SignalProcessGroup = Callable[[int, int], None]
 
@@ -85,6 +128,9 @@ class _OwnedProcessMetadata:
     wire_model: str
     capabilities: tuple[str, ...]
     load_options: Mapping[str, Any]
+    storage_path: str | None
+    scope_id: str | None
+    storage_volume_uuid: str | None
 
     @classmethod
     def for_spawn(
@@ -97,7 +143,7 @@ class _OwnedProcessMetadata:
         target: ResolvedTarget,
     ) -> "_OwnedProcessMetadata":
         return cls(
-            schema_version=1,
+            schema_version=2,
             pid=identity.pid,
             process_group_id=identity.process_group_id,
             start_identity=identity.start_identity,
@@ -110,13 +156,17 @@ class _OwnedProcessMetadata:
             wire_model=target.wire_model,
             capabilities=tuple(sorted(endpoint.value for endpoint in target.capabilities)),
             load_options=dict(target.load_options),
+            storage_path=target.storage_path,
+            scope_id=target.scope_id,
+            storage_volume_uuid=target.storage_volume_uuid,
         )
 
     @classmethod
     def from_dict(cls, value: object) -> "_OwnedProcessMetadata":
         if not isinstance(value, dict):
             raise ValueError("state record must be a JSON object")
-        if value.get("schema_version") != 1:
+        schema_version = value.get("schema_version")
+        if schema_version not in {1, 2}:
             raise ValueError("unsupported state-record schema version")
         pid = value.get("pid")
         process_group_id = value.get("process_group_id")
@@ -165,8 +215,23 @@ class _OwnedProcessMetadata:
         if not isinstance(load_options, dict):
             raise ValueError("state record contains invalid load_options")
 
+        optional_strings: dict[str, str | None] = {}
+        for key in ("storage_path", "scope_id", "storage_volume_uuid"):
+            candidate = value.get(key)
+            if candidate is not None and (
+                not isinstance(candidate, str) or not candidate
+            ):
+                raise ValueError(f"state record contains invalid {key}")
+            optional_strings[key] = candidate
+        if optional_strings["scope_id"] is not None and not re.fullmatch(
+            r"[0-9a-f]{64}", optional_strings["scope_id"] or ""
+        ):
+            raise ValueError("state record contains invalid scope_id")
+        if optional_strings["scope_id"] is not None and optional_strings["storage_path"] is None:
+            raise ValueError("state record scope_id requires storage_path")
+
         return cls(
-            schema_version=1,
+            schema_version=int(schema_version),
             pid=pid,
             process_group_id=process_group_id,
             start_identity=strings["start_identity"],
@@ -179,6 +244,9 @@ class _OwnedProcessMetadata:
             wire_model=strings["wire_model"],
             capabilities=tuple(capabilities_raw),
             load_options=dict(load_options),
+            storage_path=optional_strings["storage_path"],
+            scope_id=optional_strings["scope_id"],
+            storage_volume_uuid=optional_strings["storage_volume_uuid"],
         )
 
     def to_dict(self) -> dict[str, object]:
@@ -196,19 +264,25 @@ class _OwnedProcessMetadata:
             "wire_model": self.wire_model,
             "capabilities": list(self.capabilities),
             "load_options": dict(self.load_options),
+            "storage_path": self.storage_path,
+            "scope_id": self.scope_id,
+            "storage_volume_uuid": self.storage_volume_uuid,
         }
 
-    def target(self) -> ResolvedTarget:
+    def target(self, engine: EngineName = EngineName.DS4) -> ResolvedTarget:
         return ResolvedTarget(
             alias=self.target_alias,
             key=TargetKey(
-                engine=EngineName.DS4,
+                engine=engine,
                 canonical_model_id=self.canonical_model_id,
                 load_config_digest=self.load_config_digest,
             ),
             wire_model=self.wire_model,
             capabilities=frozenset(Endpoint(item) for item in self.capabilities),
             load_options=dict(self.load_options),
+            storage_path=self.storage_path,
+            scope_id=self.scope_id,
+            storage_volume_uuid=self.storage_volume_uuid,
         )
 
 
@@ -365,6 +439,7 @@ def _probe_process_identity_sync(pid: int) -> ProcessIdentity | None:
 class DS4Adapter(EngineAdapter):
     engine = EngineName.DS4
     ownership = "managed_process"
+    display_name = "DS4"
 
     def __init__(
         self,
@@ -375,6 +450,8 @@ class DS4Adapter(EngineAdapter):
         identity_probe: IdentityProbe | None = None,
         signal_process_group: SignalProcessGroup | None = None,
         poll_interval_seconds: float = 0.25,
+        runtime_root: str | Path | None = None,
+        security_scope_root: str | Path | None = None,
     ) -> None:
         self.config = config
         self.base_url = f"http://{config.host}:{config.port}"
@@ -384,14 +461,49 @@ class DS4Adapter(EngineAdapter):
         self._identity_probe = identity_probe or self._default_identity_probe
         self._signal_process_group = signal_process_group or os.killpg
         self._poll_interval_seconds = poll_interval_seconds
+        self._runtime_root = runtime_root
+        self._security_scope_root = security_scope_root
         self._state_path = Path(config.process_state_path).expanduser()
         self._metadata_loaded = False
         self._owned_metadata: _OwnedProcessMetadata | None = None
+        self._transient_spawn_ownership: _TransientSpawnOwnership | None = None
         self._ownership_diagnostic: str | None = None
         self._process: ProcessLike | None = None
         self._target: ResolvedTarget | None = None
         self._log_task: asyncio.Task[None] | None = None
         self._log_tail: deque[str] = deque(maxlen=80)
+
+    def _effective_config(self) -> DS4Config:
+        managed = resolve_active_runtime("ds4", root=self._runtime_root)
+        if managed is None:
+            return self.config
+        return self.config.model_copy(
+            update={
+                "binary": str(managed.path("binary")),
+                "working_directory": str(managed.path("working_directory")),
+            }
+        )
+
+    def _build_argv(self, config: DS4Config, target: ResolvedTarget) -> list[str]:
+        return build_ds4_argv(config, target)
+
+    async def _build_argv_async(
+        self,
+        config: DS4Config,
+        target: ResolvedTarget,
+        *,
+        deadline: Deadline,
+    ) -> list[str]:
+        """Prepare process arguments without blocking the coordinator loop.
+
+        DS4 argument construction is CPU-only and returns immediately. Engines
+        whose preparation touches user-selected files can override this hook
+        and move that work to a worker thread while retaining the same managed
+        process lifecycle.
+        """
+
+        del deadline
+        return self._build_argv(config, target)
 
     async def _default_spawn(self, *argv: str, **kwargs) -> ProcessLike:
         return await asyncio.create_subprocess_exec(*argv, **kwargs)
@@ -477,17 +589,25 @@ class DS4Adapter(EngineAdapter):
             with contextlib.suppress(FileNotFoundError):
                 self._state_path.unlink()
 
-    def _metadata_matches_config(self, metadata: _OwnedProcessMetadata) -> bool:
+    async def _metadata_matches_config(
+        self,
+        metadata: _OwnedProcessMetadata,
+        *,
+        deadline: Deadline,
+    ) -> bool:
+        config = self._effective_config()
         try:
-            target = metadata.target()
-            expected_argv = tuple(build_ds4_argv(self.config, target))
+            target = metadata.target(self.engine)
+            expected_argv = tuple(
+                await self._build_argv_async(config, target, deadline=deadline)
+            )
         except (AdapterError, ValueError):
             return False
         return (
             metadata.pid == metadata.process_group_id
-            and metadata.executable == _normalized_path(self.config.binary)
+            and metadata.executable == _normalized_path(config.binary)
             and metadata.working_directory
-            == _normalized_path(self.config.working_directory)
+            == _normalized_path(config.working_directory)
             and metadata.argv == expected_argv
             and _normalized_path(metadata.argv[0]) == metadata.executable
         )
@@ -505,7 +625,7 @@ class DS4Adapter(EngineAdapter):
             and identity.argv == metadata.argv
         )
 
-    async def _load_persisted_ownership(self) -> None:
+    async def _load_persisted_ownership(self, *, deadline: Deadline) -> None:
         if self._metadata_loaded or self._process is not None:
             return
         self._metadata_loaded = True
@@ -516,29 +636,33 @@ class DS4Adapter(EngineAdapter):
                 json.loads(self._state_path.read_text(encoding="utf-8"))
             )
         except (OSError, ValueError, json.JSONDecodeError) as exc:
-            self._ownership_diagnostic = f"invalid DS4 ownership state: {exc}"
+            self._ownership_diagnostic = f"invalid {self.display_name} ownership state: {exc}"
             return
 
         identity = await self._identity_probe(metadata.pid)
         if identity is None:
             self._remove_metadata(metadata)
-            self._ownership_diagnostic = "removed stale DS4 ownership state for an exited process"
+            self._ownership_diagnostic = (
+                f"removed stale {self.display_name} ownership state for an exited process"
+            )
             return
-        if not self._metadata_matches_config(metadata):
+        if not await self._metadata_matches_config(metadata, deadline=deadline):
             self._remove_metadata(metadata)
             self._ownership_diagnostic = (
-                "persisted DS4 ownership does not match current executable, argv, or configuration"
+                f"persisted {self.display_name} ownership does not match current "
+                "executable, argv, or configuration"
             )
             return
         if not self._metadata_matches_identity(metadata, identity):
             self._remove_metadata(metadata)
             self._ownership_diagnostic = (
-                "persisted DS4 PID was reused or its executable/start identity/argv changed"
+                f"persisted {self.display_name} PID was reused or its "
+                "executable/start identity/argv changed"
             )
             return
 
         self._owned_metadata = metadata
-        self._target = metadata.target()
+        self._target = metadata.target(self.engine)
         self._ownership_diagnostic = None
 
     async def _refresh_owned_identity(self) -> bool:
@@ -560,14 +684,14 @@ class DS4Adapter(EngineAdapter):
         self._process = None
         self._target = None
         self._ownership_diagnostic = (
-            "owned DS4 process exited"
+            f"owned {self.display_name} process exited"
             if identity is None
-            else "DS4 PID identity changed; refusing to adopt or signal it"
+            else f"{self.display_name} PID identity changed; refusing to adopt or signal it"
         )
         return False
 
     async def inspect(self, *, deadline: Deadline) -> EngineSnapshot:
-        await self._load_persisted_ownership()
+        await self._load_persisted_ownership(deadline=deadline)
         owned = await self._refresh_owned_identity()
         payload = await self._models_payload(deadline)
         if payload is None:
@@ -590,7 +714,9 @@ class DS4Adapter(EngineAdapter):
                     # surviving, half-ready DS4 process safely.
                     authoritative=True,
                     service_state=ServiceState.UNREACHABLE,
-                    diagnostic="managed DS4 process is running but its model API is unavailable",
+                    diagnostic=(
+                        f"managed {self.display_name} process is running but its model API is unavailable"
+                    ),
                 )
             if not owned and not self._port_accepting_connections():
                 diagnostic = self._ownership_diagnostic
@@ -610,9 +736,9 @@ class DS4Adapter(EngineAdapter):
                 diagnostic=(
                     self._ownership_diagnostic
                     or (
-                        "managed DS4 process is running but its model API is unavailable"
+                        f"managed {self.display_name} process is running but its model API is unavailable"
                         if owned
-                        else "configured DS4 port is occupied by an unknown or unready process"
+                        else f"configured {self.display_name} port is occupied by an unknown or unready process"
                     )
                 ),
             )
@@ -639,14 +765,14 @@ class DS4Adapter(EngineAdapter):
                     ),
                     authoritative=True,
                     service_state=ServiceState.INCOMPATIBLE,
-                    diagnostic="managed DS4 process returned no model id",
+                    diagnostic=f"managed {self.display_name} process returned no model id",
                 )
             return EngineSnapshot(
                 engine=self.engine,
                 residents=(),
                 authoritative=False,
                 service_state=ServiceState.INCOMPATIBLE,
-                diagnostic="DS4 /v1/models response contained no model id",
+                diagnostic=f"{self.display_name} /v1/models response contained no model id",
             )
 
         metadata = self._owned_metadata if owned else None
@@ -670,7 +796,7 @@ class DS4Adapter(EngineAdapter):
                 None
                 if managed
                 else self._ownership_diagnostic
-                or "DS4 server is not owned by Mnemosyne"
+                or f"{self.display_name} server is not owned by Mnemosyne"
             ),
         )
 
@@ -682,36 +808,70 @@ class DS4Adapter(EngineAdapter):
         process: ProcessLike,
         argv: list[str],
         deadline: Deadline,
+        *,
+        transient_argv: list[str] | None = None,
     ) -> ProcessIdentity:
+        config = self._effective_config()
         identity_deadline = time.monotonic() + min(2.0, deadline.remaining())
         while time.monotonic() <= identity_deadline:
             if process.returncode is not None:
                 raise AdapterError(
                     self.engine,
                     "load",
-                    f"DS4 exited before process identity could be recorded: {process.returncode}",
+                    f"{self.display_name} exited before process identity could be recorded: {process.returncode}",
                 )
             identity = await self._identity_probe(process.pid)
             if identity is not None:
+                ownership = _TransientSpawnOwnership(
+                    pid=process.pid,
+                    process_group_id=process.pid,
+                    start_identity=identity.start_identity,
+                    upstream_executable=_normalized_path(config.binary),
+                    upstream_argv=tuple(argv),
+                    wrapper_executable=(
+                        _normalized_path(sys.executable)
+                        if transient_argv is not None
+                        else None
+                    ),
+                    wrapper_argv=(
+                        tuple(transient_argv)
+                        if transient_argv is not None
+                        else None
+                    ),
+                )
+                if not ownership.matches(identity):
+                    raise AdapterError(
+                        self.engine,
+                        "load",
+                        f"spawned {self.display_name} process identity did not match its executable, "
+                        "process group, start identity, or argv",
+                    )
                 if (
-                    identity.pid != process.pid
-                    or identity.process_group_id != process.pid
-                    or _normalized_path(identity.executable)
-                    != _normalized_path(self.config.binary)
-                    or identity.argv != tuple(argv)
+                    self._transient_spawn_ownership is not None
+                    and self._transient_spawn_ownership != ownership
                 ):
                     raise AdapterError(
                         self.engine,
                         "load",
-                        "spawned DS4 process identity did not match its executable, "
-                        "process group, or argv",
+                        f"spawned {self.display_name} process identity changed before it could be recorded",
                     )
+                self._transient_spawn_ownership = ownership
+                if (
+                    transient_argv is not None
+                    and identity.argv == tuple(transient_argv)
+                    and _normalized_path(identity.executable)
+                    == _normalized_path(sys.executable)
+                ):
+                    await asyncio.sleep(
+                        min(0.02, max(0.0, identity_deadline - time.monotonic()))
+                    )
+                    continue
                 return identity
             await asyncio.sleep(min(0.02, max(0.0, identity_deadline - time.monotonic())))
         raise AdapterError(
             self.engine,
             "load",
-            "could not establish DS4 process identity after spawn",
+            f"could not establish {self.display_name} process identity after spawn",
         )
 
     async def load(self, target: ResolvedTarget, *, deadline: Deadline) -> LoadedHandle:
@@ -732,7 +892,7 @@ class DS4Adapter(EngineAdapter):
             raise AdapterError(
                 self.engine,
                 "load",
-                before.diagnostic or "DS4 is already resident",
+                before.diagnostic or f"{self.display_name} is already resident",
             )
         if self._port_accepting_connections():
             raise AdapterError(
@@ -741,35 +901,54 @@ class DS4Adapter(EngineAdapter):
                 f"port {self.config.port} is occupied; refusing to signal an unknown process",
             )
 
-        binary = Path(self.config.binary).expanduser()
-        working_directory = Path(self.config.working_directory).expanduser()
+        config = self._effective_config()
+        binary = Path(config.binary).expanduser()
+        working_directory = Path(config.working_directory).expanduser()
         if not binary.is_file() or not os.access(binary, os.X_OK):
-            raise AdapterError(self.engine, "load", f"DS4 binary is not executable: {binary}")
+            raise AdapterError(
+                self.engine,
+                "load",
+                f"{self.display_name} binary is not executable: {binary}",
+            )
         if not working_directory.is_dir():
             raise AdapterError(
                 self.engine,
                 "load",
-                f"DS4 working directory does not exist: {working_directory}",
+                f"{self.display_name} working directory does not exist: {working_directory}",
             )
 
-        argv = build_ds4_argv(self.config, target)
+        argv = await self._build_argv_async(config, target, deadline=deadline)
+        spawn_argv = wrap_scoped_argv(
+            argv,
+            scope_root=self._security_scope_root,
+            scope_id=target.scope_id,
+            scope_path=target.storage_path,
+        )
+        self._transient_spawn_ownership = None
         try:
             process = await self._spawn_process(
-                *argv,
+                *spawn_argv,
                 cwd=str(working_directory),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
                 start_new_session=True,
             )
         except OSError as exc:
-            raise AdapterError(self.engine, "load", f"failed to start DS4: {exc}") from exc
+            raise AdapterError(
+                self.engine, "load", f"failed to start {self.display_name}: {exc}"
+            ) from exc
         self._process = process
         self._target = target
         self._metadata_loaded = True
         self._log_task = asyncio.create_task(self._capture_logs(process.stdout))
 
         try:
-            identity = await self._observe_spawn_identity(process, argv, deadline)
+            identity = await self._observe_spawn_identity(
+                process,
+                argv,
+                deadline,
+                transient_argv=spawn_argv if spawn_argv != argv else None,
+            )
             metadata = _OwnedProcessMetadata.for_spawn(
                 identity=identity,
                 executable=binary,
@@ -781,6 +960,7 @@ class DS4Adapter(EngineAdapter):
             # disk. If the atomic state write fails, cleanup can still
             # revalidate this exact process identity before signaling it.
             self._owned_metadata = metadata
+            self._transient_spawn_ownership = None
             self._persist_metadata(metadata)
             self._ownership_diagnostic = None
 
@@ -790,7 +970,7 @@ class DS4Adapter(EngineAdapter):
                     raise AdapterError(
                         self.engine,
                         "load",
-                        f"DS4 exited with status {process.returncode}: {detail}",
+                        f"{self.display_name} exited with status {process.returncode}: {detail}",
                     )
                 snapshot = await self.inspect(deadline=deadline)
                 if snapshot.authoritative and len(snapshot.residents) == 1:
@@ -806,7 +986,7 @@ class DS4Adapter(EngineAdapter):
             raise AdapterError(
                 self.engine,
                 "load",
-                "DS4 readiness deadline expired",
+                f"{self.display_name} readiness deadline expired",
                 retryable=True,
             )
         except BaseException:
@@ -833,7 +1013,8 @@ class DS4Adapter(EngineAdapter):
                 return True
             if not self._metadata_matches_identity(metadata, identity):
                 self._ownership_diagnostic = (
-                    "DS4 PID identity changed while waiting for exit; refusing further signals"
+                    f"{self.display_name} PID identity changed while waiting for exit; "
+                    "refusing further signals"
                 )
                 return True
             remaining = end - time.monotonic()
@@ -855,7 +1036,7 @@ class DS4Adapter(EngineAdapter):
             self._process = None
             self._target = None
             self._ownership_diagnostic = (
-                "DS4 PID identity changed; refusing to signal an unknown process group"
+                f"{self.display_name} PID identity changed; refusing to signal an unknown process group"
             )
             raise AdapterError(self.engine, "unload", self._ownership_diagnostic)
         try:
@@ -866,7 +1047,68 @@ class DS4Adapter(EngineAdapter):
             raise AdapterError(
                 self.engine,
                 "unload",
-                f"failed to signal DS4 process group {metadata.process_group_id}: {exc}",
+                f"failed to signal {self.display_name} process group "
+                f"{metadata.process_group_id}: {exc}",
+            ) from exc
+        return True
+
+    async def _wait_for_transient_exit(
+        self,
+        ownership: _TransientSpawnOwnership,
+        timeout: float,
+    ) -> bool:
+        process = self._process
+        if process is not None and process.pid == ownership.pid:
+            try:
+                await asyncio.wait_for(process.wait(), timeout=max(0.0, timeout))
+                return True
+            except asyncio.TimeoutError:
+                return False
+
+        end = time.monotonic() + max(0.0, timeout)
+        while True:
+            identity = await self._identity_probe(ownership.pid)
+            if identity is None:
+                return True
+            if not ownership.matches(identity):
+                self._ownership_diagnostic = (
+                    f"{self.display_name} PID identity changed while waiting for startup cleanup; "
+                    "refusing further signals"
+                )
+                return True
+            remaining = end - time.monotonic()
+            if remaining <= 0:
+                return False
+            await asyncio.sleep(min(self._poll_interval_seconds, remaining))
+
+    async def _signal_transient(
+        self,
+        ownership: _TransientSpawnOwnership,
+        signal_number: int,
+    ) -> bool:
+        identity = await self._identity_probe(ownership.pid)
+        if identity is None:
+            return False
+        if not ownership.matches(identity):
+            self._transient_spawn_ownership = None
+            self._process = None
+            self._target = None
+            self._ownership_diagnostic = (
+                f"{self.display_name} PID identity changed during startup; "
+                "refusing to signal an unknown process group"
+            )
+            await self._finish_log_task()
+            raise AdapterError(self.engine, "unload", self._ownership_diagnostic)
+        try:
+            self._signal_process_group(ownership.process_group_id, signal_number)
+        except ProcessLookupError:
+            return False
+        except OSError as exc:
+            raise AdapterError(
+                self.engine,
+                "unload",
+                f"failed to signal {self.display_name} process group "
+                f"{ownership.process_group_id}: {exc}",
             ) from exc
         return True
 
@@ -886,17 +1128,42 @@ class DS4Adapter(EngineAdapter):
         process = self._process
         if metadata is None:
             if process is None:
+                self._transient_spawn_ownership = None
                 return
             if process.returncode is not None:
+                self._transient_spawn_ownership = None
                 self._process = None
                 self._target = None
                 await self._finish_log_task()
                 return
-            # A spawn that fails before its first complete identity probe has
-            # no durable start identity. Refuse to signal in that case: a
-            # leaked child is recoverable, while signaling a reused PID is not.
+            ownership = self._transient_spawn_ownership
+            if ownership is not None:
+                term_sent = await self._signal_transient(ownership, signal.SIGTERM)
+                exited = not term_sent or await self._wait_for_transient_exit(
+                    ownership, self.config.shutdown_grace_seconds
+                )
+                if not exited:
+                    kill_sent = await self._signal_transient(
+                        ownership, signal.SIGKILL
+                    )
+                    if kill_sent and not await self._wait_for_transient_exit(
+                        ownership, 5.0
+                    ):
+                        raise AdapterError(
+                            self.engine,
+                            "unload",
+                            f"{self.display_name} startup process group remained alive after SIGKILL",
+                        )
+                self._transient_spawn_ownership = None
+                self._process = None
+                self._target = None
+                await self._finish_log_task()
+                return
+            # A spawn that fails before any exact kernel identity observation
+            # cannot be signaled safely. A leaked child is recoverable, while
+            # signaling a reused or unrelated PID is not.
             self._ownership_diagnostic = (
-                "could not prove ownership of the newly spawned DS4 process; "
+                f"could not prove ownership of the newly spawned {self.display_name} process; "
                 "refusing to signal its process group"
             )
             raise AdapterError(self.engine, "unload", self._ownership_diagnostic)
@@ -911,11 +1178,12 @@ class DS4Adapter(EngineAdapter):
                 raise AdapterError(
                     self.engine,
                     "unload",
-                    "DS4 process group remained alive after SIGKILL",
+                    f"{self.display_name} process group remained alive after SIGKILL",
                 )
 
         self._remove_metadata(metadata)
         self._owned_metadata = None
+        self._transient_spawn_ownership = None
         self._process = None
         self._target = None
         await self._finish_log_task()
@@ -926,14 +1194,13 @@ class DS4Adapter(EngineAdapter):
         *,
         deadline: Deadline,
     ) -> None:
-        del deadline
         if not instance.managed:
             raise AdapterError(
                 self.engine,
                 "unload",
-                "refusing to terminate a DS4 server not owned by Mnemosyne",
+                f"refusing to terminate a {self.display_name} server not owned by Mnemosyne",
             )
-        await self._load_persisted_ownership()
+        await self._load_persisted_ownership(deadline=deadline)
         metadata = self._owned_metadata
         if metadata is None or instance.instance_id != str(metadata.pid):
             raise AdapterError(
@@ -969,7 +1236,13 @@ class DS4Adapter(EngineAdapter):
 
     async def aclose(self) -> None:
         try:
-            await self._load_persisted_ownership()
+            await self._load_persisted_ownership(
+                deadline=Deadline.after(
+                    self.config.request_timeout_seconds
+                    + self.config.shutdown_grace_seconds
+                    + 5.0
+                )
+            )
             await self._stop_managed_process()
         finally:
             if self._owns_client:

@@ -31,6 +31,70 @@ _KREA_2_PATTERNS = (
     "tokenizer/**",
 )
 
+SUPPORTED_MODELS: dict[str, str] = {
+    "schnell": "black-forest-labs/FLUX.1-schnell",
+    "dev": "black-forest-labs/FLUX.1-dev",
+    "krea-dev": "black-forest-labs/FLUX.1-Krea-dev",
+    "flux2-klein-4b": "black-forest-labs/FLUX.2-klein-4B",
+    "flux2-klein-9b": "black-forest-labs/FLUX.2-klein-9B",
+    "flux2-klein-9b-kv": "black-forest-labs/FLUX.2-klein-9b-kv",
+    "flux2-klein-base-4b": "black-forest-labs/FLUX.2-klein-base-4B",
+    "flux2-klein-base-9b": "black-forest-labs/FLUX.2-klein-base-9B",
+    "qwen-image": "Qwen/Qwen-Image",
+    "krea-2": _KREA_2_REPO,
+    "fibo": "briaai/FIBO",
+    "fibo-lite": "briaai/Fibo-lite",
+    "z-image": "Tongyi-MAI/Z-Image",
+    "z-image-turbo": "Tongyi-MAI/Z-Image-Turbo",
+    "ernie-image": "baidu/ERNIE-Image",
+    "ernie-image-turbo": "baidu/ERNIE-Image-Turbo",
+    "ideogram-4-fp8": "ideogram-ai/ideogram-4-fp8",
+}
+
+_MODEL_CONFIG_FACTORIES: dict[str, str] = {
+    "schnell": "schnell",
+    "dev": "dev",
+    "krea-dev": "krea_dev",
+    "flux2-klein-4b": "flux2_klein_4b",
+    "flux2-klein-9b": "flux2_klein_9b",
+    "flux2-klein-9b-kv": "flux2_klein_9b_kv",
+    "flux2-klein-base-4b": "flux2_klein_base_4b",
+    "flux2-klein-base-9b": "flux2_klein_base_9b",
+    "qwen-image": "qwen_image",
+    "krea-2": "krea2",
+    "fibo": "fibo",
+    "fibo-lite": "fibo_lite",
+    "z-image": "z_image",
+    "z-image-turbo": "z_image_turbo",
+    "ernie-image": "ernie_image",
+    "ernie-image-turbo": "ernie_image_turbo",
+    "ideogram-4-fp8": "ideogram4_fp8",
+}
+
+_FLUX_1_FAMILIES = frozenset({"schnell", "dev", "krea-dev"})
+_FLUX_2_FAMILIES = frozenset(
+    {
+        "flux2-klein-4b",
+        "flux2-klein-9b",
+        "flux2-klein-9b-kv",
+        "flux2-klein-base-4b",
+        "flux2-klein-base-9b",
+    }
+)
+_NEGATIVE_PROMPT_FAMILIES = frozenset(
+    {
+        *_FLUX_1_FAMILIES,
+        "qwen-image",
+        "krea-2",
+        "fibo",
+        "fibo-lite",
+        "z-image",
+        "z-image-turbo",
+        "ernie-image",
+        "ernie-image-turbo",
+    }
+)
+
 
 class LoadRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -79,8 +143,13 @@ def _resolve_snapshot(
 
 
 def create_pipeline(family: str, model: str, quantize: int | None) -> ImagePipeline:
+    expected_repo = SUPPORTED_MODELS.get(family)
+    if expected_repo is None:
+        raise ValueError(f"unsupported MFLUX family '{family}'")
     expanded = Path(model).expanduser()
     local_path = str(expanded) if expanded.exists() else None
+    if local_path is None and model != expected_repo:
+        raise ValueError(f"{family} supports {expected_repo} or a local model path")
     if family == "krea-2":
         local_path = _resolve_snapshot(
             model,
@@ -90,13 +159,66 @@ def create_pipeline(family: str, model: str, quantize: int | None) -> ImagePipel
         from mflux.models.krea2 import Krea2
 
         return Krea2(quantize=quantize, model_path=local_path)
+    from mflux.models.common.config import ModelConfig
+
+    model_config = getattr(ModelConfig, _MODEL_CONFIG_FACTORIES[family])()
+    if family in _FLUX_1_FAMILIES:
+        from mflux.models.flux.variants.txt2img.flux import Flux1
+
+        return Flux1(
+            quantize=quantize,
+            model_path=local_path,
+            model_config=model_config,
+        )
+    if family in _FLUX_2_FAMILIES:
+        from mflux.models.flux2.variants.txt2img.flux2_klein import Flux2Klein
+
+        return Flux2Klein(
+            quantize=quantize,
+            model_path=local_path,
+            model_config=model_config,
+        )
     if family == "qwen-image":
-        if local_path is None and model != "Qwen/Qwen-Image":
-            raise ValueError("qwen-image supports Qwen/Qwen-Image or a local model path")
         from mflux.models.qwen.variants.txt2img.qwen_image import QwenImage
 
-        return QwenImage(quantize=quantize, model_path=local_path)
-    raise ValueError(f"unsupported MFLUX family '{family}'")
+        return QwenImage(
+            quantize=quantize,
+            model_path=local_path,
+            model_config=model_config,
+        )
+    if family in {"fibo", "fibo-lite"}:
+        from mflux.models.fibo.variants.txt2img.fibo import FIBO
+
+        return FIBO(
+            quantize=quantize,
+            model_path=local_path,
+            model_config=model_config,
+        )
+    if family in {"z-image", "z-image-turbo"}:
+        from mflux.models.z_image.variants.z_image import ZImage
+
+        return ZImage(
+            quantize=quantize,
+            model_path=local_path,
+            model_config=model_config,
+        )
+    if family in {"ernie-image", "ernie-image-turbo"}:
+        from mflux.models.ernie_image.variants.txt2img.ernie_image import ErnieImage
+
+        return ErnieImage(
+            quantize=quantize,
+            model_path=local_path,
+            model_config=model_config,
+        )
+    if family == "ideogram-4-fp8":
+        from mflux.models.ideogram4.variants.txt2img.ideogram4 import Ideogram4
+
+        return Ideogram4(
+            quantize=quantize,
+            model_path=local_path,
+            model_config=model_config,
+        )
+    raise AssertionError(f"missing pipeline dispatch for supported family '{family}'")
 
 
 class WorkerState:
@@ -188,12 +310,16 @@ def create_app(*, pipeline_factory: PipelineFactory = create_pipeline) -> FastAP
                 "width": payload.width,
                 "guidance": payload.guidance_scale,
             }
-            if payload.negative_prompt is not None:
+            if (
+                payload.negative_prompt is not None
+                and state.family in _NEGATIVE_PROMPT_FAMILIES
+            ):
                 kwargs["negative_prompt"] = payload.negative_prompt
             try:
                 generated = await asyncio.to_thread(state.pipeline.generate_image, **kwargs)
                 buffer = BytesIO()
-                generated.image.save(buffer, format="PNG")
+                image = getattr(generated, "image", generated)
+                image.save(buffer, format="PNG")
             except Exception as exc:
                 raise HTTPException(500, f"image generation failed: {exc}") from exc
             return {
@@ -207,4 +333,4 @@ def create_app(*, pipeline_factory: PipelineFactory = create_pipeline) -> FastAP
 app = create_app()
 
 
-__all__ = ["app", "create_app", "create_pipeline"]
+__all__ = ["SUPPORTED_MODELS", "app", "create_app", "create_pipeline"]

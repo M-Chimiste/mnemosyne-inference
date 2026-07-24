@@ -94,8 +94,13 @@ async def test_disabled_sidecar_keeps_local_analytics_without_outbox() -> None:
 @pytest.mark.asyncio
 async def test_enabled_sidecar_reports_missing_dsn_and_keeps_outbox(
     monkeypatch,
+    tmp_path,
 ) -> None:
     monkeypatch.delenv("TOKEN_SIDECAR_POSTGRES_DSN", raising=False)
+    monkeypatch.setenv(
+        "MNEMOSYNE_TOKEN_SIDECAR_LAUNCH_AGENT",
+        str(tmp_path / "missing.plist"),
+    )
     store = UsageStore.open(":memory:")
     service = UsageService(
         store,

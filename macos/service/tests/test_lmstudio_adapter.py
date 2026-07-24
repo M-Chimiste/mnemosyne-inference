@@ -14,6 +14,7 @@ from mnemosyne_macos.models import ServiceState
 def _target():
     return MacConfig.model_validate(
         {
+            "engines": {"lmstudio": {"enabled": True}},
             "models": [
                 {
                     "alias": "studio-model",
@@ -24,6 +25,70 @@ def _target():
             ]
         }
     ).profiles()["studio-model"]
+
+
+@pytest.mark.asyncio
+async def test_lmstudio_inventory_profiles_downloaded_models_without_loading() -> None:
+    requests: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append((request.method, request.url.path))
+        return httpx.Response(
+            200,
+            json={
+                "models": [
+                    {
+                        "type": "llm",
+                        "publisher": "mlx-community",
+                        "key": "gemma-4-31b-it",
+                        "display_name": "Gemma 4 31B Instruct",
+                        "architecture": "gemma4",
+                        "quantization": {"name": "4bit", "bits_per_weight": 4},
+                        "size_bytes": 18_444_413_040,
+                        "params_string": "31B",
+                        "loaded_instances": [],
+                        "max_context_length": 262_144,
+                        "format": "mlx",
+                        "capabilities": {
+                            "vision": True,
+                            "trained_for_tool_use": True,
+                        },
+                    },
+                    {
+                        "type": "embedding",
+                        "key": "nomic-embed",
+                        "display_name": "Nomic Embed",
+                        "loaded_instances": [{"id": "embedding-instance"}],
+                    },
+                ]
+            },
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    adapter = LMStudioAdapter(LMStudioConfig(), client=client)
+
+    inventory = await adapter.inventory(deadline=Deadline.after(1))
+
+    assert requests == [("GET", "/api/v1/models")]
+    assert inventory[0] == {
+        "key": "gemma-4-31b-it",
+        "display_name": "Gemma 4 31B Instruct",
+        "type": "llm",
+        "publisher": "mlx-community",
+        "architecture": "gemma4",
+        "quantization_name": "4bit",
+        "bits_per_weight": 4,
+        "size_bytes": 18_444_413_040,
+        "params_string": "31B",
+        "max_context_length": 262_144,
+        "format": "mlx",
+        "vision": True,
+        "trained_for_tool_use": True,
+        "loaded": False,
+    }
+    assert inventory[1]["type"] == "embedding"
+    assert inventory[1]["loaded"] is True
+    await client.aclose()
 
 
 @pytest.mark.asyncio

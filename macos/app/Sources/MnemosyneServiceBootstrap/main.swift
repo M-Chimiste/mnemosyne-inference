@@ -33,7 +33,7 @@ private func executableURL() -> URL {
         .resolvingSymlinksInPath()
 }
 
-/// The bootstrap is nested inside `Contents/Helpers/MnemosyneService.app`.
+/// The bootstrap is installed in the outer app's `Contents/MacOS`.
 /// Walk upward instead of assuming a fixed number of parents so local bundle
 /// layouts can change without baking an absolute path into the LaunchAgent.
 private func outerContents(startingAt executable: URL) throws -> URL {
@@ -126,6 +126,7 @@ private func prepareApplicationSupport(resources: URL) throws -> (config: URL, e
         supportRoot,
         supportRoot.appending(path: "logs", directoryHint: .isDirectory),
         supportRoot.appending(path: "state", directoryHint: .isDirectory),
+        supportRoot.appending(path: "models", directoryHint: .isDirectory),
     ] {
         try fileManager.createDirectory(
             at: directory,

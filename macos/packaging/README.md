@@ -1,6 +1,7 @@
 # Native macOS packaging
 
-The native deployment has two long-lived processes plus an on-demand worker:
+The native deployment has a menu controller and a long-lived background
+service plus on-demand manager-owned engine processes:
 
 - `Unified Inference.app` is an AppKit `NSStatusItem` with a SwiftUI popover client of
   the control API. It
@@ -8,14 +9,36 @@ The native deployment has two long-lived processes plus an on-demand worker:
   `server.control_password_env` from the user native configuration; the
   default endpoint is `http://127.0.0.1:17321`. It shows the unified model
   catalog and can load or unload aliases without exposing individual engine
-  ports. Its dedicated configuration window edits `config.yaml` and `.env`,
-  validates YAML through the control API, preserves private file modes, and
-  distinguishes hot-reloadable profile edits from restart-required changes.
-- `MnemosyneService.app` is a background-only helper launched as a per-user
-  LaunchAgent. Its bootstrap resolves the outer app's bundled Python and then
-  calls `execve`; it does not daemonize or add a second supervisor.
-- A private MFLUX worker is launched in its own process group only while an
-  image model is resident. It uses loopback port `17324` and the independent
+  ports. Its dedicated settings window presents native forms for general,
+  engine, storage, Hugging Face library, model, usage, and credential settings.
+  Exact internal or nested external model directories are selected with a
+  native folder chooser and tied to their containing volume UUID. The Model
+  Library page provides engine-aware search and durable download controls.
+  The Models page uses a Finder-selected directory to discover GGUF shard sets,
+  multimodal projectors, and MLX folders in place without loading or copying
+  them. While the picker grant is live, it transfers an ordinary bookmark to
+  the service, which consumes it and creates a receiver-owned durable bookmark;
+  only the durable bytes stay in private state and only their SHA-256
+  `scope_id` is persisted in YAML. The service preflights referenced grants on
+  save, revalidates them and prunes unreferenced bookmarks at startup, and
+  scoped helpers/model/download children reactivate a grant before `exec`.
+  Selection is explicit and initially empty. The older LM Studio
+  inventory remains only as a read-only migration/soak bridge. The control API
+  validates and atomically persists versioned structured configuration,
+  private credentials stay write-only, and the UI distinguishes
+  hot-reloadable profile edits from restart-required changes.
+- `Contents/MacOS/mnemosyne-service-bootstrap` is the directly embedded
+  helper executable launched as a per-user LaunchAgent. This follows
+  `SMAppService`'s bundle-relative `BundleProgram` layout instead of nesting a
+  second app bundle inside the main app. The bootstrap resolves the outer
+  app's bundled Python and then calls `execve`; it does not daemonize or add a
+  second supervisor.
+- A managed `llama-server` is launched in a proven-owned process group on
+  loopback `17325` only while a GGUF profile is resident. Its binary is
+  installed from the official upstream release below Application Support,
+  not embedded in the signed app or stored beside model weights.
+- DS4 and the private MFLUX worker are also manager-owned, on-demand process
+  groups. MFLUX uses loopback port `17324` and the independent
   `framework-mnemosyne-image` Python export layer.
 
 The LaunchAgent owns the service lifetime, so **Quit Menu App** does not stop
@@ -43,11 +66,11 @@ command-line development launch at alternate files. A plain
 `swift run MnemosyneMenu` can exercise the menu and HTTP client, but
 `SMAppService` registration must be tested from a signed `.app` bundle.
 
-This workstation currently has Swift Command Line Tools but not a selected
-full Xcode installation. `swift build` works in that setup. Some Command Line
-Tools releases cannot launch Swift's test bundle because their Testing
-framework runtime search path is incomplete; full Xcode is the supported path
-for the final registration and login-item smoke tests.
+`swift build` and the Swift unit tests can run with compatible Command Line
+Tools. Full Xcode remains required for the final packaged `SMAppService`,
+login-item, signing, and notarization acceptance work. Restricted runners may
+also need access to SwiftPM's cache and plugin directories even when the source
+itself compiles normally.
 
 ## Staging a local app
 
@@ -82,13 +105,27 @@ uv lock --project macos/service
 uv lock --project macos/image-worker
 ```
 
-Then build the relocatable Python layers and stage an ad-hoc-signed app:
+Then build the relocatable Python layers and stage an app. The default identity
+is `-` (ad hoc):
 
 ```bash
 python3 macos/packaging/build_runtime.py
 macos/packaging/build_app.sh release
 open "macos/app/build/Stage/Unified Inference.app"
 ```
+
+For a stable signature, set an identity available in the login keychain:
+
+```bash
+CODESIGN_IDENTITY="Apple Development: Example Name (TEAMID)" \
+  macos/packaging/build_app.sh release
+```
+
+The script uses that identity for nested Mach-O files, the direct helper, and
+the outer app, then performs a deep strict verification. If a target Mac has no
+valid code-signing identity, its local build remains ad hoc. Rebuilding an
+ad-hoc app changes its code identity and macOS may require each protected model
+folder to be selected again.
 
 For fast UI-only work, `build_app.sh debug --bare` omits Python. Do not enable
 its background service: the bootstrap intentionally exits with a clear error
@@ -100,23 +137,42 @@ unset.
 
 Before enabling **Background service**, move the staged app to a stable path
 such as `/Applications/Unified Inference.app`. `SMAppService` tracks the containing app
-and requires it to be code signed. If the helper or LaunchAgent plist changes,
-disable and re-enable the service so macOS registers the new definition.
-The first launch after upgrading from the former `Mnemosyne.app` filename
-automatically refreshes already-enabled service and menu-login registrations;
-subsequent launches do not restart either registration.
+and requires it to be code signed. On launch, the menu app fingerprints its
+installed signed bundle and refreshes already-enabled service and menu-login
+registrations only when that bundle has changed. Refresh uses
+`SMAppService`'s asynchronous unregister completion, waits for the terminal
+disabled state, then registers and waits for enabled or approval-required; it
+never immediately re-registers a still-running old helper. Pending refresh
+intent survives failure or cancellation and is retried on the next launch.
+This covers the former `Mnemosyne.app` filename migration and local
+ad-hoc-signed updates without restarting either registration on ordinary
+launches.
 
-Ad-hoc signing is for local development only. Distribution still requires a
-Developer ID signature, hardened runtime, nested-code signing from the inside
-out, notarization, and a signed update mechanism.
+For an ad-hoc-signed update, do not merge the staged directory over a running
+installation. In the old app, first disable the background service (and menu
+login item if enabled), wait for the LaunchAgent and ports to disappear, then
+quit the menu app. Copy the staged bundle to a new sibling under
+`/Applications` and verify that copy. Move the old canonical bundle to an
+explicit sibling backup such as
+`/Applications/Unified Inference.previous.app`, then atomically move the
+verified candidate into the exact `/Applications/Unified Inference.app` path.
+If that second move fails, restore the backup to the canonical path before
+continuing. Launch the new app and explicitly enable the service again;
+approve it in Login Items if macOS reports approval-required. Keep the backup
+until the protected-folder and engine-swap smokes pass.
+
+Ad-hoc signing is for local development only. `CODESIGN_IDENTITY` provides
+signature stability but does not by itself implement distribution.
+Distribution still requires a Developer ID signature, hardened runtime,
+nested-code signing from the inside out, notarization, and a signed update
+mechanism.
 
 ## Bundle layout
 
 ```text
 Unified Inference.app/Contents/
   MacOS/UnifiedInference
-  Helpers/MnemosyneService.app/
-    Contents/MacOS/mnemosyne-service-bootstrap
+  MacOS/mnemosyne-service-bootstrap
   Library/LaunchAgents/com.mnemosyne.inference.agent.plist
   Resources/
     Python/                 # venvstacks export
@@ -131,7 +187,65 @@ At first launch the bootstrap copies missing examples to
 private permissions, and exports `MNEMOSYNE_MACOS_CONFIG_PATH` and
 `MNEMOSYNE_MACOS_ENV_PATH` for the service.
 
+The examples are copied only when the user files are absent. Upgrading an
+existing installation therefore preserves its aliases, storage roots, secrets,
+and temporary LM Studio migration setting. Fresh examples disable LM Studio
+and enable manager-owned llama.cpp. Runtime downloads live separately under
+`~/Library/Application Support/Mnemosyne/runtimes/`; installing or replacing
+the app neither deletes them nor touches model libraries on internal or
+external drives.
+
+The menu's ordinary bookmark carries Apple's implicit single interprocess
+extension and is converted by the receiving service into a durable
+security-scoped bookmark. The bundle currently declares no App Sandbox
+bookmark entitlements. Receiver-owned bytes are stored separately below the
+private `state/security-scopes/` directory beside the active config, with mode
+`0600`; that root does not follow `paths.state_database`, and only the
+bookmark's SHA-256 `scope_id` appears in the copied/user-edited YAML.
+Configuration saves reject a missing, stale, path-mismatched, or
+non-reactivatable referenced grant. Bookmark receipt and reactivation run in
+bounded, killable process groups. Startup revalidates persisted references and
+prunes unreferenced private bookmark files. Scoped helpers and managed
+engine/download children reactivate the durable bookmark before `exec`.
+
+Potentially blocking bookmark receipt/reactivation and protected-filesystem
+inspection, scanning, path resolution, destination creation/measurement, and
+GGUF validation run in bounded, killable subprocess groups off the asyncio
+event loop. Timeout, request cancellation, and shutdown terminate the complete
+group so a missing grant cannot stall the control service or leave a child
+behind.
+
+Config snapshots include a content revision. Settings saves must echo it, and
+download/import profile writes use the same mutation lock; stale Settings
+windows receive a conflict instead of overwriting a newly created profile.
+
 The menu reads `server.control_password_env` from `config.yaml`, then resolves
 that named variable with the same launch-environment-over-`.env` precedence as
 the Python service. The default name is `ADMIN_PASSWORD`. The secret is never
 copied into SwiftUI preferences.
+
+For packaged operation, `engines.mflux.python` must remain unset. The bootstrap
+exports the bundled image-layer Python and worker source, and an activated
+managed MFLUX runtime may supersede that fallback. Checkout `.venv` paths and
+checkout-valued `MNEMOSYNE_MFLUX_PYTHON` /
+`MNEMOSYNE_MFLUX_PYTHONPATH` are development-only overrides and must not be
+persisted into an installed workstation's configuration.
+
+## Engine dependency updates
+
+Routine llama.cpp, MFLUX, and DS4 updates do not require a new app bundle or a
+separately published Unified Inference artifact. The running service checks
+the official `ggml-org/llama.cpp` releases, MFLUX PyPI project, and
+`antirez/ds4` GitHub repository directly; it never relies on a
+repository-owned dependency manifest. oMLX remains externally installed, so
+the app reports its version and official update link without replacing an app
+bundle or Homebrew files.
+
+For llama.cpp, the service selects the official macOS arm64 archive and checks
+its upstream asset name, URL, published size and SHA-256, safe extraction,
+executable, and required CLI flags. It stages MFLUX in an isolated package
+directory or builds `ds4-server` from the exact reported commit and validates
+the result. Staging may run while a model is resident; pointer activation and
+rollback use the coordinator's all-engines-empty maintenance barrier. Previous
+managed runtimes are retained for recovery, and model weights never live
+inside a runtime directory.

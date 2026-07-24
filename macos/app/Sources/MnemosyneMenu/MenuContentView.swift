@@ -117,17 +117,20 @@ struct MenuContentView: View {
                 value: registration.label(for: registration.agentStatus)
             )
             HStack {
-                if registration.agentStatus == .enabled
-                    || registration.agentStatus == .requiresApproval
-                {
-                    Button("Disable Service") {
-                        registration.disableAgent()
-                    }
-                } else {
-                    Button("Enable Service") {
-                        registration.enableAgent()
+                Group {
+                    if registration.agentStatus == .enabled
+                        || registration.agentStatus == .requiresApproval
+                    {
+                        Button("Disable Service") {
+                            Task { await registration.disableAgent() }
+                        }
+                    } else {
+                        Button("Enable Service") {
+                            Task { await registration.enableAgent() }
+                        }
                     }
                 }
+                .disabled(registration.isChangingRegistration)
                 Spacer()
                 if registration.agentStatus == .requiresApproval {
                     Button("Open Login Items") {
@@ -145,13 +148,14 @@ struct MenuContentView: View {
                     },
                     set: { enabled in
                         if enabled {
-                            registration.enableMenuAtLogin()
+                            Task { await registration.enableMenuAtLogin() }
                         } else {
-                            registration.disableMenuAtLogin()
+                            Task { await registration.disableMenuAtLogin() }
                         }
                     }
                 )
             )
+            .disabled(registration.isChangingRegistration)
 
             if registration.menuLoginStatus == .requiresApproval {
                 Button("Approve Login Items in System Settings") {
@@ -188,7 +192,7 @@ struct MenuContentView: View {
                 Button("Open Logs") {
                     openApplicationSupport(subdirectory: "logs")
                 }
-                Button("Configuration…") {
+                Button("Settings…") {
                     openConfiguration()
                 }
                 Spacer()

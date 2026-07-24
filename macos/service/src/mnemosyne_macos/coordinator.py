@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from enum import StrEnum
 import time
-from typing import AsyncIterator, Mapping
+from typing import AsyncIterator, Awaitable, Callable, Mapping
 
 from .engines.base import Deadline, EngineAdapter
 from .models import (
@@ -619,6 +619,64 @@ class ResidencyCoordinator:
                 self._diagnostic = str(error)
                 self._condition.notify_all()
             raise error from exc
+        except Exception as exc:
+            async with self._condition:
+                self._initialized = False
+                self._accepting = False
+                self._state = CoordinatorState.DEGRADED
+                self._diagnostic = str(exc)
+                self._condition.notify_all()
+            raise
+        async with self._condition:
+            self._resident = None
+            self._initialized = True
+            self._accepting = True
+            self._state = CoordinatorState.IDLE
+            self._diagnostic = None
+            self._last_used_monotonic = time.monotonic()
+            self._condition.notify_all()
+
+    async def run_empty_maintenance(
+        self,
+        operation: Callable[[Deadline], Awaitable[None]],
+        *,
+        name: str,
+    ) -> None:
+        """Drain, prove global empty, and hold admission closed for maintenance."""
+
+        deadline = Deadline.after(self.transition_timeout_seconds)
+        try:
+            async with self._condition:
+                self._accepting = False
+                self._fail_all_locked(CoordinatorError(f"{name} in progress"))
+                self._condition.notify_all()
+                while self._inflight > 0:
+                    budget = deadline.remaining()
+                    if budget <= 0:
+                        raise QueueTimeout(f"timed out draining leases for {name}")
+                    try:
+                        async with asyncio.timeout(budget):
+                            while self._inflight > 0:
+                                self._state = CoordinatorState.DRAINING
+                                await self._condition.wait()
+                    except TimeoutError as exc:
+                        raise QueueTimeout(
+                            f"timed out draining leases for {name}"
+                        ) from exc
+                drive_task = self._drive_task
+            await self._await_driver_until(drive_task, deadline, operation=name)
+            budget = deadline.remaining()
+            if budget <= 0:
+                raise QueueTimeout(f"{name} transition deadline expired")
+            async with asyncio.timeout(budget):
+                async with self._operation_lock:
+                    await self._publish_state(CoordinatorState.UNLOADING)
+                    await self._unload_globally(deadline)
+                    await operation(deadline)
+                    snapshots = await self._inspect_all(deadline)
+                    residents = [item for snapshot in snapshots for item in snapshot.residents]
+                    if residents:
+                        raise CoordinatorError(f"{name} left a resident model")
         except Exception as exc:
             async with self._condition:
                 self._initialized = False

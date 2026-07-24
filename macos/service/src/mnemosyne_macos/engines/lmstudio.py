@@ -38,6 +38,97 @@ class LMStudioAdapter(HttpEngineAdapter):
             poll_interval_seconds=poll_interval_seconds,
         )
 
+    async def inventory(self, *, deadline: Deadline) -> list[dict[str, Any]]:
+        """Return downloaded LM Studio models without loading any of them."""
+
+        payload = await self._request_json(
+            "GET",
+            "/api/v1/models",
+            operation="inventory",
+            deadline=deadline,
+            headers=self._bearer_headers(),
+        )
+        raw_models = payload.get("models")
+        if not isinstance(raw_models, list):
+            raise AdapterError(
+                self.engine,
+                "inventory",
+                "native model list did not contain a models array",
+            )
+
+        models: list[dict[str, Any]] = []
+        keys: set[str] = set()
+        for raw in raw_models:
+            if not isinstance(raw, dict):
+                raise AdapterError(
+                    self.engine,
+                    "inventory",
+                    "model entry is not an object",
+                )
+            key = raw.get("key")
+            if not isinstance(key, str) or not key.strip():
+                raise AdapterError(
+                    self.engine,
+                    "inventory",
+                    "model entry has no key",
+                )
+            if key in keys:
+                raise AdapterError(
+                    self.engine,
+                    "inventory",
+                    f"duplicate model key: {key}",
+                )
+            keys.add(key)
+            instances = raw.get("loaded_instances")
+            if not isinstance(instances, list):
+                raise AdapterError(
+                    self.engine,
+                    "inventory",
+                    f"model '{key}' has no loaded_instances array",
+                )
+
+            quantization = raw.get("quantization")
+            capabilities = raw.get("capabilities")
+            models.append(
+                {
+                    "key": key,
+                    "display_name": _optional_string(raw.get("display_name")) or key,
+                    "type": _optional_string(raw.get("type")) or "unknown",
+                    "publisher": _optional_string(raw.get("publisher")),
+                    "architecture": _optional_string(raw.get("architecture")),
+                    "quantization_name": (
+                        _optional_string(quantization.get("name"))
+                        if isinstance(quantization, dict)
+                        else None
+                    ),
+                    "bits_per_weight": (
+                        _optional_number(quantization.get("bits_per_weight"))
+                        if isinstance(quantization, dict)
+                        else None
+                    ),
+                    "size_bytes": _optional_integer(raw.get("size_bytes")),
+                    "params_string": _optional_string(raw.get("params_string")),
+                    "max_context_length": _optional_integer(
+                        raw.get("max_context_length")
+                    ),
+                    "format": _optional_string(raw.get("format")),
+                    "vision": (
+                        capabilities.get("vision")
+                        if isinstance(capabilities, dict)
+                        and isinstance(capabilities.get("vision"), bool)
+                        else None
+                    ),
+                    "trained_for_tool_use": (
+                        capabilities.get("trained_for_tool_use")
+                        if isinstance(capabilities, dict)
+                        and isinstance(capabilities.get("trained_for_tool_use"), bool)
+                        else None
+                    ),
+                    "loaded": bool(instances),
+                }
+            )
+        return models
+
     async def inspect(self, *, deadline: Deadline) -> EngineSnapshot:
         try:
             payload = await self._request_json(
@@ -435,3 +526,15 @@ class LMStudioAdapter(HttpEngineAdapter):
             headers=self._bearer_headers(),
             usage_dialect="anthropic" if endpoint == Endpoint.MESSAGES else "openai",
         )
+
+
+def _optional_string(value: Any) -> str | None:
+    return value if isinstance(value, str) and value.strip() else None
+
+
+def _optional_integer(value: Any) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _optional_number(value: Any) -> int | float | None:
+    return value if isinstance(value, (int, float)) and not isinstance(value, bool) else None

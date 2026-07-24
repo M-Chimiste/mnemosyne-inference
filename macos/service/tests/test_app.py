@@ -2,15 +2,21 @@ from __future__ import annotations
 
 import asyncio
 import json
+from types import SimpleNamespace
 
 import httpx
 import pytest
 from starlette.requests import Request
 from starlette.responses import StreamingResponse
 
-from mnemosyne_macos.app import create_control_app, create_inference_app
-from mnemosyne_macos.config import MacConfig
+from mnemosyne_macos.app import (
+    _validated_install_capabilities,
+    create_control_app,
+    create_inference_app,
+)
+from mnemosyne_macos.config import LMStudioConfig, MacConfig, load_config, save_config
 from mnemosyne_macos.engines.base import Deadline, EngineAdapter
+from mnemosyne_macos.engines.lmstudio import LMStudioAdapter
 from mnemosyne_macos.models import (
     Endpoint,
     EngineName,
@@ -88,6 +94,7 @@ def _config(tmp_path, *, endpoint: Endpoint | None = None) -> MacConfig:
     return MacConfig.model_validate(
         {
             "server": {"idle_unload_seconds": None},
+            "engines": {"lmstudio": {"enabled": True}},
             "paths": {"state_database": str(tmp_path / "state.db")},
             "models": [model],
         }
@@ -122,6 +129,43 @@ def _image_config(tmp_path, *, timeout: float = 1800) -> MacConfig:
             ],
         }
     )
+
+
+def test_managed_install_roles_are_canonical_and_engine_scoped() -> None:
+    assert _validated_install_capabilities(
+        engine=EngineName.LLAMA_CPP,
+        requested=None,
+        suggested_role="embeddings",
+        has_projector=False,
+    ) == frozenset({Endpoint.EMBEDDINGS})
+    assert _validated_install_capabilities(
+        engine=EngineName.MFLUX,
+        requested=None,
+        suggested_role=None,
+        has_projector=False,
+    ) == frozenset({Endpoint.IMAGES_GENERATIONS})
+
+    with pytest.raises(ValueError, match="Generation role"):
+        _validated_install_capabilities(
+            engine=EngineName.LLAMA_CPP,
+            requested={Endpoint.EMBEDDINGS},
+            suggested_role=None,
+            has_projector=True,
+        )
+    with pytest.raises(ValueError, match="require one supported model role"):
+        _validated_install_capabilities(
+            engine=EngineName.DS4,
+            requested={Endpoint.EMBEDDINGS},
+            suggested_role=None,
+            has_projector=False,
+        )
+    with pytest.raises(ValueError, match="require one supported model role"):
+        _validated_install_capabilities(
+            engine=EngineName.LLAMA_CPP,
+            requested={Endpoint.CHAT_COMPLETIONS, Endpoint.EMBEDDINGS},
+            suggested_role=None,
+            has_projector=False,
+        )
 
 
 @pytest.mark.asyncio
@@ -277,6 +321,86 @@ async def test_image_timeout_unloads_worker_and_releases_lease(tmp_path) -> None
         assert status.inflight == 0
         assert status.resident_alias is None
         assert adapters[EngineName.MFLUX].residents == []
+    finally:
+        await client.aclose()
+        await runtime.stop()
+
+
+@pytest.mark.asyncio
+async def test_runtime_update_control_routes_use_coordinator_barrier(tmp_path) -> None:
+    class FakeUpdateManager:
+        def __init__(self) -> None:
+            self.events: list[str] = []
+
+        async def check(self, *, refresh: bool = True) -> dict:
+            self.events.append(f"check:{refresh}")
+            return {
+                "channel": "stable",
+                "manifest_url": None,
+                "checked_at": 1,
+                "core_protocol": 1,
+                "engines": [],
+            }
+
+        async def prepare(self, engine: str, version: str | None = None):
+            self.events.append(f"prepare:{engine}:{version}")
+            return SimpleNamespace(release=SimpleNamespace(engine=engine))
+
+        def activate(self, prepared):
+            self.events.append(f"activate:{prepared.release.engine}")
+            return SimpleNamespace(
+                engine=prepared.release.engine,
+                version="1.0.0",
+                source_revision="abc",
+                root=tmp_path / "runtime",
+            )
+
+        def rollback(self, engine: str):
+            self.events.append(f"rollback:{engine}")
+            return SimpleNamespace(
+                engine=engine,
+                version="0.9.0",
+                source_revision="old",
+                root=tmp_path / "runtime-old",
+            )
+
+        async def aclose(self) -> None:
+            return None
+
+    updates = FakeUpdateManager()
+    runtime = NativeRuntime(
+        _config(tmp_path),
+        adapters=_adapters(),
+        update_manager=updates,  # type: ignore[arg-type]
+    )
+    await runtime.start(raise_on_degraded=True)
+    client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=create_control_app(runtime)),
+        base_url="http://mnemosyne.test",
+    )
+    try:
+        checked = await client.post("/manager/runtime-updates/check")
+        assert checked.status_code == 200
+        installed = await client.post(
+            "/manager/runtime-updates/mflux/install",
+            json={"version": "1.0.0"},
+        )
+        assert installed.status_code == 200
+        assert installed.json()["activated"]["version"] == "1.0.0"
+        rolled_back = await client.post("/manager/runtime-updates/mflux/rollback")
+        assert rolled_back.status_code == 200
+        assert rolled_back.json()["activated"]["rollback"] is True
+        assert updates.events == [
+            "check:True",
+            "prepare:mflux:1.0.0",
+            "activate:mflux",
+            "check:False",
+            "rollback:mflux",
+            "check:False",
+        ]
+        status = await runtime.coordinator.status()
+        assert status.state.value == "idle"
+        assert status.resident_alias is None
     finally:
         await client.aclose()
         await runtime.stop()
@@ -505,12 +629,73 @@ async def test_control_plane_lists_loads_and_unloads_models(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_control_plane_validates_unsaved_configuration(tmp_path) -> None:
+async def test_control_plane_discovers_downloaded_lmstudio_models_without_loading(
+    tmp_path,
+) -> None:
+    requests: list[tuple[str, str]] = []
+
+    def lmstudio_handler(request: httpx.Request) -> httpx.Response:
+        requests.append((request.method, request.url.path))
+        return httpx.Response(
+            200,
+            json={
+                "models": [
+                    {
+                        "type": "llm",
+                        "key": "qwen/qwen3-coder-next",
+                        "display_name": "Qwen3 Coder Next",
+                        "loaded_instances": [],
+                        "format": "mlx",
+                    }
+                ]
+            },
+        )
+
+    lmstudio_client = httpx.AsyncClient(transport=httpx.MockTransport(lmstudio_handler))
+    adapters = _adapters()
+    adapters[EngineName.LMSTUDIO] = LMStudioAdapter(
+        LMStudioConfig(),
+        client=lmstudio_client,
+    )
     upstream_client = httpx.AsyncClient(
         transport=httpx.MockTransport(lambda _r: httpx.Response(500))
     )
     runtime = NativeRuntime(
         _config(tmp_path),
+        adapters=adapters,
+        proxy_client=upstream_client,
+    )
+    await runtime.start(raise_on_degraded=True)
+    client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=create_control_app(runtime)),
+        base_url="http://mnemosyne-control.test",
+    )
+    try:
+        response = await client.get("/manager/engines/lmstudio/models")
+
+        assert response.status_code == 200
+        assert response.json()["models"][0]["key"] == "qwen/qwen3-coder-next"
+        assert response.json()["models"][0]["loaded"] is False
+        assert all(method == "GET" for method, _ in requests)
+        assert all(path == "/api/v1/models" for _, path in requests)
+    finally:
+        await client.aclose()
+        await runtime.stop()
+        await upstream_client.aclose()
+        await lmstudio_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_control_plane_reads_saves_and_applies_structured_configuration(tmp_path) -> None:
+    upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _r: httpx.Response(500))
+    )
+    config = _config(tmp_path)
+    config_path = tmp_path / "config.yaml"
+    save_config(config, config_path)
+    runtime = NativeRuntime(
+        config,
+        config_path=config_path,
         adapters=_adapters(),
         proxy_client=upstream_client,
     )
@@ -520,19 +705,218 @@ async def test_control_plane_validates_unsaved_configuration(tmp_path) -> None:
         base_url="http://mnemosyne-control.test",
     )
     try:
-        valid = await client.post(
-            "/manager/config/validate",
-            json={"config_yaml": "models: []\n"},
-        )
-        assert valid.status_code == 200
-        assert valid.json() == {"valid": True, "model_count": 0}
+        loaded = await client.get("/manager/config")
+        assert loaded.status_code == 200
+        assert loaded.json()["config"]["models"][0]["alias"] == "frontier"
+        assert loaded.json()["restart_required"] is False
+        assert loaded.json()["applied_revision"] == loaded.json()["revision"]
+        revision = loaded.json()["revision"]
 
-        invalid = await client.post(
-            "/manager/config/validate",
-            json={"config_yaml": "models: [\n"},
+        edited = config.model_dump(mode="json")
+        edited["models"].append(
+            {"alias": "second-model", "engine": "lmstudio", "model": "publisher/second"}
+        )
+        saved = await client.put(
+            "/manager/config", json={"config": edited, "revision": revision}
+        )
+        assert saved.status_code == 200, saved.text
+        assert saved.json()["saved"] is True
+        assert saved.json()["applied"] is True
+        assert saved.json()["restart_required"] is False
+        assert saved.json()["model_count"] == 2
+        assert set(runtime.profiles) == {"frontier", "second-model"}
+        assert len(load_config(config_path).models) == 2
+
+        invalid_document = config_path.read_text(encoding="utf-8")
+        stale = await client.put(
+            "/manager/config", json={"config": edited, "revision": revision}
+        )
+        assert stale.status_code == 409
+        assert "settings changed" in stale.text
+        assert config_path.read_text(encoding="utf-8") == invalid_document
+
+        edited["models"][1]["alias"] = "Not Valid"
+        invalid = await client.put(
+            "/manager/config",
+            json={"config": edited, "revision": saved.json()["revision"]},
         )
         assert invalid.status_code == 400
-        assert "configuration editor" in invalid.json()["detail"]
+        assert config_path.read_text(encoding="utf-8") == invalid_document
+    finally:
+        await client.aclose()
+        await runtime.stop()
+        await upstream_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_structured_configuration_flags_restart_only_settings(tmp_path) -> None:
+    upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _r: httpx.Response(500))
+    )
+    config = _config(tmp_path)
+    config_path = tmp_path / "config.yaml"
+    save_config(config, config_path)
+    runtime = NativeRuntime(
+        config,
+        config_path=config_path,
+        adapters=_adapters(),
+        proxy_client=upstream_client,
+    )
+    await runtime.start(raise_on_degraded=True)
+    client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=create_control_app(runtime)),
+        base_url="http://mnemosyne-control.test",
+    )
+    try:
+        edited = config.model_dump(mode="json")
+        edited["server"]["idle_unload_seconds"] = 1200
+        revision = (await client.get("/manager/config")).json()["revision"]
+        saved = await client.put(
+            "/manager/config", json={"config": edited, "revision": revision}
+        )
+
+        assert saved.status_code == 200
+        assert saved.json()["applied"] is False
+        assert saved.json()["restart_required"] is True
+        assert runtime.config.server.idle_unload_seconds is None
+        assert load_config(config_path).server.idle_unload_seconds == 1200
+        pending = await client.get("/manager/config")
+        assert pending.status_code == 200
+        assert pending.json()["restart_required"] is True
+        assert pending.json()["revision"] != pending.json()["applied_revision"]
+    finally:
+        await client.aclose()
+        await runtime.stop()
+        await upstream_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_security_scope_store_does_not_follow_configurable_state_database(
+    tmp_path,
+) -> None:
+    config_path = tmp_path / "settings" / "config.yaml"
+    expected = config_path.parent / "state" / "security-scopes"
+    for name in ("first.db", "moved.db"):
+        config = _config(tmp_path).model_copy(
+            update={
+                "paths": _config(tmp_path).paths.model_copy(
+                    update={"state_database": str(tmp_path / name)}
+                )
+            }
+        )
+        save_config(config, config_path)
+        upstream_client = httpx.AsyncClient(
+            transport=httpx.MockTransport(lambda _r: httpx.Response(500))
+        )
+        runtime = NativeRuntime(
+            config,
+            config_path=config_path,
+            adapters=_adapters(),
+            proxy_client=upstream_client,
+        )
+        try:
+            assert runtime.security_scopes.root == expected
+            await runtime.start(raise_on_degraded=True)
+        finally:
+            await runtime.stop()
+            await upstream_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_each_runtime_start_reactivates_configured_folder_scope(
+    tmp_path,
+) -> None:
+    scope_id = "a" * 64
+    selected = tmp_path / "Models"
+    selected.mkdir()
+    base = _config(tmp_path)
+    payload = base.model_dump(mode="json")
+    payload["storage"] = {
+        "default": "selected",
+        "locations": [
+            {
+                "name": "selected",
+                "path": str(selected),
+                "scope_id": scope_id,
+            }
+        ],
+    }
+    config = MacConfig.model_validate(payload)
+    config_path = tmp_path / "settings" / "config.yaml"
+    save_config(config, config_path)
+    activations: list[tuple[str, str]] = []
+
+    class _RecordingScopeProcess:
+        async def activate(self, value: str, path: str) -> None:
+            activations.append((value, path))
+
+    for _ in range(2):
+        upstream_client = httpx.AsyncClient(
+            transport=httpx.MockTransport(lambda _r: httpx.Response(500))
+        )
+        runtime = NativeRuntime(
+            config,
+            config_path=config_path,
+            adapters=_adapters(),
+            proxy_client=upstream_client,
+            security_scope_process=_RecordingScopeProcess(),  # type: ignore[arg-type]
+        )
+        try:
+            await runtime.start(raise_on_degraded=True)
+        finally:
+            await runtime.stop()
+            await upstream_client.aclose()
+
+    assert activations == [(scope_id, str(selected)), (scope_id, str(selected))]
+
+
+@pytest.mark.asyncio
+async def test_structured_configuration_rejects_unusable_folder_grant_before_write(
+    tmp_path, monkeypatch
+) -> None:
+    upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _r: httpx.Response(500))
+    )
+    config = _config(tmp_path)
+    config_path = tmp_path / "config.yaml"
+    save_config(config, config_path)
+    original = config_path.read_text(encoding="utf-8")
+    runtime = NativeRuntime(
+        config,
+        config_path=config_path,
+        adapters=_adapters(),
+        proxy_client=upstream_client,
+    )
+    await runtime.start(raise_on_degraded=True)
+    client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=create_control_app(runtime)),
+        base_url="http://mnemosyne-control.test",
+    )
+    checked: list[MacConfig] = []
+
+    async def reject_scope(candidate: MacConfig) -> None:
+        checked.append(candidate)
+        raise RuntimeError("selected-folder permission is missing")
+
+    monkeypatch.setattr(runtime, "validate_security_scopes", reject_scope)
+    try:
+        edited = config.model_dump(mode="json")
+        edited["storage"]["locations"][0].update(
+            {
+                "path": str(tmp_path / "Models"),
+                "scope_id": "a" * 64,
+            }
+        )
+        revision = (await client.get("/manager/config")).json()["revision"]
+        response = await client.put(
+            "/manager/config", json={"config": edited, "revision": revision}
+        )
+
+        assert response.status_code == 400
+        assert "selected-folder permission is missing" in response.text
+        assert len(checked) == 1
+        assert checked[0].storage.locations[0].scope_id == "a" * 64
+        assert config_path.read_text(encoding="utf-8") == original
     finally:
         await client.aclose()
         await runtime.stop()

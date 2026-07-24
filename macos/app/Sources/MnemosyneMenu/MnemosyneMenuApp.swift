@@ -15,6 +15,7 @@ struct MnemosyneMenuApp: App {
 
 @MainActor
 final class MenuAppDelegate: NSObject, NSApplicationDelegate {
+    private let settingsOnboardingKey = "didPresentNativeSettingsV1"
     private let workstationName = WorkstationIdentity.current
     private let viewModel = MenuViewModel()
     private let registration = LaunchAgentRegistration()
@@ -26,7 +27,9 @@ final class MenuAppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApplication.shared.setActivationPolicy(.accessory)
-        registration.migrateRenamedBundleIfNeeded()
+        Task {
+            await registration.refreshChangedBundleRegistrationsIfNeeded()
+        }
 
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         guard let button = item.button else {
@@ -68,6 +71,20 @@ final class MenuAppDelegate: NSObject, NSApplicationDelegate {
         popover.contentViewController = controller
 
         NSLog("Unified Inference menu bar status item installed for %@", workstationName)
+        if !UserDefaults.standard.bool(forKey: settingsOnboardingKey) {
+            UserDefaults.standard.set(true, forKey: settingsOnboardingKey)
+            DispatchQueue.main.async { [weak self] in
+                self?.configurationWindowController.show()
+            }
+        }
+    }
+
+    func applicationShouldHandleReopen(
+        _ sender: NSApplication,
+        hasVisibleWindows flag: Bool
+    ) -> Bool {
+        configurationWindowController.show()
+        return true
     }
 
     @objc

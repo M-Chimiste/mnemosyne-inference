@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Stage an ad-hoc-signed Unified Inference.app for local development.
+# Stage a signed Unified Inference.app for local development.
 
 set -euo pipefail
 
@@ -10,6 +10,7 @@ CONFIG="release"
 BARE=0
 PYTHON_EXPORT="${MNEMOSYNE_PYTHON_EXPORT:-$SCRIPT_DIR/_export}"
 SWIFTPM_DISABLE_SANDBOX="${MNEMOSYNE_SWIFTPM_DISABLE_SANDBOX:-0}"
+CODESIGN_IDENTITY="${CODESIGN_IDENTITY:--}"
 
 if [[ "${1:-}" == "debug" || "${1:-}" == "release" ]]; then
     CONFIG="$1"
@@ -59,29 +60,29 @@ APP_DIR="$STAGE_DIR/Unified Inference.app"
 LEGACY_APP_DIR="$STAGE_DIR/Mnemosyne.app"
 CONTENTS="$APP_DIR/Contents"
 RESOURCES="$CONTENTS/Resources"
-HELPER_APP="$CONTENTS/Helpers/MnemosyneService.app"
-HELPER_CONTENTS="$HELPER_APP/Contents"
+SERVICE_BOOTSTRAP="$CONTENTS/MacOS/mnemosyne-service-bootstrap"
 
 rm -rf "$APP_DIR" "$LEGACY_APP_DIR"
 mkdir -p \
     "$CONTENTS/MacOS" \
     "$CONTENTS/Library/LaunchAgents" \
     "$RESOURCES/Service" \
-    "$RESOURCES/ImageWorker" \
-    "$HELPER_CONTENTS/MacOS"
+    "$RESOURCES/ImageWorker"
 
 install -m 644 "$SCRIPT_DIR/Info.plist" "$CONTENTS/Info.plist"
 install -m 755 "$BIN_DIR/MnemosyneMenu" "$CONTENTS/MacOS/UnifiedInference"
-install -m 644 "$SCRIPT_DIR/MnemosyneService-Info.plist" "$HELPER_CONTENTS/Info.plist"
 install -m 755 \
     "$BIN_DIR/mnemosyne-service-bootstrap" \
-    "$HELPER_CONTENTS/MacOS/mnemosyne-service-bootstrap"
+    "$SERVICE_BOOTSTRAP"
 install -m 644 \
     "$SCRIPT_DIR/LaunchAgents/com.mnemosyne.inference.agent.plist" \
     "$CONTENTS/Library/LaunchAgents/com.mnemosyne.inference.agent.plist"
 
 ditto "$REPO_ROOT/macos/service/src" "$RESOURCES/Service"
 ditto "$REPO_ROOT/macos/image-worker/src" "$RESOURCES/ImageWorker"
+install -m 644 \
+    "$REPO_ROOT/macos/image-worker/capabilities.json" \
+    "$RESOURCES/ImageWorker/capabilities.json"
 install -m 644 "$REPO_ROOT/macos/config.yaml.example" "$RESOURCES/config.yaml.example"
 install -m 644 "$REPO_ROOT/macos/.env.example" "$RESOURCES/.env.example"
 
@@ -100,26 +101,37 @@ sign_mach_o_tree() {
     [[ -d "$root" ]] || return 0
     while IFS= read -r -d '' candidate; do
         if file -b "$candidate" | grep -q "Mach-O"; then
-            codesign --force --sign - "$candidate"
+            codesign --force --sign "$CODESIGN_IDENTITY" "$candidate"
         fi
-    done < <(find "$root" -type f -print0)
+    done < <(
+        find "$root" -type f \
+            \( -perm -111 -o -name '*.so' -o -name '*.dylib' \) \
+            -print0
+    )
 }
 
 if [[ "$BARE" -eq 0 ]]; then
     sign_mach_o_tree "$RESOURCES/Python"
 fi
-codesign --force --sign - "$HELPER_CONTENTS/MacOS/mnemosyne-service-bootstrap"
-codesign --force --sign - "$HELPER_APP"
-codesign --force --sign - "$CONTENTS/MacOS/UnifiedInference"
-codesign --force --sign - "$APP_DIR"
+codesign \
+    --force \
+    --identifier com.mnemosyne.inference.service \
+    --sign "$CODESIGN_IDENTITY" \
+    "$SERVICE_BOOTSTRAP"
+codesign --force --sign "$CODESIGN_IDENTITY" "$CONTENTS/MacOS/UnifiedInference"
+codesign --force --sign "$CODESIGN_IDENTITY" "$APP_DIR"
 
 plutil -lint \
     "$CONTENTS/Info.plist" \
-    "$HELPER_CONTENTS/Info.plist" \
     "$CONTENTS/Library/LaunchAgents/com.mnemosyne.inference.agent.plist"
 codesign --verify --deep --strict "$APP_DIR"
 
 echo "Staged $APP_DIR"
+if [[ "$CODESIGN_IDENTITY" == "-" ]]; then
+    echo "Ad-hoc signature: protected-folder permission may need to be selected again after rebuilding."
+else
+    echo "Signed with stable identity: $CODESIGN_IDENTITY"
+fi
 if [[ "$BARE" -eq 1 ]]; then
     echo "Bare build: background service registration will fail until Python is bundled."
 fi

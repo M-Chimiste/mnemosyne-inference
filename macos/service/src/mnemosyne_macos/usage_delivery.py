@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timezone
-import os
 from pathlib import Path
 import time
 from typing import Any, Iterable, Sequence
@@ -15,6 +14,11 @@ except ImportError:  # pragma: no cover - exercised by host environments without
     psycopg = None  # type: ignore[assignment]
 
 from .config import TokenSidecarConfig
+from .sidecar_discovery import (
+    ReportingIdentity,
+    resolve_reporting_dsn,
+    resolve_reporting_identity,
+)
 from .usage import UsageEvent
 from .usage_store import UsageStore
 
@@ -127,18 +131,19 @@ class UsageService:
     ) -> None:
         self.store = store
         self.config = config
-        dsn = os.environ.get("TOKEN_SIDECAR_POSTGRES_DSN", "").strip()
+        self.identity: ReportingIdentity = resolve_reporting_identity(config.node_id)
+        dsn = resolve_reporting_dsn()
         self.last_error: str | None = None
         self.writer = writer
         if self.writer is None and config.enabled and dsn:
             self.writer = PgUsageWriter(
                 dsn=dsn,
-                node_id=config.node_id,
+                node_id=self.identity.node_id,
                 connect_timeout=config.connect_timeout_seconds,
             )
         elif self.writer is None and config.enabled:
             self.last_error = (
-                "TOKEN_SIDECAR_POSTGRES_DSN is not configured; usage remains "
+                "The Postgres usage ledger is not configured; usage remains "
                 "durable in the local outbox"
             )
         self._task: asyncio.Task[None] | None = None
@@ -209,7 +214,8 @@ class UsageService:
         pending = await asyncio.to_thread(self.store.count_outbox)
         return {
             "enabled": self.config.enabled,
-            "node_id": self.config.node_id,
+            "node_id": self.identity.node_id,
+            "node_id_source": self.identity.source,
             "writer_ready": self.writer is not None,
             "outbox_pending": pending,
             "outbox_depth": pending,

@@ -7,6 +7,7 @@ from pathlib import Path
 import signal
 import stat
 import struct
+import sys
 
 import httpx
 import pytest
@@ -39,6 +40,47 @@ def _target():
             ]
         }
     ).profiles()["deepseek-v4-flash"]
+
+
+@pytest.mark.asyncio
+async def test_managed_runtime_overrides_external_ds4_paths(tmp_path: Path) -> None:
+    runtime = tmp_path / "runtimes" / "ds4" / "1.0.0"
+    work = runtime / "checkout"
+    work.mkdir(parents=True)
+    binary = work / "ds4-server"
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    binary.chmod(0o755)
+    (runtime / "runtime.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "engine": "ds4",
+                "version": "1.0.0",
+                "source_revision": "abc",
+                "core_protocol": 1,
+                "entrypoint": {
+                    "binary": "checkout/ds4-server",
+                    "working_directory": "checkout",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "runtimes" / "ds4" / "current.json").write_text(
+        json.dumps({"schema_version": 1, "version": "1.0.0"}),
+        encoding="utf-8",
+    )
+
+    adapter = DS4Adapter(
+        DS4Config(binary="/external/ds4", working_directory="/external"),
+        runtime_root=tmp_path / "runtimes",
+    )
+    try:
+        effective = adapter._effective_config()
+        assert effective.binary == str(binary)
+        assert effective.working_directory == str(work)
+    finally:
+        await adapter.aclose()
 
 
 def test_build_ds4_argv_pins_managed_options() -> None:
@@ -137,6 +179,12 @@ def _config(tmp_path: Path, *, shutdown_grace_seconds: float = 1) -> DS4Config:
     )
 
 
+def _isolated_runtime_root(config: DS4Config) -> Path:
+    """Keep adapter fixtures independent of a developer's activated runtime."""
+
+    return Path(config.working_directory) / "runtimes"
+
+
 def _model_handler(process: FakeProcess, control: FakeProcessControl):
     def handler(_request: httpx.Request) -> httpx.Response:
         if control.started and control.api_ready and process.returncode is None:
@@ -169,6 +217,7 @@ def _adapter(
         identity_probe=control.probe,
         signal_process_group=control.signal_group,
         poll_interval_seconds=0,
+        runtime_root=_isolated_runtime_root(config),
     )
     # Keep these unit tests independent of listeners on the developer host.
     adapter._port_accepting_connections = lambda: False  # type: ignore[method-assign]
@@ -248,6 +297,104 @@ async def test_ds4_never_signals_spawn_without_a_proven_identity(tmp_path) -> No
 
 
 @pytest.mark.asyncio
+async def test_ds4_terminates_scoped_wrapper_that_hangs_before_exec(tmp_path) -> None:
+    config = _config(tmp_path, shutdown_grace_seconds=0.01)
+    process = FakeProcess()
+    control = FakeProcessControl(process)
+    client = httpx.AsyncClient(transport=httpx.MockTransport(_model_handler(process, control)))
+    spawned_argv: tuple[str, ...] | None = None
+
+    async def spawn(*argv, **_kwargs):
+        nonlocal spawned_argv
+        spawned_argv = tuple(argv)
+        control.observe_spawn(Path(sys.executable), spawned_argv)
+        return process
+
+    adapter = DS4Adapter(
+        config,
+        client=client,
+        spawn_process=spawn,
+        identity_probe=control.probe,
+        signal_process_group=control.signal_group,
+        poll_interval_seconds=0,
+        security_scope_root=tmp_path / "security-scopes",
+        runtime_root=_isolated_runtime_root(config),
+    )
+    adapter._port_accepting_connections = lambda: False  # type: ignore[method-assign]
+    target = replace(
+        _target(),
+        scope_id="a" * 64,
+        storage_path="/Volumes/Athena/models",
+    )
+
+    with pytest.raises(AdapterError, match="could not establish"):
+        await adapter.load(target, deadline=Deadline.after(0.03))
+
+    assert spawned_argv is not None
+    assert spawned_argv[:3] == (
+        sys.executable,
+        "-m",
+        "mnemosyne_macos.scope_exec",
+    )
+    assert control.signals == [(process.pid, signal.SIGTERM)]
+    assert process.returncode == 0
+    await adapter.aclose()
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_ds4_never_signals_reused_pid_after_scoped_wrapper_observation(
+    tmp_path,
+) -> None:
+    config = _config(tmp_path)
+    process = FakeProcess()
+    control = FakeProcessControl(process)
+    client = httpx.AsyncClient(transport=httpx.MockTransport(_model_handler(process, control)))
+    probe_count = 0
+
+    async def spawn(*argv, **_kwargs):
+        control.observe_spawn(Path(sys.executable), tuple(argv))
+        return process
+
+    async def reused_after_first_observation(pid: int) -> ProcessIdentity | None:
+        nonlocal probe_count
+        identity = await control.probe(pid)
+        if identity is None:
+            return None
+        probe_count += 1
+        if probe_count == 1:
+            return identity
+        return replace(identity, start_identity="pid-was-reused")
+
+    adapter = DS4Adapter(
+        config,
+        client=client,
+        spawn_process=spawn,
+        identity_probe=reused_after_first_observation,
+        signal_process_group=control.signal_group,
+        poll_interval_seconds=0,
+        security_scope_root=tmp_path / "security-scopes",
+        runtime_root=_isolated_runtime_root(config),
+    )
+    adapter._port_accepting_connections = lambda: False  # type: ignore[method-assign]
+    target = replace(
+        _target(),
+        scope_id="b" * 64,
+        storage_path="/Volumes/Athena/models",
+    )
+
+    with pytest.raises(AdapterError, match="refusing to signal"):
+        await adapter.load(target, deadline=Deadline.after(0.1))
+
+    assert probe_count >= 3
+    assert control.signals == []
+    process.exit(1)
+    control.identity = None
+    await adapter.aclose()
+    await client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_ds4_escalates_process_group_from_term_to_kill(tmp_path) -> None:
     config = _config(tmp_path, shutdown_grace_seconds=0.01)
     process = FakeProcess()
@@ -285,6 +432,7 @@ async def test_ds4_adopts_valid_survivor_after_service_restart(tmp_path) -> None
         identity_probe=control.probe,
         signal_process_group=control.signal_group,
         poll_interval_seconds=0,
+        runtime_root=_isolated_runtime_root(config),
     )
     recovered._port_accepting_connections = lambda: False  # type: ignore[method-assign]
 
@@ -319,6 +467,7 @@ async def test_ds4_can_stop_valid_survivor_when_model_api_is_unready(tmp_path) -
         identity_probe=control.probe,
         signal_process_group=control.signal_group,
         poll_interval_seconds=0,
+        runtime_root=_isolated_runtime_root(config),
     )
     recovered._port_accepting_connections = (  # type: ignore[method-assign]
         lambda: process.returncode is None
@@ -367,6 +516,7 @@ async def test_ds4_never_adopts_or_signals_mismatched_persisted_identity(
         identity_probe=control.probe,
         signal_process_group=control.signal_group,
         poll_interval_seconds=0,
+        runtime_root=_isolated_runtime_root(config),
     )
     recovered._port_accepting_connections = lambda: False  # type: ignore[method-assign]
     snapshot = await recovered.inspect(deadline=Deadline.after(5))
@@ -397,6 +547,7 @@ async def test_ds4_revalidates_identity_immediately_before_signal(tmp_path) -> N
         identity_probe=control.probe,
         signal_process_group=control.signal_group,
         poll_interval_seconds=0,
+        runtime_root=_isolated_runtime_root(config),
     )
     recovered._port_accepting_connections = lambda: False  # type: ignore[method-assign]
     snapshot = await recovered.inspect(deadline=Deadline.after(5))
@@ -426,6 +577,7 @@ async def test_ds4_unknown_listener_is_never_signaled(tmp_path) -> None:
         client=client,
         identity_probe=control.probe,
         signal_process_group=control.signal_group,
+        runtime_root=_isolated_runtime_root(config),
     )
     adapter._port_accepting_connections = lambda: True  # type: ignore[method-assign]
 
@@ -454,6 +606,7 @@ async def test_ds4_removes_dead_survivor_metadata_without_signaling(tmp_path) ->
         client=client,
         identity_probe=control.probe,
         signal_process_group=control.signal_group,
+        runtime_root=_isolated_runtime_root(config),
     )
     recovered._port_accepting_connections = lambda: False  # type: ignore[method-assign]
     snapshot = await recovered.inspect(deadline=Deadline.after(5))

@@ -2,17 +2,29 @@ import Foundation
 
 public struct TokenSidecarSnapshot: Codable, Equatable, Sendable {
     public let enabled: Bool?
+    public let nodeId: String?
+    public let nodeIdSource: String?
     public let outboxDepth: Int?
     public let lastFlushAt: Double?
 
-    public init(enabled: Bool?, outboxDepth: Int?, lastFlushAt: Double?) {
+    public init(
+        enabled: Bool?,
+        nodeId: String?,
+        nodeIdSource: String?,
+        outboxDepth: Int?,
+        lastFlushAt: Double?
+    ) {
         self.enabled = enabled
+        self.nodeId = nodeId
+        self.nodeIdSource = nodeIdSource
         self.outboxDepth = outboxDepth
         self.lastFlushAt = lastFlushAt
     }
 
     enum CodingKeys: String, CodingKey {
         case enabled
+        case nodeId = "node_id"
+        case nodeIdSource = "node_id_source"
         case outboxDepth = "outbox_depth"
         case lastFlushAt = "last_flush_at"
     }

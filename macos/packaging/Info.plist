@@ -26,5 +26,15 @@
     <true/>
     <key>NSHighResolutionCapable</key>
     <true/>
+    <key>NSDocumentsFolderUsageDescription</key>
+    <string>Unified Inference uses model folders you select to discover, download, and run local models.</string>
+    <key>NSDesktopFolderUsageDescription</key>
+    <string>Unified Inference uses Desktop model folders only after you select their exact folder.</string>
+    <key>NSDownloadsFolderUsageDescription</key>
+    <string>Unified Inference uses Downloads model folders only after you select their exact folder.</string>
+    <key>NSNetworkVolumesUsageDescription</key>
+    <string>Unified Inference uses network model folders only after you select them.</string>
+    <key>NSRemovableVolumesUsageDescription</key>
+    <string>Unified Inference uses external model drives only after you select their exact folder.</string>
 </dict>
 </plist>

@@ -7,7 +7,7 @@
 
     <!-- BundleProgram is resolved relative to the containing Unified Inference.app. -->
     <key>BundleProgram</key>
-    <string>Contents/Helpers/MnemosyneService.app/Contents/MacOS/mnemosyne-service-bootstrap</string>
+    <string>Contents/MacOS/mnemosyne-service-bootstrap</string>
     <key>ProgramArguments</key>
     <array>
         <string>mnemosyne-service-bootstrap</string>

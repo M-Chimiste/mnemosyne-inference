@@ -7,6 +7,7 @@ import ipaddress
 import json
 import os
 import re
+import tempfile
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlsplit
@@ -22,9 +23,11 @@ from .models import (
     ResolvedTarget,
     TargetKey,
 )
+from .sidecar_discovery import LEGACY_AUTOMATIC_NODE_IDS
 
 
 _ALIAS_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+_STORAGE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 _APP_SUPPORT = Path.home() / "Library" / "Application Support" / "Mnemosyne"
 
 
@@ -62,7 +65,9 @@ class ServerConfig(BaseModel):
 class LMStudioConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    enabled: bool = True
+    # Kept only as a migration source while existing profiles are moved to
+    # manager-owned llama.cpp or oMLX. Fresh installs do not depend on it.
+    enabled: bool = False
     base_url: str = "http://127.0.0.1:1234"
     api_key_env: str = "LMSTUDIO_API_KEY"
     request_timeout_seconds: float = Field(default=30, gt=0)
@@ -73,6 +78,34 @@ class LMStudioConfig(BaseModel):
         return _validate_loopback_url(value, engine="LM Studio")
 
 
+class LlamaCppConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = True
+    host: str = "127.0.0.1"
+    port: int = Field(default=17325, ge=1024, le=65535)
+    # A managed active runtime overrides this path. The deliberately missing
+    # fallback prevents a fresh install from silently depending on Homebrew.
+    binary: str = str(
+        _APP_SUPPORT / "runtimes" / "llama.cpp" / "not-installed" / "llama-server"
+    )
+    working_directory: str = str(_APP_SUPPORT)
+    process_state_path: str = str(_APP_SUPPORT / "state" / "llama-cpp-process.json")
+    request_timeout_seconds: float = Field(default=30, gt=0)
+    shutdown_grace_seconds: float = Field(default=30, gt=0)
+
+    @field_validator("host")
+    @classmethod
+    def _loopback_only(cls, value: str) -> str:
+        try:
+            if not ipaddress.ip_address(value).is_loopback:
+                raise ValueError("llama.cpp must bind to a loopback address")
+        except ValueError as exc:
+            if value != "localhost":
+                raise ValueError("llama.cpp host must be a loopback address") from exc
+        return value
+
+
 class OMLXConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -81,11 +114,24 @@ class OMLXConfig(BaseModel):
     api_key_env: str = "OMLX_API_KEY"
     admin_session_env: str = "OMLX_ADMIN_SESSION"
     request_timeout_seconds: float = Field(default=30, gt=0)
+    model_directories: list[str] = Field(default_factory=list)
 
     @field_validator("base_url")
     @classmethod
     def _loopback_only(cls, value: str) -> str:
         return _validate_loopback_url(value, engine="oMLX")
+
+    @field_validator("model_directories")
+    @classmethod
+    def _model_directories_are_unique(cls, value: list[str]) -> list[str]:
+        normalized = [
+            str(Path(item).expanduser().resolve(strict=False)) for item in value
+        ]
+        if any(not item.strip() for item in value):
+            raise ValueError("oMLX model directories must not be empty")
+        if len(normalized) != len(set(normalized)):
+            raise ValueError("oMLX model directories must be unique")
+        return normalized
 
 
 class DS4Config(BaseModel):
@@ -140,6 +186,7 @@ class EnginesConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     lmstudio: LMStudioConfig = Field(default_factory=LMStudioConfig)
+    llama_cpp: LlamaCppConfig = Field(default_factory=LlamaCppConfig)
     omlx: OMLXConfig = Field(default_factory=OMLXConfig)
     ds4: DS4Config = Field(default_factory=DS4Config)
     mflux: MFluxConfig = Field(default_factory=MFluxConfig)
@@ -153,6 +200,12 @@ class ModelLoadConfig(BaseModel):
     flash_attention: bool | None = None
     num_experts: int | None = Field(default=None, gt=0)
     offload_kv_cache_to_gpu: bool | None = None
+    projector_path: str | None = None
+    gpu_layers: int | None = Field(default=None, ge=0)
+    ubatch_size: int | None = Field(default=None, gt=0)
+    threads: int | None = Field(default=None, gt=0)
+    parallel: int | None = Field(default=None, gt=0)
+    pooling: Literal["none", "mean", "cls", "last", "rank"] | None = None
     kv_disk_directory: str | None = None
     kv_disk_space_mb: int | None = Field(default=None, gt=0)
     extra_args: list[str] = Field(default_factory=list)
@@ -161,12 +214,21 @@ class ModelLoadConfig(BaseModel):
 class ImageProfileConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    family: Literal["qwen-image", "krea-2"]
+    family: str = Field(min_length=1, max_length=80)
     quantize: Literal[3, 4, 5, 6, 8] | None = 8
     width: int = Field(default=1024, ge=64, le=4096, multiple_of=16)
     height: int = Field(default=1024, ge=64, le=4096, multiple_of=16)
     num_inference_steps: int = Field(default=30, ge=1, le=200)
     guidance_scale: float = Field(default=4.0, ge=0, le=50)
+
+    @field_validator("family")
+    @classmethod
+    def _valid_family(cls, value: str) -> str:
+        if not _ALIAS_RE.fullmatch(value):
+            raise ValueError(
+                "image family must contain lowercase letters, digits, and hyphens"
+            )
+        return value
 
 
 class ModelProfile(BaseModel):
@@ -175,6 +237,7 @@ class ModelProfile(BaseModel):
     alias: str
     engine: EngineName
     model: str
+    storage: str | None = None
     served_model_name: str | None = None
     capabilities: set[Endpoint] | None = None
     load: ModelLoadConfig = Field(default_factory=ModelLoadConfig)
@@ -223,9 +286,12 @@ class ModelProfile(BaseModel):
         if self.engine != EngineName.DS4 and (
             self.load.kv_disk_directory is not None
             or self.load.kv_disk_space_mb is not None
-            or self.load.extra_args
         ):
-            raise ValueError("DS4 KV and extra_args settings require engine='ds4'")
+            raise ValueError("KV disk settings require engine='ds4'")
+        if self.engine not in {EngineName.DS4, EngineName.LLAMA_CPP} and self.load.extra_args:
+            raise ValueError(
+                "extra_args settings require engine='ds4' or 'llama.cpp'"
+            )
         if self.engine == EngineName.OMLX and any(
             value is not None
             for value in (
@@ -234,6 +300,12 @@ class ModelProfile(BaseModel):
                 self.load.flash_attention,
                 self.load.num_experts,
                 self.load.offload_kv_cache_to_gpu,
+                self.load.projector_path,
+                self.load.gpu_layers,
+                self.load.ubatch_size,
+                self.load.threads,
+                self.load.parallel,
+                self.load.pooling,
             )
         ):
             raise ValueError("oMLX load settings belong in oMLX per-model settings")
@@ -244,14 +316,59 @@ class ModelProfile(BaseModel):
                 self.load.flash_attention,
                 self.load.num_experts,
                 self.load.offload_kv_cache_to_gpu,
+                self.load.projector_path,
+                self.load.gpu_layers,
+                self.load.ubatch_size,
+                self.load.threads,
+                self.load.parallel,
+                self.load.pooling,
             )
         ):
-            raise ValueError("LM Studio load settings are not supported by DS4")
+            raise ValueError("llama.cpp/LM Studio load settings are not supported by DS4")
+        if self.engine == EngineName.LMSTUDIO and any(
+            value is not None
+            for value in (
+                self.load.projector_path,
+                self.load.gpu_layers,
+                self.load.ubatch_size,
+                self.load.threads,
+                self.load.parallel,
+                self.load.pooling,
+            )
+        ):
+            raise ValueError("llama.cpp load settings require engine='llama.cpp'")
+        if self.engine == EngineName.LLAMA_CPP:
+            if self.load.num_experts is not None:
+                raise ValueError("num_experts is an LM Studio-only load setting")
+            capabilities = self.capabilities or set(DEFAULT_CAPABILITIES[EngineName.LLAMA_CPP])
+            generation = capabilities & {
+                Endpoint.CHAT_COMPLETIONS,
+                Endpoint.COMPLETIONS,
+                Endpoint.RESPONSES,
+                Endpoint.MESSAGES,
+            }
+            specialized = capabilities & {Endpoint.EMBEDDINGS, Endpoint.RERANK}
+            if generation and specialized:
+                raise ValueError(
+                    "llama.cpp generation profiles cannot also advertise embeddings or rerank"
+                )
+            if Endpoint.RERANK in capabilities and capabilities != {Endpoint.RERANK}:
+                raise ValueError("llama.cpp rerank profiles must use only the rerank capability")
+            if self.load.projector_path is not None and not generation:
+                raise ValueError(
+                    "llama.cpp projectors require a generation-capable profile"
+                )
         if self.capabilities is not None and not self.capabilities:
             raise ValueError("capabilities must contain at least one endpoint")
         return self
 
-    def resolve(self) -> ResolvedTarget:
+    def resolve(
+        self,
+        *,
+        storage_path: str | None = None,
+        scope_id: str | None = None,
+        storage_volume_uuid: str | None = None,
+    ) -> ResolvedTarget:
         if self.engine == EngineName.MFLUX:
             assert self.image is not None
             load_options = {
@@ -267,11 +384,17 @@ class ModelProfile(BaseModel):
         else:
             load_options = self.load.model_dump(exclude_none=True, exclude_defaults=True)
             image_defaults = {}
-        canonical = str(Path(self.model).expanduser()) if self.engine == EngineName.DS4 else self.model
+        canonical = (
+            os.path.abspath(os.path.expanduser(self.model))
+            if self.engine in {EngineName.DS4, EngineName.LLAMA_CPP}
+            else self.model
+        )
         payload = json.dumps(load_options, sort_keys=True, separators=(",", ":"))
         digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
         wire_model = self.served_model_name or (
-            self.alias if self.engine in {EngineName.DS4, EngineName.MFLUX} else self.model
+            self.alias
+            if self.engine in {EngineName.DS4, EngineName.LLAMA_CPP, EngineName.MFLUX}
+            else self.model
         )
         capabilities = (
             frozenset(self.capabilities)
@@ -290,24 +413,30 @@ class ModelProfile(BaseModel):
             load_options=load_options,
             kind=self.kind,
             image_defaults=image_defaults,
+            storage_path=storage_path,
+            scope_id=scope_id,
+            storage_volume_uuid=storage_volume_uuid,
         )
 
 
 class TokenSidecarConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    enabled: bool = False
-    node_id: str = ""
+    enabled: bool = True
+    # Empty means: migrate node.id from the previous local token sidecar,
+    # falling back to the normalized Mac hostname. ``mnemosyne-mac`` remains
+    # an automatic sentinel so older generated configs migrate safely.
+    node_id: str = Field(default="", max_length=128)
     flush_interval_seconds: int = Field(default=30, ge=1)
     batch_size: int = Field(default=500, ge=1)
     max_outbox_rows: int = Field(default=100_000, ge=1)
     connect_timeout_seconds: float = Field(default=5, gt=0)
 
-    @model_validator(mode="after")
-    def _node_required(self) -> "TokenSidecarConfig":
-        if self.enabled and not self.node_id.strip():
-            raise ValueError("token_sidecar.node_id is required when enabled")
-        return self
+    @field_validator("node_id")
+    @classmethod
+    def _clean_node_id(cls, value: str) -> str:
+        cleaned = value.strip()
+        return "" if cleaned.casefold() in LEGACY_AUTOMATIC_NODE_IDS else cleaned
 
 
 class PathsConfig(BaseModel):
@@ -317,12 +446,91 @@ class PathsConfig(BaseModel):
     log_directory: str = str(_APP_SUPPORT / "logs")
 
 
+class StorageLocationConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    path: str
+    volume_uuid: str | None = None
+    # Opaque SHA-256 identifier for bookmark bytes stored in the private state
+    # directory. Never place the transferable bookmark itself in YAML.
+    scope_id: str | None = None
+
+    @field_validator("name")
+    @classmethod
+    def _valid_name(cls, value: str) -> str:
+        if not _STORAGE_NAME_RE.fullmatch(value):
+            raise ValueError(
+                "storage location name must contain lowercase letters, digits, "
+                "and hyphens and start with alphanumeric"
+            )
+        return value
+
+    @field_validator("path")
+    @classmethod
+    def _path_required(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("storage location path must not be empty")
+        return value
+
+    @field_validator("volume_uuid")
+    @classmethod
+    def _volume_uuid_not_empty(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
+            return None
+        return value
+
+    @field_validator("scope_id")
+    @classmethod
+    def _valid_scope_id(cls, value: str | None) -> str | None:
+        if value is None or not value.strip():
+            return None
+        normalized = value.casefold()
+        if not re.fullmatch(r"[0-9a-f]{64}", normalized):
+            raise ValueError("storage scope_id must be a SHA-256 identifier")
+        return normalized
+
+
+def _default_storage_locations() -> list[StorageLocationConfig]:
+    return [
+        StorageLocationConfig(
+            name="internal",
+            path=str(_APP_SUPPORT / "models"),
+        )
+    ]
+
+
+class StorageConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    default: str = "internal"
+    locations: list[StorageLocationConfig] = Field(
+        default_factory=_default_storage_locations
+    )
+
+    @model_validator(mode="after")
+    def _validate_locations(self) -> "StorageConfig":
+        if not self.locations:
+            raise ValueError("storage.locations must contain at least one location")
+        names = [location.name for location in self.locations]
+        duplicates = sorted({name for name in names if names.count(name) > 1})
+        if duplicates:
+            raise ValueError(f"duplicate storage location names: {duplicates}")
+        if self.default not in names:
+            raise ValueError(
+                f"storage.default '{self.default}' is not a declared location"
+            )
+        return self
+
+
 class MacConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    schema_version: Literal[1] = 1
     server: ServerConfig = Field(default_factory=ServerConfig)
     engines: EnginesConfig = Field(default_factory=EnginesConfig)
     paths: PathsConfig = Field(default_factory=PathsConfig)
+    storage: StorageConfig = Field(default_factory=StorageConfig)
     models: list[ModelProfile] = Field(default_factory=list)
     token_sidecar: TokenSidecarConfig = Field(default_factory=TokenSidecarConfig)
 
@@ -335,6 +543,7 @@ class MacConfig(BaseModel):
 
         enabled_engines = {
             EngineName.LMSTUDIO: self.engines.lmstudio.enabled,
+            EngineName.LLAMA_CPP: self.engines.llama_cpp.enabled,
             EngineName.OMLX: self.engines.omlx.enabled,
             EngineName.DS4: self.engines.ds4.enabled,
             EngineName.MFLUX: self.engines.mflux.enabled,
@@ -348,6 +557,18 @@ class MacConfig(BaseModel):
             raise ValueError(
                 "enabled model profiles reference disabled engines: "
                 f"{disabled_references}"
+            )
+
+        storage_names = {location.name for location in self.storage.locations}
+        invalid_storage = sorted(
+            profile.alias
+            for profile in self.models
+            if profile.storage is not None and profile.storage not in storage_names
+        )
+        if invalid_storage:
+            raise ValueError(
+                "model profiles reference unknown storage locations: "
+                f"{invalid_storage}"
             )
 
         for profile in self.models:
@@ -367,6 +588,8 @@ class MacConfig(BaseModel):
         }
         if self.engines.lmstudio.enabled:
             ports["lmstudio"] = _url_port(self.engines.lmstudio.base_url)
+        if self.engines.llama_cpp.enabled:
+            ports["llama.cpp"] = self.engines.llama_cpp.port
         if self.engines.omlx.enabled:
             ports["omlx"] = _url_port(self.engines.omlx.base_url)
         if self.engines.ds4.enabled:
@@ -382,7 +605,20 @@ class MacConfig(BaseModel):
         return self
 
     def profiles(self) -> dict[str, ResolvedTarget]:
-        return {profile.alias: profile.resolve() for profile in self.models if profile.enabled}
+        locations = {location.name: location for location in self.storage.locations}
+        profiles: dict[str, ResolvedTarget] = {}
+        for profile in self.models:
+            if not profile.enabled:
+                continue
+            location = locations.get(profile.storage) if profile.storage else None
+            profiles[profile.alias] = profile.resolve(
+                storage_path=location.path if location is not None else None,
+                scope_id=location.scope_id if location is not None else None,
+                storage_volume_uuid=(
+                    location.volume_uuid if location is not None else None
+                ),
+            )
+        return profiles
 
 
 def _url_port(url: str) -> int:
@@ -450,3 +686,35 @@ def parse_config(contents: str, *, source: str = "configuration") -> MacConfig:
         return MacConfig.model_validate(raw)
     except Exception as exc:
         raise ConfigError(f"invalid config {source}: {exc}") from exc
+
+
+def save_config(config: MacConfig, path: str | Path) -> None:
+    """Atomically persist a validated configuration with private permissions."""
+
+    config_path = Path(path).expanduser()
+    config_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    contents = yaml.safe_dump(
+        config.model_dump(mode="json"),
+        allow_unicode=True,
+        sort_keys=False,
+    )
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{config_path.name}.",
+        suffix=".tmp",
+        dir=config_path.parent,
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            descriptor = -1
+            handle.write(contents)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, config_path)
+        os.chmod(config_path, 0o600)
+    except Exception:
+        if descriptor >= 0:
+            os.close(descriptor)
+        temporary_path.unlink(missing_ok=True)
+        raise

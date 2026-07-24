@@ -15,6 +15,8 @@ import httpx
 from .base import AdapterError, Deadline, EngineAdapter
 from .http import _is_connection_refused
 from ..config import MFluxConfig
+from ..runtime_updates import resolve_active_runtime
+from ..scoped_process import wrap_scoped_argv
 from ..models import (
     Endpoint,
     EngineName,
@@ -52,6 +54,8 @@ class MFluxAdapter(EngineAdapter):
         client: httpx.AsyncClient | None = None,
         spawn_process: SpawnProcess = _spawn,
         poll_interval_seconds: float = 0.2,
+        runtime_root: str | Path | None = None,
+        security_scope_root: str | Path | None = None,
     ) -> None:
         self.config = config
         self.base_url = f"http://{config.host}:{config.port}"
@@ -59,11 +63,23 @@ class MFluxAdapter(EngineAdapter):
         self._owns_client = client is None
         self._spawn_process = spawn_process
         self._poll_interval_seconds = poll_interval_seconds
+        self._runtime_root = runtime_root
+        self._security_scope_root = security_scope_root
         self._process: ProcessLike | None = None
+
+    def _managed_runtime(self):
+        # Managed PyPI packages and worker code may layer over either the
+        # configured interpreter or the bundled image interpreter. An explicit
+        # Python path chooses the interpreter; it must not bypass an activated
+        # dependency update.
+        return resolve_active_runtime("mflux", root=self._runtime_root)
 
     def _python(self) -> str:
         if self.config.python:
             return str(Path(self.config.python).expanduser())
+        managed = self._managed_runtime()
+        if managed is not None and "python" in managed.entrypoint:
+            return str(managed.path("python"))
         configured = os.environ.get(self.config.python_env, "").strip()
         return configured or sys.executable
 
@@ -75,9 +91,18 @@ class MFluxAdapter(EngineAdapter):
         # finding its own stdlib extensions and dependencies.
         env.pop("PYTHONHOME", None)
         env.pop("PYTHONPATH", None)
-        source = os.environ.get(self.config.source_path_env, "").strip()
-        if source:
-            env["PYTHONPATH"] = source
+        managed = self._managed_runtime()
+        paths: list[str] = []
+        if managed is not None:
+            if "site_packages" in managed.entrypoint:
+                paths.append(str(managed.path("site_packages")))
+            paths.append(str(managed.path("worker_path")))
+        else:
+            source = os.environ.get(self.config.source_path_env, "").strip()
+            if source:
+                paths.append(source)
+        if paths:
+            env["PYTHONPATH"] = os.pathsep.join(paths)
         return env
 
     async def _status(self, *, deadline: Deadline) -> dict[str, Any]:
@@ -210,10 +235,28 @@ class MFluxAdapter(EngineAdapter):
             "--parent-pid",
             str(os.getpid()),
         ]
+        environment = self._environment()
+        service_source = str(Path(__file__).resolve().parents[2])
+        spawn_argv = wrap_scoped_argv(
+            argv,
+            scope_root=self._security_scope_root,
+            scope_id=target.scope_id,
+            scope_path=target.storage_path,
+            # Consume the service-owned bookmark with the service Python. The
+            # wrapper then execs the dependency-isolated image interpreter.
+            remove_pythonpath=(service_source,),
+        )
+        if spawn_argv != argv:
+            existing_pythonpath = environment.get("PYTHONPATH", "")
+            environment["PYTHONPATH"] = os.pathsep.join(
+                value
+                for value in (service_source, existing_pythonpath)
+                if value
+            )
         try:
             self._process = await self._spawn_process(
-                *argv,
-                env=self._environment(),
+                *spawn_argv,
+                env=environment,
                 stdin=asyncio.subprocess.DEVNULL,
                 start_new_session=True,
             )

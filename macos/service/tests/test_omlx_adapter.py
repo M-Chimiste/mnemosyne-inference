@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+from pathlib import Path
+from unittest.mock import AsyncMock
+
 import httpx
 import pytest
 
 from mnemosyne_macos.config import MacConfig, OMLXConfig
+from mnemosyne_macos.coordinator import CoordinatorState, ResidencyCoordinator
 from mnemosyne_macos.engines.base import AdapterError, Deadline
 from mnemosyne_macos.engines.omlx import OMLXAdapter
-from mnemosyne_macos.models import ServiceState
+from mnemosyne_macos.models import EngineName, ServiceState
+from mnemosyne_macos.runtime import NativeRuntime
 
 
 def _target():
@@ -60,6 +65,261 @@ async def test_omlx_load_unload_and_encoded_model_id() -> None:
     assert b"mlx-community%2FGLM" in mutation_paths[0]
     assert b"mlx-community%2FGLM" in mutation_paths[1]
     await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_omlx_registers_nested_library_root_and_rescans() -> None:
+    requests: list[tuple[str, str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = request.read()
+        requests.append((request.method, request.url.path, body))
+        if (
+            request.method == "GET"
+            and request.url.path == "/admin/api/global-settings"
+        ):
+            return httpx.Response(
+                200,
+                json={
+                    "model": {
+                        "model_dirs": ["/Users/c/.omlx/models"],
+                        "effective_model_dirs": ["/Users/c/.omlx/models"],
+                    }
+                },
+            )
+        if request.method == "GET" and request.url.path == "/admin/api/models":
+            return httpx.Response(200, json={"models": []})
+        return httpx.Response(200, json={"status": "ok"})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    adapter = OMLXAdapter(OMLXConfig(), client=client)
+    await adapter.register_model_directories(
+        ["/Volumes/Athena/models/omlx"], deadline=Deadline.after(1)
+    )
+
+    assert requests[1][1] == "/admin/api/global-settings"
+    assert b'"/Volumes/Athena/models/omlx"' in requests[1][2]
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_omlx_rescan_unloads_preloaded_pinned_models_before_returning() -> None:
+    directory = "/Volumes/Athena/models/omlx"
+    loaded: set[str] = set()
+    mutation_paths: list[bytes] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if (
+            request.method == "GET"
+            and request.url.path == "/admin/api/global-settings"
+        ):
+            return httpx.Response(
+                200,
+                json={
+                    "model": {
+                        "model_dirs": [directory],
+                        "effective_model_dirs": [directory],
+                    }
+                },
+            )
+        if request.method == "POST" and request.url.path == "/admin/api/reload":
+            # Official oMLX reload semantics synchronously preload pinned
+            # models after rediscovery.
+            loaded.update({"owner/pinned-a", "owner/pinned-b"})
+            mutation_paths.append(request.url.raw_path)
+            return httpx.Response(200, json={"status": "ok"})
+        if request.method == "GET" and request.url.path == "/admin/api/models":
+            return httpx.Response(
+                200,
+                json={
+                    "models": [
+                        {
+                            "id": model_id,
+                            "loaded": model_id in loaded,
+                            "is_loading": False,
+                        }
+                        for model_id in ("owner/pinned-a", "owner/pinned-b")
+                    ]
+                },
+            )
+        if request.method == "POST" and request.url.path.endswith("/unload"):
+            mutation_paths.append(request.url.raw_path)
+            raw_path = request.url.raw_path
+            model_id = (
+                "owner/pinned-a"
+                if b"owner%2Fpinned-a" in raw_path
+                else "owner/pinned-b"
+            )
+            loaded.discard(model_id)
+            return httpx.Response(
+                200,
+                json={"status": "ok", "model_id": model_id},
+            )
+        return httpx.Response(404)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    adapter = OMLXAdapter(OMLXConfig(), client=client)
+    coordinator = ResidencyCoordinator(
+        {EngineName.OMLX: adapter},
+        queue_timeout_seconds=1,
+        transition_timeout_seconds=1,
+        cleanup_timeout_seconds=1,
+    )
+    await coordinator.initialize()
+
+    async def rescan(deadline: Deadline) -> None:
+        await adapter.register_model_directories([directory], deadline=deadline)
+
+    await coordinator.run_empty_maintenance(
+        rescan,
+        name="oMLX model-library rescan",
+    )
+
+    assert mutation_paths[0] == b"/admin/api/reload"
+    assert set(mutation_paths[1:]) == {
+        b"/admin/api/models/owner%2Fpinned-a/unload",
+        b"/admin/api/models/owner%2Fpinned-b/unload",
+    }
+    assert loaded == set()
+    assert (await adapter.inspect(deadline=Deadline.after(1))).empty is True
+    assert (await coordinator.status()).state == CoordinatorState.IDLE
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_omlx_rescan_fails_closed_when_pinned_model_cannot_be_unloaded() -> None:
+    directory = "/Volumes/Athena/models/omlx"
+    loaded = False
+    unload_attempted = False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal loaded, unload_attempted
+        if (
+            request.method == "GET"
+            and request.url.path == "/admin/api/global-settings"
+        ):
+            return httpx.Response(
+                200,
+                json={
+                    "model": {
+                        "model_dirs": [directory],
+                        "effective_model_dirs": [directory],
+                    }
+                },
+            )
+        if request.method == "POST" and request.url.path == "/admin/api/reload":
+            loaded = True
+            return httpx.Response(200, json={"status": "ok"})
+        if request.method == "GET" and request.url.path == "/admin/api/models":
+            return httpx.Response(
+                200,
+                json={
+                    "models": [
+                        {
+                            "id": "owner/pinned",
+                            "loaded": loaded,
+                            "is_loading": False,
+                        }
+                    ]
+                },
+            )
+        if request.method == "POST" and request.url.path.endswith("/unload"):
+            unload_attempted = True
+            return httpx.Response(401, json={"detail": "admin required"})
+        return httpx.Response(404)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    adapter = OMLXAdapter(OMLXConfig(), client=client)
+    coordinator = ResidencyCoordinator(
+        {EngineName.OMLX: adapter},
+        queue_timeout_seconds=1,
+        transition_timeout_seconds=1,
+        cleanup_timeout_seconds=1,
+    )
+    await coordinator.initialize()
+
+    async def rescan(deadline: Deadline) -> None:
+        await adapter.register_model_directories([directory], deadline=deadline)
+
+    with pytest.raises(
+        AdapterError,
+        match="could not authoritatively restore empty residency",
+    ):
+        await coordinator.run_empty_maintenance(
+            rescan,
+            name="oMLX model-library rescan",
+        )
+
+    assert unload_attempted is True
+    assert loaded is True
+    status = await coordinator.status()
+    assert status.state == CoordinatorState.DEGRADED
+    assert "could not authoritatively restore empty residency" in (
+        status.diagnostic or ""
+    )
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_failed_model_directory_sync_stays_pending_and_retries_after_reconcile(
+    tmp_path: Path,
+) -> None:
+    class Coordinator:
+        def __init__(self) -> None:
+            self.events: list[str] = []
+
+        async def run_empty_maintenance(self, operation, *, name: str) -> None:
+            self.events.append(f"maintenance:{name}")
+            await operation(Deadline.after(1))
+
+        async def reconcile(self) -> bool:
+            self.events.append("reconcile")
+            return True
+
+        async def audit(self) -> bool:
+            self.events.append("audit")
+            return True
+
+    config = MacConfig.model_validate(
+        {
+            "engines": {
+                "llama_cpp": {"enabled": False},
+                "omlx": {"enabled": True},
+                "ds4": {"enabled": False},
+            },
+            "paths": {"state_database": str(tmp_path / "state.db")},
+            "storage": {
+                "default": "models",
+                "locations": [{"name": "models", "path": str(tmp_path / "models")}],
+            },
+        }
+    )
+    Path(config.storage.locations[0].path).mkdir()
+    adapter = OMLXAdapter(OMLXConfig())
+    register = AsyncMock(side_effect=[RuntimeError("oMLX is starting"), None])
+    adapter.register_model_directories = register  # type: ignore[method-assign]
+    runtime = object.__new__(NativeRuntime)
+    runtime.config = config
+    runtime.adapters = {EngineName.OMLX: adapter}
+    runtime.coordinator = Coordinator()
+    runtime._omlx_directory_sync_pending = False
+    runtime.startup_error = "oMLX is starting"
+
+    with pytest.raises(RuntimeError, match="starting"):
+        await runtime._sync_omlx_model_directories()
+
+    assert runtime._omlx_directory_sync_pending is True
+    await runtime._reconcile_maintenance()
+
+    assert runtime.coordinator.events == [
+        "maintenance:oMLX model-library rescan",
+        "reconcile",
+        "maintenance:oMLX model-library rescan",
+    ]
+    assert register.await_count == 2
+    assert runtime._omlx_directory_sync_pending is False
+    assert runtime.startup_error is None
+    await adapter.aclose()
 
 
 @pytest.mark.asyncio
