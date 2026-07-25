@@ -108,8 +108,9 @@ carried by this write-only DSN:
 postgresql://user:password@host:5432/database
 ```
 
-The saved value is never displayed again. Save the settings and restart the
-background service before testing delivery.
+The saved value is never displayed again. Leaving the secure field blank keeps
+the current connection; only the explicit **Clear** action removes it. Save the
+settings and restart the background service before testing a replacement.
 
 Model weights are separate from engine runtimes. Install or import weights
 through **Settings → Model Library** after preparing the corresponding engine.
