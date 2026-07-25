@@ -516,9 +516,10 @@ Theseus, Metis, Athena, and other machines aligned during the transition.
 Set or replace the secret DSN through **Settings → Usage → Postgres
 connection**. The field is write-only: the app stores it in Unified
 Inference's private mode-`0600` `.env`, reports only whether it is configured,
-and requires a service restart to apply a replacement. Existing installations
-inherit and persist it from the previous sidecar's LaunchAgent during
-migration. The equivalent private-file form is:
+leaves it unchanged when the editor is blank, and requires an explicit
+**Clear** action to remove it. A service restart applies a replacement.
+Existing installations inherit and persist it from the previous sidecar's
+LaunchAgent during migration. The equivalent private-file form is:
 
 ```dotenv
 TOKEN_SIDECAR_POSTGRES_DSN=postgresql://writer:password@server/token_sidecar
