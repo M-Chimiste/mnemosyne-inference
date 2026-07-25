@@ -97,12 +97,22 @@ if [[ "$BARE" -eq 0 ]]; then
     ditto "$PYTHON_EXPORT" "$RESOURCES/Python"
 fi
 
+CODESIGN_ARGS=(--force --sign "$CODESIGN_IDENTITY")
+if [[ "$CODESIGN_IDENTITY" != "-" ]]; then
+    CODESIGN_ARGS=(
+        --force
+        --options runtime
+        --timestamp
+        --sign "$CODESIGN_IDENTITY"
+    )
+fi
+
 sign_mach_o_tree() {
     local root="$1"
     [[ -d "$root" ]] || return 0
     while IFS= read -r -d '' candidate; do
         if file -b "$candidate" | grep -q "Mach-O"; then
-            codesign --force --sign "$CODESIGN_IDENTITY" "$candidate"
+            codesign "${CODESIGN_ARGS[@]}" "$candidate"
         fi
     done < <(
         find "$root" -type f \
@@ -115,12 +125,11 @@ if [[ "$BARE" -eq 0 ]]; then
     sign_mach_o_tree "$RESOURCES/Python"
 fi
 codesign \
-    --force \
+    "${CODESIGN_ARGS[@]}" \
     --identifier com.mnemosyne.inference.service \
-    --sign "$CODESIGN_IDENTITY" \
     "$SERVICE_BOOTSTRAP"
-codesign --force --sign "$CODESIGN_IDENTITY" "$CONTENTS/MacOS/UnifiedInference"
-codesign --force --sign "$CODESIGN_IDENTITY" "$APP_DIR"
+codesign "${CODESIGN_ARGS[@]}" "$CONTENTS/MacOS/UnifiedInference"
+codesign "${CODESIGN_ARGS[@]}" "$APP_DIR"
 
 plutil -lint \
     "$CONTENTS/Info.plist" \
@@ -131,7 +140,7 @@ echo "Staged $APP_DIR"
 if [[ "$CODESIGN_IDENTITY" == "-" ]]; then
     echo "Ad-hoc signature: protected-folder permission may need to be selected again after rebuilding."
 else
-    echo "Signed with stable identity: $CODESIGN_IDENTITY"
+    echo "Hardened and timestamped with stable identity: $CODESIGN_IDENTITY"
 fi
 if [[ "$BARE" -eq 1 ]]; then
     echo "Bare build: background service registration will fail until Python is bundled."

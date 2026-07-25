@@ -128,10 +128,51 @@ CODESIGN_IDENTITY="Apple Development: Example Name (TEAMID)" \
 ```
 
 The script uses that identity for nested Mach-O files, the direct helper, and
-the outer app, then performs a deep strict verification. If a target Mac has no
-valid code-signing identity, its local build remains ad hoc. Rebuilding an
-ad-hoc app changes its code identity and macOS may require each protected model
-folder to be selected again.
+the outer app, applies hardened runtime and secure timestamps, then performs a
+deep strict verification. If a target Mac has no valid code-signing identity,
+its local build remains ad hoc. Rebuilding an ad-hoc app changes its code
+identity and macOS may require each protected model folder to be selected
+again.
+
+## Building a disk image
+
+After staging the app, create the installable disk image with:
+
+```bash
+CODESIGN_IDENTITY="Developer ID Application: Example Name (TEAMID)" \
+  macos/packaging/build_dmg.sh
+```
+
+The default output is
+`macos/app/build/Distribution/Unified-Inference-<version>-macos-<architecture>.dmg`.
+The disk image contains the signed app and an Applications shortcut for the
+usual drag-to-install workflow. The builder validates the source app, creates
+and optionally signs the compressed image, verifies it with `hdiutil`, mounts
+it read-only, and revalidates the app and shortcut before replacing the final
+artifact.
+
+Notarization credentials stay in the login Keychain, not the repository. Set
+up a profile once; leaving out `--password` makes `notarytool` prompt securely
+for an Apple app-specific password:
+
+```bash
+xcrun notarytool store-credentials unified-inference-notary \
+  --apple-id "developer@example.com" \
+  --team-id "TEAMID"
+```
+
+Then create, submit, wait for Apple, staple the approval ticket, and validate
+the result in one command:
+
+```bash
+CODESIGN_IDENTITY="Developer ID Application: Example Name (TEAMID)" \
+NOTARYTOOL_PROFILE="unified-inference-notary" \
+  macos/packaging/build_dmg.sh
+```
+
+An App Store Connect API-key-backed profile works as well. Use `--app`,
+`--output`, or `--volume-name` to override the artifact defaults, and
+`--notary-profile` instead of the environment variable when desired.
 
 For fast UI-only work, `build_app.sh debug --bare` omits Python. Do not enable
 its background service: the bootstrap intentionally exits with a clear error

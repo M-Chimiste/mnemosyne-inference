@@ -12,6 +12,7 @@ AGENT_PLIST = (
     / "com.mnemosyne.inference.agent.plist"
 )
 BUILD_SCRIPT = PACKAGING_ROOT / "build_app.sh"
+DMG_BUILD_SCRIPT = PACKAGING_ROOT / "build_dmg.sh"
 INFO_PLIST = PACKAGING_ROOT / "Info.plist"
 APP_ICON = PACKAGING_ROOT / "AppIcon.icns"
 
@@ -43,6 +44,8 @@ class AppLayoutTests(unittest.TestCase):
         self.assertFalse(
             (PACKAGING_ROOT / "MnemosyneService-Info.plist").exists()
         )
+        self.assertIn("--options runtime", script)
+        self.assertIn("--timestamp", script)
 
     def test_bundle_declares_and_stages_the_app_icon(self) -> None:
         with INFO_PLIST.open("rb") as stream:
@@ -55,6 +58,27 @@ class AppLayoutTests(unittest.TestCase):
         self.assertIn(
             'install -m 644 "$SCRIPT_DIR/AppIcon.icns" "$RESOURCES/AppIcon.icns"',
             script,
+        )
+
+    def test_dmg_builder_verifies_drag_install_layout(self) -> None:
+        script = DMG_BUILD_SCRIPT.read_text(encoding="utf-8")
+
+        self.assertIn(
+            'ln -s /Applications "$SOURCE_DIR/Applications"',
+            script,
+        )
+        self.assertIn("hdiutil verify", script)
+        self.assertIn("hdiutil attach", script)
+        self.assertIn("xcrun notarytool submit", script)
+        self.assertIn("xcrun stapler staple", script)
+        self.assertIn("xcrun stapler validate", script)
+        self.assertIn(
+            'codesign --verify --deep --strict --verbose=2 "$MOUNTED_APP"',
+            script,
+        )
+        self.assertLess(
+            script.index("hdiutil verify"),
+            script.index('mv -f "$TEMP_DMG" "$OUTPUT_PATH"'),
         )
 
 

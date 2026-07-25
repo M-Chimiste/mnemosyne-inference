@@ -98,14 +98,19 @@ back to the normalized macOS Computer Name. The identifier is displayed
 read-only in Settings, while the DSN remains secret and is never returned by
 the API.
 
-After the identity and DSN have been persisted, retire the old job before
-moving Unified Inference to `:1240`. Boot it out if it is loaded, then disable
-the label so it cannot reclaim the port on the next login:
+After installing Unified Inference, run the one-shot migration script before
+enabling clients on `:1240`:
 
 ```bash
-launchctl bootout gui/"$(id -u)"/com.athena.token-sidecar
-launchctl disable gui/"$(id -u)"/com.athena.token-sidecar
+macos/retire_legacy_sidecar.sh
 ```
+
+It validates the exact `com.athena.token-sidecar` user plist, persistently
+disables and boots out that job, restarts Unified Inference, and waits for both
+native HTTP planes. It never kills an arbitrary listener on the port. The
+script retains the old plist while the new service starts so it can migrate
+the reporting identity and ledger DSN, then archives the inactive plist only
+after both APIs are reachable.
 
 Install oMLX from its official `.dmg` or Homebrew package, configure its server
 port as `17322`, and start it. For a CLI/Homebrew installation this can be done
@@ -121,6 +126,13 @@ even when load accepts a bearer key. The safest integration is loopback-only
 oMLX with inner admin authentication disabled and authentication enforced at
 Mnemosyne. `OMLX_API_KEY` and `OMLX_ADMIN_SESSION` remain available for an
 installation that requires them.
+
+Model profiles are retained when their engine is disabled, but omitted from
+the callable `/v1/models` catalog until that engine is enabled. This keeps the
+Settings UI available while an external engine such as oMLX is being installed
+or repaired. Older app builds rejected that state at startup; use
+`macos/enable_omlx_engine.sh` as a one-time recovery without disabling the
+configured GLM profile.
 
 oMLX remains a separately owned process. Unified Inference can register a
 configured model directory through oMLX's admin API, but its Finder bookmark
@@ -390,11 +402,12 @@ CODESIGN_IDENTITY="Apple Development: Example Name (TEAMID)" \
 
 Move the app to a stable location such as `/Applications` before enabling its
 background service. Theseus currently runs a Developer ID-signed installation
-whose menu app and direct LaunchAgent helper share the same Team ID. Ad-hoc
-development builds remain supported, but rebuilding under a different code
-identity may require protected model folders to be selected again. Wider
-distribution still requires hardened runtime, notarization, and nested
-signing.
+whose menu app and direct LaunchAgent helper share the same Team ID. Stable
+builds use hardened runtime, secure timestamps, and inside-out nested signing.
+Ad-hoc development builds remain supported, but rebuilding under a different
+code identity may require protected model folders to be selected again. Use
+`macos/packaging/build_dmg.sh` for a verified drag-to-install artifact; setting
+`NOTARYTOOL_PROFILE` submits it to Apple and staples the accepted ticket.
 See [packaging/README.md](packaging/README.md) for the bundle layout and build
 details.
 

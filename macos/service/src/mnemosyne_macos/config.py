@@ -563,24 +563,6 @@ class MacConfig(BaseModel):
             duplicates = sorted({alias for alias in aliases if aliases.count(alias) > 1})
             raise ValueError(f"duplicate model aliases: {duplicates}")
 
-        enabled_engines = {
-            EngineName.LMSTUDIO: self.engines.lmstudio.enabled,
-            EngineName.LLAMA_CPP: self.engines.llama_cpp.enabled,
-            EngineName.OMLX: self.engines.omlx.enabled,
-            EngineName.DS4: self.engines.ds4.enabled,
-            EngineName.MFLUX: self.engines.mflux.enabled,
-        }
-        disabled_references = sorted(
-            profile.alias
-            for profile in self.models
-            if profile.enabled and not enabled_engines[profile.engine]
-        )
-        if disabled_references:
-            raise ValueError(
-                "enabled model profiles reference disabled engines: "
-                f"{disabled_references}"
-            )
-
         storage_names = {location.name for location in self.storage.locations}
         invalid_storage = sorted(
             profile.alias
@@ -626,11 +608,20 @@ class MacConfig(BaseModel):
             raise ValueError(f"configured Mnemosyne ports must be distinct: {conflicts}")
         return self
 
+    def engine_enabled(self, engine: EngineName) -> bool:
+        return {
+            EngineName.LMSTUDIO: self.engines.lmstudio.enabled,
+            EngineName.LLAMA_CPP: self.engines.llama_cpp.enabled,
+            EngineName.OMLX: self.engines.omlx.enabled,
+            EngineName.DS4: self.engines.ds4.enabled,
+            EngineName.MFLUX: self.engines.mflux.enabled,
+        }[engine]
+
     def profiles(self) -> dict[str, ResolvedTarget]:
         locations = {location.name: location for location in self.storage.locations}
         profiles: dict[str, ResolvedTarget] = {}
         for profile in self.models:
-            if not profile.enabled:
+            if not profile.enabled or not self.engine_enabled(profile.engine):
                 continue
             location = locations.get(profile.storage) if profile.storage else None
             profiles[profile.alias] = profile.resolve(

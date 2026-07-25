@@ -860,7 +860,9 @@ class NativeRuntime:
             new_config = MacConfig.model_validate(new_config.model_dump(mode="json"))
             save_config(new_config, self.config_path)
             adapters_available = all(
-                profile.engine in self.adapters for profile in new_config.models if profile.enabled
+                profile.engine in self.adapters
+                for profile in new_config.models
+                if profile.enabled and new_config.engine_enabled(profile.engine)
             )
             if adapters_available and not restart_required:
                 self.config = new_config

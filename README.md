@@ -153,9 +153,12 @@ open "/Applications/Unified Inference.app"
 ```
 
 `build_app.sh` uses ad-hoc signing by default. Set `CODESIGN_IDENTITY` to a
-valid identity in the login keychain for a stable local signature. Theseus
-currently has no valid code-signing identity, so its local build is ad hoc and
-a rebuild may require reselecting protected model folders in Settings.
+valid identity in the login keychain for a stable local signature. A
+non-ad-hoc build uses hardened runtime and secure timestamps. Create a
+drag-to-install disk image with `macos/packaging/build_dmg.sh`; it can also
+submit and staple the image when `NOTARYTOOL_PROFILE` names credentials saved
+by `xcrun notarytool store-credentials`. See the packaging guide for the exact
+release commands.
 
 Click the brain-profile menu-bar icon and choose **Enable Service**. Approve
 the background item in System Settings if macOS asks, then verify:

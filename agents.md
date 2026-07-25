@@ -43,6 +43,16 @@ upstream engines and must not fork or embed their serving implementations.
   persists missing values into Unified Inference's private `.env`. Unified
   Inference is the native token sidecar; the legacy process is not in the
   inference path and must not remain a permanent reporting dependency.
+- Keep configured model profiles when an engine is disabled, but exclude them
+  from the resolved/callable catalog until that engine is enabled. An external
+  engine being unavailable must not make the control plane or Settings UI
+  unable to start.
+- `macos/retire_legacy_sidecar.sh` validates and persistently disables the
+  exact `com.athena.token-sidecar` user job, boots it out, restarts Unified
+  Inference, and archives the inactive plist only after both native HTTP
+  planes are reachable. Preserve the plist until the service has inherited
+  and persisted its node identity and ledger DSN; never kill an arbitrary
+  listener on `:1240`.
 - `macos/service/runtime_updates.py` discovers releases directly from the
   official upstreams, verifies and installs official `ggml-org/llama.cpp`
   Apple Silicon assets, installs MFLUX from PyPI, builds an exact DS4 GitHub
@@ -50,7 +60,7 @@ upstream engines and must not fork or embed their serving implementations.
   the coordinator's all-engines-empty maintenance barrier; never introduce a
   repository-owned dependency manifest.
 - `macos/image-worker/` is the separately locked MFLUX runtime. It is launched only as a manager-owned child, binds loopback `:17324`, and must remain dependency-isolated from the macOS coordinator service.
-- `macos/app/` is the SwiftPM menu bar controller, typed native settings UI, secret-safe credential store, and native service bootstrap. `macos/packaging/` stages the signed app, embedded LaunchAgent plist, direct `Contents/MacOS/mnemosyne-service-bootstrap` executable, and relocatable Python runtime. Keep this unsandboxed `SMAppService` LaunchAgent's `BundleProgram` pointed at that direct helper; introducing a second bundle identity is unnecessary here and broke launch-requirement refresh during in-place updates. A future sandboxed or restricted-entitlement job would require its own deliberate wrapper architecture.
+- `macos/app/` is the SwiftPM menu bar controller, typed native settings UI, secret-safe credential store, and native service bootstrap. `macos/packaging/` stages the signed app, embedded LaunchAgent plist, direct `Contents/MacOS/mnemosyne-service-bootstrap` executable, relocatable Python runtime, and verified drag-to-Applications DMG. Keep this unsandboxed `SMAppService` LaunchAgent's `BundleProgram` pointed at that direct helper; introducing a second bundle identity is unnecessary here and broke launch-requirement refresh during in-place updates. A future sandboxed or restricted-entitlement job would require its own deliberate wrapper architecture.
 - `macos/config.yaml.example`, `macos/.env.example`, `macos/README.md`, and `macos/smoke_checks.md` are the native deployment's setup and validation surface. Mac settings must not be added to the external CUDA compose file.
 - `agents.md` is the single repository guide for coding assistants and contributors. Keep it aligned with code, examples, and verification commands when architecture or workflows change.
 

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
+import yaml
 
 from mnemosyne_macos.config import (
     ConfigError,
@@ -11,6 +14,19 @@ from mnemosyne_macos.config import (
     save_config,
     suggested_model_alias,
 )
+
+
+EXAMPLE_CONFIG = Path(__file__).resolve().parents[2] / "config.yaml.example"
+
+
+def test_shipped_example_config_is_valid() -> None:
+    payload = yaml.safe_load(EXAMPLE_CONFIG.read_text(encoding="utf-8"))
+
+    config = MacConfig.model_validate(payload)
+
+    assert config.engines.omlx.enabled is False
+    assert next(model for model in config.models if model.alias == "glm-5-2").enabled
+    assert "glm-5-2" not in config.profiles()
 from mnemosyne_macos.models import Endpoint, EngineName, ModelKind
 
 
@@ -267,21 +283,23 @@ def test_mflux_accepts_each_bundled_text_to_image_family() -> None:
         assert profile.family == family
 
 
-def test_image_profile_requires_enabled_mflux() -> None:
-    with pytest.raises(ValueError, match="disabled engines"):
-        MacConfig.model_validate(
-            {
-                "models": [
-                    {
-                        "alias": "qwen-image",
-                        "engine": "mflux",
-                        "model": "Qwen/Qwen-Image",
-                        "kind": "image",
-                        "image": {"family": "qwen-image"},
-                    }
-                ]
-            }
-        )
+def test_disabled_engine_profile_is_retained_but_not_resolved() -> None:
+    config = MacConfig.model_validate(
+        {
+            "models": [
+                {
+                    "alias": "qwen-image",
+                    "engine": "mflux",
+                    "model": "Qwen/Qwen-Image",
+                    "kind": "image",
+                    "image": {"family": "qwen-image"},
+                }
+            ]
+        }
+    )
+
+    assert config.models[0].enabled is True
+    assert config.profiles() == {}
 
 
 def test_storage_scope_uses_only_an_opaque_sha256_identifier() -> None:
