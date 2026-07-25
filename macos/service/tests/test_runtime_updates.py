@@ -22,6 +22,7 @@ import mnemosyne_macos.runtime_updates as runtime_updates
 from mnemosyne_macos.runtime_updates import (
     RuntimeUpdateError,
     RuntimeUpdateManager,
+    _python_subprocess_environment,
     _safe_extract,
     resolve_active_runtime,
 )
@@ -60,6 +61,77 @@ async def test_version_probe_terminates_its_process_group_on_timeout(
         is None
     )
     assert signals == [(process.pid, signal.SIGTERM)]
+
+
+def test_packaged_image_python_retains_only_its_required_pythonhome(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PYTHONHOME", "/Applications/Unified/Python/cpython-3.12")
+    monkeypatch.setenv("PYTHONPATH", "/service/source:/service/site-packages")
+    monkeypatch.setenv(
+        "TEST_MFLUX_PYTHON",
+        "/Applications/Unified/Python/framework-mnemosyne-image/bin/python3",
+    )
+
+    packaged = _python_subprocess_environment(
+        "/Applications/Unified/Python/framework-mnemosyne-image/bin/python3",
+        bundled_python_env="TEST_MFLUX_PYTHON",
+    )
+    external = _python_subprocess_environment(
+        "/custom/image-venv/bin/python3",
+        bundled_python_env="TEST_MFLUX_PYTHON",
+    )
+
+    assert packaged["PYTHONHOME"] == "/Applications/Unified/Python/cpython-3.12"
+    assert "PYTHONPATH" not in packaged
+    assert "PYTHONHOME" not in external
+    assert "PYTHONPATH" not in external
+
+
+@pytest.mark.asyncio
+async def test_mflux_ensurepip_probe_uses_packaged_python_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    python = tmp_path / "framework-mnemosyne-image" / "bin" / "python3"
+    wheel = tmp_path / "pip-25.0.1-py3-none-any.whl"
+    wheel.write_bytes(b"pip fixture")
+    monkeypatch.setenv("TEST_MFLUX_PYTHON", str(python))
+    monkeypatch.setenv("PYTHONHOME", "/Applications/Unified/Python/cpython-3.12")
+    monkeypatch.setenv("PYTHONPATH", "/service/source:/service/site-packages")
+    observed: dict[str, object] = {}
+
+    async def run_version_command(
+        *argv: str,
+        timeout: float = 5.0,
+        env: dict[str, str] | None = None,
+    ) -> str:
+        observed.update(argv=argv, timeout=timeout, env=env)
+        return str(wheel)
+
+    monkeypatch.setattr(
+        runtime_updates,
+        "_run_version_command",
+        run_version_command,
+    )
+    manager = RuntimeUpdateManager(
+        omlx=OMLXConfig(base_url="http://127.0.0.1:17322"),
+        mflux=MFluxConfig(python_env="TEST_MFLUX_PYTHON"),
+        ds4=DS4Config(binary=str(tmp_path / "missing-ds4")),
+        root=tmp_path / "runtimes",
+    )
+    try:
+        assert await manager._pip_wheel(python) == wheel
+        assert observed["argv"][:2] == (str(python), "-c")
+        environment = observed["env"]
+        assert isinstance(environment, dict)
+        assert (
+            environment["PYTHONHOME"]
+            == "/Applications/Unified/Python/cpython-3.12"
+        )
+        assert "PYTHONPATH" not in environment
+    finally:
+        await manager.aclose()
 
 
 def _ds4_source_archive(revision: str) -> bytes:

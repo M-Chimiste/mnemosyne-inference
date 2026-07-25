@@ -32,6 +32,12 @@ the CUDA image or its `8000-8002` topology. The first implementation includes:
 - official-source managed llama.cpp plus native oMLX lifecycle integration and
   manager-owned DS4/MFLUX subprocesses; the LM Studio adapter is now disabled
   by default and retained only for migration soak;
+- packaged MFLUX discovery, installation, smoke checks, and worker launch retain
+  the relocatable image interpreter's required `PYTHONHOME` only when that
+  exact bundled interpreter is selected, while continuing to strip inherited
+  Python paths from external runtimes;
+- fresh native configuration starts with an empty model catalog so profiles
+  come only from Model Library downloads or Finder-confirmed exact locations;
 - OpenAI/Responses/Anthropic usage normalization plus an atomic SQLite
   analytics/Postgres-outbox path;
 - a per-user LaunchAgent bundle, native Python bootstrap, and explicit AppKit
@@ -93,7 +99,7 @@ then explicitly unloaded; the coordinator and authoritative oMLX inventory
 both returned empty.
 GUI Finder-confirmed migration, durable oMLX login startup, and login-cycle
 validation remain in progress.
-The native service and package-layout suites pass all 270 tests on the target
+The native service and package-layout suites pass all 274 tests on the target
 host (the two
 real-bookmark tests skip in restricted runners), and the isolated MFLUX worker
 passes 23 tests with real Metal

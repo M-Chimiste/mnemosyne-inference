@@ -317,14 +317,42 @@ def _clean_subprocess_environment() -> dict[str, str]:
     return environment
 
 
-async def _run_version_command(*argv: str, timeout: float = 5.0) -> str | None:
+def _python_subprocess_environment(
+    python: str | Path,
+    *,
+    bundled_python_env: str,
+) -> dict[str, str]:
+    """Isolate Python layers while retaining the packaged stdlib location.
+
+    The relocatable image-layer interpreter uses the same bundled CPython
+    runtime as the service and needs the bootstrap-provided ``PYTHONHOME`` to
+    locate that stdlib. Development virtualenvs and arbitrary configured
+    interpreters must not inherit it.
+    """
+
+    environment = _clean_subprocess_environment()
+    bundled_python = os.environ.get(bundled_python_env, "").strip()
+    python_home = os.environ.get("PYTHONHOME", "").strip()
+    if bundled_python and python_home:
+        selected = Path(python).expanduser().resolve(strict=False)
+        bundled = Path(bundled_python).expanduser().resolve(strict=False)
+        if selected == bundled:
+            environment["PYTHONHOME"] = python_home
+    return environment
+
+
+async def _run_version_command(
+    *argv: str,
+    timeout: float = 5.0,
+    env: Mapping[str, str] | None = None,
+) -> str | None:
     try:
         process = await asyncio.create_subprocess_exec(
             *argv,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             stdin=asyncio.subprocess.DEVNULL,
-            env=_clean_subprocess_environment(),
+            env=dict(env) if env is not None else _clean_subprocess_environment(),
             start_new_session=True,
         )
     except OSError:
@@ -627,6 +655,12 @@ class RuntimeUpdateManager:
         ).strip()
         return Path(configured).expanduser() if configured else None
 
+    def _mflux_environment(self, python: Path) -> dict[str, str]:
+        return _python_subprocess_environment(
+            python,
+            bundled_python_env=self.mflux.python_env,
+        )
+
     def _mflux_worker_source(self) -> Path | None:
         value = os.environ.get(self.mflux.source_path_env, "").strip()
         source = Path(value).expanduser() if value else None
@@ -647,7 +681,12 @@ class RuntimeUpdateManager:
             "r=u.get('vcs_info',{}).get('commit_id'); "
             "print(json.dumps({'version':d.version,'revision':r}))"
         )
-        output = await _run_version_command(str(python), "-c", script)
+        output = await _run_version_command(
+            str(python),
+            "-c",
+            script,
+            env=self._mflux_environment(python),
+        )
         if not output:
             return None, None, str(python)
         try:
@@ -811,7 +850,12 @@ class RuntimeUpdateManager:
             "import ensurepip,pathlib; "
             "print(next((pathlib.Path(ensurepip.__file__).parent/'_bundled').glob('pip-*.whl')))"
         )
-        output = await _run_version_command(str(python), "-c", script)
+        output = await _run_version_command(
+            str(python),
+            "-c",
+            script,
+            env=self._mflux_environment(python),
+        )
         if not output:
             raise RuntimeUpdateError("the MFLUX Python runtime does not include ensurepip")
         wheel = Path(output.splitlines()[-1])
@@ -840,7 +884,7 @@ class RuntimeUpdateManager:
             worker / "mnemosyne_mflux_worker",
         )
         pip_wheel = await self._pip_wheel(python)
-        environment = _clean_subprocess_environment()
+        environment = self._mflux_environment(python)
         environment["PYTHONPATH"] = str(pip_wheel)
         await _run_checked(
             str(python),
@@ -1002,7 +1046,7 @@ class RuntimeUpdateManager:
         paths = [runtime.path("worker_path")]
         if "site_packages" in runtime.entrypoint:
             paths.insert(0, runtime.path("site_packages"))
-        environment = _clean_subprocess_environment()
+        environment = self._mflux_environment(python)
         environment["PYTHONPATH"] = os.pathsep.join(str(path) for path in paths)
         await _run_checked(
             str(python),

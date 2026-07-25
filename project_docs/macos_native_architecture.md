@@ -136,37 +136,10 @@ engines:
     host: 127.0.0.1
     port: 17324
 
-models:
-  - alias: local-qwen
-    engine: llama.cpp
-    model: /Volumes/Athena/models/publisher/model/model-Q4_K_M.gguf
-    storage: athena-models
-    served_model_name: local-qwen
-    load:
-      context_length: 32768
-      projector_path: /Volumes/Athena/models/publisher/model/mmproj-BF16.gguf
-
-  - alias: glm-5-2
-    engine: omlx
-    model: GLM-5.2-4bit
-
-  - alias: deepseek-v4-flash
-    engine: ds4
-    model: /Volumes/Models/ds4flash.gguf
-    load:
-      context_length: 100000
-      kv_disk_directory: /Volumes/ModelCache/ds4-kv
-      kv_disk_space_mb: 8192
-
-  - alias: krea-2-turbo
-    engine: mflux
-    model: krea/Krea-2-Turbo
-    kind: image
-    image:
-      family: krea-2
-      quantize: 8
-      num_inference_steps: 8
-      guidance_scale: 1
+# Fresh installs have no model profiles. Model Library and Finder discovery
+# create profiles only after the user selects the exact model and destination;
+# the service preserves those paths instead of assuming a volume or cache root.
+models: []
 ```
 
 Engine-specific options live below `load`. Unknown options are rejected unless

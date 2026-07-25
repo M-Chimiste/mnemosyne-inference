@@ -25,8 +25,8 @@ def test_shipped_example_config_is_valid() -> None:
     config = MacConfig.model_validate(payload)
 
     assert config.engines.omlx.enabled is False
-    assert next(model for model in config.models if model.alias == "glm-5-2").enabled
-    assert "glm-5-2" not in config.profiles()
+    assert config.models == []
+    assert config.profiles() == {}
 from mnemosyne_macos.models import Endpoint, EngineName, ModelKind
 
 
