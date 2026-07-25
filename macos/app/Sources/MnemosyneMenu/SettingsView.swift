@@ -1261,7 +1261,7 @@ struct SettingsView: View {
                     valueLabel: "Connection URL",
                     placeholder: "postgresql://user:password@host:5432/database"
                 )
-                Text("The host, port, database, username, and password are stored privately on this Mac. Existing values are never displayed; save and restart the service to apply a replacement.")
+                Text("The host, port, database, username, and password are stored privately on this Mac. Existing values are never displayed. Leave this blank to keep the current connection, or use Clear to remove it; save and restart the service to apply a replacement.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
