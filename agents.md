@@ -116,8 +116,9 @@ The live `docker-compose.yml` is intentionally machine-specific and may live out
   reporting defaults on. During migration, it may inherit `node.id` and the
   ledger DSN from the previous sidecar's LaunchAgent; explicit native values
   win. Persist missing inherited values into the private native `.env` before
-  retiring that LaunchAgent. Keep the Settings identity read-only and never
-  expose or log the DSN.
+  retiring that LaunchAgent. Keep the Settings identity read-only. The Usage
+  page may replace or clear the Postgres DSN only through a write-only secure
+  field backed by the private `.env`; never return, prefill, or log the DSN.
 - The primary local migration surface is the read-only
   `GET /manager/model-library/local-sources` hint list, followed by
   Finder-driven `POST /manager/model-library/local-scan` and explicit

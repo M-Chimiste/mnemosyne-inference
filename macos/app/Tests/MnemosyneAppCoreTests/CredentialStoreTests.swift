@@ -56,3 +56,37 @@ func credentialClearing() throws {
     #expect(!contents.contains("ADMIN_PASSWORD"))
     #expect(contents.contains("UNMANAGED=preserved"))
 }
+
+@Test("Postgres ledger connection is managed as a write-only credential")
+func postgresLedgerCredentialLifecycle() throws {
+    let temporary = FileManager.default.temporaryDirectory
+        .appending(path: UUID().uuidString, directoryHint: .isDirectory)
+    defer { try? FileManager.default.removeItem(at: temporary) }
+    try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: true)
+    let url = temporary.appending(path: ".env")
+    let original = "postgresql://writer:old-secret@ledger.local:5432/usage"
+    try Data("TOKEN_SIDECAR_POSTGRES_DSN=\(original)\n".utf8).write(to: url)
+    let store = CredentialStore(environmentURL: url)
+
+    let status = try store.status()
+
+    #expect(status.configured == [.tokenSidecarPostgresDSN])
+
+    let replacement = "postgresql://writer:new-secret@ledger.local:5432/usage?sslmode=require"
+    try store.apply(
+        replacements: [.tokenSidecarPostgresDSN: replacement],
+        clearing: []
+    )
+
+    var contents = try String(contentsOf: url, encoding: .utf8)
+    #expect(contents.contains("TOKEN_SIDECAR_POSTGRES_DSN=\(replacement)"))
+    #expect(!contents.contains(original))
+    let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+    #expect((attributes[.posixPermissions] as? NSNumber)?.intValue == 0o600)
+
+    try store.apply(replacements: [:], clearing: [.tokenSidecarPostgresDSN])
+
+    contents = try String(contentsOf: url, encoding: .utf8)
+    #expect(!contents.contains("TOKEN_SIDECAR_POSTGRES_DSN"))
+    #expect(try store.status().configured.isEmpty)
+}

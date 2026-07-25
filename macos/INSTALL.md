@@ -100,6 +100,17 @@ In **Settings → Credentials**, add a Hugging Face token when you want faster
 downloads or need a gated model. Credential values are write-only and are not
 stored in `config.yaml`.
 
+In **Settings → Usage → Postgres connection**, add or replace the central
+ledger connection URL. The host, port, database, username, and password are
+carried by this write-only DSN:
+
+```text
+postgresql://user:password@host:5432/database
+```
+
+The saved value is never displayed again. Save the settings and restart the
+background service before testing delivery.
+
 Model weights are separate from engine runtimes. Install or import weights
 through **Settings → Model Library** after preparing the corresponding engine.
 

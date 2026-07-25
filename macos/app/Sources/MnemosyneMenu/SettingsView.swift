@@ -1255,6 +1255,16 @@ struct SettingsView: View {
                 }
                 .disabled(!viewModel.settings.tokenSidecar.enabled)
             }
+            Section("Postgres connection") {
+                credentialEditor(
+                    .tokenSidecarPostgresDSN,
+                    valueLabel: "Connection URL",
+                    placeholder: "postgresql://user:password@host:5432/database"
+                )
+                Text("The host, port, database, username, and password are stored privately on this Mac. Existing values are never displayed; save and restart the service to apply a replacement.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
             Section("Privacy") {
                 Text("Language requests record token counts and model metadata. Image requests do not create token-usage records.")
                     .foregroundStyle(.secondary)
@@ -1271,65 +1281,77 @@ struct SettingsView: View {
             }
             ForEach(
                 ManagedCredential.allCases.filter {
-                    $0 != .lmStudioAPIKey
+                    guard $0 != .tokenSidecarPostgresDSN else { return false }
+                    return $0 != .lmStudioAPIKey
                         || viewModel.settings.engines.lmstudio.enabled
                         || viewModel.configuredCredentials.contains(.lmStudioAPIKey)
                 }
             ) { credential in
                 Section {
-                    if viewModel.credentialsToClear.contains(credential) {
-                        HStack {
-                            Label("Will be removed when you save", systemImage: "trash")
-                                .foregroundStyle(.orange)
-                            Spacer()
-                            Button("Undo") { viewModel.undoCredentialClear(credential) }
-                        }
-                    } else {
-                        LabeledContent(
-                            viewModel.configuredCredentials.contains(credential)
-                                ? "Replacement value"
-                                : "New value"
-                        ) {
-                            SecureField(
-                                viewModel.configuredCredentials.contains(credential)
-                                    ? "Enter a replacement"
-                                    : "Enter a credential",
-                                text: viewModel.credentialBinding(credential)
-                            )
-                            .textFieldStyle(.roundedBorder)
-                            .frame(minWidth: 320)
-                            .privacySensitive()
-                            .accessibilityLabel("\(credential.displayName) value")
-                        }
-                        HStack {
-                            Label(
-                                viewModel.configuredCredentials.contains(credential)
-                                    ? "Configured" : "Not configured",
-                                systemImage: viewModel.configuredCredentials.contains(credential)
-                                    ? "checkmark.circle.fill" : "circle"
-                            )
-                            .font(.caption)
-                            .foregroundStyle(
-                                viewModel.configuredCredentials.contains(credential)
-                                    ? Color.green : Color.secondary
-                            )
-                            Spacer()
-                            if viewModel.configuredCredentials.contains(credential) {
-                                Button("Clear", role: .destructive) {
-                                    viewModel.clearCredential(credential)
-                                }
-                            }
-                        }
-                    }
-                    Text(credential.help)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                    credentialEditor(credential)
                 } header: {
                     Text(credential.displayName)
                 }
             }
         }
         .formStyle(.grouped)
+    }
+
+    @ViewBuilder
+    private func credentialEditor(
+        _ credential: ManagedCredential,
+        valueLabel: String? = nil,
+        placeholder: String? = nil
+    ) -> some View {
+        if viewModel.credentialsToClear.contains(credential) {
+            HStack {
+                Label("Will be removed when you save", systemImage: "trash")
+                    .foregroundStyle(.orange)
+                Spacer()
+                Button("Undo") { viewModel.undoCredentialClear(credential) }
+            }
+        } else {
+            LabeledContent(
+                valueLabel
+                    ?? (viewModel.configuredCredentials.contains(credential)
+                        ? "Replacement value"
+                        : "New value")
+            ) {
+                SecureField(
+                    placeholder
+                        ?? (viewModel.configuredCredentials.contains(credential)
+                            ? "Enter a replacement"
+                            : "Enter a credential"),
+                    text: viewModel.credentialBinding(credential)
+                )
+                .textFieldStyle(.roundedBorder)
+                .frame(minWidth: 320)
+                .privacySensitive()
+                .accessibilityLabel("\(credential.displayName) value")
+            }
+            HStack {
+                Label(
+                    viewModel.configuredCredentials.contains(credential)
+                        ? "Configured" : "Not configured",
+                    systemImage: viewModel.configuredCredentials.contains(credential)
+                        ? "checkmark.circle.fill" : "circle"
+                )
+                .font(.caption)
+                .foregroundStyle(
+                    viewModel.configuredCredentials.contains(credential)
+                        ? Color.green : Color.secondary
+                )
+                Spacer()
+                if viewModel.configuredCredentials.contains(credential) {
+                    Button("Clear", role: .destructive) {
+                        viewModel.clearCredential(credential)
+                    }
+                }
+            }
+        }
+        Text(credential.help)
+            .font(.caption)
+            .foregroundStyle(.secondary)
     }
 
     private var footer: some View {

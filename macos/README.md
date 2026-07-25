@@ -513,9 +513,12 @@ Inference's private `.env` before the legacy LaunchAgent is retired.
 `token_sidecar.node_id` is only an explicit override; leave it empty to keep
 Theseus, Metis, Athena, and other machines aligned during the transition.
 
-Set the secret DSN only in Unified Inference's `.env`. Existing installations
+Set or replace the secret DSN through **Settings → Usage → Postgres
+connection**. The field is write-only: the app stores it in Unified
+Inference's private mode-`0600` `.env`, reports only whether it is configured,
+and requires a service restart to apply a replacement. Existing installations
 inherit and persist it from the previous sidecar's LaunchAgent during
-migration:
+migration. The equivalent private-file form is:
 
 ```dotenv
 TOKEN_SIDECAR_POSTGRES_DSN=postgresql://writer:password@server/token_sidecar

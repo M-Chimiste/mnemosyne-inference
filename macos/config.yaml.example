@@ -153,8 +153,8 @@ models:
       num_inference_steps: 8
       guidance_scale: 1.0
 
-# The DSN is secret and belongs in the environment file as
-# TOKEN_SIDECAR_POSTGRES_DSN=postgresql://...
+# The DSN is secret. Set it through Settings > Usage > Postgres connection;
+# the app stores TOKEN_SIDECAR_POSTGRES_DSN only in the private environment file.
 token_sidecar:
   enabled: true
   # Empty migrates node.id from the previous sidecar's active LaunchAgent
