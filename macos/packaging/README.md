@@ -1,5 +1,9 @@
 # Native macOS packaging
 
+This file is for people building the application. To install an existing disk
+image and prepare all native engines, use the
+[Mac installation guide](../INSTALL.md).
+
 The native deployment has a menu controller and a long-lived background
 service plus on-demand manager-owned engine processes:
 

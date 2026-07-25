@@ -9,6 +9,11 @@ API while moving the single resident model between a manager-owned
 projects; Mnemosyne coordinates and proxies them without modifying their model
 runtimes.
 
+For a fresh workstation, begin with the
+[end-user installation guide](INSTALL.md). It covers the Unified Inference
+disk image, model storage, every native engine, legacy LM Studio model
+adoption, and the canonical headless Homebrew/CLI installation of oMLX.
+
 The runtime is deliberately not a Docker image. Docker Desktop runs ordinary
 containers in a Linux VM, so it is not the right boundary for arbitrary
 MLX/Metal processes. Mnemosyne Core and all engines run natively.
@@ -69,13 +74,15 @@ environment variable `MNEMOSYNE_WORKSTATION_NAME` overrides auto-detection.
 - Swift 6 for menu development. Full Xcode is required for final app signing,
   `SMAppService` integration testing, and source builds of custom Metal kernels.
 - oMLX, DS4, MFLUX, and the temporary LM Studio migration adapter are optional,
-  but each engine and its model profiles must be set `enabled: false` when it
-  is not part of the installation.
+  and an unavailable engine should be disabled. Its profiles are retained but
+  omitted from the callable model catalog until the engine is enabled again.
 
-The official oMLX `.dmg` is the simplest choice for frontier model families
-because it includes its native kernels. Its current source documentation notes
-that GLM-5.2 and related custom-kernel builds need full Xcode; a plain source
-install falls back to a much slower generic path.
+The supported operator path for oMLX is its official Homebrew formula and
+headless CLI, not the separate oMLX menu-bar app. GLM-5.2 and related
+custom-kernel builds require full Xcode; a plain installation falls back to a
+much slower, more memory-hungry generic path. See
+[Install oMLX with Homebrew and the CLI](INSTALL.md#5-install-omlx-with-homebrew-and-the-cli)
+for the exact upstream commands and verification.
 
 ## Engine preparation
 
@@ -112,13 +119,12 @@ script retains the old plist while the new service starts so it can migrate
 the reporting identity and ledger DSN, then archives the inactive plist only
 after both APIs are reachable.
 
-Install oMLX from its official `.dmg` or Homebrew package, configure its server
-port as `17322`, and start it. For a CLI/Homebrew installation this can be done
-with the upstream `OMLX_PORT` setting:
-
-```bash
-OMLX_PORT=17322 omlx start
-```
+Install oMLX through Homebrew and persist its loopback host, port `17322`, and
+exact model directory with the upstream `omlx serve` CLI before starting its
+Homebrew service. The complete copy-and-paste procedure, including the
+GLM-5.2 native-kernel build and verification, is in
+[INSTALL.md](INSTALL.md#5-install-omlx-with-homebrew-and-the-cli). No oMLX GUI
+configuration is required.
 
 Disable model pinning and per-model TTL/LRU behavior for profiles managed by
 Mnemosyne. Current oMLX releases may protect unload through an admin session
@@ -265,9 +271,10 @@ worker; it is not stored in YAML or SQLite.
 ## Engine runtime updates
 
 Open **Settings → Runtime Updates** to inspect installed and upstream versions
-of llama.cpp, oMLX, MFLUX, and DS4. oMLX owns its own installation: Unified Inference
-detects the app, Homebrew CLI, or running server version and links to the
-official stable release, but never overwrites it.
+of llama.cpp, oMLX, MFLUX, and DS4. oMLX owns its own installation: Unified
+Inference detects the Homebrew CLI or running server version and links to the
+official stable release, but never overwrites it. A legacy oMLX app
+installation is still detected, although the documented setup uses Homebrew.
 
 llama.cpp, MFLUX, and DS4 are resolved directly from their official upstreams;
 there is no Unified Inference release manifest to maintain. MFLUX versions come from the

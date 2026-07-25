@@ -12,7 +12,8 @@ deployments with independent dependencies and packaging:
   GGUF models, coordinates oMLX for MLX models and DwarfStar (DS4) for its
   specialized DeepSeek weights, and runs MFLUX in an isolated worker. It does
   not use Docker, so MLX and Metal remain available to the host processes.
-  Start with [macos/README.md](macos/README.md).
+  Start with the [Mac installation guide](macos/INSTALL.md), then use
+  [macos/README.md](macos/README.md) as the operator and developer reference.
 
 The remainder of this README describes the CUDA deployment unless a section is
 explicitly labeled macOS.
@@ -172,9 +173,15 @@ curl http://127.0.0.1:17321/manager/status
 The Model Library page can search engine-compatible Hugging Face models and
 download them into a GUI-selected internal or external folder before first
 use. Downloads are process-isolated, resumable, cancellable, and do not load
-the model. The app contains the runtime and worker code, not model weights.
+the model. The app contains Unified Inference's core and isolated MFLUX worker;
+oMLX is a separate Homebrew runtime, and model weights are never embedded.
 See [macos/README.md](macos/README.md) for engine preparation, storage,
 configuration, development mode, and signing details.
+
+For installation from the disk image—including the Homebrew/CLI oMLX setup
+needed for GLM-5.2 and the in-app llama.cpp, DS4, and MFLUX installation
+paths—follow [macos/INSTALL.md](macos/INSTALL.md). The oMLX GUI/DMG is not
+required.
 
 The Runtime Updates page compares llama.cpp, oMLX, MFLUX, and DS4 with their
 official upstream projects. Unified Inference downloads the official

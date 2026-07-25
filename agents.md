@@ -61,7 +61,11 @@ upstream engines and must not fork or embed their serving implementations.
   repository-owned dependency manifest.
 - `macos/image-worker/` is the separately locked MFLUX runtime. It is launched only as a manager-owned child, binds loopback `:17324`, and must remain dependency-isolated from the macOS coordinator service.
 - `macos/app/` is the SwiftPM menu bar controller, typed native settings UI, secret-safe credential store, and native service bootstrap. `macos/packaging/` stages the signed app, embedded LaunchAgent plist, direct `Contents/MacOS/mnemosyne-service-bootstrap` executable, relocatable Python runtime, and verified drag-to-Applications DMG. Keep this unsandboxed `SMAppService` LaunchAgent's `BundleProgram` pointed at that direct helper; introducing a second bundle identity is unnecessary here and broke launch-requirement refresh during in-place updates. A future sandboxed or restricted-entitlement job would require its own deliberate wrapper architecture.
-- `macos/config.yaml.example`, `macos/.env.example`, `macos/README.md`, and `macos/smoke_checks.md` are the native deployment's setup and validation surface. Mac settings must not be added to the external CUDA compose file.
+- `macos/INSTALL.md` is the end-user disk-image and all-engine setup path.
+  `macos/config.yaml.example`, `macos/.env.example`, `macos/README.md`, and
+  `macos/smoke_checks.md` are the native deployment's configuration, operator,
+  development, and validation surface. Mac settings must not be added to the
+  external CUDA compose file.
 - `agents.md` is the single repository guide for coding assistants and contributors. Keep it aligned with code, examples, and verification commands when architecture or workflows change.
 
 The live `docker-compose.yml` is intentionally machine-specific and may live outside this repo. The CLI expects it under `$VLLM_COMPOSE_DIR`, defaulting to `~/vllm-manager`. Use `docker-compose.example.yml` as the maintained template. If a change affects ports, env vars, volumes, container names, build args, or mounts, call out the required external compose changes.
@@ -374,4 +378,5 @@ When behavior touches process launch, ports, engine argv construction, Docker mo
 9. `Dockerfile`, `config.yaml.example`, `.env.example`, and `docker-compose.example.yml`
 10. `ui/src/`
 11. `project_docs/smoke_checks.md` for CUDA-host validation
-12. `macos/README.md`, then `project_docs/macos_native_architecture.md`, for the native sibling
+12. `macos/INSTALL.md`, `macos/README.md`, then
+    `project_docs/macos_native_architecture.md`, for the native sibling
