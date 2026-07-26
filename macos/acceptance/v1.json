@@ -7,12 +7,12 @@
   "release_ready": false,
   "latest_local_artifact": {
     "filename": "Unified-Inference-0.9.0-macos-arm64.dmg",
-    "sha256": "a7de822f0a215fd0420b5ee802feef3f27bf7d4a5c98c26e58b8ca0a8af32b87",
-    "bytes": 309975463,
+    "sha256": "039a5b055f275c79d60dadb3568140648928a351065f692b15a6e84cb6632c7c",
+    "bytes": 310016662,
     "signature": "ad-hoc",
     "notarized": false,
     "acceptance_report": "Unified-Inference-0.9.0-macos-arm64-acceptance.json",
-    "verification": "Mounted read-only with the Applications shortcut; the embedded app passed deep strict code-signature verification after its embedded import/configuration smoke. The secret-redacted machine-readable artifact report is accepted."
+    "verification": "Build 45 from implementation commit a4e7106 was mounted read-only with the Applications shortcut; the embedded app passed deep strict code-signature verification after its embedded import/configuration smoke, contains zero Python bytecode entries, and its mode-0600 secret-redacted machine-readable artifact report is accepted."
   },
   "tiers": {
     "stable": ["core", "llama.cpp", "omlx"],
@@ -29,7 +29,7 @@
       "id": "github-macos-ci",
       "required": true,
       "status": "passed",
-      "evidence": "GitHub Actions macOS CI run 30218077264 passed every version/lock, native service, image worker, packaging, Swift build/test, bare-app verification, acceptance-report, and artifact-upload step for implementation commit 0cc05e7. The signed release workflow remains gated separately on Apple and Sparkle credentials."
+      "evidence": "GitHub Actions macOS CI run 30218910777 passed every version/lock, native service, image worker, packaging, Swift build/test, bare-app verification, acceptance-report, and artifact-upload step for implementation commit a4e7106. The signed release workflow remains gated separately on Apple and Sparkle credentials."
     },
     {
       "id": "guided-clean-install",
@@ -95,7 +95,7 @@
       "id": "developer-id-notarized-dmg",
       "required": true,
       "status": "pending",
-      "evidence": "The 309,975,463-byte 0.9.0 build-43 arm64 ad-hoc DMG (SHA-256 a7de822f0a215fd0420b5ee802feef3f27bf7d4a5c98c26e58b8ca0a8af32b87) builds, mounts read-only, and passes its paired machine-readable acceptance report, but it is not a distribution artifact. The credentialed release workflow exists; Apple signing/notarization and Sparkle private-key credentials are not available in this checkout."
+      "evidence": "The 310,016,662-byte 0.9.0 build-45 arm64 ad-hoc DMG from implementation commit a4e7106 (SHA-256 039a5b055f275c79d60dadb3568140648928a351065f692b15a6e84cb6632c7c) builds, mounts read-only, contains zero Python bytecode entries, and passes its mode-0600 paired machine-readable acceptance report, but it is not a distribution artifact. The credentialed release workflow exists; Apple signing/notarization and Sparkle private-key credentials are not available in this checkout."
     },
     {
       "id": "signed-update-and-recovery",
