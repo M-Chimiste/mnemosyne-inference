@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import shutil
 from typing import Any
 
 from .local_models import scan_local_models
@@ -40,6 +41,11 @@ def _parser() -> argparse.ArgumentParser:
     ensure.add_argument("--root", required=True)
     ensure.add_argument("--path", required=True)
     ensure.add_argument("--expected-volume-uuid")
+
+    delete = commands.add_parser("delete-directory")
+    delete.add_argument("--root", required=True)
+    delete.add_argument("--path", required=True)
+    delete.add_argument("--expected-volume-uuid")
     return parser
 
 
@@ -83,6 +89,37 @@ def _directory_size(root: Path, path: str) -> int:
             if candidate.is_file():
                 total += candidate.stat().st_size
     return total
+
+
+def _delete_directory(root: Path, root_value: str, path: str) -> bool:
+    lexical_root = Path(root_value).expanduser().absolute()
+    lexical_target = Path(path).expanduser().absolute()
+    try:
+        relative = lexical_target.relative_to(lexical_root)
+    except ValueError as exc:
+        raise ValueError(
+            f"path escapes selected model storage: {lexical_target}"
+        ) from exc
+    if not relative.parts:
+        raise ValueError("refusing to delete the selected model storage root")
+
+    current = lexical_root
+    for component in relative.parts:
+        current /= component
+        if current.is_symlink():
+            raise ValueError(
+                f"refusing to delete a model path containing a symlink: {current}"
+            )
+
+    selected = _contained(root, str(lexical_target), must_exist=False)
+    if selected == root:
+        raise ValueError("refusing to delete the selected model storage root")
+    if not selected.exists():
+        return False
+    if not selected.is_dir():
+        raise ValueError("managed model deletion requires a directory")
+    shutil.rmtree(lexical_target)
+    return True
 
 
 def _run(args: argparse.Namespace) -> dict[str, Any]:
@@ -130,6 +167,16 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         if not destination.is_dir():
             raise ValueError("model destination is not a directory")
         return {"status": status, "path": str(destination)}
+    if args.command == "delete-directory":
+        root, status = _validated_root(args.root, args.expected_volume_uuid)
+        if not status["writable"]:
+            raise ValueError(
+                status["diagnostic"] or "selected model storage is not writable"
+            )
+        return {
+            "status": status,
+            "deleted": _delete_directory(root, args.root, args.path),
+        }
     raise ValueError("unsupported filesystem operation")
 
 

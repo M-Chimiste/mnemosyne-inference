@@ -26,8 +26,10 @@ service plus on-demand manager-owned engine processes:
   `scope_id` is persisted in YAML. The service preflights referenced grants on
   save, revalidates them and prunes unreferenced bookmarks at startup, and
   scoped helpers/model/download children reactivate a grant before `exec`.
-  Selection is explicit and initially empty. The older LM Studio
-  inventory remains only as a read-only migration/soak bridge. The control API
+  Model import is explicit, while compatible vision projectors are selected
+  automatically with manual and text-only choices. LM Studio model-folder
+  settings are read only to offer a migration shortcut; there is no LM Studio
+  engine or inventory bridge. The control API
   validates and atomically persists versioned structured configuration,
   private credentials stay write-only, and the UI distinguishes
   hot-reloadable profile edits from restart-required changes.
@@ -240,9 +242,10 @@ private permissions, and exports `MNEMOSYNE_MACOS_CONFIG_PATH` and
 `MNEMOSYNE_MACOS_ENV_PATH` for the service.
 
 The examples are copied only when the user files are absent. Upgrading an
-existing installation therefore preserves its aliases, storage roots, secrets,
-and temporary LM Studio migration setting. Fresh examples disable LM Studio
-and enable manager-owned llama.cpp. Runtime downloads live separately under
+existing installation therefore preserves its aliases, storage roots, and
+secrets. Schema-version migration converts old LM Studio profiles into inert
+alias/load-setting records for later Finder import and removes the engine
+configuration. Fresh examples enable manager-owned llama.cpp. Runtime downloads live separately under
 `~/Library/Application Support/Mnemosyne/runtimes/`; installing or replacing
 the app neither deletes them nor touches model libraries on internal or
 external drives.

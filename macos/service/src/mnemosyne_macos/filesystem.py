@@ -201,6 +201,24 @@ class FilesystemProbe:
         )
         return int(payload["bytes"])
 
+    async def delete_directory(
+        self,
+        *,
+        root: str,
+        path: str,
+        expected_volume_uuid: str | None,
+        scope_id: str | None,
+    ) -> bool:
+        arguments = ["delete-directory", "--root", root, "--path", path]
+        if expected_volume_uuid is not None:
+            arguments.extend(["--expected-volume-uuid", expected_volume_uuid])
+        payload = await self._run(
+            *arguments,
+            scope_id=scope_id,
+            scope_path=root,
+        )
+        return bool(payload["deleted"])
+
 
 async def _terminate(process: asyncio.subprocess.Process) -> None:
     with contextlib.suppress(ProcessLookupError):

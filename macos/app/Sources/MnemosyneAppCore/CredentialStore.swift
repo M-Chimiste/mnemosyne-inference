@@ -1,7 +1,6 @@
 import Foundation
 
 public enum ManagedCredential: String, CaseIterable, Identifiable, Sendable {
-    case lmStudioAPIKey = "LMSTUDIO_API_KEY"
     case omlxAPIKey = "OMLX_API_KEY"
     case omlxAdminSession = "OMLX_ADMIN_SESSION"
     case huggingFaceToken = "HF_TOKEN"
@@ -13,7 +12,6 @@ public enum ManagedCredential: String, CaseIterable, Identifiable, Sendable {
 
     public var displayName: String {
         switch self {
-        case .lmStudioAPIKey: "LM Studio API key"
         case .omlxAPIKey: "oMLX API key"
         case .omlxAdminSession: "oMLX admin session"
         case .huggingFaceToken: "Hugging Face token"
@@ -25,8 +23,6 @@ public enum ManagedCredential: String, CaseIterable, Identifiable, Sendable {
 
     public var help: String {
         switch self {
-        case .lmStudioAPIKey:
-            "Optional credential used only by the temporary LM Studio migration adapter."
         case .omlxAPIKey: "Optional credential sent only to the local oMLX API."
         case .omlxAdminSession: "Session used to unload models through the oMLX admin API."
         case .huggingFaceToken:
@@ -35,6 +31,86 @@ public enum ManagedCredential: String, CaseIterable, Identifiable, Sendable {
         case .adminPassword: "Required only when the control API is exposed beyond this Mac."
         case .tokenSidecarPostgresDSN: "Connection URL used by Unified Inference to deliver token usage to the central ledger."
         }
+    }
+}
+
+public enum CredentialDraftPreview {
+    public static func render(
+        _ value: String,
+        for credential: ManagedCredential
+    ) -> String {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "" }
+        if credential == .tokenSidecarPostgresDSN {
+            return postgresDSN(trimmed) ?? compactSecret(trimmed)
+        }
+        return compactSecret(trimmed)
+    }
+
+    private static func postgresDSN(_ value: String) -> String? {
+        guard
+            let components = URLComponents(string: value),
+            let scheme = components.scheme,
+            let host = components.host,
+            !scheme.isEmpty,
+            !host.isEmpty
+        else {
+            return nil
+        }
+
+        var preview = "\(scheme)://"
+        if let user = components.user, !user.isEmpty {
+            preview += user
+            if let password = components.password {
+                preview += ":\(truncatedPassword(password))"
+            }
+            preview += "@"
+        }
+        if host.contains(":") {
+            preview += "[\(host)]"
+        } else {
+            preview += host
+        }
+        if let port = components.port {
+            preview += ":\(port)"
+        }
+        preview += components.path
+        if components.query != nil {
+            preview += "?…"
+        }
+        if components.fragment != nil {
+            preview += "#…"
+        }
+        if let password = components.password {
+            let noun = password.count == 1 ? "character" : "characters"
+            preview += " · password \(password.count) \(noun)"
+        }
+        return preview
+    }
+
+    private static func truncatedPassword(_ value: String) -> String {
+        guard value.count > 8 else {
+            return String(repeating: "•", count: max(1, value.count))
+        }
+        return middleTruncated(value)
+    }
+
+    private static func compactSecret(_ value: String) -> String {
+        let noun = value.count == 1 ? "character" : "characters"
+        guard value.count > 8 else {
+            return "\(String(repeating: "•", count: max(1, value.count))) · \(value.count) \(noun)"
+        }
+        return "\(middleTruncated(value)) · \(value.count) \(noun)"
+    }
+
+    private static func middleTruncated(_ value: String) -> String {
+        let hiddenCharacterCount = 4
+        let prefixCount = min(12, max(2, (value.count - hiddenCharacterCount) / 2))
+        let suffixCount = min(
+            7,
+            max(2, value.count - prefixCount - hiddenCharacterCount)
+        )
+        return "\(value.prefix(prefixCount)) •••• \(value.suffix(suffixCount))"
     }
 }
 

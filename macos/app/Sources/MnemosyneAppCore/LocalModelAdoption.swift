@@ -32,6 +32,12 @@ public struct LocalModelCandidate: Codable, Equatable, Identifiable, Sendable {
     public let compatibility: String
     public let compatibilityReason: String
     public let capabilities: [String]
+    public let architecture: String?
+    public let contextLength: Int?
+    public let parameterCount: Int64?
+    public let summary: String?
+    public let modelCardMarkdown: String?
+    public let recommendedProjectorId: String?
     public let projectorOptions: [LocalProjectorCandidate]
     public let existingAlias: String?
     public let alreadyImported: Bool
@@ -54,15 +60,18 @@ public struct LocalModelImportSelection: Codable, Equatable, Sendable {
     public let candidateId: String
     public let alias: String?
     public let projectorId: String?
+    public let includeProjector: Bool
 
     public init(
         candidateId: String,
         alias: String? = nil,
-        projectorId: String? = nil
+        projectorId: String? = nil,
+        includeProjector: Bool = true
     ) {
         self.candidateId = candidateId
         self.alias = alias
         self.projectorId = projectorId
+        self.includeProjector = includeProjector
     }
 }
 

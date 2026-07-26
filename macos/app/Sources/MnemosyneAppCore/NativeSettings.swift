@@ -1,7 +1,7 @@
 import Foundation
 
 public struct NativeSettings: Codable, Equatable, Sendable {
-    public static let supportedSchemaVersion = 1
+    public static let supportedSchemaVersion = 2
 
     public var schemaVersion: Int
     public var server: ServerSettings
@@ -9,6 +9,7 @@ public struct NativeSettings: Codable, Equatable, Sendable {
     public var paths: PathSettings
     public var storage: ModelStorageSettings
     public var models: [ModelProfileSettings]
+    public var migration: MigrationSettings
     public var tokenSidecar: TokenSidecarSettings
 
     public init(
@@ -18,6 +19,7 @@ public struct NativeSettings: Codable, Equatable, Sendable {
         paths: PathSettings = .init(),
         storage: ModelStorageSettings = .init(),
         models: [ModelProfileSettings] = [],
+        migration: MigrationSettings = .init(),
         tokenSidecar: TokenSidecarSettings = .init()
     ) {
         self.schemaVersion = schemaVersion
@@ -26,6 +28,7 @@ public struct NativeSettings: Codable, Equatable, Sendable {
         self.paths = paths
         self.storage = storage
         self.models = models
+        self.migration = migration
         self.tokenSidecar = tokenSidecar
     }
 
@@ -36,6 +39,7 @@ public struct NativeSettings: Codable, Equatable, Sendable {
         case paths
         case storage
         case models
+        case migration
         case tokenSidecar
     }
 
@@ -48,6 +52,10 @@ public struct NativeSettings: Codable, Equatable, Sendable {
         paths = try container.decode(PathSettings.self, forKey: .paths)
         storage = try container.decode(ModelStorageSettings.self, forKey: .storage)
         models = try container.decode([ModelProfileSettings].self, forKey: .models)
+        migration = try container.decodeIfPresent(
+            MigrationSettings.self,
+            forKey: .migration
+        ) ?? .init()
         tokenSidecar = try container.decode(TokenSidecarSettings.self, forKey: .tokenSidecar)
     }
 }
@@ -72,20 +80,10 @@ public struct ServerSettings: Codable, Equatable, Sendable {
 }
 
 public struct EngineSettings: Codable, Equatable, Sendable {
-    public var lmstudio = LMStudioSettings()
     public var llamaCpp = LlamaCppSettings()
     public var omlx = OMLXSettings()
     public var ds4 = DS4Settings()
     public var mflux = MFluxSettings()
-
-    public init() {}
-}
-
-public struct LMStudioSettings: Codable, Equatable, Sendable {
-    public var enabled = false
-    public var baseUrl = "http://127.0.0.1:1234"
-    public var apiKeyEnv = "LMSTUDIO_API_KEY"
-    public var requestTimeoutSeconds = 30.0
 
     public init() {}
 }
@@ -189,7 +187,6 @@ public struct StorageLocationSettings: Codable, Equatable, Identifiable, Sendabl
 }
 
 public enum InferenceEngine: String, Codable, CaseIterable, Identifiable, Sendable {
-    case lmstudio
     case llamaCpp = "llama.cpp"
     case omlx
     case ds4
@@ -199,7 +196,6 @@ public enum InferenceEngine: String, Codable, CaseIterable, Identifiable, Sendab
 
     public var displayName: String {
         switch self {
-        case .lmstudio: "LM Studio"
         case .llamaCpp: "llama.cpp"
         case .omlx: "oMLX"
         case .ds4: "DS4"
@@ -254,7 +250,6 @@ public struct ModelLoadSettings: Codable, Equatable, Sendable {
     public var contextLength: Int?
     public var evalBatchSize: Int?
     public var flashAttention: Bool?
-    public var numExperts: Int?
     public var offloadKvCacheToGpu: Bool?
     public var projectorPath: String?
     public var gpuLayers: Int?
@@ -270,7 +265,6 @@ public struct ModelLoadSettings: Codable, Equatable, Sendable {
         contextLength: Int? = nil,
         evalBatchSize: Int? = nil,
         flashAttention: Bool? = nil,
-        numExperts: Int? = nil,
         offloadKvCacheToGpu: Bool? = nil,
         projectorPath: String? = nil,
         gpuLayers: Int? = nil,
@@ -285,7 +279,6 @@ public struct ModelLoadSettings: Codable, Equatable, Sendable {
         self.contextLength = contextLength
         self.evalBatchSize = evalBatchSize
         self.flashAttention = flashAttention
-        self.numExperts = numExperts
         self.offloadKvCacheToGpu = offloadKvCacheToGpu
         self.projectorPath = projectorPath
         self.gpuLayers = gpuLayers
@@ -296,6 +289,41 @@ public struct ModelLoadSettings: Codable, Equatable, Sendable {
         self.kvDiskDirectory = kvDiskDirectory
         self.kvDiskSpaceMb = kvDiskSpaceMb
         self.extraArgs = extraArgs
+    }
+}
+
+public struct MigrationSettings: Codable, Equatable, Sendable {
+    public var legacyLmstudioProfiles: [LegacyLMStudioProfileSettings]
+
+    public init(
+        legacyLmstudioProfiles: [LegacyLMStudioProfileSettings] = []
+    ) {
+        self.legacyLmstudioProfiles = legacyLmstudioProfiles
+    }
+}
+
+public struct LegacyLMStudioProfileSettings: Codable, Equatable, Sendable {
+    public var alias: String
+    public var model: String
+    public var servedModelName: String?
+    public var capabilities: [String]?
+    public var load: ModelLoadSettings
+    public var enabled: Bool
+
+    public init(
+        alias: String,
+        model: String,
+        servedModelName: String? = nil,
+        capabilities: [String]? = nil,
+        load: ModelLoadSettings = .init(),
+        enabled: Bool = true
+    ) {
+        self.alias = alias
+        self.model = model
+        self.servedModelName = servedModelName
+        self.capabilities = capabilities
+        self.load = load
+        self.enabled = enabled
     }
 }
 

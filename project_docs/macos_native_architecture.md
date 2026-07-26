@@ -6,8 +6,9 @@ Status: implemented native architecture; target-Mac acceptance remains pending.
 
 The macOS deployment provides one OpenAI/Anthropic-compatible endpoint for a
 manager-owned llama.cpp runtime, oMLX, DwarfStar (DS4), and a managed MFLUX
-image worker. LM Studio is retained only as an explicitly enabled migration
-fallback until its soak is accepted. The deployment preserves the
+image worker. LM Studio is not an inference engine; its configured and
+conventional model directories are read only as Finder-confirmed migration
+hints. The deployment preserves the
 single-resident-model behavior of the CUDA deployment while running natively so
 Apple Metal and unified memory remain available to the inference engines.
 
@@ -89,21 +90,20 @@ There is exactly one lifecycle owner: Mnemosyne Core.
 - Clients use Mnemosyne on port 1240. Direct client traffic to an inner engine
   can violate the single-resident invariant and is unsupported.
 
-During the migration soak, LM Studio JIT loading and oMLX pinning/automatic
-loading must not create models outside the coordinator. Operators disable
-those behaviors during setup. Startup and periodic audits fail closed if an
-unexpected resident appears or an enabled engine cannot report authoritative
-state.
+oMLX pinning or automatic loading must not create models outside the
+coordinator. Operators disable those behaviors during setup. Startup and
+periodic audits fail closed if an unexpected resident appears or an enabled
+engine cannot report authoritative state.
 
 ## Model Profiles
 
 Public aliases are globally unique and explicitly select an engine. Mnemosyne
 does not infer the engine from a model name or file extension.
 
-Conceptual configuration (fresh installs disable the legacy LM Studio adapter):
+Conceptual configuration:
 
 ```yaml
-schema_version: 1
+schema_version: 2
 
 server:
   inference_bind: 127.0.0.1
@@ -115,9 +115,6 @@ server:
   swap_queue_timeout_seconds: 300
 
 engines:
-  lmstudio:
-    enabled: false
-    base_url: http://127.0.0.1:1234
   llama_cpp:
     enabled: true
     host: 127.0.0.1
@@ -140,6 +137,11 @@ engines:
 # create profiles only after the user selects the exact model and destination;
 # the service preserves those paths instead of assuming a volume or cache root.
 models: []
+
+# Version-1 LM Studio profiles are converted to inert migration records and
+# consumed only when Finder import adopts their weights into a native engine.
+migration:
+  legacy_lmstudio_profiles: []
 ```
 
 Engine-specific options live below `load`. Unknown options are rejected unless
@@ -165,11 +167,10 @@ atomic profile migration. Projector GGUFs never become primary models. DS4
 profiles are always explicit because DS4 accepts only its purpose-built GGUF
 layouts. A read-only local-source route parses LM Studio's configured
 `downloadsFolder` and advertises that exact path before its documented
-`~/.lmstudio/models` default, without depending on the LM Studio adapter or
-daemon. These are only Finder preselection hints; the picker grant and bounded
+`~/.lmstudio/models` default, without contacting an LM Studio adapter, daemon,
+or API. These are only Finder preselection hints; the picker grant and bounded
 filesystem helper remain the access and validation boundary. Symlink and
-nested paths are retained rather than collapsed to a volume root. The LM
-Studio inventory remains only for the temporary soak fallback.
+nested paths are retained rather than collapsed to a volume root.
 
 ## Finder Access and Protected Paths
 
@@ -401,8 +402,8 @@ package under compatibility imports. The macOS package must never import
 1. Configuration, adapter protocol, coordinator, and deterministic fake-engine
    tests.
 2. Manager-owned llama.cpp adapter, official runtime integrity checks, GGUF
-   quant/shard/projector selection, and local-library adoption tests. The LM
-   Studio adapter remains covered only for migration/soak compatibility.
+   quant/shard selection, automatic vision-projector defaults with opt-out,
+   metadata/model-card discovery, and local-library adoption tests.
 3. oMLX adapter, including explicit validation of programmatic unload auth.
 4. DS4 subprocess adapter and readiness/termination tests using a fake server.
 5. Inference proxy, endpoint capability checks, and usage normalization.
@@ -417,7 +418,6 @@ package under compatibility imports. The macOS package must never import
 ## External References
 
 - llama.cpp: <https://github.com/ggml-org/llama.cpp>
-- LM Studio model management (temporary migration fallback): <https://lmstudio.ai/docs/developer/rest>
 - oMLX: <https://github.com/jundot/omlx>
 - DwarfStar: <https://github.com/antirez/ds4>
 - MLX unified memory: <https://ml-explore.github.io/mlx/build/html/usage/unified_memory.html>

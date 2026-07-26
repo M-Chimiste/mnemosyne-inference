@@ -108,9 +108,9 @@ class FakeAdapter(EngineAdapter):
 def _targets() -> tuple[ResolvedTarget, ResolvedTarget]:
     profiles = MacConfig.model_validate(
         {
-            "engines": {"lmstudio": {"enabled": True}},
+            "engines": {"llama_cpp": {"enabled": True}},
             "models": [
-                {"alias": "studio", "engine": "lmstudio", "model": "org/studio"},
+                {"alias": "studio", "engine": "llama.cpp", "model": "org/studio"},
                 {"alias": "glm", "engine": "omlx", "model": "org/glm"},
             ]
         }
@@ -121,7 +121,7 @@ def _targets() -> tuple[ResolvedTarget, ResolvedTarget]:
 def _coordinator(events: list[str]) -> tuple[ResidencyCoordinator, dict[EngineName, FakeAdapter]]:
     adapters = {
         engine: FakeAdapter(engine, events)
-        for engine in (EngineName.LMSTUDIO, EngineName.OMLX, EngineName.DS4)
+        for engine in (EngineName.LLAMA_CPP, EngineName.OMLX, EngineName.DS4)
     }
     coordinator = ResidencyCoordinator(
         adapters,
@@ -143,7 +143,7 @@ async def test_concurrent_same_target_coalesces_one_load() -> None:
     second_task = asyncio.create_task(coordinator.acquire(studio))
     first, second = await asyncio.gather(first_task, second_task)
 
-    assert adapters[EngineName.LMSTUDIO].load_count == 1
+    assert adapters[EngineName.LLAMA_CPP].load_count == 1
     status = await coordinator.status()
     assert status.inflight == 2
     assert status.state == CoordinatorState.READY
@@ -166,12 +166,12 @@ async def test_different_target_waits_for_stream_lease_to_drain() -> None:
             break
         await asyncio.sleep(0)
     assert not glm_task.done()
-    assert not any(event.startswith("unload:lmstudio") for event in events)
+    assert not any(event.startswith("unload:llama.cpp") for event in events)
 
     await studio_lease.release()
     glm_lease = await asyncio.wait_for(glm_task, timeout=1)
     unload_index = next(
-        index for index, event in enumerate(events) if event.startswith("unload:lmstudio")
+        index for index, event in enumerate(events) if event.startswith("unload:llama.cpp")
     )
     load_index = next(
         index for index, event in enumerate(events) if event == "load:omlx:glm"
@@ -271,7 +271,7 @@ async def test_fifo_switch_prevents_old_target_starvation() -> None:
 
     later_studio = await asyncio.wait_for(later_studio_task, timeout=1)
     assert events.count("load:omlx:glm") == 1
-    assert events.count("load:lmstudio:studio") == 2
+    assert events.count("load:llama.cpp:studio") == 2
     await later_studio.release()
 
 
@@ -286,7 +286,7 @@ async def test_uncertain_adapter_state_fails_closed_before_load() -> None:
         await coordinator.initialize()
     with pytest.raises(CoordinatorError, match="not initialized"):
         await coordinator.acquire(studio)
-    assert adapters[EngineName.LMSTUDIO].load_count == 0
+    assert adapters[EngineName.LLAMA_CPP].load_count == 0
 
 
 @pytest.mark.asyncio
@@ -338,7 +338,7 @@ async def test_transition_failure_remains_degraded() -> None:
     coordinator, adapters = _coordinator(events)
     studio, _glm = _targets()
     await coordinator.initialize()
-    adapters[EngineName.LMSTUDIO].fail_load = True
+    adapters[EngineName.LLAMA_CPP].fail_load = True
 
     with pytest.raises(CoordinatorError, match="synthetic load failure"):
         await coordinator.acquire(studio)
@@ -356,7 +356,7 @@ async def test_failed_manual_unload_fails_closed() -> None:
     await coordinator.initialize()
     lease = await coordinator.acquire(studio)
     await lease.release()
-    adapters[EngineName.LMSTUDIO].fail_unload = True
+    adapters[EngineName.LLAMA_CPP].fail_unload = True
 
     with pytest.raises(CoordinatorError, match="synthetic unload failure"):
         await coordinator.unload()
@@ -371,11 +371,11 @@ async def test_unusable_post_load_resident_is_rejected_and_cleaned() -> None:
     coordinator, adapters = _coordinator(events)
     studio, _glm = _targets()
     await coordinator.initialize()
-    adapters[EngineName.LMSTUDIO].loaded_ready = False
+    adapters[EngineName.LLAMA_CPP].loaded_ready = False
 
     with pytest.raises(CoordinatorError, match="unusable"):
         await coordinator.acquire(studio)
-    assert adapters[EngineName.LMSTUDIO].residents == []
+    assert adapters[EngineName.LLAMA_CPP].residents == []
     assert (await coordinator.status()).state == CoordinatorState.DEGRADED
 
 
@@ -455,10 +455,10 @@ async def test_audit_skips_long_running_transition() -> None:
     studio, _glm = _targets()
     await coordinator.initialize()
     load_gate = asyncio.Event()
-    adapters[EngineName.LMSTUDIO].load_gate = load_gate
+    adapters[EngineName.LLAMA_CPP].load_gate = load_gate
 
     acquire_task = asyncio.create_task(coordinator.acquire(studio))
-    await asyncio.wait_for(adapters[EngineName.LMSTUDIO].load_started.wait(), timeout=1)
+    await asyncio.wait_for(adapters[EngineName.LLAMA_CPP].load_started.wait(), timeout=1)
 
     assert (await coordinator.status()).state == CoordinatorState.LOADING
     assert await asyncio.wait_for(coordinator.audit(), timeout=0.1) is True
@@ -481,7 +481,7 @@ async def test_idle_eviction_uses_verified_global_unload() -> None:
     await lease.release()
 
     assert await coordinator.evict_if_idle(0) is True
-    assert adapters[EngineName.LMSTUDIO].residents == []
+    assert adapters[EngineName.LLAMA_CPP].residents == []
     assert (await coordinator.status()).state == CoordinatorState.IDLE
 
 
@@ -492,11 +492,11 @@ async def test_same_alias_with_changed_load_digest_reloads() -> None:
     await coordinator.initialize()
     first = MacConfig.model_validate(
         {
-            "engines": {"lmstudio": {"enabled": True}},
+            "engines": {"llama_cpp": {"enabled": True}},
             "models": [
                 {
                     "alias": "studio",
-                    "engine": "lmstudio",
+                    "engine": "llama.cpp",
                     "model": "org/studio",
                     "load": {"context_length": 4096},
                 }
@@ -505,11 +505,11 @@ async def test_same_alias_with_changed_load_digest_reloads() -> None:
     ).profiles()["studio"]
     second = MacConfig.model_validate(
         {
-            "engines": {"lmstudio": {"enabled": True}},
+            "engines": {"llama_cpp": {"enabled": True}},
             "models": [
                 {
                     "alias": "studio",
-                    "engine": "lmstudio",
+                    "engine": "llama.cpp",
                     "model": "org/studio",
                     "load": {"context_length": 8192},
                 }
@@ -521,7 +521,7 @@ async def test_same_alias_with_changed_load_digest_reloads() -> None:
     await first_lease.release()
     second_lease = await coordinator.acquire(second)
     await second_lease.release()
-    assert adapters[EngineName.LMSTUDIO].load_count == 2
+    assert adapters[EngineName.LLAMA_CPP].load_count == 2
 
 
 @pytest.mark.asyncio
@@ -531,7 +531,7 @@ async def test_transition_has_a_hard_timeout() -> None:
     studio, _glm = _targets()
     await coordinator.initialize()
     coordinator.transition_timeout_seconds = 0.01
-    adapters[EngineName.LMSTUDIO].load_gate = asyncio.Event()
+    adapters[EngineName.LLAMA_CPP].load_gate = asyncio.Event()
 
     with pytest.raises(CoordinatorError, match="transition.*timed out"):
         await coordinator.acquire(studio)
@@ -543,7 +543,7 @@ async def test_shutdown_deadline_cancels_blocked_transition_and_attempts_cleanup
     events: list[str] = []
     adapters = {
         engine: FakeAdapter(engine, events)
-        for engine in (EngineName.LMSTUDIO, EngineName.OMLX, EngineName.DS4)
+        for engine in (EngineName.LLAMA_CPP, EngineName.OMLX, EngineName.DS4)
     }
     coordinator = ResidencyCoordinator(
         adapters,
@@ -554,7 +554,7 @@ async def test_shutdown_deadline_cancels_blocked_transition_and_attempts_cleanup
     )
     studio, _glm = _targets()
     await coordinator.initialize()
-    studio_adapter = adapters[EngineName.LMSTUDIO]
+    studio_adapter = adapters[EngineName.LLAMA_CPP]
     studio_adapter.load_gate = asyncio.Event()
     acquire_task = asyncio.create_task(coordinator.acquire(studio))
     await asyncio.wait_for(studio_adapter.load_started.wait(), timeout=1)
@@ -583,7 +583,7 @@ async def test_control_barrier_deadline_bounds_blocked_driver(operation: str) ->
     events: list[str] = []
     adapters = {
         engine: FakeAdapter(engine, events)
-        for engine in (EngineName.LMSTUDIO, EngineName.OMLX, EngineName.DS4)
+        for engine in (EngineName.LLAMA_CPP, EngineName.OMLX, EngineName.DS4)
     }
     coordinator = ResidencyCoordinator(
         adapters,
@@ -593,7 +593,7 @@ async def test_control_barrier_deadline_bounds_blocked_driver(operation: str) ->
     )
     studio, _glm = _targets()
     await coordinator.initialize()
-    studio_adapter = adapters[EngineName.LMSTUDIO]
+    studio_adapter = adapters[EngineName.LLAMA_CPP]
     studio_adapter.load_gate = asyncio.Event()
     acquire_task = asyncio.create_task(coordinator.acquire(studio))
     await asyncio.wait_for(studio_adapter.load_started.wait(), timeout=1)
@@ -627,7 +627,7 @@ async def test_audit_detects_and_repairs_missing_resident() -> None:
     await coordinator.initialize()
     lease = await coordinator.acquire(studio)
     await lease.release()
-    adapters[EngineName.LMSTUDIO].residents = []
+    adapters[EngineName.LLAMA_CPP].residents = []
 
     assert await coordinator.audit() is False
     status = await coordinator.status()

@@ -168,7 +168,14 @@ def test_install_store_migrates_projector_and_download_file_columns(
                 "PRAGMA table_info(native_model_installs)"
             )
         }
-        assert {"projector_filename", "files_json", "capabilities_json"} <= columns
+        assert {
+            "projector_filename",
+            "context_length",
+            "files_json",
+            "capabilities_json",
+            "download_speed_bps",
+            "hidden",
+        } <= columns
         migrated = store.get("legacy-install")
         assert migrated.projector_filename is None
         assert migrated.files_json is None
@@ -176,6 +183,40 @@ def test_install_store_migrates_projector_and_download_file_columns(
         assert migrated.capabilities is None
         assert migrated.to_dict()["download_files"] == []
         assert migrated.to_dict()["capabilities"] is None
+    finally:
+        store.close()
+
+
+def test_install_history_can_be_hidden_without_losing_managed_download_identity(
+    tmp_path,
+) -> None:
+    store = InstallStore(tmp_path / "state.db")
+    try:
+        record = store.create(
+            repo_id="owner/model",
+            engine="llama.cpp",
+            storage="internal",
+            alias="model",
+            destination="/models/owner/model",
+            revision="abc123",
+            filename="model.gguf",
+            family=None,
+            total_bytes=4096,
+        )
+        store.update(
+            record.id,
+            status="installed",
+            bytes_downloaded=4096,
+            download_speed_bps=None,
+        )
+
+        dismissed = store.dismiss(record.id)
+
+        assert dismissed.status == "installed"
+        assert store.list() == []
+        assert store.get(record.id).hidden == 1
+        assert store.latest_for_alias("model").id == record.id
+        assert "hidden" not in store.get(record.id).to_dict()
     finally:
         store.close()
 

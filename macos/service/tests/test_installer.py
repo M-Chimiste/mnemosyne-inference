@@ -82,3 +82,29 @@ async def test_profile_registration_retry_does_not_redownload_after_restart(
     assert registration_attempts == 2
     assert len(spawn_calls) == 1
     await second.stop()
+
+
+@pytest.mark.asyncio
+async def test_install_history_dismissal_refuses_active_downloads(tmp_path) -> None:
+    installer = NativeInstaller(tmp_path / "state.db")
+    record = installer.store.create(
+        repo_id="owner/model",
+        engine="llama.cpp",
+        storage="internal",
+        alias="model",
+        destination=str(tmp_path / "models" / "owner" / "model"),
+        revision="abc123",
+        filename="model.gguf",
+        family=None,
+        total_bytes=4096,
+    )
+
+    with pytest.raises(ValueError, match="active install"):
+        await installer.dismiss(record.id)
+
+    installer.store.update(record.id, status="installed", bytes_downloaded=4096)
+    dismissed = await installer.dismiss(record.id)
+
+    assert dismissed.status == "installed"
+    assert await installer.list() == []
+    installer.store.close()

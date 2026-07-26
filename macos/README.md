@@ -35,8 +35,8 @@ startup, DS4 model loading, automatic LaunchAgent restart/login behavior, and
 CUDA parity remain separate smoke gates. A Developer ID-signed bundle is now
 installed on Theseus: its direct `Contents/MacOS/mnemosyne-service-bootstrap`
 LaunchAgent is running through `SMAppService`, and both native HTTP planes
-answer from the packaged runtime. LM Studio is still available only as an
-explicitly enabled migration fallback until the native-model soak is accepted.
+answer from the packaged runtime. LM Studio is not an inference engine or API
+dependency; only its on-disk model directory remains as a migration hint.
 
 ## Ports and processes
 
@@ -50,8 +50,7 @@ explicitly enabled migration fallback until the native-model soak is accepted.
 | `17325` | `llama-server` | Unified Inference-owned GGUF process |
 
 All listeners default to loopback. Ports `17326` through `17329` are reserved
-for future local engines and diagnostics. Legacy migration configurations may
-also enable LM Studio on `1234`; fresh configurations do not.
+for future local engines and diagnostics.
 
 Mnemosyne Core is a per-user LaunchAgent. `Unified Inference.app` is only a controller,
 so **Quit Menu App** does not interrupt inference. The coordinator holds a model
@@ -73,9 +72,9 @@ environment variable `MNEMOSYNE_WORKSTATION_NAME` overrides auto-detection.
 - Python 3.11–3.13 and `uv` for service development.
 - Swift 6 for menu development. Full Xcode is required for final app signing,
   `SMAppService` integration testing, and source builds of custom Metal kernels.
-- oMLX, DS4, MFLUX, and the temporary LM Studio migration adapter are optional,
-  and an unavailable engine should be disabled. Its profiles are retained but
-  omitted from the callable model catalog until the engine is enabled again.
+- oMLX, DS4, and MFLUX are optional. An unavailable engine should be disabled;
+  its profiles are retained but omitted from the callable model catalog until
+  the engine is enabled again.
 
 The supported operator path for oMLX is its official Homebrew formula and
 headless CLI, not the separate oMLX menu-bar app. GLM-5.2 and related
@@ -154,12 +153,10 @@ recovery fallback. Mnemosyne starts DS4 with an explicit model, context, host,
 and port and terminates only a process whose recorded identity it can prove it
 owns.
 
-An existing LM Studio installation is not required for a fresh setup. During
-the staged migration only, an older configuration may keep `engines.lmstudio`
-enabled on loopback `:1234` so unconverted aliases remain usable. Keep it
-loopback-only and disable JIT loading for direct clients. Do not remove that
-explicit fallback or its credential until the local-library import and
-packaged-service soak are accepted.
+An existing LM Studio installation is not required. Version-1 configurations
+are upgraded without starting or contacting LM Studio: legacy LM Studio
+profiles become inert alias/load-setting records and disappear from the
+callable catalog until their weights are imported into llama.cpp or oMLX.
 
 ## Model storage and Hugging Face library
 
@@ -220,11 +217,14 @@ The selected root is then organized by engine:
 
 Use **Settings → Model Library** to choose llama.cpp, oMLX, DS4, or MFLUX,
 search or pick a curated recommendation, choose one of the configured folders,
-and download. llama.cpp search first returns GGUF repositories; a second GUI
-step requires an exact quant/shard set and optionally an explicit
-same-directory multimodal projector before Download is enabled. The resolved
-Hub revision and exact file list are persisted so retries cannot silently
-change weights.
+and download. Search results and details show bounded model-card prose plus
+detected architecture, context length, parameter count, and license when the
+Hub repository, config, or GGUF provides them. llama.cpp search first returns
+GGUF repositories; a second GUI step requires an exact quant/shard set. When a
+same-directory vision projector exists, the highest-fidelity option is selected
+automatically; the user can choose another or opt out for text-only use. The
+resolved Hub revision and exact file list are persisted so retries cannot
+silently change weights.
 DS4 results are restricted to the GGUF files published for DS4. MFLUX offers
 the text-to-image configurations present in the pinned runtime: FLUX.1,
 FLUX.2 Klein, Qwen Image, Krea 2 Turbo, FIBO, Z-Image, ERNIE Image, and
@@ -240,11 +240,13 @@ library without copying weights. The action always opens `NSOpenPanel`; the
 user may select an exact nested folder such as `/Volumes/Athena/models`.
 Unified Inference rescans the folder server-side, groups complete split GGUF
 sets, excludes `mmproj` files as primary models, discovers MLX folders, and
-returns opaque candidate IDs. Nothing is selected automatically. The user
-chooses aliases and an explicit projector (or text-only) before import; the
-service rescans and validates those IDs again, records the exact folder and
-volume UUID, and atomically migrates matching legacy aliases and compatible
-load settings. Discovery and import never load a model.
+returns opaque candidate IDs. Models remain an explicit import choice, while
+the highest-fidelity same-directory projector is preselected for each vision
+candidate. The user chooses aliases and can select another projector or opt
+out for text-only use; the service rescans and validates those IDs again,
+records detected metadata plus the exact folder and volume UUID, and atomically
+migrates matching legacy aliases and compatible load settings. Discovery and
+import never load a model.
 
 The ordinary Models editor does not accept raw model IDs or projector paths.
 Engine, model source, storage, served name, projector, and image family are
@@ -256,6 +258,9 @@ Downloads run in killable child processes and persist queued, downloading,
 registering, downloaded-but-not-registered, partial, cancelled, failed, and
 installed states in SQLite. They can continue while the Settings window is
 closed, be cancelled or retried from the GUI, and never make a model resident.
+The GUI shows transferred/total bytes, percentage, a progress bar, and smoothed
+live transfer speed. Completed entries can be hidden from recent history
+without discarding the managed-download identity used for safe maintenance.
 If profile registration fails after the weights land, Retry resumes only
 registration without downloading the weights again. On completion Mnemosyne
 creates the profile and, for oMLX, safely adds the selected library directory
@@ -263,6 +268,14 @@ through oMLX's admin API while the global residency coordinator has every
 engine empty. Downloaded oMLX metadata is classified before registration so
 the profile advertises only its detected generation, embeddings, or rerank
 routes.
+
+Removing a model profile keeps its files by default. The separate
+**Delete Files** confirmation is available only for a completed download owned
+by Unified Inference; Finder imports and hand-authored paths are never deleted.
+Deletion drains residency, revalidates the exact configured storage and managed
+destination, removes it in a bounded helper that refuses roots, escapes, and
+symlinks, then atomically removes the profile. oMLX deletion also refreshes its
+authoritative directory inventory inside the same all-engines-empty barrier.
 
 Set `HF_TOKEN` in the private environment file for gated or private Hub repos.
 The token is write-only in Settings and is inherited only by the download
@@ -450,14 +463,14 @@ uses `POST /manager/model-library/local-scan` plus
 `~/.lmstudio/settings.json` `downloadsFolder` and offers that exact path, then
 the documented `~/.lmstudio/models` default, as convenient Finder-backed scan
 shortcuts. Source discovery neither requires the LM Studio engine nor contacts
-its server. It does not inspect model weights: Finder still confirms the
+its server, load an adapter, or require an API credential. It does not inspect model weights: Finder still confirms the
 folder and the bounded filesystem helper performs the scan. This preserves
 nested and symlink paths used for external SSD libraries. Results are initially
-unselected, show engine, quant, size, compatibility, exact path, and whether an
-alias will be migrated, and offer explicit projector selection for multimodal
-use. A newly adopted profile does not become resident until a client requests
-its alias. The legacy LM Studio inventory endpoint remains only during the
-migration soak and is not the primary import workflow.
+unselected, show engine, quant, size, compatibility, detected model metadata,
+exact path, and whether an alias will be migrated. Vision candidates
+automatically select a projector while retaining manual and text-only choices.
+A newly adopted profile does not become resident until a client requests its
+alias.
 
 The Storage page displays the exact selected directory, containing mount,
 free space, and availability. Add/change actions always use `NSOpenPanel`, so

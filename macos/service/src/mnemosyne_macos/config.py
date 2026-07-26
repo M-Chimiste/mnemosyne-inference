@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import ipaddress
 import json
@@ -82,22 +83,6 @@ class ServerConfig(BaseModel):
         if self.startup_policy != "unload_all":
             raise ValueError("only startup_policy='unload_all' is currently supported")
         return self
-
-
-class LMStudioConfig(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    # Kept only as a migration source while existing profiles are moved to
-    # manager-owned llama.cpp or oMLX. Fresh installs do not depend on it.
-    enabled: bool = False
-    base_url: str = "http://127.0.0.1:1234"
-    api_key_env: str = "LMSTUDIO_API_KEY"
-    request_timeout_seconds: float = Field(default=30, gt=0)
-
-    @field_validator("base_url")
-    @classmethod
-    def _loopback_only(cls, value: str) -> str:
-        return _validate_loopback_url(value, engine="LM Studio")
 
 
 class LlamaCppConfig(BaseModel):
@@ -207,7 +192,6 @@ class MFluxConfig(BaseModel):
 class EnginesConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    lmstudio: LMStudioConfig = Field(default_factory=LMStudioConfig)
     llama_cpp: LlamaCppConfig = Field(default_factory=LlamaCppConfig)
     omlx: OMLXConfig = Field(default_factory=OMLXConfig)
     ds4: DS4Config = Field(default_factory=DS4Config)
@@ -220,7 +204,6 @@ class ModelLoadConfig(BaseModel):
     context_length: int | None = Field(default=None, gt=0)
     eval_batch_size: int | None = Field(default=None, gt=0)
     flash_attention: bool | None = None
-    num_experts: int | None = Field(default=None, gt=0)
     offload_kv_cache_to_gpu: bool | None = None
     projector_path: str | None = None
     gpu_layers: int | None = Field(default=None, ge=0)
@@ -231,6 +214,31 @@ class ModelLoadConfig(BaseModel):
     kv_disk_directory: str | None = None
     kv_disk_space_mb: int | None = Field(default=None, gt=0)
     extra_args: list[str] = Field(default_factory=list)
+
+
+class LegacyLMStudioLoadConfig(ModelLoadConfig):
+    """Settings retained only until a v1 profile is adopted from local files."""
+
+    num_experts: int | None = Field(default=None, gt=0)
+
+
+class LegacyLMStudioProfile(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    alias: str
+    model: str
+    served_model_name: str | None = None
+    capabilities: set[Endpoint] | None = None
+    load: LegacyLMStudioLoadConfig = Field(default_factory=LegacyLMStudioLoadConfig)
+    enabled: bool = True
+
+
+class MigrationConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    legacy_lmstudio_profiles: list[LegacyLMStudioProfile] = Field(
+        default_factory=list
+    )
 
 
 class ImageProfileConfig(BaseModel):
@@ -320,7 +328,6 @@ class ModelProfile(BaseModel):
                 self.load.context_length,
                 self.load.eval_batch_size,
                 self.load.flash_attention,
-                self.load.num_experts,
                 self.load.offload_kv_cache_to_gpu,
                 self.load.projector_path,
                 self.load.gpu_layers,
@@ -336,7 +343,6 @@ class ModelProfile(BaseModel):
             for value in (
                 self.load.eval_batch_size,
                 self.load.flash_attention,
-                self.load.num_experts,
                 self.load.offload_kv_cache_to_gpu,
                 self.load.projector_path,
                 self.load.gpu_layers,
@@ -346,22 +352,8 @@ class ModelProfile(BaseModel):
                 self.load.pooling,
             )
         ):
-            raise ValueError("llama.cpp/LM Studio load settings are not supported by DS4")
-        if self.engine == EngineName.LMSTUDIO and any(
-            value is not None
-            for value in (
-                self.load.projector_path,
-                self.load.gpu_layers,
-                self.load.ubatch_size,
-                self.load.threads,
-                self.load.parallel,
-                self.load.pooling,
-            )
-        ):
-            raise ValueError("llama.cpp load settings require engine='llama.cpp'")
+            raise ValueError("llama.cpp load settings are not supported by DS4")
         if self.engine == EngineName.LLAMA_CPP:
-            if self.load.num_experts is not None:
-                raise ValueError("num_experts is an LM Studio-only load setting")
             capabilities = self.capabilities or set(DEFAULT_CAPABILITIES[EngineName.LLAMA_CPP])
             generation = capabilities & {
                 Endpoint.CHAT_COMPLETIONS,
@@ -548,13 +540,64 @@ class StorageConfig(BaseModel):
 class MacConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    schema_version: Literal[1] = 1
+    schema_version: Literal[2] = 2
     server: ServerConfig = Field(default_factory=ServerConfig)
     engines: EnginesConfig = Field(default_factory=EnginesConfig)
     paths: PathsConfig = Field(default_factory=PathsConfig)
     storage: StorageConfig = Field(default_factory=StorageConfig)
     models: list[ModelProfile] = Field(default_factory=list)
+    migration: MigrationConfig = Field(default_factory=MigrationConfig)
     token_sidecar: TokenSidecarConfig = Field(default_factory=TokenSidecarConfig)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_v1_lmstudio_configuration(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        raw = copy.deepcopy(value)
+        version = raw.get("schema_version", 1)
+        if version != 1:
+            return raw
+
+        engines = raw.get("engines")
+        if isinstance(engines, dict):
+            engines.pop("lmstudio", None)
+
+        migrated_profiles: list[dict[str, Any]] = []
+        retained_profiles: list[Any] = []
+        models = raw.get("models", [])
+        if isinstance(models, list):
+            for profile in models:
+                if isinstance(profile, dict) and profile.get("engine") == "lmstudio":
+                    migrated_profiles.append(
+                        {
+                            key: item
+                            for key, item in profile.items()
+                            if key
+                            in {
+                                "alias",
+                                "model",
+                                "served_model_name",
+                                "capabilities",
+                                "load",
+                                "enabled",
+                            }
+                        }
+                    )
+                else:
+                    retained_profiles.append(profile)
+            raw["models"] = retained_profiles
+
+        migration = raw.get("migration")
+        if not isinstance(migration, dict):
+            migration = {}
+        previous = migration.get("legacy_lmstudio_profiles")
+        if isinstance(previous, list):
+            migrated_profiles = [*previous, *migrated_profiles]
+        migration["legacy_lmstudio_profiles"] = migrated_profiles
+        raw["migration"] = migration
+        raw["schema_version"] = 2
+        return raw
 
     @model_validator(mode="after")
     def _validate_cross_references(self) -> "MacConfig":
@@ -590,8 +633,6 @@ class MacConfig(BaseModel):
             "inference": self.server.inference_port,
             "control": self.server.control_port,
         }
-        if self.engines.lmstudio.enabled:
-            ports["lmstudio"] = _url_port(self.engines.lmstudio.base_url)
         if self.engines.llama_cpp.enabled:
             ports["llama.cpp"] = self.engines.llama_cpp.port
         if self.engines.omlx.enabled:
@@ -610,7 +651,6 @@ class MacConfig(BaseModel):
 
     def engine_enabled(self, engine: EngineName) -> bool:
         return {
-            EngineName.LMSTUDIO: self.engines.lmstudio.enabled,
             EngineName.LLAMA_CPP: self.engines.llama_cpp.enabled,
             EngineName.OMLX: self.engines.omlx.enabled,
             EngineName.DS4: self.engines.ds4.enabled,

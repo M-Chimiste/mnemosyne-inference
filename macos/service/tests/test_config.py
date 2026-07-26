@@ -32,10 +32,9 @@ from mnemosyne_macos.models import Endpoint, EngineName, ModelKind
 
 def test_defaults_replace_the_legacy_sidecar_port() -> None:
     config = MacConfig()
+    assert config.schema_version == 2
     assert config.server.inference_port == 1240
     assert config.server.control_port == 17321
-    assert config.engines.lmstudio.base_url.endswith(":1234")
-    assert config.engines.lmstudio.enabled is False
     assert config.engines.llama_cpp.port == 17325
     assert config.engines.llama_cpp.enabled is True
     assert config.engines.omlx.base_url.endswith(":17322")
@@ -53,7 +52,7 @@ def test_legacy_mac_node_placeholder_migrates_to_automatic_identity() -> None:
     assert config.token_sidecar.node_id == ""
 
 
-def test_parse_config_validates_in_memory_yaml_without_a_file() -> None:
+def test_parse_config_migrates_v1_lmstudio_profiles_to_inert_import_records() -> None:
     config = parse_config(
         """
         engines:
@@ -71,7 +70,12 @@ def test_parse_config_validates_in_memory_yaml_without_a_file() -> None:
         source="in-memory configuration",
     )
 
-    assert [model.alias for model in config.models] == ["local-model"]
+    assert config.schema_version == 2
+    assert config.models == []
+    assert [
+        model.alias for model in config.migration.legacy_lmstudio_profiles
+    ] == ["local-model"]
+    assert not hasattr(config.engines, "lmstudio")
 
 
 def test_parse_config_reports_source_for_invalid_yaml() -> None:
@@ -114,15 +118,12 @@ def test_ds4_process_state_path_is_configurable(tmp_path) -> None:
 def test_profiles_resolve_engine_specific_wire_names() -> None:
     config = MacConfig.model_validate(
         {
-            "engines": {"lmstudio": {"enabled": True}},
             "models": [
-                {"alias": "studio-model", "engine": "lmstudio", "model": "org/model"},
                 {"alias": "deepseek-v4", "engine": "ds4", "model": "~/ds4.gguf"},
             ]
         }
     )
     profiles = config.profiles()
-    assert profiles["studio-model"].wire_model == "org/model"
     assert profiles["deepseek-v4"].wire_model == "deepseek-v4"
     assert profiles["deepseek-v4"].key.engine == EngineName.DS4
     assert Endpoint.RESPONSES in profiles["deepseek-v4"].capabilities
@@ -205,15 +206,15 @@ def test_inner_engine_urls_must_be_loopback_and_secret_free() -> None:
         MacConfig.model_validate(
             {
                 "engines": {
-                    "lmstudio": {
-                        "base_url": "http://token:secret@127.0.0.1:1234"
+                    "omlx": {
+                        "base_url": "http://token:secret@127.0.0.1:17322"
                     }
                 }
             }
         )
 
 
-def test_ds4_rejects_lmstudio_only_load_options() -> None:
+def test_ds4_rejects_llama_cpp_only_load_options() -> None:
     with pytest.raises(ValueError, match="not supported by DS4"):
         MacConfig.model_validate(
             {

@@ -19,7 +19,6 @@ llama.cpp, DS4, and MFLUX are installed or updated from Unified Inference.
 | oMLX | MLX language, vision, embedding, and rerank models | Homebrew CLI | `17322` |
 | DS4 | Supported DeepSeek V4 and GLM 5.2 layouts | **Settings → Runtime Updates** | `17323` |
 | MFLUX | Apple Silicon image generation | Bundled; updates in **Runtime Updates** | `17324` |
-| LM Studio | Temporary migration fallback only | Do not install for a fresh setup | `1234` |
 
 Clients never call those private ports. Unified Inference owns model selection,
 global residency, proxying, and language-token accounting on port `1240`.
@@ -123,8 +122,9 @@ No Homebrew llama.cpp installation is needed.
 2. Choose **Check Now**.
 3. Install the available llama.cpp runtime.
 4. In **Settings → Engines**, leave llama.cpp enabled.
-5. Use **Model Library → llama.cpp** to choose a GGUF repository, exact
-   quant/shard set, and optional multimodal projector.
+5. Use **Model Library → llama.cpp** to choose a GGUF repository and exact
+   quant/shard set. A detected vision projector is selected automatically; you
+   can choose another or opt out for text-only use.
 
 Unified Inference downloads the official
 [ggml-org/llama.cpp release](https://github.com/ggml-org/llama.cpp/releases/latest),
@@ -257,7 +257,7 @@ environment is not used by Unified Inference.
 
 ## 8. Import an existing LM Studio library
 
-LM Studio is not required and should remain disabled on a fresh Mac. To reuse
+LM Studio is not required and is never used as an inference engine. To reuse
 weights from an older installation:
 
 1. Open **Settings → Models → Add Existing Models…**.
@@ -268,8 +268,9 @@ weights from an older installation:
 4. Test every migrated alias through Unified Inference before deleting the
    old LM Studio installation.
 
-The scan does not contact LM Studio, load a model, copy weights, or treat a
-multimodal projector as a primary model.
+The source hint reads only LM Studio's on-disk settings and conventional model
+directory. The scan does not contact LM Studio, load a model, copy weights, or
+treat a multimodal projector as a primary model.
 
 ## 9. Verify the complete installation
 

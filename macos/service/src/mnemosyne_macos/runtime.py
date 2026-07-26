@@ -28,7 +28,6 @@ from .config import (
 from .coordinator import CoordinatorStatus, ResidencyCoordinator
 from .engines.base import EngineAdapter
 from .engines.ds4 import DS4Adapter
-from .engines.lmstudio import LMStudioAdapter
 from .engines.llamacpp import LlamaCppAdapter
 from .engines.mflux import MFluxAdapter
 from .engines.omlx import OMLXAdapter
@@ -117,6 +116,32 @@ def _lexical_path(value: str | Path) -> str:
     )
 
 
+def _path_is_within(root: str | Path, candidate: str | Path) -> bool:
+    root_value = _lexical_path(root)
+    candidate_value = _lexical_path(candidate)
+    try:
+        return os.path.commonpath([root_value, candidate_value]) == root_value
+    except ValueError:
+        return False
+
+
+def _profile_uses_install_destination(
+    profile: ModelProfile,
+    install: InstallRecord,
+) -> bool:
+    destination = _lexical_path(install.destination)
+    if profile.engine in {EngineName.LLAMA_CPP, EngineName.DS4}:
+        if not _path_is_within(destination, profile.model):
+            return False
+        projector = profile.load.projector_path
+        return projector is None or _path_is_within(destination, projector)
+    if profile.engine == EngineName.MFLUX:
+        return _lexical_path(profile.model) == destination
+    if profile.engine == EngineName.OMLX:
+        return profile.model == Path(destination).name
+    return False
+
+
 def _storage_scope_for_path(
     config: MacConfig,
     value: str | Path,
@@ -144,8 +169,6 @@ def build_adapters(
     security_scope_root: str | Path | None = None,
 ) -> dict[EngineName, EngineAdapter]:
     adapters: dict[EngineName, EngineAdapter] = {}
-    if config.engines.lmstudio.enabled:
-        adapters[EngineName.LMSTUDIO] = LMStudioAdapter(config.engines.lmstudio)
     if config.engines.llama_cpp.enabled:
         adapters[EngineName.LLAMA_CPP] = LlamaCppAdapter(
             config.engines.llama_cpp,
@@ -415,6 +438,139 @@ class NativeRuntime:
                 self.installer.storage = config.storage
             return restart_required, revision
 
+    async def delete_managed_model(
+        self,
+        alias: str,
+        *,
+        expected_revision: str,
+    ) -> tuple[MacConfig, str, bool]:
+        """Delete one app-managed download and remove its profile atomically.
+
+        The install ledger supplies the exact manager-owned destination. Finder
+        imports and hand-authored profiles deliberately cannot use this path.
+        The coordinator maintenance barrier prevents a new lease from opening
+        while the bounded filesystem helper removes the directory.
+        """
+
+        if self.config_path is None:
+            raise RuntimeConfigurationError("runtime has no configured YAML path")
+
+        removed_files = False
+        updated_config: MacConfig | None = None
+
+        async def remove(deadline) -> None:
+            nonlocal removed_files, updated_config
+            async with self._reload_lock:
+                fresh = load_config(self.config_path, env_path=self.env_path)
+                current_revision = configuration_revision(fresh)
+                if expected_revision != current_revision:
+                    raise ConfigurationConflict(
+                        "settings changed while this window was open; reload them before deleting"
+                    )
+                profile = next(
+                    (item for item in fresh.models if item.alias == alias),
+                    None,
+                )
+                if profile is None:
+                    raise KeyError(f"unknown model alias '{alias}'")
+                install = await self.installer.latest_for_alias(alias)
+                if install is None or install.status != "installed":
+                    raise RuntimeConfigurationError(
+                        "model files can only be deleted for a completed download "
+                        "owned by Unified Inference"
+                    )
+                if profile.engine.value != install.engine:
+                    raise RuntimeConfigurationError(
+                        "the model profile no longer matches its managed download"
+                    )
+                location = next(
+                    (
+                        item
+                        for item in fresh.storage.locations
+                        if item.name == install.storage
+                    ),
+                    None,
+                )
+                if (
+                    location is None
+                    or profile.storage != install.storage
+                    or not _profile_uses_install_destination(profile, install)
+                ):
+                    raise RuntimeConfigurationError(
+                        "the model profile no longer points at its managed download"
+                    )
+
+                removed_files = await self.filesystem.delete_directory(
+                    root=location.path,
+                    path=install.destination,
+                    expected_volume_uuid=location.volume_uuid,
+                    scope_id=location.scope_id,
+                )
+                updated_config = fresh.model_copy(
+                    update={
+                        "models": [
+                            item for item in fresh.models if item.alias != alias
+                        ]
+                    }
+                )
+                updated_config = MacConfig.model_validate(
+                    updated_config.model_dump(mode="json")
+                )
+                save_config(updated_config, self.config_path)
+                self.config = updated_config
+                self.profiles = updated_config.profiles()
+                self.installer.storage = updated_config.storage
+                await asyncio.to_thread(
+                    self.installer.store.update,
+                    install.id,
+                    status="deleted",
+                    hidden=1,
+                    pid=None,
+                    download_speed_bps=None,
+                    error=None,
+                )
+
+                if profile.engine == EngineName.OMLX:
+                    adapter = self.adapters.get(EngineName.OMLX)
+                    if isinstance(adapter, OMLXAdapter):
+                        directories: list[str] = []
+                        for item in updated_config.storage.locations:
+                            try:
+                                model_root = await self.filesystem.ensure_directory(
+                                    root=item.path,
+                                    path=os.path.join(
+                                        item.path,
+                                        EngineName.OMLX.value,
+                                    ),
+                                    expected_volume_uuid=item.volume_uuid,
+                                    scope_id=item.scope_id,
+                                )
+                            except FilesystemProbeError:
+                                continue
+                            directories.append(model_root)
+                        directories.extend(
+                            updated_config.engines.omlx.model_directories
+                        )
+                        directories = list(dict.fromkeys(directories))
+                        if directories:
+                            self._omlx_directory_sync_pending = True
+                            await adapter.register_model_directories(
+                                directories,
+                                deadline=deadline,
+                            )
+                        self._omlx_directory_sync_pending = False
+
+        await self.coordinator.run_empty_maintenance(
+            remove,
+            name=f"delete managed model {alias}",
+        )
+        assert updated_config is not None
+        return (
+            updated_config,
+            configuration_revision(updated_config),
+            removed_files,
+        )
+
     async def register_security_scope(self, path: str, bookmark_data: str) -> str:
         return (await self.security_scope_process.register(path, bookmark_data)).id
 
@@ -659,8 +815,13 @@ class NativeRuntime:
                 )
 
             models = list(fresh.models)
+            legacy_profiles = list(
+                fresh.migration.legacy_lmstudio_profiles
+            )
             imported: list[dict[str, str | bool | None]] = []
-            planned_aliases = {profile.alias for profile in models}
+            planned_aliases = {
+                profile.alias for profile in [*models, *legacy_profiles]
+            }
             needs_omlx = False
             for selection, candidate_id in zip(selections, ids, strict=True):
                 candidate = by_id[candidate_id]
@@ -671,10 +832,6 @@ class NativeRuntime:
                         index
                         for index, profile in enumerate(models)
                         if (
-                            profile.engine == EngineName.LMSTUDIO
-                            and profile.model == candidate.source_key
-                        )
-                        or (
                             profile.engine == EngineName.LLAMA_CPP
                             and _lexical_path(profile.model)
                             == _lexical_path(candidate.model_path)
@@ -689,8 +846,17 @@ class NativeRuntime:
                     None,
                 )
                 existing = models[existing_index] if existing_index is not None else None
+                legacy = next(
+                    (
+                        profile
+                        for profile in legacy_profiles
+                        if profile.model == candidate.source_key
+                    ),
+                    None,
+                )
+                prior = existing or legacy
                 requested_alias = str(selection.get("alias") or "").strip()
-                alias = requested_alias or (existing.alias if existing else "")
+                alias = requested_alias or (prior.alias if prior else "")
                 if not alias:
                     alias = suggested_model_alias(
                         candidate.display_name,
@@ -701,11 +867,12 @@ class NativeRuntime:
                     while alias in planned_aliases:
                         alias = f"{base_alias}-{suffix}"
                         suffix += 1
-                if alias in planned_aliases and (existing is None or alias != existing.alias):
+                if alias in planned_aliases and (prior is None or alias != prior.alias):
                     raise LocalModelError(f"model alias '{alias}' is already in use")
 
                 if candidate.engine == EngineName.LLAMA_CPP.value:
                     projector_id = selection.get("projector_id")
+                    include_projector = selection.get("include_projector", True) is not False
                     projector = next(
                         (
                             item
@@ -718,12 +885,23 @@ class NativeRuntime:
                         raise LocalModelError(
                             "the selected projector changed; scan the folder again"
                         )
-                    prior = existing.load if existing is not None else ModelLoadConfig()
-                    compatible_load = prior.model_dump(mode="python")
-                    # These settings belong to LM Studio/DS4 and have no
-                    # llama-server equivalent. Preserve every other typed
-                    # option, including advanced llama.cpp tuning and
-                    # extra_args, when re-adopting an existing profile.
+                    if (
+                        projector is None
+                        and include_projector
+                        and candidate.recommended_projector_id is not None
+                    ):
+                        projector = next(
+                            (
+                                item
+                                for item in candidate.projector_options
+                                if item.id == candidate.recommended_projector_id
+                            ),
+                            None,
+                        )
+                    prior_load = prior.load if prior is not None else ModelLoadConfig()
+                    compatible_load = prior_load.model_dump(mode="python")
+                    # Retain compatible tuning from an active or migrated
+                    # profile while removing options llama-server cannot use.
                     compatible_load.pop("num_experts", None)
                     compatible_load.pop("kv_disk_directory", None)
                     compatible_load.pop("kv_disk_space_mb", None)
@@ -731,9 +909,9 @@ class NativeRuntime:
                     if (
                         existing is not None
                         and existing.engine == EngineName.LLAMA_CPP
-                        and prior.projector_path is not None
+                        and prior_load.projector_path is not None
                     ):
-                        previous = _lexical_path(prior.projector_path)
+                        previous = _lexical_path(prior_load.projector_path)
                         matching_projector = next(
                             (
                                 item
@@ -745,17 +923,26 @@ class NativeRuntime:
                         if matching_projector is not None:
                             prior_projector = matching_projector.path
                     compatible_load["projector_path"] = (
-                        projector.path if projector is not None else prior_projector
+                        projector.path
+                        if projector is not None
+                        else prior_projector
+                        if include_projector
+                        else None
                     )
+                    if (
+                        compatible_load.get("context_length") is None
+                        and candidate.context_length is not None
+                    ):
+                        compatible_load["context_length"] = candidate.context_length
                     load = ModelLoadConfig.model_validate(compatible_load)
-                    capabilities = (
-                        existing.capabilities
-                        if existing is not None
-                        and existing.capabilities
+                    preserved_capabilities = (
+                        prior.capabilities
+                        if prior is not None
+                        and prior.capabilities
                         and not (
-                            existing.capabilities
+                            prior.capabilities
                             & {Endpoint.EMBEDDINGS, Endpoint.RERANK}
-                            and existing.capabilities
+                            and prior.capabilities
                             & {
                                 Endpoint.CHAT_COMPLETIONS,
                                 Endpoint.COMPLETIONS,
@@ -765,6 +952,10 @@ class NativeRuntime:
                         )
                         else None
                     )
+                    detected_capabilities = {
+                        Endpoint(value) for value in candidate.capabilities
+                    }
+                    capabilities = preserved_capabilities or detected_capabilities
                     profile = ModelProfile(
                         alias=alias,
                         engine=EngineName.LLAMA_CPP,
@@ -773,7 +964,7 @@ class NativeRuntime:
                         served_model_name=alias,
                         capabilities=capabilities,
                         load=load,
-                        enabled=existing.enabled if existing is not None else True,
+                        enabled=prior.enabled if prior is not None else True,
                     )
                 else:
                     needs_omlx = True
@@ -808,7 +999,7 @@ class NativeRuntime:
                         capabilities={
                             Endpoint(value) for value in candidate.capabilities
                         },
-                        enabled=existing.enabled if existing is not None else True,
+                        enabled=prior.enabled if prior is not None else True,
                     )
                 if existing_index is None:
                     models.append(profile)
@@ -818,6 +1009,11 @@ class NativeRuntime:
                         planned_aliases.remove(existing.alias)
                         planned_aliases.add(alias)
                     models[existing_index] = profile
+                if legacy is not None:
+                    legacy_profiles.remove(legacy)
+                    if alias != legacy.alias:
+                        planned_aliases.discard(legacy.alias)
+                        planned_aliases.add(alias)
                 imported.append(
                     {
                         "candidate_id": candidate.id,
@@ -829,7 +1025,7 @@ class NativeRuntime:
                             if profile.engine == EngineName.LLAMA_CPP
                             else None
                         ),
-                        "migrated": existing is not None,
+                        "migrated": prior is not None,
                     }
                 )
 
@@ -852,8 +1048,16 @@ class NativeRuntime:
                 restart_required = restart_required or not engines.omlx.enabled
                 engines = engines.model_copy(update={"omlx": omlx})
             storage = fresh.storage.model_copy(update={"locations": locations})
+            migration = fresh.migration.model_copy(
+                update={"legacy_lmstudio_profiles": legacy_profiles}
+            )
             new_config = fresh.model_copy(
-                update={"engines": engines, "storage": storage, "models": models}
+                update={
+                    "engines": engines,
+                    "storage": storage,
+                    "models": models,
+                    "migration": migration,
+                }
             )
             # Force a full validation pass after model_copy's intentionally
             # lightweight construction and before the atomic write.
@@ -872,7 +1076,7 @@ class NativeRuntime:
         if needs_omlx and not restart_required:
             await self._sync_omlx_model_directories()
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "imported": imported,
             "restart_required": restart_required,
             "revision": configuration_revision(new_config),
@@ -974,6 +1178,8 @@ class NativeRuntime:
                 )
             model = str(Path(install.destination) / install.filename)
             load = {}
+            if install.context_length is not None:
+                load["context_length"] = install.context_length
             if install.projector_filename:
                 load["projector_path"] = str(
                     Path(install.destination) / install.projector_filename

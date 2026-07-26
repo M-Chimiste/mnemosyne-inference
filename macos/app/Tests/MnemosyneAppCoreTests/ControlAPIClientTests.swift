@@ -6,11 +6,9 @@ import Testing
 func defaultControlPort() {
     #expect(ControlAPIClient.defaultBaseURL.host == "127.0.0.1")
     #expect(ControlAPIClient.defaultBaseURL.port == 17_321)
-    #expect(NativeSettings().engines.lmstudio.baseUrl == "http://127.0.0.1:1234")
-    #expect(!NativeSettings().engines.lmstudio.enabled)
     #expect(NativeSettings().engines.llamaCpp.enabled)
     #expect(NativeSettings().engines.llamaCpp.port == 17_325)
-    #expect(NativeSettings().schemaVersion == 1)
+    #expect(NativeSettings().schemaVersion == 2)
     #expect(NativeSettings().tokenSidecar.enabled)
 }
 
@@ -90,7 +88,7 @@ func configurationSaveRequestEncoding() throws {
     let locations = try #require(storage["locations"] as? [[String: Any]])
     let load = try #require(models.first?["load"] as? [String: Any])
     #expect(server["inference_port"] as? Int == 17_330)
-    #expect(config["schema_version"] as? Int == 1)
+    #expect(config["schema_version"] as? Int == 2)
     #expect(load["context_length"] as? Int == 32_768)
     #expect(load["projector_path"] as? String == "/Volumes/Athena/models/mmproj.gguf")
     #expect(load["gpu_layers"] as? Int == 99)
@@ -174,9 +172,9 @@ func futureConfigurationSchemaSaveRefused() throws {
     let client = ControlAPIClient(
         baseURL: URL(string: "http://localhost:17321")!
     )
-    let settings = NativeSettings(schemaVersion: 2)
+    let settings = NativeSettings(schemaVersion: 3)
 
-    #expect(throws: ControlAPIError.unsupportedConfigurationSchema(2)) {
+    #expect(throws: ControlAPIError.unsupportedConfigurationSchema(3)) {
         _ = try client.configurationSaveRequest(
             settings: settings,
             revision: String(repeating: "f", count: 64)
@@ -184,62 +182,13 @@ func futureConfigurationSchemaSaveRefused() throws {
     }
 }
 
-@Test("LM Studio discovery uses the read-only engine inventory endpoint")
-func lmStudioDiscoveryRequest() {
-    let client = ControlAPIClient(
-        baseURL: URL(string: "http://localhost:17321")!,
-        adminPassword: "secret"
-    )
-
-    let request = client.lmStudioModelsRequest()
-
-    #expect(
-        request.url?.absoluteString
-            == "http://localhost:17321/manager/engines/lmstudio/models"
-    )
-    #expect(request.httpMethod == "GET")
-    #expect(request.httpBody == nil)
-    #expect(request.value(forHTTPHeaderField: "Authorization") == "Basic YWRtaW46c2VjcmV0")
-}
-
-@Test("LM Studio inventory metadata decodes without loaded instances")
-func lmStudioInventoryDecoding() throws {
-    let payload = #"""
-    {
-      "models": [{
-        "key":"qwen/qwen3-coder-next",
-        "display_name":"Qwen3 Coder Next",
-        "type":"llm",
-        "publisher":"qwen",
-        "architecture":"qwen3_next",
-        "quantization_name":"4bit",
-        "bits_per_weight":4,
-        "size_bytes":44856096359,
-        "params_string":"80B",
-        "max_context_length":262144,
-        "format":"mlx",
-        "vision":false,
-        "trained_for_tool_use":true,
-        "loaded":false
-      }]
-    }
-    """#.data(using: .utf8)!
-
-    let snapshot = try JSONDecoder.nativeSettingsDecoder()
-        .decode(LMStudioInventorySnapshot.self, from: payload)
-
-    #expect(snapshot.models.first?.key == "qwen/qwen3-coder-next")
-    #expect(snapshot.models.first?.sizeBytes == 44_856_096_359)
-    #expect(snapshot.models.first?.loaded == false)
-}
-
 @Test("Structured configuration decodes every engine and image setting")
 func configurationDecoding() throws {
     let payload = #"""
     {
+      "schema_version": 2,
       "server": {"inference_bind":"127.0.0.1","inference_port":1240,"control_bind":"127.0.0.1","control_port":17321,"idle_unload_seconds":900,"startup_timeout_seconds":900,"swap_queue_timeout_seconds":300,"shutdown_grace_seconds":30,"reconcile_interval_seconds":30,"image_request_timeout_seconds":1800,"image_max_pixels":4194304,"startup_policy":"unload_all","inference_api_key_env":"INFERENCE_API_KEY","control_password_env":"ADMIN_PASSWORD"},
       "engines": {
-        "lmstudio":{"enabled":true,"base_url":"http://127.0.0.1:1234","api_key_env":"LMSTUDIO_API_KEY","request_timeout_seconds":30},
         "llama_cpp":{"enabled":true,"host":"127.0.0.1","port":17325,"binary":"/runtime/llama-server","working_directory":"/runtime","process_state_path":"/state/llama.json","request_timeout_seconds":30,"shutdown_grace_seconds":30},
         "omlx":{"enabled":true,"base_url":"http://127.0.0.1:17322","api_key_env":"OMLX_API_KEY","admin_session_env":"OMLX_ADMIN_SESSION","request_timeout_seconds":30,"model_directories":["/Volumes/Athena/models"]},
         "ds4":{"enabled":true,"host":"127.0.0.1","port":17323,"binary":"/ds4","working_directory":"/","process_state_path":"/state","request_timeout_seconds":30,"shutdown_grace_seconds":30},
@@ -247,7 +196,8 @@ func configurationDecoding() throws {
       },
       "paths":{"state_database":"/state.db","log_directory":"/logs"},
       "storage":{"default":"athena-models","locations":[{"name":"athena-models","path":"/Volumes/Athena/models","volume_uuid":"ATHENA-UUID"}]},
-      "models":[{"alias":"qwen-image","engine":"mflux","model":"Qwen/Qwen-Image","served_model_name":null,"capabilities":["images/generations"],"load":{"context_length":null,"eval_batch_size":null,"flash_attention":null,"num_experts":null,"offload_kv_cache_to_gpu":null,"kv_disk_directory":null,"kv_disk_space_mb":null,"extra_args":[]},"kind":"image","image":{"family":"qwen-image","quantize":8,"width":1024,"height":1024,"num_inference_steps":30,"guidance_scale":4},"enabled":true}],
+      "models":[{"alias":"qwen-image","engine":"mflux","model":"Qwen/Qwen-Image","served_model_name":null,"capabilities":["images/generations"],"load":{"context_length":null,"eval_batch_size":null,"flash_attention":null,"offload_kv_cache_to_gpu":null,"kv_disk_directory":null,"kv_disk_space_mb":null,"extra_args":[]},"kind":"image","image":{"family":"qwen-image","quantize":8,"width":1024,"height":1024,"num_inference_steps":30,"guidance_scale":4},"enabled":true}],
+      "migration":{"legacy_lmstudio_profiles":[]},
       "token_sidecar":{"enabled":false,"node_id":"","flush_interval_seconds":30,"batch_size":500,"max_outbox_rows":100000,"connect_timeout_seconds":5}
     }
     """#.data(using: .utf8)!
@@ -284,6 +234,12 @@ func localModelScanDecoding() throws {
         "compatibility":"structural",
         "compatibility_reason":"Valid GGUF header.",
         "capabilities":["chat/completions","responses"],
+        "architecture":"qwen2vl",
+        "context_length":131072,
+        "parameter_count":7615000000,
+        "summary":"A local vision model.",
+        "model_card_markdown":"# Qwen\n\nA local vision model.",
+        "recommended_projector_id":"projector-1",
         "projector_options":[{
           "id":"projector-1",
           "path":"/Volumes/Athena/models/Qwen/mmproj-F16.gguf",
@@ -302,6 +258,8 @@ func localModelScanDecoding() throws {
     #expect(scan.root == "/Volumes/Athena/models")
     #expect(scan.models.first?.engine == .llamaCpp)
     #expect(scan.models.first?.projectorOptions.first?.id == "projector-1")
+    #expect(scan.models.first?.recommendedProjectorId == "projector-1")
+    #expect(scan.models.first?.contextLength == 131_072)
     #expect(scan.models.first?.existingAlias == "qwen")
     #expect(scan.models.first?.isImportable == true)
 }
@@ -399,7 +357,7 @@ func llamaCppFileSelectionDecoding() throws {
       "size_bytes":4294967296,
       "quantization":"Q4_K_M",
       "filename":"model-Q4_K_M.gguf",
-      "projector_filename":null,
+      "projector_filename":"mmproj-F16.gguf",
       "projector_options":["mmproj-F16.gguf","mmproj-Q5_K_M.gguf"],
       "download_files":["model-Q4_K_M.gguf"],
       "resolved_revision":"abc123",
@@ -412,7 +370,10 @@ func llamaCppFileSelectionDecoding() throws {
       "default_width":null,
       "default_height":null,
       "default_num_inference_steps":null,
-      "default_guidance_scale":null
+      "default_guidance_scale":null,
+      "architecture":"qwen2vl",
+      "context_length":131072,
+      "parameter_count":7615000000
     }
     """#.data(using: .utf8)!
 
@@ -420,6 +381,8 @@ func llamaCppFileSelectionDecoding() throws {
     #expect(model.engine == .llamaCpp)
     #expect(model.filename == "model-Q4_K_M.gguf")
     #expect(model.availableProjectors == ["mmproj-F16.gguf", "mmproj-Q5_K_M.gguf"])
+    #expect(model.projectorFilename == "mmproj-F16.gguf")
+    #expect(model.contextLength == 131_072)
     #expect(model.suggestedRole == .generation)
 
     let install = StartModelInstallRequest(
@@ -429,6 +392,7 @@ func llamaCppFileSelectionDecoding() throws {
         role: .generation
     )
     #expect(install.projectorFilename == "mmproj-F16.gguf")
+    #expect(install.includeProjector)
     #expect(install.revision == "abc123")
     #expect(install.capabilities == ModelRole.generation.capabilities)
 }
@@ -472,7 +436,8 @@ func modelLibraryDecoding() throws {
       "capabilities":["chat/completions","completions","responses","messages"],
       "family":null,
       "bytes_downloaded":1048576,
-      "total_bytes":null,
+      "total_bytes":4194304,
+      "download_speed_bps":524288.5,
       "error":null,
       "pid":123,
       "created_at":1,
@@ -485,6 +450,41 @@ func modelLibraryDecoding() throws {
     #expect(install.isActive)
     #expect(install.destination.hasPrefix("/Volumes/Athena/models/"))
     #expect(install.capabilities == ModelRole.generation.capabilities)
+    #expect(install.progressFraction == 0.25)
+    #expect(install.downloadSpeedBps == 524_288.5)
+}
+
+@Test("Download history removal and managed deletion use explicit DELETE requests")
+func modelDeletionRequestEncoding() throws {
+    let client = ControlAPIClient(
+        baseURL: URL(string: "http://localhost:17321")!,
+        adminPassword: "secret"
+    )
+
+    let dismissed = client.dismissModelInstallRequest(id: "install-1")
+    #expect(
+        dismissed.url?.absoluteString
+            == "http://localhost:17321/manager/model-library/installs/install-1"
+    )
+    #expect(dismissed.httpMethod == "DELETE")
+
+    let revision = String(repeating: "a", count: 64)
+    let deleted = try client.deleteManagedModelRequest(
+        alias: "qwen-model",
+        revision: revision
+    )
+    #expect(
+        deleted.url?.absoluteString
+            == "http://localhost:17321/manager/models/qwen-model"
+    )
+    #expect(deleted.httpMethod == "DELETE")
+    #expect(deleted.value(forHTTPHeaderField: "Content-Type") == "application/json")
+    let body = try #require(deleted.httpBody)
+    #expect(
+        try JSONDecoder.nativeSettingsDecoder()
+            .decode(DeleteManagedModelRequest.self, from: body)
+            == DeleteManagedModelRequest(revision: revision)
+    )
 }
 
 @Test("Downloaded weights can retry registration without appearing active")

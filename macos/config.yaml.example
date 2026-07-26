@@ -1,7 +1,7 @@
 # Mnemosyne native macOS configuration.
 # Copy to ~/Library/Application Support/Mnemosyne/config.yaml.
 
-schema_version: 1
+schema_version: 2
 
 server:
   inference_bind: 127.0.0.1
@@ -20,15 +20,6 @@ server:
   control_password_env: ADMIN_PASSWORD
 
 engines:
-  # Legacy migration/soak fallback only. Fresh installs leave this disabled;
-  # an existing installation may temporarily enable it until its aliases have
-  # been adopted and validated through Models > Add Existing Models.
-  lmstudio:
-    enabled: false
-    base_url: http://127.0.0.1:1234
-    api_key_env: LMSTUDIO_API_KEY
-    request_timeout_seconds: 30
-
   # Unified Inference downloads an official Apple Silicon llama.cpp release,
   # verifies GitHub's published size and SHA-256, and owns one llama-server
   # process at a time. The managed active runtime overrides binary/working_directory.
@@ -100,6 +91,13 @@ storage:
 # volumes, or assumed cache locations; the exact user-selected destinations
 # are preserved when a model is installed or imported.
 models: []
+
+# Version-1 LM Studio profiles are moved here automatically as inert alias and
+# tuning records. Add Existing Models consumes matching records when the
+# corresponding on-disk GGUF/MLX model is adopted; nothing here can load a
+# model or contact LM Studio.
+migration:
+  legacy_lmstudio_profiles: []
 
 # The DSN is secret. Set it through Settings > Usage > Postgres connection;
 # the app stores TOKEN_SIDECAR_POSTGRES_DSN only in the private environment file.

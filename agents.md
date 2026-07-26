@@ -5,8 +5,9 @@ single-workstation deployments. The CUDA deployment runs vLLM, llama.cpp, or
 SGLang Diffusion in a
 container; the native Apple Silicon deployment owns an official llama.cpp
 server for GGUF, coordinates oMLX and DS4, and uses a process-isolated MFLUX
-worker without Docker. LM Studio remains only as an explicitly enabled
-migration/soak fallback. Both remain thin managers around
+worker without Docker. LM Studio is not an inference engine; its configured
+and conventional model folders remain read-only migration hints. Both
+deployments remain thin managers around
 upstream engines and must not fork or embed their serving implementations.
 
 ## Repository Shape
@@ -99,7 +100,7 @@ The live `docker-compose.yml` is intentionally machine-specific and may live out
 
 ### Native macOS deployment
 
-- Inference is on `127.0.0.1:1240` so Unified Inference is a drop-in replacement for the previous token sidecar; control is on `127.0.0.1:17321`, oMLX uses `:17322`, the manager-owned DS4 child uses `:17323`, the manager-owned MFLUX worker uses `:17324`, and manager-owned llama.cpp uses `:17325`. Reserve `17320` and `17326-17329` for later native services. The legacy sidecar must be booted out and persistently disabled or removed before Unified Inference binds `:1240`; merely unloading it lets it return at the next login. Legacy migration configs may explicitly keep LM Studio on `:1234`; fresh configs disable it.
+- Inference is on `127.0.0.1:1240` so Unified Inference is a drop-in replacement for the previous token sidecar; control is on `127.0.0.1:17321`, oMLX uses `:17322`, the manager-owned DS4 child uses `:17323`, the manager-owned MFLUX worker uses `:17324`, and manager-owned llama.cpp uses `:17325`. Reserve `17320` and `17326-17329` for later native services. The legacy sidecar must be booted out and persistently disabled or removed before Unified Inference binds `:1240`; merely unloading it lets it return at the next login.
 - A per-user LaunchAgent owns Mnemosyne Core. The controller uses an explicit AppKit `NSStatusItem` with a SwiftUI popover; quitting it must not terminate inference. `SMAppService.agent` registers the embedded plist and the bootstrap must `execve` the bundled Python without daemonizing.
 - `ResidencyCoordinator` owns the cross-engine invariant. A request holds an epoch-tagged model lease through its complete stream. FIFO queuing stops old-target admission once a switch is pending, drains active leases, proves all enabled adapters empty, loads one target, and proves exactly one ready manager-owned resident.
 - oMLX is an external loopback service controlled through its native lifecycle APIs. llama.cpp and DS4 are model-specific process groups started by Mnemosyne. Never kill an unknown PID or listener; persisted managed-process identity must match executable, argv, start identity, and process group before recovery or signaling.
@@ -124,14 +125,15 @@ The live `docker-compose.yml` is intentionally machine-specific and may live out
   Finder-driven `POST /manager/model-library/local-scan` and explicit
   `POST /manager/model-library/imports`. Source hints read LM Studio's
   configured download root and documented default without contacting its
-  server, probing model paths, or requiring its adapter to be enabled.
+  server or probing model paths. There is no LM Studio adapter, credential,
+  control endpoint, or runnable profile. Version-1 LM Studio profiles migrate
+  into inert alias/load-setting records that the Finder import consumes.
   Finder must still confirm the exact folder before bookmark creation or
   scanning. Scan again before persisting opaque candidate/projector IDs; never
   preselect every candidate, load a model, copy weights, treat `mmproj` as a
   primary model, or replace an exact nested/symlink path with its resolved
   target or mount root. Preserve matching aliases and compatible load
-  settings. The LM Studio inventory endpoint remains only for the temporary
-  soak fallback.
+  settings.
 - The native Storage UI always uses the macOS directory picker. Preserve the exact selected folder (including paths such as `/Volumes/Athena/models`) separately from the containing mount and its UUID; never replace it with the volume root or make users type it.
 - The menu app must create an ordinary bookmark while its `NSOpenPanel` grant
   is live. Its implicit extension is the Apple-supported single interprocess
@@ -156,16 +158,27 @@ The live `docker-compose.yml` is intentionally machine-specific and may live out
   process group and fail closed with an actionable permission/volume diagnostic
   while both HTTP planes remain responsive.
 - Native Hugging Face installs are engine-aware and durable. llama.cpp search
-  requires explicit GGUF quant/shard selection and explicit optional projector
-  pairing, pins the resolved Hub revision, and downloads only that exact file
-  set. DS4 and MFLUX use verified curated candidates; oMLX search exposes
+  requires explicit GGUF quant/shard selection, automatically selects the
+  highest-fidelity same-directory vision projector when present, and retains
+  explicit text-only opt-out/manual projector selection. Discovery shows a
+  bounded model-card preview plus architecture, context length, parameter
+  count, and license when Hub/config/GGUF metadata provides them. Detected GGUF
+  context length and selected projector persist into the created profile.
+  Exact revisions and file sets remain pinned. DS4 and MFLUX use verified
+  curated candidates; oMLX search exposes
   metadata-derived compatibility honestly and downloaded snapshots must be
   classified before profile registration so they advertise only detected
   generation, embeddings, or rerank routes. Downloads run out of process,
   never load a model, and oMLX directory changes run only through the
   coordinator's all-engines-empty maintenance barrier. Treat
   downloaded-but-not-registered weights as a durable retryable state; retry
-  profile registration without redownloading them.
+  profile registration without redownloading them. Report durable byte/total
+  progress and smoothed transfer speed. Hiding completed history must retain
+  internal managed-download provenance. File deletion is an explicit separate
+  action limited to an exact app-managed destination under configured storage;
+  run it in a bounded helper behind the global empty-residency barrier, refuse
+  roots/escapes/symlinks, and never delete Finder imports or hand-authored
+  model paths.
 - Runtime update checks are read-only. oMLX remains externally owned; never
   replace its app or Homebrew files. llama.cpp must come from the official
   `ggml-org/llama.cpp` macOS arm64 release asset and pass published size,

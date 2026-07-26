@@ -14,9 +14,8 @@ from mnemosyne_macos.app import (
     create_control_app,
     create_inference_app,
 )
-from mnemosyne_macos.config import LMStudioConfig, MacConfig, load_config, save_config
+from mnemosyne_macos.config import MacConfig, load_config, save_config
 from mnemosyne_macos.engines.base import Deadline, EngineAdapter
-from mnemosyne_macos.engines.lmstudio import LMStudioAdapter
 from mnemosyne_macos.models import (
     Endpoint,
     EngineName,
@@ -86,7 +85,7 @@ class FakeAdapter(EngineAdapter):
 def _config(tmp_path, *, endpoint: Endpoint | None = None) -> MacConfig:
     model: dict = {
         "alias": "frontier",
-        "engine": "lmstudio",
+        "engine": "omlx",
         "model": "publisher/upstream-model",
     }
     if endpoint is not None:
@@ -94,7 +93,7 @@ def _config(tmp_path, *, endpoint: Endpoint | None = None) -> MacConfig:
     return MacConfig.model_validate(
         {
             "server": {"idle_unload_seconds": None},
-            "engines": {"lmstudio": {"enabled": True}},
+            "engines": {"omlx": {"enabled": True}},
             "paths": {"state_database": str(tmp_path / "state.db")},
             "models": [model],
         }
@@ -232,7 +231,7 @@ async def test_non_streaming_proxy_rewrites_model_strips_credentials_and_records
         rows = await runtime.usage.list_usage()
         assert len(rows) == 1
         assert rows[0]["alias"] == "frontier"
-        assert rows[0]["backend"] == "lmstudio"
+        assert rows[0]["backend"] == "omlx"
         assert rows[0]["total_tokens"] == 6
     finally:
         await client.aclose()
@@ -629,63 +628,6 @@ async def test_control_plane_lists_loads_and_unloads_models(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_control_plane_discovers_downloaded_lmstudio_models_without_loading(
-    tmp_path,
-) -> None:
-    requests: list[tuple[str, str]] = []
-
-    def lmstudio_handler(request: httpx.Request) -> httpx.Response:
-        requests.append((request.method, request.url.path))
-        return httpx.Response(
-            200,
-            json={
-                "models": [
-                    {
-                        "type": "llm",
-                        "key": "qwen/qwen3-coder-next",
-                        "display_name": "Qwen3 Coder Next",
-                        "loaded_instances": [],
-                        "format": "mlx",
-                    }
-                ]
-            },
-        )
-
-    lmstudio_client = httpx.AsyncClient(transport=httpx.MockTransport(lmstudio_handler))
-    adapters = _adapters()
-    adapters[EngineName.LMSTUDIO] = LMStudioAdapter(
-        LMStudioConfig(),
-        client=lmstudio_client,
-    )
-    upstream_client = httpx.AsyncClient(
-        transport=httpx.MockTransport(lambda _r: httpx.Response(500))
-    )
-    runtime = NativeRuntime(
-        _config(tmp_path),
-        adapters=adapters,
-        proxy_client=upstream_client,
-    )
-    await runtime.start(raise_on_degraded=True)
-    client = httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=create_control_app(runtime)),
-        base_url="http://mnemosyne-control.test",
-    )
-    try:
-        response = await client.get("/manager/engines/lmstudio/models")
-
-        assert response.status_code == 200
-        assert response.json()["models"][0]["key"] == "qwen/qwen3-coder-next"
-        assert response.json()["models"][0]["loaded"] is False
-        assert all(method == "GET" for method, _ in requests)
-        assert all(path == "/api/v1/models" for _, path in requests)
-    finally:
-        await client.aclose()
-        await runtime.stop()
-        await upstream_client.aclose()
-        await lmstudio_client.aclose()
-
-
-@pytest.mark.asyncio
 async def test_control_plane_reads_saves_and_applies_structured_configuration(tmp_path) -> None:
     upstream_client = httpx.AsyncClient(
         transport=httpx.MockTransport(lambda _r: httpx.Response(500))
@@ -714,7 +656,7 @@ async def test_control_plane_reads_saves_and_applies_structured_configuration(tm
 
         edited = config.model_dump(mode="json")
         edited["models"].append(
-            {"alias": "second-model", "engine": "lmstudio", "model": "publisher/second"}
+            {"alias": "second-model", "engine": "omlx", "model": "publisher/second"}
         )
         saved = await client.put(
             "/manager/config", json={"config": edited, "revision": revision}
@@ -742,6 +684,97 @@ async def test_control_plane_reads_saves_and_applies_structured_configuration(tm
         )
         assert invalid.status_code == 400
         assert config_path.read_text(encoding="utf-8") == invalid_document
+    finally:
+        await client.aclose()
+        await runtime.stop()
+        await upstream_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_control_plane_deletes_only_an_exact_managed_model_destination(
+    tmp_path,
+) -> None:
+    model_root = tmp_path / "Models"
+    destination = model_root / "llama.cpp" / "owner" / "model-GGUF"
+    destination.mkdir(parents=True)
+    model_path = destination / "model-Q4_K_M.gguf"
+    model_path.write_bytes(b"GGUFmanaged")
+    config = MacConfig.model_validate(
+        {
+            "server": {"idle_unload_seconds": None},
+            "engines": {"llama_cpp": {"enabled": True}},
+            "paths": {"state_database": str(tmp_path / "state.db")},
+            "storage": {
+                "default": "internal",
+                "locations": [{"name": "internal", "path": str(model_root)}],
+            },
+            "models": [
+                {
+                    "alias": "managed-model",
+                    "engine": "llama.cpp",
+                    "model": str(model_path),
+                    "storage": "internal",
+                }
+            ],
+        }
+    )
+    config_path = tmp_path / "config.yaml"
+    save_config(config, config_path)
+    upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _r: httpx.Response(500))
+    )
+    runtime = NativeRuntime(
+        config,
+        config_path=config_path,
+        adapters=_adapters(),
+        proxy_client=upstream_client,
+    )
+    await runtime.start(raise_on_degraded=True)
+    install = runtime.installer.store.create(
+        repo_id="owner/model-GGUF",
+        engine="llama.cpp",
+        storage="internal",
+        alias="managed-model",
+        destination=str(destination),
+        revision="abc123",
+        filename=model_path.name,
+        family=None,
+        total_bytes=model_path.stat().st_size,
+    )
+    runtime.installer.store.update(
+        install.id,
+        status="installed",
+        bytes_downloaded=model_path.stat().st_size,
+    )
+    client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=create_control_app(runtime)),
+        base_url="http://mnemosyne-control.test",
+    )
+    try:
+        dismissed = await client.delete(
+            f"/manager/model-library/installs/{install.id}"
+        )
+        assert dismissed.status_code == 204
+        assert (await client.get("/manager/model-library/installs")).json() == {
+            "installs": []
+        }
+
+        revision = (await client.get("/manager/config")).json()["revision"]
+        deleted = await client.request(
+            "DELETE",
+            "/manager/models/managed-model",
+            json={"revision": revision},
+        )
+
+        assert deleted.status_code == 200, deleted.text
+        assert deleted.json()["deleted_files"] is True
+        assert deleted.json()["model_count"] == 0
+        assert not destination.exists()
+        assert model_root.is_dir()
+        assert load_config(config_path).models == []
+        assert runtime.model_list() == []
+        assert await runtime.installer.list() == []
+        assert runtime.installer.store.latest_for_alias("managed-model").status == "deleted"
     finally:
         await client.aclose()
         await runtime.stop()

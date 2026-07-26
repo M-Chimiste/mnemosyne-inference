@@ -11,7 +11,6 @@ uv run --project macos/service mnemosyne-macos --check-config \
   --config "$HOME/Library/Application Support/Mnemosyne/config.yaml" \
   --env "$HOME/Library/Application Support/Mnemosyne/.env"
 lsof -nP \
-  -iTCP:1234 \
   -iTCP:1240 -iTCP:17321 -iTCP:17322 -iTCP:17323 \
   -iTCP:17324 -iTCP:17325 \
   -sTCP:LISTEN
@@ -20,9 +19,8 @@ lsof -nP \
 Confirm Unified Inference owns `1240`/`17321` and every inner listener is
 loopback-only. oMLX owns `17322` when that optional engine is enabled.
 Manager-owned DS4, MFLUX, and llama.cpp should be absent from `17323`,
-`17324`, and `17325` while unloaded. An older migration installation may still
-have LM Studio on `1234`, but a fresh configuration does not require it. The
-previous token sidecar is not required in the inference path.
+`17324`, and `17325` while unloaded. LM Studio is not part of the inference
+topology. The previous token sidecar is not required in the inference path.
 
 With every configured engine empty, confirm both status and the aggregate model
 catalog remain available:
@@ -40,14 +38,17 @@ existing library directory, including a nested external path such as
 
 Confirm:
 
-- no candidate is selected automatically;
+- no model is selected for import automatically;
 - complete split-GGUF sets appear as one candidate and incomplete sets are
   unavailable;
 - `mmproj` files appear only as projector choices, never as primary models;
 - MLX directories and GGUF models are assigned to oMLX and llama.cpp
   respectively;
-- every selected model has an editable, unique alias and every GGUF has an
-  explicit **Text only (no projector)** or same-directory projector choice;
+- every selected model has an editable, unique alias; a vision GGUF
+  preselects the highest-fidelity same-directory projector and offers another
+  projector or **Text only (opt out)**;
+- architecture, context length, parameter count, and summary are shown when
+  discoverable from GGUF/config/model-card metadata;
 - importing does not copy model files, contact an engine load/unload endpoint,
   or make a process resident;
 - the exact selected directory and containing-volume UUID are persisted;
@@ -129,15 +130,24 @@ fail-closed ownership/port error and never signals that process.
 
 In **Settings → Model Library**, choose llama.cpp and search for a GGUF
 repository. Confirm Download remains disabled until an exact quant/shard set is
-selected. Select an optional projector only from the same repository directory,
-choose a GUI-configured storage folder, and start a small download.
+selected. Confirm the model-card preview and detected architecture, context
+length, parameter count, and license match the repository metadata. When the
+repository publishes a vision projector beside the selected GGUF, confirm the
+highest-fidelity option is selected automatically; then exercise both a manual
+choice and **Text only (opt out)**. Choose a GUI-configured storage folder and
+start a small download.
 
 Confirm the install record pins the resolved Hub revision and exact primary
 shards/projector, survives closing and reopening Settings, and creates a
-profile without loading it. Exercise cancel and retry, then verify no unrelated
-files are downloaded and no partial install is advertised as available. Repeat
-with a gated repository to prove the write-only `HF_TOKEN` reaches only the
-download worker.
+profile without loading it. While it runs, confirm transferred/total bytes,
+percentage, the progress bar, and transfer speed update without reopening the
+window. Exercise cancel and retry, then clear the completed history row and
+verify the model profile and files remain. Remove that profile with
+**Keep Files** and verify only configuration changes; separately use
+**Delete Files** on an app-managed test download and verify its exact directory
+and profile disappear. Confirm Finder-imported profiles cannot delete files,
+and no unrelated files are touched. Repeat with a gated repository to prove
+the write-only `HF_TOKEN` reaches only the download worker.
 
 ## 5. oMLX lifecycle
 
@@ -250,20 +260,21 @@ section.
   different volume at the same path and confirm the UUID mismatch fails closed;
 - **Model Library** exposes engine and model choices through pickers/lists,
   never a raw repository or storage-path field; start a small compatible test
-  download, close/reopen Settings, then confirm progress persists and
-  cancel/retry work without making any model resident;
+  download, confirm bytes/total, percentage, progress, and speed update live,
+  then close/reopen Settings and confirm progress persists and cancel/retry
+  work without making any model resident;
 - **Models → Add Existing Models…** always opens the directory picker and uses
   the explicit, initially-unselected workflow from section 2;
 - **Models → Detected model folders** lists LM Studio's configured
-  `downloadsFolder` before `~/.lmstudio/models`, even while the LM Studio
-  migration engine is disabled and its server is stopped; selecting either is
-  still a Finder-confirmed scan, not an automatic model load;
+  `downloadsFolder` before `~/.lmstudio/models`, without contacting an LM
+  Studio process; selecting either is still a Finder-confirmed scan, not an
+  automatic model load;
 - existing model engine/source/storage/served-name/projector/family fields are
   read-only; there is no raw model or projector path editor and endpoint
   routing uses only the typed Generation, Embeddings, Rerank, or Image role
   choices valid for that engine;
-- **Legacy LM Studio Inventory…** appears only as the temporary migration
-  bridge and remains read-only/residency-neutral;
+- there is no LM Studio engine toggle, credential, inventory action, callable
+  profile, or request to `:1234`;
 - a deliberately invalid field combination is rejected without overwriting
   `config.yaml`; an older app refuses to save a newer `schema_version`;
   model-only changes apply without restart, while an engine, storage, or port
@@ -310,48 +321,25 @@ the service, and confirm the same runtime is selected. Finally choose
 checksum, unsafe archive, failed DS4 build, or failed MFLUX import never changes
 `current.json`.
 
-## 12. LM Studio migration soak
+## 12. LM Studio directory migration
 
-This gate applies only to a machine migrating an older LM Studio-backed
-configuration. Before the soak, keep the legacy adapter explicitly enabled and
-confirm its read-only inventory lists downloaded models without loading any:
+This gate applies only to a machine with an older LM Studio-backed
+configuration or model library.
 
-```bash
-curl -s http://127.0.0.1:17321/manager/engines/lmstudio/models \
-  | jq '{count: (.models | length), loaded: [.models[] | select(.loaded)]}'
-```
+1. Stop LM Studio before starting Unified Inference.
+2. Open the upgraded schema-version-2 configuration and confirm there is no
+   `engines.lmstudio` block. Old LM Studio profiles should appear only under
+   `migration.legacy_lmstudio_profiles` and must not appear in `/v1/models`.
+3. Confirm **Detected model folders** offers the configured
+   `downloadsFolder`, then `~/.lmstudio/models`, without opening either path
+   until Finder selection.
+4. Adopt the library with **Add Existing Models…** and verify matching aliases
+   and compatible load settings are preserved. Imported records must disappear
+   from the inert migration list.
+5. Exercise each imported alias through native llama.cpp or oMLX, including
+   non-streaming, streaming usage, explicit unload, service restart, and a
+   login cycle.
 
-Create only the representative temporary profiles needed for the soak; do not
-profile or download every model merely to test the bridge. Exercise at least
-one existing language model and, when present, one embeddings model. Confirm
-non-streaming, streaming with `stream_options.include_usage=true`, repeated
-load, same-engine swap, and explicit `POST :17321/manager/unload`. After
-unload, both `/manager/status` and the LM Studio inventory must report no
-resident model. Verify the resulting local usage rows identify backend
-`lmstudio` and the durable reporting outbox drains normally.
-
-Before switching Unified Inference to `:1240`, boot out the previous token
-sidecar LaunchAgent, persistently disable its launchd label, and prove the port
-is free. Merely unloading it is insufficient because it can return at the next
-login. Unified Inference then owns the same client-facing endpoint and must
-account for requests itself; the previous sidecar is never chained in front of
-or behind the new service.
-
-Adopt the existing model library with
-**Add Existing Models…**, verify matching aliases and compatible settings were
-preserved, and test each migrated alias through its native llama.cpp or oMLX
-engine.
-
-Then disable **Keep LM Studio available during migration**, save, and restart
-the background service. Confirm:
-
-- every migrated alias works after repeated unloads, service restarts, and a
-  login cycle;
-- status and logs show no Unified Inference traffic to `:1234`;
-- no model is missing merely because LM Studio itself is stopped; and
-- token accounting, central delivery, and strict cross-engine residency remain
-  correct for the entire soak period.
-
-LM Studio adapter/configuration/credential/inventory removal is a later,
-operator-accepted cleanup. Do not remove that fallback merely because the
-short smoke passes.
+Throughout the check, confirm logs and network inspection show no request to
+`:1234`, and that stopping or uninstalling LM Studio has no effect on the
+catalog, residency, or token accounting.

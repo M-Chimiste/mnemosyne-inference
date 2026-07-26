@@ -23,11 +23,14 @@ class InstallRecord:
     revision: str | None = None
     filename: str | None = None
     projector_filename: str | None = None
+    context_length: int | None = None
     files_json: str | None = None
     capabilities_json: str | None = None
     family: str | None = None
     bytes_downloaded: int = 0
     total_bytes: int | None = None
+    download_speed_bps: float | None = None
+    hidden: int = 0
     error: str | None = None
     pid: int | None = None
     created_at: float = 0
@@ -37,6 +40,7 @@ class InstallRecord:
         payload = asdict(self)
         encoded = payload.pop("files_json")
         capabilities_encoded = payload.pop("capabilities_json")
+        payload.pop("hidden")
         try:
             files = json.loads(encoded) if encoded else []
         except (TypeError, ValueError, json.JSONDecodeError):
@@ -91,11 +95,14 @@ class InstallStore:
                 revision TEXT,
                 filename TEXT,
                 projector_filename TEXT,
+                context_length INTEGER,
                 files_json TEXT,
                 capabilities_json TEXT,
                 family TEXT,
                 bytes_downloaded INTEGER NOT NULL DEFAULT 0,
                 total_bytes INTEGER,
+                download_speed_bps REAL,
+                hidden INTEGER NOT NULL DEFAULT 0,
                 error TEXT,
                 pid INTEGER,
                 created_at REAL NOT NULL,
@@ -113,6 +120,10 @@ class InstallStore:
             self._connection.execute(
                 "ALTER TABLE native_model_installs ADD COLUMN projector_filename TEXT"
             )
+        if "context_length" not in columns:
+            self._connection.execute(
+                "ALTER TABLE native_model_installs ADD COLUMN context_length INTEGER"
+            )
         if "files_json" not in columns:
             self._connection.execute(
                 "ALTER TABLE native_model_installs ADD COLUMN files_json TEXT"
@@ -120,6 +131,15 @@ class InstallStore:
         if "capabilities_json" not in columns:
             self._connection.execute(
                 "ALTER TABLE native_model_installs ADD COLUMN capabilities_json TEXT"
+            )
+        if "download_speed_bps" not in columns:
+            self._connection.execute(
+                "ALTER TABLE native_model_installs ADD COLUMN download_speed_bps REAL"
+            )
+        if "hidden" not in columns:
+            self._connection.execute(
+                "ALTER TABLE native_model_installs "
+                "ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0"
             )
         self._connection.commit()
 
@@ -134,6 +154,7 @@ class InstallStore:
         revision: str | None,
         filename: str | None,
         projector_filename: str | None = None,
+        context_length: int | None = None,
         download_files: list[str] | tuple[str, ...] = (),
         capabilities: list[str] | tuple[str, ...] | None = None,
         family: str | None,
@@ -151,6 +172,7 @@ class InstallStore:
             revision=revision,
             filename=filename,
             projector_filename=projector_filename,
+            context_length=context_length,
             files_json=(
                 json.dumps(list(download_files), separators=(",", ":"))
                 if download_files
@@ -199,16 +221,49 @@ class InstallStore:
 
     def list(self, *, limit: int = 100) -> list[InstallRecord]:
         rows = self._connection.execute(
-            "SELECT * FROM native_model_installs ORDER BY created_at DESC LIMIT ?",
+            """
+            SELECT * FROM native_model_installs
+             WHERE hidden = 0
+             ORDER BY created_at DESC
+             LIMIT ?
+            """,
             (limit,),
         ).fetchall()
         return [InstallRecord(**dict(row)) for row in rows]
+
+    def latest_for_alias(self, alias: str) -> InstallRecord | None:
+        row = self._connection.execute(
+            """
+            SELECT * FROM native_model_installs
+             WHERE alias = ?
+             ORDER BY created_at DESC
+             LIMIT 1
+            """,
+            (alias,),
+        ).fetchone()
+        return InstallRecord(**dict(row)) if row is not None else None
+
+    def dismiss(self, install_id: str) -> InstallRecord:
+        record = self.get(install_id)
+        cursor = self._connection.execute(
+            """
+            UPDATE native_model_installs
+               SET hidden = 1, updated_at = ?
+             WHERE id = ?
+            """,
+            (time.time(), install_id),
+        )
+        if cursor.rowcount != 1:
+            raise KeyError(f"unknown install '{install_id}'")
+        self._connection.commit()
+        return record
 
     def recover_interrupted(self) -> None:
         self._connection.execute(
             """
             UPDATE native_model_installs
                SET status = 'partial', pid = NULL,
+                   download_speed_bps = NULL,
                    error = 'service stopped before the download completed', updated_at = ?
              WHERE status IN ('queued', 'downloading')
             """,
@@ -218,6 +273,7 @@ class InstallStore:
             """
             UPDATE native_model_installs
                SET status = 'downloaded', pid = NULL,
+                   download_speed_bps = NULL,
                    error = 'download completed but profile registration was interrupted',
                    updated_at = ?
              WHERE status = 'registering'
@@ -230,7 +286,8 @@ class InstallStore:
         self._connection.execute(
             """
             UPDATE native_model_installs
-               SET status = 'downloaded', pid = NULL, updated_at = ?
+               SET status = 'downloaded', pid = NULL,
+                   download_speed_bps = NULL, updated_at = ?
              WHERE status = 'installed'
                AND error LIKE 'download completed but profile registration failed:%'
             """,

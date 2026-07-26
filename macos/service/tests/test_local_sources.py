@@ -95,7 +95,7 @@ def test_unsafe_or_oversize_settings_do_not_create_a_source(
 
 
 @pytest.mark.asyncio
-async def test_control_route_exposes_sources_when_lmstudio_engine_is_disabled(
+async def test_control_route_exposes_lmstudio_folder_without_an_engine(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv("ADMIN_PASSWORD", raising=False)
@@ -112,7 +112,7 @@ async def test_control_route_exposes_sources_when_lmstudio_engine_is_disabled(
         ],
     )
     runtime = SimpleNamespace(config=MacConfig())
-    assert runtime.config.engines.lmstudio.enabled is False
+    assert not hasattr(runtime.config.engines, "lmstudio")
     client = httpx.AsyncClient(
         transport=httpx.ASGITransport(app=create_control_app(runtime)),
         base_url="http://mnemosyne.test",

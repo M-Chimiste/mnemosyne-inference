@@ -1,9 +1,11 @@
+import Foundation
 import MnemosyneAppCore
 import SwiftUI
 
 struct SettingsView: View {
     @ObservedObject var viewModel: SettingsViewModel
     let restartService: () -> Void
+    @State private var previewedCredentialDrafts: Set<ManagedCredential> = []
 
     var body: some View {
         HStack(spacing: 0) {
@@ -29,16 +31,18 @@ struct SettingsView: View {
         } message: {
             Text("This restores every setting to the last saved value.")
         }
-        .alert("Remove this model profile?", isPresented: $viewModel.confirmRemoveModel) {
+        .alert("Remove this model?", isPresented: $viewModel.confirmRemoveModel) {
             Button("Cancel", role: .cancel) {}
-            Button("Remove Model", role: .destructive) {
+            Button("Keep Files", role: .destructive) {
                 viewModel.removeSelectedModel()
             }
+            Button("Delete Files", role: .destructive) {
+                Task { await viewModel.deleteSelectedModelFiles() }
+            }
         } message: {
-            Text("The downloaded model is not deleted; only its Unified Inference profile is removed.")
-        }
-        .sheet(isPresented: $viewModel.showLMStudioImporter) {
-            LMStudioImporterView(viewModel: viewModel)
+            Text(
+                "Keep Files removes only the profile after you save. Delete Files immediately removes the profile and its app-managed download. Finder imports and manually configured paths are never eligible for file deletion."
+            )
         }
         .sheet(isPresented: $viewModel.showLocalModelImporter) {
             ExistingModelImporterView(viewModel: viewModel)
@@ -299,24 +303,6 @@ struct SettingsView: View {
                 engineHeader("MFLUX", detail: "Qwen Image and Krea 2")
             }
 
-            Section {
-                Toggle(
-                    "Keep LM Studio available during migration",
-                    isOn: $viewModel.settings.engines.lmstudio.enabled
-                )
-                TextField(
-                    "LM Studio API address",
-                    text: $viewModel.settings.engines.lmstudio.baseUrl
-                )
-                LabeledContent("Request timeout") {
-                    secondsField($viewModel.settings.engines.lmstudio.requestTimeoutSeconds)
-                }
-                Text("Legacy migration source only. Use Add Existing Models to adopt its GGUF and MLX files in place, then disable this adapter for the soak period.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            } header: {
-                engineHeader("LM Studio", detail: "Temporary migration bridge")
-            }
         }
         .formStyle(.grouped)
     }
@@ -651,6 +637,59 @@ struct SettingsView: View {
                                 .textSelection(.enabled)
                             Text(searchResult.compatibilityReason)
                                 .font(.callout)
+                            if viewModel.isLoadingLibraryDetails {
+                                HStack(spacing: 7) {
+                                    ProgressView().controlSize(.small)
+                                    Text("Reading model card and metadata…")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                            } else if let details = viewModel.libraryDetails {
+                                if let summary = details.summary {
+                                    Text(ModelTextMarkup.attributedString(from: summary))
+                                        .font(.callout)
+                                        .foregroundStyle(.secondary)
+                                        .textSelection(.enabled)
+                                }
+                                HStack(spacing: 8) {
+                                    if let context = details.contextLength {
+                                        modelBadge(
+                                            "\(context.formatted()) token context",
+                                            color: .blue
+                                        )
+                                    }
+                                    if let architecture = details.architecture {
+                                        modelBadge(architecture, color: .purple)
+                                    }
+                                    if let parameters = details.parameterCount {
+                                        modelBadge(
+                                            parameterCount(parameters),
+                                            color: .secondary
+                                        )
+                                    }
+                                    if let license = details.license {
+                                        modelBadge(license, color: .secondary)
+                                    }
+                                }
+                                if let markdown = details.modelCardMarkdown {
+                                    DisclosureGroup("Model card") {
+                                        ScrollView {
+                                            Text(
+                                                ModelTextMarkup.attributedString(
+                                                    from: markdown
+                                                )
+                                            )
+                                                .frame(
+                                                    maxWidth: .infinity,
+                                                    alignment: .leading
+                                                )
+                                                .textSelection(.enabled)
+                                                .padding(.vertical, 8)
+                                        }
+                                        .frame(maxHeight: 260)
+                                    }
+                                }
+                            }
                         }
 
                         Divider()
@@ -704,12 +743,12 @@ struct SettingsView: View {
                                             set: { viewModel.selectLibraryProjector($0) }
                                         )
                                     ) {
-                                        Text("Text only (no projector)").tag("")
+                                        Text("Text only (opt out)").tag("")
                                         ForEach(model.availableProjectors, id: \.self) {
                                             Text($0).tag($0)
                                         }
                                     }
-                                    Text("Select a matching projector only for multimodal GGUF models. Pairing is explicit because a nearby filename alone does not prove compatibility.")
+                                    Text("The highest-fidelity nearby vision projector is selected automatically. Choose Text only to opt out, or select a different projector.")
                                         .font(.caption)
                                         .foregroundStyle(.secondary)
                                 }
@@ -801,22 +840,20 @@ struct SettingsView: View {
             if !viewModel.modelInstalls.isEmpty {
                 Divider()
                 VStack(alignment: .leading, spacing: 7) {
-                    Text("Recent downloads").font(.caption.weight(.semibold))
-                    ForEach(viewModel.modelInstalls.prefix(3)) { install in
-                        HStack {
-                            Image(systemName: install.isActive ? "arrow.down.circle" : install.status == "installed" ? "checkmark.circle.fill" : "exclamationmark.circle")
-                                .foregroundStyle(install.status == "installed" ? Color.green : Color.secondary)
-                            Text(install.alias).fontWeight(.medium)
-                            Text(install.status.capitalized).foregroundStyle(.secondary)
-                            Text(byteCount(install.bytesDownloaded)).foregroundStyle(.secondary)
-                            Spacer()
-                            if install.isActive {
-                                Button("Cancel") { Task { await viewModel.cancelInstall(install) } }
-                            } else if install.canRetry {
-                                Button("Retry") { Task { await viewModel.retryInstall(install) } }
+                    HStack {
+                        Text("Recent downloads")
+                            .font(.caption.weight(.semibold))
+                        Spacer()
+                        if viewModel.modelInstalls.contains(where: { $0.status == "installed" }) {
+                            Button("Clear Completed") {
+                                Task { await viewModel.clearCompletedInstalls() }
                             }
+                            .font(.caption)
+                            .buttonStyle(.borderless)
                         }
-                        .font(.caption)
+                    }
+                    ForEach(viewModel.modelInstalls.prefix(3)) { install in
+                        downloadInstallRow(install)
                     }
                 }
                 .padding(.horizontal, 16)
@@ -885,32 +922,6 @@ struct SettingsView: View {
                     .padding(.horizontal, 10)
                 }
 
-                if viewModel.settings.engines.lmstudio.enabled {
-                    Button {
-                        viewModel.showLMStudioImporter = true
-                        Task { await viewModel.discoverLMStudioModels() }
-                    } label: {
-                        Label(
-                            "Legacy LM Studio Inventory…",
-                            systemImage: "arrow.triangle.branch"
-                        )
-                        .frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(.bordered)
-                    .padding(.horizontal, 10)
-                    .disabled(!viewModel.canDiscoverLMStudioInventory)
-                    .help(
-                        viewModel.lmStudioInventoryAvailability.guidance
-                            ?? "Create temporary LM Studio profiles during the migration soak."
-                    )
-                    if let guidance = viewModel.lmStudioInventoryAvailability.guidance {
-                        Label(guidance, systemImage: "exclamationmark.triangle")
-                            .font(.caption)
-                            .foregroundStyle(.orange)
-                            .padding(.horizontal, 10)
-                    }
-                }
-
                 List(selection: $viewModel.selectedModelIndex) {
                     ForEach(viewModel.settings.models.indices, id: \.self) { index in
                         HStack {
@@ -927,24 +938,33 @@ struct SettingsView: View {
                 }
                 HStack {
                     Button { viewModel.selectedSection = .library } label: {
-                        Label("Download from Model Library", systemImage: "arrow.down.circle")
+                        Image(systemName: "arrow.down.circle")
+                            .frame(width: 30, height: 18)
                     }
+                    .buttonStyle(.bordered)
+                    .frame(width: 52, height: 30)
                     .help("Download a compatible model from Hugging Face.")
                     Button {
                         viewModel.confirmRemoveModel = true
                     } label: {
-                        Label("Remove", systemImage: "minus")
+                        Image(systemName: "minus")
+                            .frame(width: 30, height: 18)
                     }
+                    .buttonStyle(.bordered)
+                    .frame(width: 52, height: 30)
                     .disabled(viewModel.selectedModelIndex == nil)
+                    .help("Remove the profile, with an optional managed-file deletion.")
                     Spacer()
                 }
-                .labelStyle(.iconOnly)
                 .padding(.horizontal, 10)
                 .padding(.bottom, 8)
             }
             .frame(width: 230)
             Divider()
             modelEditor
+        }
+        .task {
+            await viewModel.refreshModelsConfiguration()
         }
     }
 
@@ -1038,7 +1058,7 @@ struct SettingsView: View {
                     "Context length",
                     value: $viewModel.settings.models[index].load.contextLength
                 )
-                if engine == .lmstudio || engine == .llamaCpp {
+                if engine == .llamaCpp {
                     optionalIntegerField(
                         "Evaluation batch size",
                         value: $viewModel.settings.models[index].load.evalBatchSize
@@ -1047,12 +1067,6 @@ struct SettingsView: View {
                         "Flash attention",
                         value: $viewModel.settings.models[index].load.flashAttention
                     )
-                    if engine == .lmstudio {
-                        optionalIntegerField(
-                            "Active experts",
-                            value: $viewModel.settings.models[index].load.numExperts
-                        )
-                    }
                     optionalBooleanPicker(
                         "Keep KV cache on GPU",
                         value: $viewModel.settings.models[index].load.offloadKvCacheToGpu
@@ -1281,10 +1295,7 @@ struct SettingsView: View {
             }
             ForEach(
                 ManagedCredential.allCases.filter {
-                    guard $0 != .tokenSidecarPostgresDSN else { return false }
-                    return $0 != .lmStudioAPIKey
-                        || viewModel.settings.engines.lmstudio.enabled
-                        || viewModel.configuredCredentials.contains(.lmStudioAPIKey)
+                    $0 != .tokenSidecarPostgresDSN
                 }
             ) { credential in
                 Section {
@@ -1317,17 +1328,59 @@ struct SettingsView: View {
                         ? "Replacement value"
                         : "New value")
             ) {
-                SecureField(
-                    placeholder
-                        ?? (viewModel.configuredCredentials.contains(credential)
-                            ? "Enter a replacement"
-                            : "Enter a credential"),
-                    text: viewModel.credentialBinding(credential)
-                )
-                .textFieldStyle(.roundedBorder)
+                HStack(spacing: 8) {
+                    SecureField(
+                        placeholder
+                            ?? (viewModel.configuredCredentials.contains(credential)
+                                ? "Enter a replacement"
+                                : "Enter a credential"),
+                        text: viewModel.credentialBinding(credential)
+                    )
+                    .textFieldStyle(.roundedBorder)
+                    .frame(minWidth: 280)
+                    .privacySensitive()
+                    .accessibilityLabel("\(credential.displayName) value")
+
+                    Button {
+                        if previewedCredentialDrafts.contains(credential) {
+                            previewedCredentialDrafts.remove(credential)
+                        } else {
+                            previewedCredentialDrafts.insert(credential)
+                        }
+                    } label: {
+                        Image(
+                            systemName: previewedCredentialDrafts.contains(credential)
+                                ? "eye.slash" : "eye"
+                        )
+                    }
+                    .buttonStyle(.borderless)
+                    .help(
+                        previewedCredentialDrafts.contains(credential)
+                            ? "Hide pasted-value preview"
+                            : "Preview the pasted value with its secret truncated"
+                    )
+                    .accessibilityLabel(
+                        previewedCredentialDrafts.contains(credential)
+                            ? "Hide \(credential.displayName) preview"
+                            : "Show truncated \(credential.displayName) preview"
+                    )
+                    .disabled(viewModel.credentialDrafts[credential, default: ""].isEmpty)
+                }
                 .frame(minWidth: 320)
-                .privacySensitive()
-                .accessibilityLabel("\(credential.displayName) value")
+            }
+            if previewedCredentialDrafts.contains(credential) {
+                let draft = viewModel.credentialDrafts[credential, default: ""]
+                if !draft.isEmpty {
+                    LabeledContent("Pasted value preview") {
+                        Text(CredentialDraftPreview.render(draft, for: credential))
+                            .font(.caption.monospaced())
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
+                            .truncationMode(.middle)
+                            .textSelection(.enabled)
+                            .privacySensitive()
+                    }
+                }
             }
             HStack {
                 Label(
@@ -1420,6 +1473,112 @@ struct SettingsView: View {
         }
     }
 
+    private func downloadInstallRow(_ install: ModelInstall) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(spacing: 8) {
+                Image(
+                    systemName: install.isActive
+                        ? "arrow.down.circle"
+                        : install.status == "installed"
+                            ? "checkmark.circle.fill"
+                            : "exclamationmark.circle"
+                )
+                .foregroundStyle(
+                    install.status == "installed" ? Color.green : Color.secondary
+                )
+                Text(install.alias)
+                    .fontWeight(.medium)
+                    .lineLimit(1)
+                Text(install.status.capitalized)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                if install.isActive {
+                    Button("Cancel") {
+                        Task { await viewModel.cancelInstall(install) }
+                    }
+                    .frame(width: 62)
+                } else {
+                    if install.canRetry {
+                        Button("Retry") {
+                            Task { await viewModel.retryInstall(install) }
+                        }
+                        .frame(width: 62)
+                    }
+                    if install.canDismiss {
+                        Button {
+                            Task { await viewModel.dismissInstall(install) }
+                        } label: {
+                            Image(systemName: "trash")
+                                .frame(width: 14)
+                        }
+                        .frame(width: 34)
+                        .help("Remove this entry from download history.")
+                    }
+                }
+            }
+
+            if install.isActive {
+                if let totalBytes = install.totalBytes, totalBytes > 0 {
+                    ProgressView(
+                        value: Double(min(install.bytesDownloaded, totalBytes)),
+                        total: Double(totalBytes)
+                    )
+                    .progressViewStyle(.linear)
+                    HStack {
+                        Text(
+                            "\(byteCount(install.bytesDownloaded)) of \(byteCount(totalBytes))"
+                        )
+                        if let fraction = install.progressFraction {
+                            Text(
+                                fraction.formatted(
+                                    .percent.precision(.fractionLength(0))
+                                )
+                            )
+                        }
+                        Spacer()
+                        downloadSpeedLabel(install)
+                    }
+                    .foregroundStyle(.secondary)
+                } else {
+                    ProgressView()
+                        .controlSize(.small)
+                    HStack {
+                        Text(byteCount(install.bytesDownloaded))
+                        Spacer()
+                        downloadSpeedLabel(install)
+                    }
+                    .foregroundStyle(.secondary)
+                }
+            } else {
+                Text(byteCount(install.bytesDownloaded))
+                    .foregroundStyle(.secondary)
+                if let error = install.error, !error.isEmpty {
+                    Text(error)
+                        .foregroundStyle(.red)
+                        .lineLimit(2)
+                }
+            }
+        }
+        .font(.caption)
+        .padding(.vertical, 2)
+    }
+
+    @ViewBuilder
+    private func downloadSpeedLabel(_ install: ModelInstall) -> some View {
+        if install.status == "downloading" {
+            if let speed = install.downloadSpeedBps, speed > 0 {
+                Text("\(byteCount(Int64(speed)))/s")
+                    .monospacedDigit()
+            } else {
+                Text("Calculating speed…")
+            }
+        } else if install.status == "registering" {
+            Text("Registering profile…")
+        } else if install.status == "queued" {
+            Text("Waiting…")
+        }
+    }
+
     private func compatibilityBadge(_ value: String) -> some View {
         let color: Color = switch value {
         case "verified": .green
@@ -1440,6 +1599,31 @@ struct SettingsView: View {
 
     private func byteCount(_ bytes: Int64) -> String {
         ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
+    }
+
+    private func parameterCount(_ value: Int64) -> String {
+        if value >= 1_000_000_000 {
+            let count = (Double(value) / 1_000_000_000).formatted(
+                .number.precision(.fractionLength(1))
+            )
+            return "\(count)B parameters"
+        }
+        if value >= 1_000_000 {
+            let count = (Double(value) / 1_000_000).formatted(
+                .number.precision(.fractionLength(1))
+            )
+            return "\(count)M parameters"
+        }
+        return "\(value.formatted()) parameters"
+    }
+
+    private func modelBadge(_ text: String, color: Color) -> some View {
+        Text(text)
+            .font(.caption2.weight(.semibold))
+            .foregroundStyle(color)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background(color.opacity(0.12), in: Capsule())
     }
 
     private func secondsField(_ value: Binding<Double>) -> some View {
@@ -1684,6 +1868,12 @@ private struct ExistingModelImporterView: View {
                                 if candidate.shardCount > 1 {
                                     Text("\(candidate.shardCount) shards")
                                 }
+                                if let context = candidate.contextLength {
+                                    Text("\(context.formatted()) token context")
+                                }
+                                if let architecture = candidate.architecture {
+                                    Text(architecture)
+                                }
                                 if !candidate.projectorOptions.isEmpty {
                                     Text("\(candidate.projectorOptions.count) projector option\(candidate.projectorOptions.count == 1 ? "" : "s")")
                                 }
@@ -1696,6 +1886,12 @@ private struct ExistingModelImporterView: View {
                                     candidate.compatibility == "unavailable"
                                         ? Color.orange : Color.secondary
                                 )
+                            if let summary = candidate.summary {
+                                Text(summary)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(3)
+                            }
                         }
                     }
 
@@ -1715,7 +1911,7 @@ private struct ExistingModelImporterView: View {
                                         candidate.id
                                     )
                                 ) {
-                                    Text("Text only (no projector)").tag("")
+                                    Text("Text only (opt out)").tag("")
                                     ForEach(candidate.projectorOptions) { projector in
                                         Text(
                                             "\(projector.filename) — "
@@ -1752,164 +1948,5 @@ private struct ExistingModelImporterView: View {
             .padding(.horizontal, 6)
             .padding(.vertical, 2)
             .background(color.opacity(0.12), in: Capsule())
-    }
-}
-
-private struct LMStudioImporterView: View {
-    @ObservedObject var viewModel: SettingsViewModel
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            HStack(alignment: .top) {
-                VStack(alignment: .leading, spacing: 4) {
-                    Label(
-                        "Legacy LM Studio Profiles",
-                        systemImage: "shippingbox.and.arrow.backward"
-                    )
-                        .font(.title2.weight(.semibold))
-                    Text("Create temporary LM Studio-backed profiles for the migration soak. Use Add Existing Models for native llama.cpp or oMLX adoption.")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                }
-                Spacer()
-                if viewModel.isDiscoveringLMStudio {
-                    ProgressView().controlSize(.small)
-                }
-            }
-            .padding(20)
-
-            Divider()
-
-            importerContent
-
-            Divider()
-
-            HStack(spacing: 10) {
-                Button("Select Unprofiled") {
-                    viewModel.selectAllUnprofiledLMStudioModels()
-                }
-                .disabled(viewModel.lmStudioInventory.isEmpty)
-
-                Button("Refresh") {
-                    Task { await viewModel.discoverLMStudioModels() }
-                }
-                .disabled(viewModel.isDiscoveringLMStudio)
-
-                Spacer()
-
-                Button("Cancel") {
-                    viewModel.showLMStudioImporter = false
-                }
-                Button(importButtonTitle) {
-                    viewModel.importSelectedLMStudioModels()
-                }
-                .buttonStyle(.borderedProminent)
-                .disabled(viewModel.selectedLMStudioKeys.isEmpty)
-            }
-            .padding(16)
-        }
-        .frame(minWidth: 720, minHeight: 520)
-    }
-
-    @ViewBuilder
-    private var importerContent: some View {
-        if !viewModel.lmStudioDiscoveryError.isEmpty {
-            VStack(spacing: 12) {
-                Image(systemName: "exclamationmark.triangle")
-                    .font(.system(size: 30))
-                    .foregroundStyle(.orange)
-                Text("LM Studio inventory is unavailable")
-                    .font(.headline)
-                Text(viewModel.lmStudioDiscoveryError)
-                    .foregroundStyle(.secondary)
-                    .multilineTextAlignment(.center)
-                Text("Make sure LM Studio's local server is running, then choose Refresh.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .padding(40)
-        } else if viewModel.isDiscoveringLMStudio && viewModel.lmStudioInventory.isEmpty {
-            VStack(spacing: 12) {
-                ProgressView()
-                Text("Reading downloaded models from LM Studio…")
-                    .foregroundStyle(.secondary)
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-        } else if viewModel.lmStudioInventory.isEmpty {
-            VStack(spacing: 12) {
-                Image(systemName: "shippingbox")
-                    .font(.system(size: 30))
-                    .foregroundStyle(.secondary)
-                Text("No downloaded LM Studio models were found.")
-                    .foregroundStyle(.secondary)
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-        } else {
-            List(viewModel.lmStudioInventory) { model in
-                Toggle(isOn: viewModel.lmStudioSelectionBinding(model.key)) {
-                    HStack(spacing: 12) {
-                        Image(systemName: model.type == "embedding" ? "point.3.connected.trianglepath.dotted" : "text.bubble")
-                            .foregroundStyle(.secondary)
-                            .frame(width: 24)
-                        VStack(alignment: .leading, spacing: 3) {
-                            HStack(spacing: 7) {
-                                Text(model.displayName).fontWeight(.medium)
-                                if model.loaded {
-                                    inventoryBadge("Loaded", color: .green)
-                                }
-                                if viewModel.isLMStudioModelProfiled(model.key) {
-                                    inventoryBadge("Already profiled", color: .secondary)
-                                }
-                                if !model.isImportable {
-                                    inventoryBadge("Unsupported type", color: .orange)
-                                }
-                            }
-                            Text(model.key)
-                                .font(.caption.monospaced())
-                                .foregroundStyle(.secondary)
-                                .lineLimit(1)
-                            Text(metadata(for: model))
-                                .font(.caption)
-                                .foregroundStyle(.tertiary)
-                                .lineLimit(1)
-                        }
-                    }
-                    .padding(.vertical, 4)
-                }
-                .toggleStyle(.checkbox)
-                .disabled(
-                    viewModel.isLMStudioModelProfiled(model.key) || !model.isImportable
-                )
-            }
-            .listStyle(.inset)
-        }
-    }
-
-    private var importButtonTitle: String {
-        let count = viewModel.selectedLMStudioKeys.count
-        return count == 1 ? "Create 1 Legacy Profile" : "Create \(count) Legacy Profiles"
-    }
-
-    private func inventoryBadge(_ text: String, color: Color) -> some View {
-        Text(text)
-            .font(.caption2.weight(.semibold))
-            .foregroundStyle(color)
-            .padding(.horizontal, 6)
-            .padding(.vertical, 2)
-            .background(color.opacity(0.12), in: Capsule())
-    }
-
-    private func metadata(for model: LMStudioDiscoveredModel) -> String {
-        var parts = [model.type.uppercased()]
-        if let format = model.format { parts.append(format.uppercased()) }
-        if let quantization = model.quantizationName { parts.append(quantization) }
-        if let parameters = model.paramsString { parts.append(parameters) }
-        if let size = model.sizeBytes {
-            parts.append(ByteCountFormatter.string(fromByteCount: size, countStyle: .file))
-        }
-        if model.vision == true { parts.append("Vision") }
-        if model.trainedForToolUse == true { parts.append("Tools") }
-        return parts.joined(separator: "  •  ")
     }
 }

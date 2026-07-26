@@ -2,7 +2,7 @@
 
 ## What this is
 
-Mnemosyne Inference gives a single workstation Ollama/LMStudio-style ergonomics
+Mnemosyne Inference gives a single workstation local-model-manager experience
 on top of upstream inference engines. The repository now contains two sibling
 deployments with independent dependencies and packaging:
 
@@ -23,7 +23,7 @@ explicitly labeled macOS.
 | Deployment | Runtime and engines | Status |
 | --- | --- | --- |
 | CUDA/Linux | Docker, vLLM, llama.cpp, SGLang Diffusion | Feature-complete implementation and automated coverage; current engine pins and cross-backend swaps still need a CUDA-workstation release smoke. |
-| Apple Silicon | Managed llama.cpp, external oMLX, optional DS4, isolated MFLUX worker | Official llama.cpp arm64 download/integrity checks plus real GGUF and oMLX/MLX generations with token accounting have passed on Theseus. GUI migration, packaged-service soak, durable external-oMLX startup, and DS4 acceptance remain in progress; LM Studio is retained only as an explicitly enabled migration fallback until that soak is accepted. |
+| Apple Silicon | Managed llama.cpp, external oMLX, optional DS4, isolated MFLUX worker | Official llama.cpp arm64 download/integrity checks plus real GGUF and oMLX/MLX generations with token accounting have passed on Theseus. LM Studio engine support has been removed; its model directory remains only as a Finder-confirmed migration hint. Packaged-service soak, durable external-oMLX startup, and DS4 acceptance remain in progress. |
 
 Both deployments expose one stable API, keep at most one model resident, and
 use the same `/v1/images/generations` contract. Language-model usage can be
@@ -63,10 +63,10 @@ The native service listens on `127.0.0.1:1240` for inference and
 `127.0.0.1:17321` for control. It is the workstation's token sidecar and
 enforces one resident model globally across a manager-owned llama.cpp process
 (`:17325`), oMLX (`:17322`), a manager-owned DS4 process (`:17323`), and the
-MFLUX image worker (`:17324`). LM Studio (`:1234`) is disabled on fresh
-configurations and remains available only as an explicit migration/soak
-fallback. After the service is enabled from the menu app, a per-user
-LaunchAgent keeps inference alive when the controller quits.
+MFLUX image worker (`:17324`). LM Studio is not an engine and is never
+contacted; only its configured or conventional model directory is offered as a
+read-only migration hint. After the service is enabled from the menu app, a
+per-user LaunchAgent keeps inference alive when the controller quits.
 
 `Unified Inference.app` is a menu-bar-only controller: it intentionally has no Dock
 icon or ordinary window. Launching it creates a brain-profile status icon on
@@ -97,10 +97,12 @@ the upstream command, so a background LaunchAgent can continue to use an
 approved protected or removable folder after the menu app exits.
 The Models page uses a Finder directory picker to scan an existing library in
 place. It groups GGUF shard sets, excludes projector files as primary models,
-offers explicit multimodal-projector pairing, recognizes MLX folders, and
-migrates matching aliases without copying or loading any weights. The Model
-Library provides an explicit GGUF quant/file picker before a Hugging Face
-download begins.
+automatically selects the highest-fidelity nearby vision projector with a
+text-only opt-out, recognizes MLX folders, and migrates matching aliases
+without copying or loading any weights. The Model Library shows model-card
+prose and detected architecture, context length, parameter count, and license,
+then provides an explicit GGUF quant/file picker before a Hugging Face download
+begins.
 Bookmark registration/preflight, filesystem inspection, model-path resolution,
 directory creation/measurement, and GGUF/projector validation run in killable
 subprocess groups off the asyncio event loop behind bounded deadlines. A
@@ -710,8 +712,8 @@ for features that are not implemented.
   official managed llama.cpp arm64 runtime has also generated successfully
   from an existing GGUF on Theseus, and an external oMLX 0.5.3 service
   generated from an MLX model with usage delivery. The packaged Finder
-  migration, LM-Studio-disabled soak, durable external-oMLX login startup, and
-  real DS4 target acceptance remain in progress.
+  migration, durable external-oMLX login startup, and real DS4 target
+  acceptance remain in progress.
 - **No runtime hard-fail when `gpus='all'` finds no GPUs.** The manager logs
   a warning and falls back to `VLLM_DEFAULT_TP`. On a real CUDA host this
   only happens if the nvidia-container-toolkit is misconfigured — fix the
