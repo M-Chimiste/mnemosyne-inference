@@ -7,8 +7,8 @@
   "release_ready": false,
   "latest_local_artifact": {
     "filename": "Unified-Inference-0.9.0-macos-arm64.dmg",
-    "sha256": "352c8a17919c886d0df20285937d27a5d358e9140e9ebc5c233a30af6d8d5f12",
-    "bytes": 311002829,
+    "sha256": "c470b069657e239e9222556581e831bb604bf203feb11b218b65b6084ce9de2b",
+    "bytes": 309942603,
     "signature": "ad-hoc",
     "notarized": false,
     "acceptance_report": "Unified-Inference-0.9.0-macos-arm64-acceptance.json",
@@ -28,8 +28,8 @@
     {
       "id": "github-macos-ci",
       "required": true,
-      "status": "pending",
-      "evidence": "The arm64 macOS 15 workflow and release workflow parse locally and now publish secret-redacted artifact acceptance reports, but the new workflow has not yet completed on GitHub."
+      "status": "passed",
+      "evidence": "GitHub Actions macOS CI run 30217055343 passed every version/lock, native service, image worker, packaging, Swift build/test, bare-app verification, acceptance-report, and artifact-upload step for implementation commit b9884fc. The signed release workflow remains gated separately on Apple and Sparkle credentials."
     },
     {
       "id": "guided-clean-install",
@@ -95,7 +95,7 @@
       "id": "developer-id-notarized-dmg",
       "required": true,
       "status": "pending",
-      "evidence": "The 311,002,829-byte 0.9.0 arm64 ad-hoc DMG (SHA-256 352c8a17919c886d0df20285937d27a5d358e9140e9ebc5c233a30af6d8d5f12) builds, mounts read-only, and passes its paired machine-readable acceptance report, but it is not a distribution artifact. The credentialed release workflow exists; Apple signing/notarization and Sparkle private-key credentials are not available in this checkout."
+      "evidence": "The 309,942,603-byte 0.9.0 arm64 ad-hoc DMG (SHA-256 c470b069657e239e9222556581e831bb604bf203feb11b218b65b6084ce9de2b) builds, mounts read-only, and passes its paired machine-readable acceptance report, but it is not a distribution artifact. The credentialed release workflow exists; Apple signing/notarization and Sparkle private-key credentials are not available in this checkout."
     },
     {
       "id": "signed-update-and-recovery",
