@@ -23,7 +23,7 @@ upstream engines and must not fork or embed their serving implementations.
 - `pg_writer.py` and `scripts/probe_token_sidecar_schema.py` implement and inspect the optional Postgres token-usage sink; SQLite remains the local system of record and durable outbox.
 - `project_docs/project_status.md` records current release status and feature history; `project_docs/smoke_checks.md` is the manual GPU-host checklist for behavior pytest cannot exercise.
 - `macos/service/` is an independent Python package for the native inference/control planes, engine adapters, lease-based global residency coordinator, and durable usage outbox. Its dependencies and lock file stay below that directory.
-- `macos/service/storage.py`, `model_library.py`, `install_store.py`, `installer.py`, and `download_worker.py` implement exact nested-folder/volume validation, engine-aware Hugging Face discovery, and process-isolated durable native downloads. Managed downloads must remain residency-neutral.
+- `macos/service/storage.py`, `model_library.py`, `install_store.py`, `installer.py`, and `download_worker.py` implement exact nested-folder/volume validation, engine-aware Hugging Face discovery, and process-isolated durable native downloads. The install store retains a compact transition journal so target-Mac cancel/retry/registration/dismiss/delete acceptance remains provable after UI history is hidden. Managed downloads must remain residency-neutral.
 - `macos/service/local_models.py` scans Finder-selected GGUF/MLX libraries without loading or copying weights. `macos/service/engines/llamacpp.py` translates typed profiles into a manager-owned upstream `llama-server` process while reusing the hardened managed-process ownership proof.
 - `macos/service/security_scopes.py` consumes Finder-created transfer
   bookmarks and creates receiver-owned durable bookmarks for protected model
@@ -73,6 +73,12 @@ upstream engines and must not fork or embed their serving implementations.
   `macos/RELEASE_NOTES.md` define the Stable/Preview contract, release gates,
   credentials, update behavior, and rollback. Do not advance
   `macos/VERSION` to `1.0.0` while a required acceptance gate is pending.
+  `macos/packaging/collect_acceptance.py` is the secret-redacted artifact/live
+  evidence collector. Its opt-in restart and KeepAlive exercises must address
+  only the exact registered LaunchAgent label, require a new PID and both HTTP
+  planes, and never discover or signal a process by port. A migrated install
+  journal `snapshot` is not evidence for transitions this candidate did not
+  observe.
   Release verification must reject every 1.x build unless the ledger version
   matches, `release_ready` is true, and every required gate is passed; 0.x
   candidate artifacts remain prereleases.

@@ -317,6 +317,7 @@ The control plane starts with:
 - `GET /manager/model-library/search`
 - `GET /manager/model-library/files`
 - `GET /manager/model-library/installs`
+- `GET /manager/model-library/install-evidence`
 - `POST /manager/model-library/installs`
 - `POST /manager/model-library/installs/{id}/cancel`
 - `POST /manager/model-library/installs/{id}/retry`

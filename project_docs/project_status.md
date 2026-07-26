@@ -61,7 +61,8 @@ the CUDA image or its `8000-8002` topology. The first implementation includes:
   verified recommendations, exact llama.cpp GGUF shard/projector downloads,
   oMLX compatibility signals, nested external-folder support, containing-volume
   UUID validation, live byte/percentage/speed progress, dismissible completed
-  history, residency-neutral profile creation, and exact manager-owned
+  history, a compact persistent transition journal for target-Mac lifecycle
+  evidence, residency-neutral profile creation, and exact manager-owned
   directory deletion behind the global empty-residency barrier; and
 - independent setup, architecture, and Apple Silicon smoke documentation.
 
@@ -118,11 +119,15 @@ native proxy with 17 prompt and 4 completion tokens, flushed one usage row,
 then explicitly unloaded; the coordinator and authoritative oMLX inventory
 both returned empty.
 GUI Finder-confirmed migration, durable oMLX login startup, and login-cycle
-validation remain in progress.
-The current native service suite passes all 277 tests on the development Mac,
+validation remain in progress. The secret-redacted acceptance collector now
+has opt-in exact-label restart and KeepAlive exercises plus strict
+protected-model, oMLX recovery, LM Studio-directory adoption, Postgres drain,
+and durable download-lifecycle checks; those checks do not clear a gate until
+the candidate actually produces the required state transitions.
+The current native service suite passes all 278 tests on the development Mac,
 including the two real-bookmark tests that skip in restricted runners. The
 isolated MFLUX worker passes 23 tests with
-real Metal access, the packaging suite passes 22 tests, and all 59 current
+real Metal access, the packaging suite passes 27 tests, and all 59 current
 Swift tests pass. The full relocatable build reports version 0.9.0 and its
 embedded service passes configuration validation without adding bytecode to or
 invalidating the signed app. GitHub Actions macOS CI run

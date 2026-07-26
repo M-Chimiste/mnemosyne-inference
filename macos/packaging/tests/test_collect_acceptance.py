@@ -6,14 +6,20 @@ from pathlib import Path
 import stat
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from macos.packaging.collect_acceptance import (
+    _download_lifecycle_summary,
+    _exercise_launch_agent,
+    _lmstudio_adoption_summary,
     _packaged_engine_defaults,
     _postgres_drained,
+    _protected_model_summary,
     _redact_text,
     _redact_url,
     _usage_summary,
     _write_report,
+    collect_live,
     redact,
 )
 
@@ -136,6 +142,361 @@ class AcceptanceEvidenceTests(unittest.TestCase):
         self.assertFalse(_postgres_drained(ready, since=121.0))
         ready["token_sidecar"]["outbox_depth"] = 1
         self.assertFalse(_postgres_drained(ready, since=100.0))
+
+    def test_download_lifecycle_requires_observed_target_mac_transitions(self) -> None:
+        payload = {
+            "installs": [
+                {
+                    "id": "cancel-retry",
+                    "repo_id": "owner/model",
+                    "engine": "llama.cpp",
+                    "alias": "model",
+                    "status": "deleted",
+                    "revision": "a" * 40,
+                    "dismissed": True,
+                    "events": [
+                        {"event": "created", "status": "queued"},
+                        {"event": "status", "status": "downloading"},
+                        {"event": "status", "status": "cancelled"},
+                        {"event": "status", "status": "queued"},
+                        {"event": "status", "status": "downloading"},
+                        {"event": "status", "status": "registering"},
+                        {"event": "status", "status": "installed"},
+                        {"event": "history_dismissed", "status": "installed"},
+                        {"event": "status", "status": "deleted"},
+                    ],
+                },
+                {
+                    "id": "registration-retry",
+                    "repo_id": "owner/other",
+                    "engine": "omlx",
+                    "alias": "other",
+                    "status": "installed",
+                    "revision": "b" * 40,
+                    "dismissed": False,
+                    "events": [
+                        {"event": "created", "status": "queued"},
+                        {"event": "status", "status": "downloaded"},
+                        {"event": "status", "status": "registering"},
+                        {"event": "status", "status": "installed"},
+                    ],
+                },
+            ]
+        }
+
+        result = _download_lifecycle_summary(payload)
+
+        self.assertTrue(result["accepted"])
+        self.assertTrue(all(result["checks"].values()))
+        payload["installs"][0]["events"] = [
+            event
+            for event in payload["installs"][0]["events"]
+            if event["status"] != "cancelled"
+        ]
+        self.assertFalse(_download_lifecycle_summary(payload)["accepted"])
+
+    def test_protected_model_requires_scope_volume_and_healthy_storage(self) -> None:
+        config = {
+            "config": {
+                "storage": {
+                    "locations": [
+                        {
+                            "name": "athena",
+                            "path": "/Volumes/Athena/models",
+                            "scope_id": "a" * 64,
+                            "volume_uuid": "volume-uuid",
+                        }
+                    ]
+                },
+                "models": [
+                    {
+                        "alias": "vision",
+                        "engine": "llama.cpp",
+                        "storage": "athena",
+                    }
+                ],
+            }
+        }
+        storage = {
+            "locations": [
+                {
+                    "name": "athena",
+                    "exists": True,
+                    "is_directory": True,
+                    "writable": True,
+                    "volume_matches": True,
+                }
+            ]
+        }
+
+        result = _protected_model_summary(config, storage, alias="vision")
+
+        self.assertTrue(result["accepted"])
+        config["config"]["storage"]["locations"][0]["scope_id"] = "not-a-scope"
+        self.assertFalse(
+            _protected_model_summary(config, storage, alias="vision")["accepted"]
+        )
+
+    def test_lmstudio_adoption_requires_native_profile_and_offline_listener(self) -> None:
+        config = {
+            "config": {
+                "engines": {"llama_cpp": {"enabled": True}},
+                "storage": {
+                    "locations": [
+                        {
+                            "name": "lm-models",
+                            "path": "~/.lmstudio/models",
+                        }
+                    ]
+                },
+                "models": [
+                    {
+                        "alias": "adopted",
+                        "engine": "llama.cpp",
+                        "storage": "lm-models",
+                        "model": "~/.lmstudio/models/owner/model/model.gguf",
+                    }
+                ],
+                "migration": {"legacy_lmstudio_profiles": []},
+            }
+        }
+        sources = {
+            "sources": [
+                {
+                    "id": "lmstudio-models",
+                    "path": "~/.lmstudio/models",
+                    "source": "lmstudio-conventional",
+                }
+            ]
+        }
+
+        result = _lmstudio_adoption_summary(
+            config,
+            sources,
+            alias="adopted",
+            lmstudio_offline=True,
+        )
+
+        self.assertTrue(result["accepted"])
+        self.assertFalse(
+            _lmstudio_adoption_summary(
+                config,
+                sources,
+                alias="adopted",
+                lmstudio_offline=False,
+            )["accepted"]
+        )
+
+    def test_launch_agent_exercise_requires_a_new_healthy_process(self) -> None:
+        before = {
+            "registered": True,
+            "state": "running",
+            "pid": 100,
+            "runs": 1,
+            "last_exit_code": None,
+        }
+        after = {
+            "registered": True,
+            "state": "running",
+            "pid": 200,
+            "runs": 2,
+            "last_exit_code": 0,
+        }
+        with (
+            patch(
+                "macos.packaging.collect_acceptance._launch_agent",
+                side_effect=[before, after, after],
+            ),
+            patch(
+                "macos.packaging.collect_acceptance._run",
+                return_value={"ok": True, "returncode": 0, "diagnostic": None},
+            ) as run,
+            patch(
+                "macos.packaging.collect_acceptance._json_request",
+                return_value={"ok": True, "status": 200, "payload": {}},
+            ),
+        ):
+            result = _exercise_launch_agent(
+                "keepalive",
+                control_url="http://127.0.0.1:17321",
+                public_url="http://127.0.0.1:1240",
+                admin_password=None,
+                timeout=1,
+            )
+
+        self.assertTrue(result["accepted"])
+        self.assertEqual(
+            run.call_args.args[0],
+            [
+                "launchctl",
+                "kill",
+                "SIGTERM",
+                f"gui/{os.getuid()}/com.mnemosyne.inference.agent",
+            ],
+        )
+
+    def test_live_collector_composes_restart_reconcile_and_strict_evidence(
+        self,
+    ) -> None:
+        readiness = {
+            "product_version": "0.9.0",
+            "core": {"ready": True},
+            "ready_for_inference": True,
+            "engines": [
+                {
+                    "engine": "llama.cpp",
+                    "enabled": True,
+                    "authoritative": True,
+                    "ready": True,
+                }
+            ],
+        }
+        config = {
+            "config": {
+                "schema_version": 2,
+                "engines": {"llama_cpp": {"enabled": True}},
+                "storage": {
+                    "locations": [
+                        {
+                            "name": "athena",
+                            "path": "/Volumes/Athena/models",
+                            "scope_id": "a" * 64,
+                            "volume_uuid": "volume-uuid",
+                        }
+                    ]
+                },
+                "models": [
+                    {
+                        "alias": "vision",
+                        "engine": "llama.cpp",
+                        "storage": "athena",
+                        "load": {"projector_path": "/Volumes/Athena/mmproj.gguf"},
+                    }
+                ],
+                "migration": {"legacy_lmstudio_profiles": []},
+            },
+            "revision": "same",
+            "applied_revision": "same",
+            "restart_required": False,
+        }
+        install_evidence = {
+            "installs": [
+                {
+                    "id": "install",
+                    "repo_id": "owner/model",
+                    "engine": "llama.cpp",
+                    "alias": "vision",
+                    "status": "deleted",
+                    "revision": "b" * 40,
+                    "dismissed": True,
+                    "events": [
+                        {"event": "status", "status": "cancelled"},
+                        {"event": "status", "status": "queued"},
+                        {"event": "status", "status": "installed"},
+                        {"event": "status", "status": "downloaded"},
+                        {"event": "status", "status": "registering"},
+                        {"event": "status", "status": "installed"},
+                        {"event": "history_dismissed", "status": "installed"},
+                        {"event": "status", "status": "deleted"},
+                    ],
+                }
+            ]
+        }
+
+        def response(url: str, **kwargs: object) -> dict[str, object]:
+            if url.endswith("/health"):
+                payload: object = {"version": "0.9.0"}
+            elif url.endswith("/manager/readiness"):
+                payload = readiness
+            elif url.endswith("/manager/status"):
+                payload = {
+                    "state": "idle",
+                    "diagnostic": None,
+                    "startup_error": None,
+                }
+            elif url.endswith("/manager/models"):
+                payload = {"models": [{"alias": "vision"}]}
+            elif "/manager/usage" in url:
+                payload = {"rows": [], "token_sidecar": {"enabled": False}}
+            elif url.endswith("/manager/storage"):
+                payload = {
+                    "locations": [
+                        {
+                            "name": "athena",
+                            "exists": True,
+                            "is_directory": True,
+                            "writable": True,
+                            "volume_matches": True,
+                        }
+                    ]
+                }
+            elif url.endswith("/manager/config"):
+                payload = config
+            elif "/manager/model-library/install-evidence" in url:
+                payload = install_evidence
+            elif url.endswith("/manager/model-library/local-sources"):
+                payload = {"sources": []}
+            elif url.endswith("/manager/reconcile"):
+                payload = {
+                    "state": "idle",
+                    "diagnostic": None,
+                    "startup_error": None,
+                }
+            elif url.endswith("/manager/self-test"):
+                payload = {
+                    "success": True,
+                    "engine": "llama.cpp",
+                    "release_tier": "stable",
+                    "vision": True,
+                    "usage": {"total_tokens": 7},
+                    "usage_recorded": True,
+                }
+            else:
+                raise AssertionError(url)
+            return {"ok": True, "status": 200, "payload": payload}
+
+        agent = {
+            "registered": True,
+            "state": "running",
+            "pid": 200,
+            "runs": 2,
+            "last_exit_code": 0,
+        }
+        with (
+            patch(
+                "macos.packaging.collect_acceptance._json_request",
+                side_effect=response,
+            ),
+            patch(
+                "macos.packaging.collect_acceptance._launch_agent",
+                return_value=agent,
+            ),
+            patch(
+                "macos.packaging.collect_acceptance._exercise_launch_agent",
+                return_value={"accepted": True, "mode": "restart"},
+            ),
+        ):
+            result = collect_live(
+                expected_version="0.9.0",
+                control_url="http://127.0.0.1:17321",
+                public_url="http://127.0.0.1:1240",
+                admin_password=None,
+                self_test_model="vision",
+                include_vision=True,
+                expected_engine="llama.cpp",
+                require_vision=True,
+                require_postgres_drain=False,
+                postgres_timeout=1,
+                launch_agent_exercise="restart",
+                exercise_reconcile=True,
+                require_protected_model=True,
+                require_download_lifecycle=True,
+            )
+
+        self.assertTrue(result["accepted"])
+        self.assertTrue(all(result["checks"].values()))
+        self.assertTrue(result["protected_model"]["accepted"])
+        self.assertTrue(result["download_lifecycle"]["accepted"])
 
     def test_report_write_is_atomic_private_and_valid_json(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

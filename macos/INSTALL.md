@@ -356,6 +356,11 @@ The report is written with mode `0600` and redacts credentials and
 credential-bearing URLs. A running Login Item alone is not accepted when the
 public or control listener, readiness contract, catalog, usage store, product
 version, or requested self-test fails.
+Release operators should then use the opt-in restart/KeepAlive, protected
+folder, LM Studio-directory adoption, oMLX recovery, Postgres drain, and
+download-lifecycle flags documented in [RELEASE.md](RELEASE.md). Those flags
+produce durable machine-readable evidence and signal only the exact registered
+LaunchAgent; ordinary users do not need to run them.
 
 ## Updating Unified Inference
 

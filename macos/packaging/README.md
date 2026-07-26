@@ -176,7 +176,15 @@ secure timestamp, Sparkle signing configuration, staple validation, and
 Gatekeeper acceptance. After installation, run
 `collect_acceptance.py --live --require-live --self-test <alias>` to add
 LaunchAgent, listener, readiness, catalog, usage, and durable self-test
-evidence without putting credentials on the command line.
+evidence without putting credentials on the command line. The live report also
+captures bounded configuration, storage, installed-runtime readiness, LM Studio
+directory-hint, and durable download-transition evidence. Explicit
+`--exercise-service-restart` and `--exercise-keepalive` modes operate through
+the exact registered LaunchAgent label and require a new PID plus both healthy
+HTTP planes. Strict options can require protected-model reactivation, oMLX
+reconcile/auth recovery, native LM Studio-directory adoption, and the complete
+download cancel/retry/registration-retry/dismiss/delete history. See
+[`../RELEASE.md`](../RELEASE.md) for the composed target-Mac commands.
 
 Notarization credentials stay in the login Keychain, not the repository. Set
 up a profile once; leaving out `--password` makes `notarytool` prompt securely

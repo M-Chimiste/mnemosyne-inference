@@ -43,6 +43,38 @@ token usage is returned, and the matching durable local usage row is found.
 `--require-postgres-drain` additionally waits for a successful post-test flush
 and an empty local delivery outbox; query the central ledger by the report's
 event ID to prove the remote row and uniqueness.
+
+The collector can also run explicit, opt-in target-Mac exercises. These
+operations restart or signal only the exact registered
+`com.mnemosyne.inference.agent` job; they never find or kill a process by port:
+
+```bash
+python3 macos/packaging/collect_acceptance.py \
+  --live --require-live \
+  --exercise-service-restart \
+  --exercise-reconcile \
+  --self-test protected-vision-alias \
+  --expected-engine llama.cpp \
+  --require-vision \
+  --require-protected-model \
+  --require-download-lifecycle \
+  --require-postgres-drain \
+  --output "$HOME/Desktop/unified-inference-target-mac-acceptance.json"
+```
+
+Use `--exercise-keepalive` instead of `--exercise-service-restart` for the
+unexpected-exit recovery pass. A protected-model result requires a
+Finder-created receiver scope, persisted volume identity, healthy storage, and
+a successful post-restart llama.cpp request. Download lifecycle acceptance is
+based on the service's durable transition journal; migrated `snapshot` events
+do not fabricate prior cancellation, retry, dismissal, or deletion evidence.
+`--require-lmstudio-adoption <alias>` additionally requires LM Studio's
+listener to be offline, the alias to be native and callable, the matching inert
+migration row to be consumed, and its storage/model to remain under a
+read-only LM Studio directory hint. For external oMLX, combine a restart,
+`--exercise-reconcile`, `--expected-engine omlx`, and
+`--require-omlx-recovery`.
+
 For a public release, `--require-distribution` additionally requires the
 Developer ID identity, hardened runtime, timestamp, Sparkle public key/HTTPS
 feed, notarization staple, and Gatekeeper acceptance for both app and DMG.

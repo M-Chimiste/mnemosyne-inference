@@ -81,6 +81,17 @@ async def test_profile_registration_retry_does_not_redownload_after_restart(
     assert completed.error is None
     assert registration_attempts == 2
     assert len(spawn_calls) == 1
+    assert [
+        (event.event, event.status)
+        for event in second.store.events(install.id)
+    ] == [
+        ("created", "queued"),
+        ("status", "downloading"),
+        ("status", "registering"),
+        ("status", "downloaded"),
+        ("status", "registering"),
+        ("status", "installed"),
+    ]
     await second.stop()
 
 

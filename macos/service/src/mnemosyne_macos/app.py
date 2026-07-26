@@ -863,6 +863,15 @@ def create_control_app(runtime: NativeRuntime) -> FastAPI:
         records = await runtime.installer.list(limit=limit)
         return {"installs": [record.to_dict() for record in records]}
 
+    @app.get("/manager/model-library/install-evidence")
+    async def library_install_evidence(
+        limit: int = Query(default=100, ge=1, le=500),
+    ) -> dict:
+        return {
+            "schema_version": 1,
+            "installs": await runtime.installer.evidence(limit=limit),
+        }
+
     @app.get("/manager/model-library/installs/{install_id}")
     async def library_install(install_id: str) -> dict:
         try:

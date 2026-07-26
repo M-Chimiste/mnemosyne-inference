@@ -1001,6 +1001,14 @@ async def test_control_plane_deletes_only_an_exact_managed_model_destination(
         assert (await client.get("/manager/model-library/installs")).json() == {
             "installs": []
         }
+        evidence_before_delete = (
+            await client.get("/manager/model-library/install-evidence")
+        ).json()
+        assert evidence_before_delete["schema_version"] == 1
+        assert evidence_before_delete["installs"][0]["dismissed"] is True
+        assert evidence_before_delete["installs"][0]["events"][-1]["event"] == (
+            "history_dismissed"
+        )
 
         revision = (await client.get("/manager/config")).json()["revision"]
         deleted = await client.request(
@@ -1018,6 +1026,16 @@ async def test_control_plane_deletes_only_an_exact_managed_model_destination(
         assert runtime.model_list() == []
         assert await runtime.installer.list() == []
         assert runtime.installer.store.latest_for_alias("managed-model").status == "deleted"
+        evidence_after_delete = (
+            await client.get("/manager/model-library/install-evidence")
+        ).json()
+        assert [
+            (event["event"], event["status"])
+            for event in evidence_after_delete["installs"][0]["events"][-2:]
+        ] == [
+            ("history_dismissed", "installed"),
+            ("status", "deleted"),
+        ]
     finally:
         await client.aclose()
         await runtime.stop()

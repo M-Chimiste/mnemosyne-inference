@@ -29,6 +29,41 @@ fails. The Postgres option also requires a new successful flush and an empty
 outbox; verify the corresponding `event_id` exists exactly once in the central
 ledger before clearing the remote-delivery gate.
 
+After the ordinary UI pass, rerun the collector with the relevant strict
+scenario flags instead of translating screenshots into release claims:
+
+```bash
+python3 macos/packaging/collect_acceptance.py \
+  --app "/Applications/Unified Inference.app" \
+  --dmg "/path/to/Unified-Inference-0.9.0-macos-arm64.dmg" \
+  --require-live \
+  --exercise-service-restart \
+  --exercise-reconcile \
+  --self-test protected-vision-alias \
+  --expected-engine llama.cpp \
+  --require-vision \
+  --require-protected-model \
+  --require-download-lifecycle \
+  --require-postgres-drain \
+  --output "$HOME/Desktop/unified-inference-restart-acceptance.json"
+```
+
+Run a second pass with `--exercise-keepalive` to prove launchd restarted the
+exact registered job after SIGTERM. The report requires a different PID and
+both HTTP planes healthy before continuing to reconciliation and inference.
+For the migrated-library pass add
+`--require-lmstudio-adoption <the-same-self-test-alias>` while LM Studio is
+stopped. For the oMLX pass select an oMLX alias and add
+`--require-omlx-recovery --expected-engine omlx`; this combination requires a
+service restart/KeepAlive exercise and `--exercise-reconcile`.
+
+The download check reads the durable install transition journal. It needs
+real target-Mac records proving cancellation followed by retry and completion,
+downloaded-weight registration retry without another download, completed
+history dismissal, exact revision pinning, and managed deletion. An upgraded
+database receives only a `snapshot` event, which is deliberately insufficient
+to clear transitions that were not observed by this candidate.
+
 ## 1. Configuration and listeners
 
 ```bash
@@ -181,6 +216,11 @@ verify the model profile and files remain. Remove that profile with
 and profile disappear. Confirm Finder-imported profiles cannot delete files,
 and no unrelated files are touched. Repeat with a gated repository to prove
 the write-only `HF_TOKEN` reaches only the download worker.
+
+Afterward, `GET /manager/model-library/install-evidence` must show the
+candidate-observed state transitions, including hidden/deleted rows, without
+credentials or arbitrary worker output. The ordinary installs endpoint remains
+the dismissible UI view.
 
 ## 5. oMLX lifecycle
 

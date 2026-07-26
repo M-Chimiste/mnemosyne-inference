@@ -217,8 +217,55 @@ def test_install_history_can_be_hidden_without_losing_managed_download_identity(
         assert store.get(record.id).hidden == 1
         assert store.latest_for_alias("model").id == record.id
         assert "hidden" not in store.get(record.id).to_dict()
+        evidence = store.evidence()
+        assert len(evidence) == 1
+        assert evidence[0]["dismissed"] is True
+        assert [
+            (event["event"], event["status"])
+            for event in evidence[0]["events"]
+        ] == [
+            ("created", "queued"),
+            ("status", "installed"),
+            ("history_dismissed", "installed"),
+        ]
     finally:
         store.close()
+
+
+def test_existing_install_rows_gain_only_an_honest_migration_snapshot(
+    tmp_path,
+) -> None:
+    path = tmp_path / "legacy-events.db"
+    first = InstallStore(path)
+    record = first.create(
+        repo_id="owner/model",
+        engine="llama.cpp",
+        storage="internal",
+        alias="model",
+        destination="/models/owner/model",
+        revision="abc123",
+        filename="model.gguf",
+        family=None,
+        total_bytes=4096,
+    )
+    first.close()
+
+    connection = sqlite3.connect(path)
+    connection.execute(
+        "DELETE FROM native_model_install_events WHERE install_id = ?",
+        (record.id,),
+    )
+    connection.commit()
+    connection.close()
+
+    migrated = InstallStore(path)
+    try:
+        events = migrated.events(record.id)
+        assert [(event.event, event.status) for event in events] == [
+            ("snapshot", "queued")
+        ]
+    finally:
+        migrated.close()
 
 
 def test_install_store_round_trips_exact_shards_and_projector(tmp_path) -> None:

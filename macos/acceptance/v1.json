@@ -23,7 +23,7 @@
       "id": "automated-native-suites",
       "required": true,
       "status": "passed",
-      "evidence": "Local Apple Silicon run: service 277 passed including the real-bookmark tests; image worker 23 passed with Metal access; Swift 59 passed; packaging 22 passed; version and locked-runtime checks passed. The artifact acceptance collector passes the complete staged app and DMG."
+      "evidence": "Local Apple Silicon run: service 278 passed (276 in the restricted suite plus both real-bookmark tests with host access); image worker 23 passed with Metal access; Swift 59 passed; packaging 27 passed; version and locked-runtime checks passed. The artifact acceptance collector passes the complete staged app and DMG."
     },
     {
       "id": "github-macos-ci",
@@ -41,13 +41,13 @@
       "id": "login-and-launchagent-lifecycle",
       "required": true,
       "status": "pending",
-      "evidence": "Requires logout/login on the target Apple Silicon Mac."
+      "evidence": "The acceptance collector can now prove an exact-label service restart or launchd KeepAlive recovery with a new PID and both HTTP planes before inference. The current candidate still requires install plus a real logout/login cycle on the target Apple Silicon Mac."
     },
     {
       "id": "lmstudio-finder-migration",
       "required": true,
       "status": "pending",
-      "evidence": "Requires the current candidate to adopt a real LM Studio library through Finder, preserve aliases/load settings, and remain callable after LM Studio is stopped or removed."
+      "evidence": "The strict live collector now verifies the post-adoption native alias, consumed inert migration row, hinted-library containment, offline LM Studio listener, and successful request. The current candidate still needs the real Finder adoption and historical alias/load-setting comparison on the target Mac."
     },
     {
       "id": "llamacpp-real-text-and-vision",
@@ -65,7 +65,7 @@
       "id": "omlx-durable-startup-auth-recovery",
       "required": true,
       "status": "pending",
-      "evidence": "Requires the external oMLX service to survive login/startup with its configured model directories and prove authenticated unload/reconcile recovery on the current candidate."
+      "evidence": "The strict live collector can now combine exact core restart/KeepAlive, authoritative reconciliation, oMLX readiness/auth inspection, and a durable oMLX self-test. The external service still must survive a real login/startup with its configured model directories on the current candidate."
     },
     {
       "id": "postgres-idempotent-delivery",
@@ -77,13 +77,13 @@
       "id": "protected-folder-restart",
       "required": true,
       "status": "pending",
-      "evidence": "Requires Finder selection and a service restart on the target Mac."
+      "evidence": "The strict live collector now requires a receiver scope ID, persisted volume identity, healthy matching storage, exact service restart/KeepAlive, and a successful post-restart manager-owned llama.cpp request. A real Finder selection and candidate run are still required."
     },
     {
       "id": "durable-download-lifecycle",
       "required": true,
       "status": "pending",
-      "evidence": "Candidate download, cancel, registration retry, history removal, and managed deletion are required."
+      "evidence": "Native installs now retain a compact, non-secret transition journal even after history is hidden or files are deleted, and the strict collector rejects migrated snapshots as invented history. Real candidate download, cancel/retry completion, downloaded-weight registration retry, history removal, exact revision pin, and managed deletion actions are still required."
     },
     {
       "id": "managed-runtime-update-rollback",

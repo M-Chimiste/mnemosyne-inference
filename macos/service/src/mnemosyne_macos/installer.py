@@ -127,6 +127,9 @@ class NativeInstaller:
     async def list(self, *, limit: int = 100) -> list[InstallRecord]:
         return await asyncio.to_thread(self.store.list, limit=limit)
 
+    async def evidence(self, *, limit: int = 100) -> list[dict[str, object]]:
+        return await asyncio.to_thread(self.store.evidence, limit=limit)
+
     async def dismiss(self, install_id: str) -> InstallRecord:
         record = await asyncio.to_thread(self.store.get, install_id)
         if record.status in {"queued", "downloading", "registering"}:
