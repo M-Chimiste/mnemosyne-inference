@@ -2,6 +2,13 @@ import Foundation
 
 public protocol ControlAPI: Sendable {
     func status() async throws -> ServiceSnapshot
+    func readiness() async throws -> ReadinessSnapshot
+    func reconcile() async throws -> ServiceSnapshot
+    func selfTest(
+        model: String,
+        includeVision: Bool,
+        unloadAfter: Bool
+    ) async throws -> ModelSelfTestResult
     func models() async throws -> ModelCatalogSnapshot
     func load(model: String) async throws -> ServiceSnapshot
     func unload() async throws
@@ -166,6 +173,58 @@ public struct ControlAPIClient: ControlAPI, Sendable {
         let (data, response) = try await session.data(for: request)
         try validate(response, data: data)
         return try JSONDecoder().decode(ServiceSnapshot.self, from: data)
+    }
+
+    public func readiness() async throws -> ReadinessSnapshot {
+        let request = makeRequest(path: "/manager/readiness")
+        let (data, response) = try await session.data(for: request)
+        try validate(response, data: data)
+        return try JSONDecoder.nativeSettingsDecoder().decode(
+            ReadinessSnapshot.self,
+            from: data
+        )
+    }
+
+    public func reconcile() async throws -> ServiceSnapshot {
+        let request = makeRequest(path: "/manager/reconcile", method: "POST")
+        let (data, response) = try await session.data(for: request)
+        try validate(response, data: data)
+        return try JSONDecoder().decode(ServiceSnapshot.self, from: data)
+    }
+
+    public func selfTest(
+        model: String,
+        includeVision: Bool = true,
+        unloadAfter: Bool = false
+    ) async throws -> ModelSelfTestResult {
+        let request = try selfTestRequest(
+            model: model,
+            includeVision: includeVision,
+            unloadAfter: unloadAfter
+        )
+        let (data, response) = try await session.data(for: request)
+        try validate(response, data: data)
+        return try JSONDecoder.nativeSettingsDecoder().decode(
+            ModelSelfTestResult.self,
+            from: data
+        )
+    }
+
+    func selfTestRequest(
+        model: String,
+        includeVision: Bool,
+        unloadAfter: Bool
+    ) throws -> URLRequest {
+        var request = makeRequest(path: "/manager/self-test", method: "POST")
+        request.httpBody = try JSONEncoder.nativeSettingsEncoder().encode(
+            ModelSelfTestRequest(
+                model: model,
+                includeVision: includeVision,
+                unloadAfter: unloadAfter
+            )
+        )
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        return request
     }
 
     public func models() async throws -> ModelCatalogSnapshot {

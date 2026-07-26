@@ -6,6 +6,7 @@ import SwiftUI
 @MainActor
 final class SettingsViewModel: ObservableObject {
     enum Section: String, CaseIterable, Identifiable {
+        case setup = "Setup & Health"
         case general = "General"
         case engines = "Engines"
         case updates = "Runtime Updates"
@@ -19,6 +20,7 @@ final class SettingsViewModel: ObservableObject {
 
         var symbol: String {
             switch self {
+            case .setup: "checklist"
             case .general: "gearshape"
             case .engines: "cpu"
             case .updates: "arrow.triangle.2.circlepath.circle"
@@ -38,13 +40,14 @@ final class SettingsViewModel: ObservableObject {
         case error
     }
 
-    @Published var selectedSection: Section = .general
+    @Published var selectedSection: Section = .setup
     @Published var settings = NativeSettings()
     @Published var selectedModelIndex: Int?
     @Published var credentialDrafts: [ManagedCredential: String] = [:]
     @Published var credentialsToClear: Set<ManagedCredential> = []
     @Published var confirmDiscard = false
     @Published var confirmRemoveModel = false
+    @Published var confirmHomebrewOMLXInstall = false
     @Published var showLocalModelImporter = false
     @Published var selectedLocalModelIDs: Set<String> = []
     @Published var localModelAliases: [String: String] = [:]
@@ -62,10 +65,16 @@ final class SettingsViewModel: ObservableObject {
     @Published private(set) var libraryDetails: LibraryModelDetails?
     @Published private(set) var modelInstalls: [ModelInstall] = []
     @Published private(set) var runtimeUpdateSnapshot: RuntimeUpdateSnapshot?
+    @Published private(set) var readinessSnapshot: ReadinessSnapshot?
+    @Published private(set) var lastSelfTest: ModelSelfTestResult?
+    @Published private(set) var isRefreshingReadiness = false
+    @Published private(set) var isReconciling = false
+    @Published private(set) var isRunningSelfTest = false
     @Published private(set) var tokenReportingNodeID = ""
     @Published private(set) var tokenReportingIdentitySource = "computer_name"
     @Published private(set) var isCheckingRuntimeUpdates = false
     @Published private(set) var updatingRuntimeEngine: InferenceEngine?
+    @Published private(set) var isInstallingOMLXWithHomebrew = false
     @Published private(set) var isSearchingLibrary = false
     @Published private(set) var isLoadingLibraryFiles = false
     @Published private(set) var isLoadingLibraryDetails = false
@@ -183,9 +192,82 @@ final class SettingsViewModel: ObservableObject {
             Task { await refreshModelLibrary() }
             Task { await refreshLocalModelSources() }
             Task { await refreshRuntimeUpdates() }
+            Task { await refreshReadiness() }
         } catch {
             isLoaded = false
             setStatus("Could not load settings: \(error.localizedDescription)", tone: .error)
+        }
+    }
+
+    func refreshReadiness() async {
+        guard !isRefreshingReadiness else { return }
+        isRefreshingReadiness = true
+        defer { isRefreshingReadiness = false }
+        do {
+            readinessSnapshot = try await client.readiness()
+        } catch {
+            setStatus(
+                "Could not refresh system health: \(error.localizedDescription)",
+                tone: .warning
+            )
+        }
+    }
+
+    func reconcileService() async {
+        guard !isReconciling else { return }
+        isReconciling = true
+        setStatus("Reconciling engine residency…", tone: .normal)
+        defer { isReconciling = false }
+        do {
+            _ = try await client.reconcile()
+            await refreshReadiness()
+            setStatus("Every enabled engine reported authoritative state.", tone: .success)
+        } catch {
+            setStatus(
+                "Could not reconcile engine state: \(error.localizedDescription)",
+                tone: .error
+            )
+        }
+    }
+
+    @discardableResult
+    func runSelfTest(model: String) async -> Bool {
+        guard !model.isEmpty, !isRunningSelfTest else { return false }
+        isRunningSelfTest = true
+        lastSelfTest = nil
+        setStatus("Testing \(model) through the public inference API…", tone: .normal)
+        defer { isRunningSelfTest = false }
+        do {
+            let result = try await client.selfTest(
+                model: model,
+                includeVision: true,
+                unloadAfter: false
+            )
+            lastSelfTest = result
+            await refreshReadiness()
+            if result.usage == nil {
+                setStatus(
+                    "\(model) responded, but it returned no token usage. Choose a language model that reports usage to complete setup.",
+                    tone: .warning
+                )
+            } else if result.usageRecorded != true {
+                setStatus(
+                    "\(model) responded, but its token usage was not recorded.",
+                    tone: .warning
+                )
+            } else {
+                setStatus(
+                    "\(model) passed its \(result.vision ? "vision" : "inference") self-test.",
+                    tone: .success
+                )
+            }
+            return result.completesGuidedSetup
+        } catch {
+            setStatus(
+                "Model self-test failed: \(error.localizedDescription)",
+                tone: .error
+            )
+            return false
         }
     }
 
@@ -572,7 +654,11 @@ final class SettingsViewModel: ObservableObject {
     }
 
     func refreshRuntimeUpdates(force: Bool = false) async {
-        guard !isCheckingRuntimeUpdates, updatingRuntimeEngine == nil else { return }
+        guard
+            !isCheckingRuntimeUpdates,
+            updatingRuntimeEngine == nil,
+            !isInstallingOMLXWithHomebrew
+        else { return }
         isCheckingRuntimeUpdates = true
         defer { isCheckingRuntimeUpdates = false }
         do {
@@ -584,6 +670,67 @@ final class SettingsViewModel: ObservableObject {
             }
         } catch {
             setStatus("Could not check runtime updates: \(error.localizedDescription)", tone: .warning)
+        }
+    }
+
+    func installOMLXWithHomebrew() async {
+        guard
+            !isInstallingOMLXWithHomebrew,
+            updatingRuntimeEngine == nil
+        else { return }
+        guard let executable = HomebrewOMLXInstaller.executableURL() else {
+            setStatus(
+                "Homebrew was not found. Use the recommended official oMLX app installer instead.",
+                tone: .warning
+            )
+            return
+        }
+
+        isInstallingOMLXWithHomebrew = true
+        defer { isInstallingOMLXWithHomebrew = false }
+        do {
+            setStatus("Adding the official oMLX Homebrew tap…", tone: .normal)
+            _ = try await HomebrewOMLXInstaller.run(
+                executableURL: executable,
+                arguments: HomebrewOMLXInstaller.commands[0]
+            )
+            setStatus("Installing the stable oMLX Homebrew formula…", tone: .normal)
+            _ = try await HomebrewOMLXInstaller.run(
+                executableURL: executable,
+                arguments: HomebrewOMLXInstaller.commands[1]
+            )
+            runtimeUpdateSnapshot = try await client.checkRuntimeUpdates()
+            setStatus(
+                "oMLX was installed with Homebrew. Configure and start it on 127.0.0.1:17322, then enable the engine.",
+                tone: .success
+            )
+        } catch {
+            setStatus(
+                "Could not install oMLX with Homebrew: \(error.localizedDescription)",
+                tone: .error
+            )
+        }
+    }
+
+    func openOMLXApplication(_ update: EngineRuntimeUpdate) {
+        guard
+            update.engine == .omlx,
+            let installedPath = update.installedPath,
+            installedPath.hasSuffix(".app")
+        else {
+            setStatus(
+                "The installed oMLX application could not be located.",
+                tone: .warning
+            )
+            return
+        }
+        if NSWorkspace.shared.open(URL(fileURLWithPath: installedPath)) {
+            setStatus(
+                "Opened oMLX. Start its server on 127.0.0.1:17322, then check again.",
+                tone: .success
+            )
+        } else {
+            setStatus("Could not open oMLX at \(installedPath).", tone: .error)
         }
     }
 

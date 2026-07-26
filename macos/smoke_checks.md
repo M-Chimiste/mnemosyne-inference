@@ -4,6 +4,31 @@ Run these checks on the target Apple Silicon workstation. Automated tests use
 fake engines and cannot validate Metal memory release, upstream API drift,
 LaunchAgent behavior, or model quality.
 
+Start every candidate pass with the evidence collector. It is read-only unless
+`--self-test` is supplied, and it writes the report atomically with mode
+`0600`. Credential-bearing fields and URLs are redacted; token counts remain
+visible:
+
+```bash
+python3 macos/packaging/collect_acceptance.py \
+  --app "/Applications/Unified Inference.app" \
+  --dmg "/path/to/Unified-Inference-0.9.0-macos-arm64.dmg" \
+  --live \
+  --require-live \
+  --self-test your-model-alias \
+  --require-postgres-drain \
+  --output "$HOME/Desktop/unified-inference-live-acceptance.json"
+```
+
+When control authentication is enabled, export its password as
+`MNEMOSYNE_ADMIN_PASSWORD` for this command only. Do not pass the value on the
+command line. Attach the resulting report to the acceptance ledger evidence;
+a registered/running LaunchAgent does not pass when either HTTP plane,
+readiness, version matching, catalog, usage, or the requested durable self-test
+fails. The Postgres option also requires a new successful flush and an empty
+outbox; verify the corresponding `event_id` exists exactly once in the central
+ledger before clearing the remote-delivery gate.
+
 ## 1. Configuration and listeners
 
 ```bash
@@ -27,8 +52,16 @@ catalog remain available:
 
 ```bash
 curl -s http://127.0.0.1:17321/manager/status | jq
+curl -s http://127.0.0.1:17321/manager/readiness | jq
 curl -s http://127.0.0.1:1240/v1/models | jq
 ```
+
+Open **Settings → Setup & Health** and compare it with the readiness payload.
+Confirm the product version matches `macos/VERSION`, diagnostics contain no
+credential or URI password, manager-owned stopped engines are described as
+available when their runtime is installed, external oMLX is not described as
+ready unless its authoritative service responds, and DS4/MFLUX are labeled
+Preview rather than Stable.
 
 ## 2. Local-library adoption
 
@@ -244,9 +277,9 @@ section.
 
 - launching the installed app creates exactly one visible brain-profile status
   item and logs `Unified Inference menu bar status item installed`;
-- **Settings…** opens a separate resizable window with General, Engines,
-  Runtime Updates, Storage, Model Library, Models, Usage, and Credentials
-  pages; the pages use native controls rather than a raw file editor,
+- **Settings…** opens a separate resizable window with Setup & Health, General,
+  Engines, Runtime Updates, Storage, Model Library, Models, Usage, and
+  Credentials pages; the pages use native controls rather than a raw file editor,
   add profiles only through Model Library or Finder discovery, remove profiles
   correctly, and warn before discarding unsaved edits;
 - **Storage → Add Model Folder…** opens the native directory chooser; selecting
@@ -291,8 +324,17 @@ section.
 - clicking the item opens the controller popover while the app remains absent
   from the Dock;
 - reopening the already-running app brings the Settings window forward;
-- a fresh preferences domain presents Settings once on first launch and does
-  not present it again on an ordinary login launch;
+- a fresh preferences domain presents Setup & Health on first launch and does
+  not mark setup complete merely because the window opened or the service
+  registered;
+- select a configured alias and run the Setup & Health self-test. Confirm it
+  calls the public `:1240` listener with the alpaca prompt, selects the profile's
+  vision projector when present, shows the response/route/timing/token result,
+  and finds the matching durable local usage row. Its Postgres status must
+  distinguish writer readiness and outbox depth from an actually drained
+  central event;
+- only after that successful self-test does an ordinary login launch stop
+  presenting the setup window automatically;
 - the service survives **Quit Menu App**;
 - the menu app can list/load/unload configured aliases after reopening;
 - disabling the background service unregisters the LaunchAgent;
@@ -343,3 +385,21 @@ configuration or model library.
 Throughout the check, confirm logs and network inspection show no request to
 `:1234`, and that stopping or uninstalling LM Studio has no effect on the
 catalog, residency, or token accounting.
+
+## 13. Signed application update and rollback
+
+This gate requires two Developer ID-notarized builds with the production
+Sparkle public key and signed HTTPS appcast. It cannot be cleared with ad-hoc
+artifacts.
+
+1. Install the older notarized DMG and complete Setup & Health.
+2. Publish the candidate to a non-public test feed signed by the matching
+   Sparkle private key. **Check for Updates…** must validate its EdDSA signature
+   and Apple code identity, replace the app, refresh service registration, and
+   preserve Application Support data.
+3. Serve an altered archive and an invalidly signed appcast in turn. Both must
+   be rejected with the older installed app left intact.
+4. Install the previous immutable notarized DMG over the app bundle without
+   deleting `~/Library/Application Support/Mnemosyne`, then rerun Setup &
+   Health. Configuration, weights, runtimes, bookmarks, usage, and outbox state
+   must remain available.

@@ -108,7 +108,10 @@ class FakeAdapter(EngineAdapter):
 def _targets() -> tuple[ResolvedTarget, ResolvedTarget]:
     profiles = MacConfig.model_validate(
         {
-            "engines": {"llama_cpp": {"enabled": True}},
+            "engines": {
+                "llama_cpp": {"enabled": True},
+                "omlx": {"enabled": True},
+            },
             "models": [
                 {"alias": "studio", "engine": "llama.cpp", "model": "org/studio"},
                 {"alias": "glm", "engine": "omlx", "model": "org/glm"},

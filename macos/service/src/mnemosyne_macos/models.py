@@ -14,6 +14,14 @@ class EngineName(StrEnum):
     MFLUX = "mflux"
 
 
+ENGINE_RELEASE_TIER: dict[EngineName, str] = {
+    EngineName.LLAMA_CPP: "stable",
+    EngineName.OMLX: "stable",
+    EngineName.DS4: "preview",
+    EngineName.MFLUX: "preview",
+}
+
+
 class Endpoint(StrEnum):
     CHAT_COMPLETIONS = "chat/completions"
     COMPLETIONS = "completions"

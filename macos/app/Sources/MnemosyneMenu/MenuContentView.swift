@@ -8,6 +8,7 @@ struct MenuContentView: View {
     @ObservedObject var viewModel: MenuViewModel
     @ObservedObject var registration: LaunchAgentRegistration
     let openConfiguration: () -> Void
+    let checkForUpdates: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -192,6 +193,9 @@ struct MenuContentView: View {
                 Button("Open Logs") {
                     openApplicationSupport(subdirectory: "logs")
                 }
+                Button("Check for Updates…") {
+                    checkForUpdates()
+                }
                 Button("Settings…") {
                     openConfiguration()
                 }
@@ -206,7 +210,9 @@ struct MenuContentView: View {
     private var connectionSymbol: String {
         switch viewModel.connection {
         case .online:
-            "checkmark.circle.fill"
+            serviceDiagnostic == nil
+                ? "checkmark.circle.fill"
+                : "exclamationmark.triangle.fill"
         case .checking:
             "clock"
         case .offline:
@@ -217,7 +223,7 @@ struct MenuContentView: View {
     private var connectionColor: Color {
         switch viewModel.connection {
         case .online:
-            .green
+            serviceDiagnostic == nil ? .green : .orange
         case .checking:
             .secondary
         case .offline:
@@ -228,13 +234,37 @@ struct MenuContentView: View {
     private var connectionLabel: String {
         switch viewModel.connection {
         case .online:
-            viewModel.snapshot?.status
-                ?? "Control service online at \(viewModel.controlBaseURL.absoluteString)"
+            if let serviceDiagnostic {
+                "Degraded — \(serviceDiagnostic)"
+            } else {
+                viewModel.snapshot?.status
+                    ?? "Control service online at \(viewModel.controlBaseURL.absoluteString)"
+            }
         case .checking:
             "Checking \(viewModel.controlBaseURL.absoluteString)"
         case let .offline(message):
             message
         }
+    }
+
+    private var serviceDiagnostic: String? {
+        guard let snapshot = viewModel.snapshot else {
+            return nil
+        }
+        if let startupError = snapshot.startupError, !startupError.isEmpty {
+            return startupError
+        }
+        if let diagnostic = snapshot.diagnostic, !diagnostic.isEmpty {
+            return diagnostic
+        }
+        if let usageError = snapshot.tokenSidecar?.lastError, !usageError.isEmpty {
+            return "usage reporting: \(usageError)"
+        }
+        if snapshot.tokenSidecar?.enabled == true,
+           snapshot.tokenSidecar?.writerReady == false {
+            return "usage reporting is not ready"
+        }
+        return nil
     }
 
     private func openApplicationSupport(subdirectory: String?) {

@@ -12,16 +12,27 @@ runtimes.
 For a fresh workstation, begin with the
 [end-user installation guide](INSTALL.md). It covers the Unified Inference
 disk image, model storage, every native engine, legacy LM Studio model
-adoption, and the canonical headless Homebrew/CLI installation of oMLX.
+adoption, and the recommended official oMLX app plus its headless Homebrew
+alternative.
 
 The runtime is deliberately not a Docker image. Docker Desktop runs ordinary
 containers in a Linux VM, so it is not the right boundary for arbitrary
 MLX/Metal processes. Mnemosyne Core and all engines run natively.
 
+The [V1 scope](V1_SCOPE.md) makes llama.cpp and oMLX Stable and keeps DS4 and
+MFLUX explicitly Preview. The [acceptance ledger](acceptance/v1.json) is the
+release truth; a 0.9 candidate is not V1 while any required gate remains
+pending. See [release and recovery](RELEASE.md) for versioning, signing,
+notarization, signed updates, and rollback.
+
 ## Current validation
 
-The relocatable runtime, signed local app bundle, embedded service bootstrap,
-and embedded MFLUX worker have been exercised on an M4 Max. A real
+The current 0.9.0 source passes the native service, image-worker, Swift, and
+packaging suites. A full relocatable ad-hoc app and private DMG have also been
+built and structurally reverified. They are development artifacts, not the
+Developer ID/notarized V1 distribution.
+
+Earlier hardware and packaging smokes were exercised on an M4 Max. A real
 `krea/Krea-2-Turbo` request through `POST :1240/v1/images/generations`
 returned a valid 512×512 PNG, and the request was correctly absent from token
 usage. The official llama.cpp `b10091` arm64 asset passed published-size and
@@ -32,11 +43,13 @@ MLX model and returned usage that drained to the central ledger under
 `theseus`. Packaged-service migration/soak, a real protected-folder transfer
 followed by helper restart and managed-child `exec`, durable oMLX login
 startup, DS4 model loading, automatic LaunchAgent restart/login behavior, and
-CUDA parity remain separate smoke gates. A Developer ID-signed bundle is now
-installed on Theseus: its direct `Contents/MacOS/mnemosyne-service-bootstrap`
-LaunchAgent is running through `SMAppService`, and both native HTTP planes
-answer from the packaged runtime. LM Studio is not an inference engine or API
-dependency; only its on-disk model directory remains as a migration hint.
+CUDA parity remain separate smoke gates. An earlier Developer ID-signed bundle
+on Theseus proved that its direct
+`Contents/MacOS/mnemosyne-service-bootstrap` LaunchAgent could run through
+`SMAppService` and answer both native HTTP planes. That historical smoke does
+not substitute for signing, notarizing, and exercising the exact current
+candidate. LM Studio is not an inference engine or API dependency; only its
+on-disk model directory remains as a migration hint.
 
 ## Ports and processes
 
@@ -76,12 +89,14 @@ environment variable `MNEMOSYNE_WORKSTATION_NAME` overrides auto-detection.
   its profiles are retained but omitted from the callable model catalog until
   the engine is enabled again.
 
-The supported operator path for oMLX is its official Homebrew formula and
-headless CLI, not the separate oMLX menu-bar app. GLM-5.2 and related
-custom-kernel builds require full Xcode; a plain installation falls back to a
-much slower, more memory-hungry generic path. See
-[Install oMLX with Homebrew and the CLI](INSTALL.md#5-install-omlx-with-homebrew-and-the-cli)
-for the exact upstream commands and verification.
+The supported default path for oMLX is its official macOS app, selected from
+**Runtime Updates**. Its DMG includes precompiled custom kernels and its own
+one-click updater. A stable headless Homebrew installation is available
+through an approval-gated button that shows and runs only the official tap and
+stable install commands; the fragile `--HEAD --with-custom-kernel` source
+build is advanced-only. See
+[Install the official oMLX app](INSTALL.md#5-install-the-official-omlx-app)
+for the guided setup and headless alternative.
 
 ## Engine preparation
 
@@ -118,12 +133,11 @@ script retains the old plist while the new service starts so it can migrate
 the reporting identity and ledger DSN, then archives the inactive plist only
 after both APIs are reachable.
 
-Install oMLX through Homebrew and persist its loopback host, port `17322`, and
-exact model directory with the upstream `omlx serve` CLI before starting its
-Homebrew service. The complete copy-and-paste procedure, including the
-GLM-5.2 native-kernel build and verification, is in
-[INSTALL.md](INSTALL.md#5-install-omlx-with-homebrew-and-the-cli). No oMLX GUI
-configuration is required.
+Install the official oMLX app from **Runtime Updates**, configure its loopback
+server on port `17322`, and let its app own future updates. The release DMG
+includes the native kernels used by GLM-5.2 and related families. A stable
+headless Homebrew path and the advanced source-build verification are in
+[INSTALL.md](INSTALL.md#5-install-the-official-omlx-app).
 
 Disable model pinning and per-model TTL/LRU behavior for profiles managed by
 Mnemosyne. Current oMLX releases may protect unload through an admin session
@@ -285,9 +299,11 @@ worker; it is not stored in YAML or SQLite.
 
 Open **Settings → Runtime Updates** to inspect installed and upstream versions
 of llama.cpp, oMLX, MFLUX, and DS4. oMLX owns its own installation: Unified
-Inference detects the Homebrew CLI or running server version and links to the
-official stable release, but never overwrites it. A legacy oMLX app
-installation is still detected, although the documented setup uses Homebrew.
+Inference selects the official DMG matching this Mac, detects the installed
+app, CLI shim, conventional Homebrew paths, or running server, and links to
+the official stable release without overwriting it. For a missing runtime, an
+explicitly confirmed action may delegate the initial stable installation to
+Homebrew; updates and replacements remain externally owned.
 
 llama.cpp, MFLUX, and DS4 are resolved directly from their official upstreams;
 there is no Unified Inference release manifest to maintain. MFLUX versions come from the
@@ -421,15 +437,16 @@ CODESIGN_IDENTITY="Apple Development: Example Name (TEAMID)" \
 ```
 
 Move the app to a stable location such as `/Applications` before enabling its
-background service. Theseus currently runs a Developer ID-signed installation
-whose menu app and direct LaunchAgent helper share the same Team ID. Stable
-builds use hardened runtime, secure timestamps, and inside-out nested signing.
+background service. An earlier Theseus installation proved that the menu app
+and direct LaunchAgent helper can run with the same Developer ID Team ID.
+Production builds use hardened runtime, secure timestamps, and inside-out
+nested signing.
 Ad-hoc development builds remain supported, but rebuilding under a different
 code identity may require protected model folders to be selected again. Use
 `macos/packaging/build_dmg.sh` for a verified drag-to-install artifact; setting
 `NOTARYTOOL_PROFILE` submits it to Apple and staples the accepted ticket.
-See [packaging/README.md](packaging/README.md) for the bundle layout and build
-details.
+See [packaging/README.md](packaging/README.md) for the bundle layout and local
+build details, and [RELEASE.md](RELEASE.md) for the production pipeline.
 
 The app is intentionally menu-bar-only: it has no Dock icon or normal app
 window. On launch it installs a square AppKit status item using the
@@ -442,10 +459,14 @@ forward, which provides a visible entry point even when the menu-bar icon is
 hidden by a crowded display. The same window is shown once on first launch for
 discoverability; subsequent login launches remain menu-bar-only.
 
-Choose **Settings…** to open a dedicated native settings window. Its General,
-Engines, Runtime Updates, Storage, Model Library, Models, Usage, and
-Credentials pages expose ordinary toggles, folder/model pickers, and labeled
-fields instead of YAML. The control service remains the schema authority:
+Choose **Settings…** to open a dedicated native settings window. **Setup &
+Health** guides service registration, Stable and Preview engine readiness,
+storage, model setup, and reporting. Its real self-test uses the public
+listener and verifies the durable local usage row before first-run setup is
+marked complete. General, Engines, Runtime Updates, Storage, Model Library,
+Models, Usage, and Credentials expose ordinary toggles, folder/model pickers,
+and labeled fields instead of YAML. The control service remains the schema
+authority:
 `GET /manager/config` supplies normalized settings and
 `PUT /manager/config` validates and atomically writes `config.yaml` with mode
 `0600`. Each snapshot includes an optimistic content revision that the UI

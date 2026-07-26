@@ -25,6 +25,7 @@ from mnemosyne_macos.engines.ds4 import (
 def _target():
     return MacConfig.model_validate(
         {
+            "engines": {"ds4": {"enabled": True}},
             "models": [
                 {
                     "alias": "deepseek-v4-flash",

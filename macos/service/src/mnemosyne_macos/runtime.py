@@ -15,6 +15,7 @@ from typing import Mapping
 
 import httpx
 
+from . import __version__
 from .config import (
     ImageProfileConfig,
     MacConfig,
@@ -26,13 +27,19 @@ from .config import (
     suggested_model_alias,
 )
 from .coordinator import CoordinatorStatus, ResidencyCoordinator
-from .engines.base import EngineAdapter
+from .engines.base import Deadline, EngineAdapter
 from .engines.ds4 import DS4Adapter
 from .engines.llamacpp import LlamaCppAdapter
 from .engines.mflux import MFluxAdapter
 from .engines.omlx import OMLXAdapter
 from .filesystem import FilesystemProbe, FilesystemProbeError
-from .models import Endpoint, EngineName, ResolvedTarget
+from .models import (
+    ENGINE_RELEASE_TIER,
+    Endpoint,
+    EngineName,
+    ResolvedTarget,
+    ServiceState,
+)
 from .install_store import InstallRecord
 from .installer import NativeInstaller
 from .local_models import (
@@ -40,7 +47,7 @@ from .local_models import (
     LocalModelError,
     mark_omlx_id_conflicts,
 )
-from .usage import UsageEvent
+from .usage import UsageEvent, normalize_usage
 from .usage_delivery import UsageService
 from .runtime_updates import RuntimeUpdateManager
 from .scope_process import SecurityScopeProcess
@@ -57,6 +64,54 @@ class RestartRequired(RuntimeConfigurationError):
 
 class ConfigurationConflict(RuntimeConfigurationError):
     pass
+
+
+_SELF_TEST_VISION_IMAGE = (
+    "data:image/png;base64,"
+    "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAAcklEQVR42u3a"
+    "oQ0AIAwAwQ6GZv9UswEaDStUkvTEL3D64+y8nQsAAAAAAAAAAAAAAACUWnN8"
+    "HQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADA"
+    "KAkAAAAAAAAAAAAAQHOAB/FKxe8qaK5EAAAAAElFTkSuQmCC"
+)
+
+
+def _redact_diagnostic(
+    value: str | None,
+    *,
+    secret_env_keys: tuple[str, ...] = (),
+) -> str | None:
+    if value is None:
+        return None
+    redacted = value
+    for key in (
+        "INFERENCE_API_KEY",
+        "ADMIN_PASSWORD",
+        "OMLX_API_KEY",
+        "OMLX_ADMIN_SESSION",
+        "HF_TOKEN",
+        "HUGGING_FACE_HUB_TOKEN",
+        "TOKEN_SIDECAR_POSTGRES_DSN",
+        *secret_env_keys,
+    ):
+        secret = os.environ.get(key, "")
+        if secret:
+            redacted = redacted.replace(secret, "<redacted>")
+    redacted = re.sub(
+        r"(?i)((?:postgres(?:ql)?|https?)://[^:/\s]+:)[^@\s]+@",
+        r"\1<redacted>@",
+        redacted,
+    )
+    redacted = re.sub(
+        r"(?i)\b(authorization:\s*(?:bearer|basic)\s+)\S+",
+        r"\1<redacted>",
+        redacted,
+    )
+    redacted = re.sub(
+        r"(?i)\b(api[_-]?key|token|password|secret|session)=([^&\s]+)",
+        r"\1=<redacted>",
+        redacted,
+    )
+    return redacted
 
 
 def configuration_revision(config: MacConfig) -> str:
@@ -203,6 +258,7 @@ class NativeRuntime:
         env_path: str | Path | None = None,
         adapters: Mapping[EngineName, EngineAdapter] | None = None,
         proxy_client: httpx.AsyncClient | None = None,
+        self_test_client: httpx.AsyncClient | None = None,
         usage_service: UsageService | None = None,
         update_manager: RuntimeUpdateManager | None = None,
         runtime_root: str | Path | None = None,
@@ -261,6 +317,11 @@ class NativeRuntime:
         )
         self.proxy_client = proxy_client or httpx.AsyncClient(timeout=None)
         self._owns_proxy_client = proxy_client is None
+        self.self_test_client = self_test_client or httpx.AsyncClient(
+            timeout=None,
+            trust_env=False,
+        )
+        self._owns_self_test_client = self_test_client is None
         self.usage = usage_service or UsageService.open(
             config.paths.state_database,
             config.token_sidecar,
@@ -359,7 +420,11 @@ class NativeRuntime:
                         if self._owns_proxy_client:
                             await self.proxy_client.aclose()
                     finally:
-                        await asyncio.to_thread(self.security_scopes.close)
+                        try:
+                            if self._owns_self_test_client:
+                                await self.self_test_client.aclose()
+                        finally:
+                            await asyncio.to_thread(self.security_scopes.close)
 
     async def _activate_configured_security_scopes(self) -> None:
         referenced: set[str] = set()
@@ -1086,9 +1151,23 @@ class NativeRuntime:
     async def status(self) -> dict:
         value: CoordinatorStatus = await self.coordinator.status()
         payload = asdict(value)
+        secret_env_keys = (
+            self.config.server.inference_api_key_env,
+            self.config.server.control_password_env,
+            self.config.engines.omlx.api_key_env,
+            self.config.engines.omlx.admin_session_env,
+        )
+
+        def redact(value: str | None) -> str | None:
+            return _redact_diagnostic(
+                value,
+                secret_env_keys=secret_env_keys,
+            )
+
+        payload["diagnostic"] = redact(payload.get("diagnostic"))
         payload["status"] = payload["state"]
         payload["in_flight_requests"] = payload["inflight"]
-        payload["startup_error"] = self.startup_error
+        payload["startup_error"] = redact(self.startup_error)
         payload["omlx_model_directory_sync_pending"] = (
             self._omlx_directory_sync_pending
         )
@@ -1096,8 +1175,377 @@ class NativeRuntime:
             "inference": self.config.server.inference_port,
             "control": self.config.server.control_port,
         }
-        payload["token_sidecar"] = await self.usage.status()
+        usage_status = await self.usage.status()
+        usage_status["last_error"] = redact(usage_status.get("last_error"))
+        payload["token_sidecar"] = usage_status
         return payload
+
+    async def readiness(self) -> dict:
+        """Return bounded, actionable setup and health state without upstream checks."""
+
+        coordinator = await self.status()
+        runtime_status = await self.runtime_updates.installed_status()
+        secret_env_keys = (
+            self.config.server.inference_api_key_env,
+            self.config.server.control_password_env,
+            self.config.engines.omlx.api_key_env,
+            self.config.engines.omlx.admin_session_env,
+        )
+
+        def redact(value: str | None) -> str | None:
+            return _redact_diagnostic(
+                value,
+                secret_env_keys=secret_env_keys,
+            )
+
+        async def inspect_engine(engine: EngineName) -> dict:
+            enabled = self.config.engine_enabled(engine)
+            release_tier = ENGINE_RELEASE_TIER[engine]
+            installed = runtime_status.get(engine.value, {})
+            if not enabled:
+                return {
+                    "engine": engine.value,
+                    "release_tier": release_tier,
+                    "enabled": False,
+                    "installed": bool(installed.get("installed")),
+                    "installed_version": installed.get("version"),
+                    "installed_path": installed.get("path"),
+                    "service_state": "disabled",
+                    "authoritative": True,
+                    "resident_models": [],
+                    "ready": False,
+                    "diagnostic": None,
+                }
+            adapter = self.adapters.get(engine)
+            if adapter is None:
+                return {
+                    "engine": engine.value,
+                    "release_tier": release_tier,
+                    "enabled": True,
+                    "installed": bool(installed.get("installed")),
+                    "installed_version": installed.get("version"),
+                    "installed_path": installed.get("path"),
+                    "service_state": "unavailable",
+                    "authoritative": False,
+                    "resident_models": [],
+                    "ready": False,
+                    "diagnostic": "enabled engine has no configured adapter",
+                }
+            try:
+                async with asyncio.timeout(5):
+                    snapshot = await adapter.inspect(deadline=Deadline.after(5))
+                available_states = {ServiceState.READY}
+                if engine != EngineName.OMLX:
+                    # Manager-owned engines are intentionally stopped while
+                    # idle. An installed runtime plus authoritative empty
+                    # state means it is available to launch, not unhealthy.
+                    available_states.add(ServiceState.STOPPED)
+                ready = (
+                    bool(installed.get("installed"))
+                    and snapshot.authoritative
+                    and snapshot.service_state in available_states
+                )
+                return {
+                    "engine": engine.value,
+                    "release_tier": release_tier,
+                    "enabled": True,
+                    "installed": bool(installed.get("installed")),
+                    "installed_version": installed.get("version"),
+                    "installed_path": installed.get("path"),
+                    "service_state": snapshot.service_state.value,
+                    "authoritative": snapshot.authoritative,
+                    "resident_models": [
+                        item.canonical_model_id for item in snapshot.residents
+                    ],
+                    "ready": ready,
+                    "diagnostic": redact(snapshot.diagnostic),
+                }
+            except TimeoutError:
+                return {
+                    "engine": engine.value,
+                    "release_tier": release_tier,
+                    "enabled": True,
+                    "installed": bool(installed.get("installed")),
+                    "installed_version": installed.get("version"),
+                    "installed_path": installed.get("path"),
+                    "service_state": "unreachable",
+                    "authoritative": False,
+                    "resident_models": [],
+                    "ready": False,
+                    "diagnostic": "engine health inspection timed out after 5 seconds",
+                }
+            except Exception as exc:
+                return {
+                    "engine": engine.value,
+                    "release_tier": release_tier,
+                    "enabled": True,
+                    "installed": bool(installed.get("installed")),
+                    "installed_version": installed.get("version"),
+                    "installed_path": installed.get("path"),
+                    "service_state": "unreachable",
+                    "authoritative": False,
+                    "resident_models": [],
+                    "ready": False,
+                    "diagnostic": redact(str(exc)),
+                }
+
+        engine_rows = await asyncio.gather(*(inspect_engine(engine) for engine in EngineName))
+        storage_results = await asyncio.gather(
+            *(
+                self.filesystem.inspect(
+                    location.path,
+                    name=location.name,
+                    expected_volume_uuid=location.volume_uuid,
+                    scope_id=location.scope_id,
+                )
+                for location in self.config.storage.locations
+            ),
+            return_exceptions=True,
+        )
+        storage_rows: list[dict] = []
+        for location, result in zip(
+            self.config.storage.locations,
+            storage_results,
+            strict=True,
+        ):
+            if isinstance(result, BaseException):
+                storage_rows.append(
+                    {
+                        "name": location.name,
+                        "path": location.path,
+                        "available": False,
+                        "writable": False,
+                        "volume_matches": False,
+                        "free_bytes": None,
+                        "diagnostic": redact(str(result)),
+                    }
+                )
+            else:
+                storage_rows.append(
+                    {
+                        "name": location.name,
+                        "path": result.path,
+                        "available": (
+                            result.exists
+                            and result.is_directory
+                            and result.volume_matches
+                        ),
+                        "writable": result.writable,
+                        "volume_matches": result.volume_matches,
+                        "free_bytes": result.free_bytes,
+                        "diagnostic": redact(result.diagnostic),
+                    }
+                )
+
+        active_installs = [
+            item.to_dict()
+            for item in await self.installer.list(limit=100)
+            if item.status in {"queued", "downloading", "registering", "cancelling"}
+        ]
+        core_ready = (
+            coordinator["state"] in {"idle", "ready"}
+            and coordinator["diagnostic"] is None
+            and coordinator["startup_error"] is None
+        )
+        stable_engines = [
+            item
+            for item in engine_rows
+            if item["release_tier"] == "stable" and item["enabled"] and item["ready"]
+        ]
+        storage_ready = any(
+            item["available"] and item["writable"] for item in storage_rows
+        )
+        usage_status = dict(coordinator["token_sidecar"])
+        usage_status["last_error"] = redact(usage_status.get("last_error"))
+        return {
+            "schema_version": 1,
+            "product_version": __version__,
+            "core": {
+                "ready": core_ready,
+                "state": coordinator["state"],
+                "diagnostic": redact(coordinator["diagnostic"]),
+                "startup_error": redact(coordinator["startup_error"]),
+                "resident_alias": coordinator["resident_alias"],
+                "in_flight_requests": coordinator["in_flight_requests"],
+                "queued_requests": coordinator["queued"],
+                "omlx_model_directory_sync_pending": coordinator[
+                    "omlx_model_directory_sync_pending"
+                ],
+            },
+            "engines": engine_rows,
+            "storage": storage_rows,
+            "models": {
+                "configured": len(self.profiles),
+                "callable": len(self.model_list()),
+            },
+            "downloads": {
+                "active": len(active_installs),
+                "items": active_installs,
+            },
+            "usage": usage_status,
+            "ready_for_inference": bool(
+                core_ready and stable_engines and storage_ready and self.model_list()
+            ),
+        }
+
+    def _self_test_base_url(self) -> str:
+        bind = self.config.server.inference_bind
+        if bind in {"0.0.0.0", "*"}:
+            bind = "127.0.0.1"
+        elif bind in {"::", "[::]"}:
+            bind = "::1"
+        host = f"[{bind.strip('[]')}]" if ":" in bind else bind
+        return f"http://{host}:{self.config.server.inference_port}"
+
+    async def self_test(
+        self,
+        alias: str,
+        *,
+        include_vision: bool = True,
+        unload_after: bool = False,
+    ) -> dict:
+        """Exercise the public inference listener and verify durable usage."""
+
+        target = await self.resolve_target(alias)
+        started_monotonic = time.monotonic()
+        started_wall = time.time()
+        headers = {"Content-Type": "application/json"}
+        inference_key = os.environ.get(
+            self.config.server.inference_api_key_env,
+            "",
+        ).strip()
+        if inference_key:
+            headers["Authorization"] = f"Bearer {inference_key}"
+
+        vision = bool(
+            include_vision
+            and target.key.engine == EngineName.LLAMA_CPP
+            and target.load_options.get("projector_path")
+        )
+        if Endpoint.CHAT_COMPLETIONS in target.capabilities:
+            endpoint = Endpoint.CHAT_COMPLETIONS
+            content: str | list[dict[str, object]]
+            if vision:
+                content = [
+                    {
+                        "type": "text",
+                        "text": "Describe the test image in one short sentence.",
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": _SELF_TEST_VISION_IMAGE},
+                    },
+                ]
+            else:
+                content = "Tell me about alpacas in 5 sentences or less."
+            payload: dict[str, object] = {
+                "model": alias,
+                "messages": [{"role": "user", "content": content}],
+                "stream": False,
+                "max_tokens": 128,
+            }
+        elif Endpoint.EMBEDDINGS in target.capabilities:
+            endpoint = Endpoint.EMBEDDINGS
+            payload = {"model": alias, "input": "alpacas"}
+        elif Endpoint.RERANK in target.capabilities:
+            endpoint = Endpoint.RERANK
+            payload = {
+                "model": alias,
+                "query": "alpacas",
+                "documents": ["Alpacas are camelids.", "The ocean is salty."],
+            }
+        elif Endpoint.IMAGES_GENERATIONS in target.capabilities:
+            endpoint = Endpoint.IMAGES_GENERATIONS
+            payload = {
+                "model": alias,
+                "prompt": "A simple icon of an alpaca.",
+                "size": "256x256",
+                "num_inference_steps": 1,
+                "response_format": "b64_json",
+            }
+        else:
+            raise RuntimeConfigurationError(
+                f"model '{alias}' has no endpoint supported by the self-test"
+            )
+
+        try:
+            response = await self.self_test_client.post(
+                f"{self._self_test_base_url()}/v1/{endpoint.value}",
+                headers=headers,
+                json=payload,
+                timeout=max(
+                    self.config.server.startup_timeout_seconds
+                    + self.config.server.swap_queue_timeout_seconds,
+                    self.config.server.image_request_timeout_seconds
+                    if endpoint == Endpoint.IMAGES_GENERATIONS
+                    else 60,
+                ),
+            )
+            response.raise_for_status()
+            decoded = response.json()
+            if not isinstance(decoded, dict):
+                raise RuntimeConfigurationError(
+                    "self-test response was not a JSON object"
+                )
+        except httpx.HTTPStatusError as exc:
+            detail = exc.response.text[:1000]
+            raise RuntimeConfigurationError(
+                f"self-test returned HTTP {exc.response.status_code}: {detail}"
+            ) from exc
+        except (httpx.HTTPError, ValueError) as exc:
+            raise RuntimeConfigurationError(f"self-test request failed: {exc}") from exc
+        finally:
+            if unload_after:
+                await self.coordinator.unload()
+
+        usage = normalize_usage(decoded, endpoint=f"/v1/{endpoint.value}")
+        usage_rows = await self.usage.list_usage(limit=100)
+        recorded = next(
+            (
+                row
+                for row in usage_rows
+                if row.get("alias") == alias
+                and float(row.get("ts") or 0) >= started_wall
+            ),
+            None,
+        )
+        response_preview: str | None = None
+        if endpoint == Endpoint.CHAT_COMPLETIONS:
+            try:
+                response_preview = str(
+                    decoded["choices"][0]["message"]["content"]
+                )[:2_000]
+            except (KeyError, IndexError, TypeError):
+                response_preview = None
+        elif endpoint == Endpoint.EMBEDDINGS:
+            response_preview = f"{len(decoded.get('data', []))} embedding result(s)"
+        elif endpoint == Endpoint.RERANK:
+            response_preview = f"{len(decoded.get('results', []))} rerank result(s)"
+        elif endpoint == Endpoint.IMAGES_GENERATIONS:
+            response_preview = f"{len(decoded.get('data', []))} image result(s)"
+
+        return {
+            "schema_version": 1,
+            "success": True,
+            "model": alias,
+            "engine": target.key.engine.value,
+            "release_tier": ENGINE_RELEASE_TIER[target.key.engine],
+            "endpoint": f"/v1/{endpoint.value}",
+            "vision": vision,
+            "response_preview": response_preview,
+            "response_ms": (time.monotonic() - started_monotonic) * 1000,
+            "usage": (
+                {
+                    "prompt_tokens": usage.prompt_tokens,
+                    "completion_tokens": usage.completion_tokens,
+                    "total_tokens": usage.total_tokens,
+                }
+                if usage is not None
+                else None
+            ),
+            "usage_recorded": recorded is not None if usage is not None else None,
+            "usage_delivery": await self.usage.status(),
+        }
 
     async def record_usage(self, event: UsageEvent) -> None:
         await self.usage.record(event)

@@ -18,6 +18,7 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
+from . import __version__
 from .config import MacConfig, suggested_model_alias
 from .coordinator import CoordinatorError, QueueTimeout
 from .engines.base import AdapterError
@@ -66,6 +67,14 @@ def _lexical_path(value: str) -> str:
 class LoadRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     model: str
+
+
+class ModelSelfTestRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    model: str
+    include_vision: bool = True
+    unload_after: bool = False
 
 
 class SaveConfigurationRequest(BaseModel):
@@ -377,6 +386,7 @@ def create_inference_app(runtime: NativeRuntime) -> FastAPI:
         status = await runtime.status()
         return {
             "status": "ok" if status["state"] in {"idle", "ready"} else "degraded",
+            "version": __version__,
             "state": status["state"],
             "model_loaded": status["resident_alias"] is not None,
         }
@@ -604,6 +614,10 @@ def create_control_app(runtime: NativeRuntime) -> FastAPI:
     @app.get("/manager/status")
     async def status() -> dict:
         return await runtime.status()
+
+    @app.get("/manager/readiness")
+    async def readiness() -> dict:
+        return await runtime.readiness()
 
     @app.get("/manager/models")
     async def models() -> dict:
@@ -1051,6 +1065,17 @@ def create_control_app(runtime: NativeRuntime) -> FastAPI:
             result = await runtime.status()
             result["matched"] = matched
             return result
+        except Exception as exc:
+            raise HTTPException(_error_status(exc), str(exc)) from exc
+
+    @app.post("/manager/self-test")
+    async def self_test(payload: ModelSelfTestRequest) -> dict:
+        try:
+            return await runtime.self_test(
+                payload.model,
+                include_vision=payload.include_vision,
+                unload_after=payload.unload_after,
+            )
         except Exception as exc:
             raise HTTPException(_error_status(exc), str(exc)) from exc
 

@@ -62,7 +62,7 @@ public struct NativeSettings: Codable, Equatable, Sendable {
 
 public struct ServerSettings: Codable, Equatable, Sendable {
     public var inferenceBind = "127.0.0.1"
-    public var inferencePort = 17_320
+    public var inferencePort = 1_240
     public var controlBind = "127.0.0.1"
     public var controlPort = 17_321
     public var idleUnloadSeconds: Int? = 900
@@ -104,7 +104,7 @@ public struct LlamaCppSettings: Codable, Equatable, Sendable {
 }
 
 public struct OMLXSettings: Codable, Equatable, Sendable {
-    public var enabled = true
+    public var enabled = false
     public var baseUrl = "http://127.0.0.1:17322"
     public var apiKeyEnv = "OMLX_API_KEY"
     public var adminSessionEnv = "OMLX_ADMIN_SESSION"
@@ -115,7 +115,7 @@ public struct OMLXSettings: Codable, Equatable, Sendable {
 }
 
 public struct DS4Settings: Codable, Equatable, Sendable {
-    public var enabled = true
+    public var enabled = false
     public var host = "127.0.0.1"
     public var port = 17_323
     public var binary = "/Applications/DwarfStar/ds4-server"

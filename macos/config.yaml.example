@@ -46,10 +46,11 @@ engines:
     # Finder-selected MLX library roots are added here by the import flow.
     model_directories: []
 
-  # DS4 is launched and terminated by Mnemosyne. It is not a general GGUF
-  # runtime; use only GGUFs supported by the installed DwarfStar build.
+  # Preview: DS4 is launched and terminated by Mnemosyne. It is not a general
+  # GGUF runtime; opt in only after installing it and selecting supported
+  # weights.
   ds4:
-    enabled: true
+    enabled: false
     host: 127.0.0.1
     port: 17323
     binary: /Applications/DwarfStar/ds4-server
@@ -60,10 +61,10 @@ engines:
     request_timeout_seconds: 30
     shutdown_grace_seconds: 30
 
-  # MFLUX runs in a separately locked, process-isolated worker bundled with
-  # the menu app. The main service owns the worker and port 17324.
+  # Preview: MFLUX runs in a separately locked, process-isolated worker bundled
+  # with the menu app. Opt in when local image generation is wanted.
   mflux:
-    enabled: true
+    enabled: false
     host: 127.0.0.1
     port: 17324
     request_timeout_seconds: 30

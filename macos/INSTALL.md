@@ -8,17 +8,24 @@ clients with one OpenAI-compatible endpoint:
 http://127.0.0.1:1240/v1
 ```
 
-Docker and LM Studio are not required. Only oMLX is installed separately.
+Docker and LM Studio are not required. Only oMLX is installed separately,
+through its official app or Homebrew.
 llama.cpp, DS4, and MFLUX are installed or updated from Unified Inference.
+
+The current 0.9 line is a release candidate. Use the private DMG for local
+testing, but do not treat it as the V1 distribution until the
+[acceptance ledger](acceptance/v1.json) is clear and a Developer ID-notarized
+artifact is published. The exact Stable/Preview contract is in
+[V1_SCOPE.md](V1_SCOPE.md).
 
 ## What gets installed
 
-| Engine | Model format or role | Normal installation | Private port |
-| --- | --- | --- | ---: |
-| llama.cpp | GGUF language and vision models | **Settings → Runtime Updates** | `17325` |
-| oMLX | MLX language, vision, embedding, and rerank models | Homebrew CLI | `17322` |
-| DS4 | Supported DeepSeek V4 and GLM 5.2 layouts | **Settings → Runtime Updates** | `17323` |
-| MFLUX | Apple Silicon image generation | Bundled; updates in **Runtime Updates** | `17324` |
+| Engine | V1 tier | Model format or role | Normal installation | Private port |
+| --- | --- | --- | --- | ---: |
+| llama.cpp | Stable | GGUF language and vision models | **Settings → Runtime Updates** | `17325` |
+| oMLX | Stable | MLX generation, embedding, and rerank models | Official oMLX app (recommended) | `17322` |
+| DS4 | Preview | Supported DeepSeek V4 and GLM 5.2 layouts | **Settings → Runtime Updates** | `17323` |
+| MFLUX | Preview | Apple Silicon image generation | Bundled; updates in **Runtime Updates** | `17324` |
 
 Clients never call those private ports. Unified Inference owns model selection,
 global residency, proxying, and language-token accounting on port `1240`.
@@ -28,21 +35,13 @@ global residency, proxying, and language-token accounting on port `1240`.
 You need:
 
 - An Apple Silicon Mac running macOS 15 or newer.
-- Full Xcode for oMLX's GLM-5.2 custom Metal kernels. Apple Command Line Tools
-  alone are enough for DS4, but not for these oMLX kernels.
-- [Homebrew](https://brew.sh/) for the headless oMLX installation.
+- Apple Command Line Tools for DS4. The recommended official oMLX app includes
+  its custom Metal kernels and does not require a local kernel build.
+- Optional: [Homebrew](https://brew.sh/) for a headless oMLX installation.
+  Full Xcode is needed only for the advanced Homebrew HEAD custom-kernel build.
 - Enough internal or external storage for model weights.
 
-After installing Xcode, select it and confirm that the Metal compiler is
-available:
-
-```bash
-sudo xcode-select --switch /Applications/Xcode.app/Contents/Developer
-xcrun --find metal
-```
-
-If you will not use oMLX custom kernels, DS4's smaller prerequisite can be
-installed with:
+Install DS4's command-line build prerequisite with:
 
 ```bash
 xcode-select --install
@@ -66,11 +65,18 @@ For a private, non-notarized local build, use Finder's **Control-click →
 Open** once if Gatekeeper asks. Do not disable Gatekeeper system-wide.
 
 Unified Inference is a menu-bar app, so it intentionally has no Dock icon.
-Open its menu-bar item and choose **Enable Service**. Approve the background
-item in **System Settings → General → Login Items & Extensions** if macOS
-requests it.
+Open its menu-bar item and choose **Settings → Setup & Health**. Enable the
+background service, then approve the background item in **System Settings →
+General → Login Items & Extensions** if macOS requests it. Setup & Health
+shows actionable core, engine, storage, model, download, and reporting state;
+use **Reconcile Engines**, **Restart Service**, or **Open Logs** when a check
+is degraded.
 
-Verify the core before installing models:
+The first-run flow remains incomplete until a configured model passes **Run
+Self-Test**. That sends a real request through the public listener, uses a
+matching vision projector automatically when the selected llama.cpp profile
+has one, and verifies the durable local usage row. Before installing a model,
+these commands provide a basic core check:
 
 ```bash
 curl --fail http://127.0.0.1:1240/health
@@ -131,48 +137,61 @@ Unified Inference downloads the official
 verifies its published metadata and server contract, and owns the resulting
 `llama-server` process. Do not start a second `llama-server` on port `17325`.
 
-## 5. Install oMLX with Homebrew and the CLI
+## 5. Install the official oMLX app
 
-The oMLX GUI/DMG is not needed. The normal Unified Inference setup uses the
-official Homebrew formula and its headless `omlx` command.
+The official oMLX app is the normal installation. It ships precompiled custom
+kernels, avoids a local CMake/Xcode build, and owns its own one-click updates.
 
-First add the official tap:
+1. Open **Settings → Runtime Updates** and choose **Check Now**.
+2. In the oMLX card, choose **Download oMLX**. Unified Inference selects the
+   official DMG for this Mac's macOS major version.
+3. Open the downloaded DMG, drag **oMLX** to **Applications**, and launch it.
+4. Complete oMLX's welcome flow. Configure the server for host `127.0.0.1`
+   and port `17322`, choose the model folder you want oMLX to scan, and start
+   its server.
+5. Return to Unified Inference, choose **Check Again**, then enable oMLX under
+   **Settings → Engines**.
+
+Leave oMLX model pinning and per-model TTL/LRU behavior disabled because
+Unified Inference owns the one-model residency policy. The oMLX app remains an
+independently installed engine; Unified Inference does not overwrite or
+silently update it. Do not also start a Homebrew oMLX service.
+
+The official app installs a lightweight CLI shim at
+`~/.omlx/bin/omlx`. This is useful for diagnostics:
+
+```bash
+"$HOME/.omlx/bin/omlx" restart
+curl --fail http://127.0.0.1:17322/v1/models
+```
+
+No oMLX API key or admin session is needed for this loopback-only default. If
+you deliberately enable oMLX authentication, save the corresponding
+`OMLX_API_KEY` and `OMLX_ADMIN_SESSION` values through Unified Inference's
+Credentials page.
+
+### Headless Homebrew alternative
+
+For a Mac that should not run the oMLX menu app, install the current stable
+formula—not the source-tracking HEAD build:
+
+1. In the oMLX Runtime Updates card, choose **Install with Homebrew…**.
+2. Review the exact `brew tap` and `brew install` commands in the confirmation
+   dialog, then approve them.
+3. Wait for the app to re-check the detected oMLX version.
+
+Unified Inference delegates these fixed commands to the user's existing
+Homebrew installation. It does not request `sudo`, use `--HEAD`, update an
+existing oMLX installation, or accept arbitrary formula arguments. The same
+steps can be run manually:
 
 ```bash
 brew tap jundot/omlx https://github.com/jundot/omlx
+brew install omlx
 ```
-
-For GLM-5.2, MiniMax M3, and the other frontier families that use oMLX's
-custom Metal kernels, install the upstream HEAD build with those kernels:
-
-```bash
-brew install omlx --HEAD --with-custom-kernel
-```
-
-`--HEAD` follows oMLX's current main branch; it is used here because the
-upstream project currently requires that build for the Homebrew custom-kernel
-option. A Mac that will not serve those model families can instead use the
-stable `brew install omlx`.
-
-If oMLX is already installed without them, replace that installation:
-
-```bash
-brew reinstall omlx --HEAD --with-custom-kernel
-```
-
-The official oMLX documentation warns that a plain install silently uses a
-substantially slower, more memory-hungry fallback for GLM-5.2. The custom
-kernel build requires full Xcode. Verify the Homebrew runtime itself:
-
-```bash
-"$(brew --prefix omlx)/libexec/bin/python" -c \
-  'from omlx.custom_kernels import native_kernel_status; print(native_kernel_status())'
-```
-
-The `glm_moe_dsa` entry must report that its native kernel is available.
 
 Configure oMLX once from the CLI. Use the same exact model-library folder you
-selected in Unified Inference; the example below is intentionally a nested
+selected in Unified Inference; the example is intentionally a nested
 external-drive path:
 
 ```bash
@@ -192,26 +211,39 @@ brew services info omlx
 curl --fail http://127.0.0.1:17322/v1/models
 ```
 
-On Athena or another Mac, replace only the model folder; keep the host and
-port unchanged. A fresh CLI installation has no pinned models. Do not add
-oMLX pins or per-model TTL rules, because Unified Inference owns the one-model
-residency policy.
+On another Mac, replace only the model folder; keep the host and port
+unchanged. A fresh CLI installation has no pinned models.
 
 Finally open **Settings → Engines**, enable oMLX, and leave its local API
-address at the supplied default:
+address at `http://127.0.0.1:17322`.
 
-```text
-http://127.0.0.1:17322
+### Advanced source-built custom kernels
+
+Only use this path when you deliberately require a headless Homebrew service
+for GLM-5.2, MiniMax M3, or Qwen3.5/3.6 and cannot use the recommended app.
+It follows oMLX main, requires full Xcode and its Metal toolchain, and can fail
+when an upstream native extension does not build on a new macOS/Xcode version:
+
+```bash
+sudo xcode-select --switch /Applications/Xcode.app/Contents/Developer
+xcrun --find metal
+brew install omlx --HEAD --with-custom-kernel
 ```
 
-No oMLX API key or admin session is needed for this loopback-only default. If
-you deliberately enable oMLX authentication, save the corresponding
-`OMLX_API_KEY` and `OMLX_ADMIN_SESSION` values through Unified Inference's
-Credentials page.
+Verify that the resulting Homebrew runtime has its native kernels:
+
+```bash
+"$(brew --prefix omlx)/libexec/bin/python" -c \
+  'from omlx.custom_kernels import native_kernel_status; print(native_kernel_status())'
+```
+
+If this build fails in CMake, use the official oMLX app instead. Its release
+DMG already contains the compiled kernels and does not depend on the local
+source-build toolchain.
 
 Official references:
 
-- [oMLX Homebrew and custom-kernel installation](https://github.com/jundot/omlx#homebrew)
+- [Official oMLX app and Homebrew installation](https://github.com/jundot/omlx#install)
 - [oMLX CLI configuration](https://github.com/jundot/omlx#cli-configuration)
 - [Official oMLX releases](https://github.com/jundot/omlx/releases)
 
@@ -305,13 +337,48 @@ Language usage is recorded locally and central Postgres reporting defaults on.
 The workstation identifier is inherited from the previous token sidecar when
 available, then falls back to the normalized macOS Computer Name.
 
+Return to **Settings → Setup & Health**, select the newly configured alias, and
+run the real self-test. Confirm the response preview, route, engine tier,
+latency, token counts, local usage result, and Postgres writer/outbox status.
+The test does not claim central delivery until the outbox has actually drained.
+
+For a release-candidate acceptance pass from a source checkout, capture the
+same service/version/durable-usage proof in a private report:
+
+```bash
+python3 macos/packaging/collect_acceptance.py \
+  --app "/Applications/Unified Inference.app" \
+  --live --require-live --self-test your-model-alias \
+  --output "$HOME/Desktop/unified-inference-live-acceptance.json"
+```
+
+The report is written with mode `0600` and redacts credentials and
+credential-bearing URLs. A running Login Item alone is not accepted when the
+public or control listener, readiness contract, catalog, usage store, product
+version, or requested self-test fails.
+
+## Updating Unified Inference
+
+A production build exposes **Check for Updates…** and accepts only updates from
+the HTTPS appcast that pass Sparkle's EdDSA signature and Apple code-identity
+checks. Private ad-hoc builds intentionally disable application updates because
+they contain no production public key.
+
+If an application update regresses, install the previous notarized DMG without
+deleting `~/Library/Application Support/Mnemosyne`. Configuration, model
+weights, managed engine runtimes, bookmarks, local usage, and the Postgres
+outbox remain in Application Support. Follow the exact recovery sequence in
+[RELEASE.md](RELEASE.md).
+
 ## Updating engines
 
 - llama.cpp, DS4, and MFLUX: use **Settings → Runtime Updates**. Activation
   drains active requests and unloads the resident model first.
+- Official oMLX app: use its in-app updater. Unified Inference's oMLX card
+  opens the matching official release and detects the new version afterward.
 - oMLX stable installations: `brew update` followed by
   `brew upgrade omlx`.
-- oMLX custom-kernel HEAD installations:
+- Advanced oMLX custom-kernel HEAD installations:
 
   ```bash
   brew update
@@ -319,7 +386,8 @@ available, then falls back to the normalized macOS Computer Name.
   omlx restart
   ```
 
-Re-run the native-kernel verification after every oMLX replacement.
+Re-run the native-kernel verification after every advanced Homebrew
+custom-kernel replacement.
 
 ## Troubleshooting
 
@@ -335,6 +403,9 @@ curl --fail http://127.0.0.1:17321/manager/status
 Use **Open Logs** in the menu-bar popover for the service diagnostic.
 
 ### The status is degraded because oMLX is unavailable
+
+For the recommended app, open oMLX and confirm its server is running on
+`127.0.0.1:17322`. For the headless Homebrew alternative:
 
 ```bash
 brew services info omlx

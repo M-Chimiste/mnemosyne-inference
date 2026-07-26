@@ -1,0 +1,119 @@
+{
+  "schema_version": 1,
+  "product": "Unified Inference for macOS",
+  "last_updated": "2026-07-26",
+  "candidate_version": "0.9.0",
+  "release_version": "1.0.0",
+  "release_ready": false,
+  "latest_local_artifact": {
+    "filename": "Unified-Inference-0.9.0-macos-arm64.dmg",
+    "sha256": "352c8a17919c886d0df20285937d27a5d358e9140e9ebc5c233a30af6d8d5f12",
+    "bytes": 311002829,
+    "signature": "ad-hoc",
+    "notarized": false,
+    "acceptance_report": "Unified-Inference-0.9.0-macos-arm64-acceptance.json",
+    "verification": "Mounted read-only with the Applications shortcut; the embedded app passed deep strict code-signature verification after its embedded import/configuration smoke. The secret-redacted machine-readable artifact report is accepted."
+  },
+  "tiers": {
+    "stable": ["core", "llama.cpp", "omlx"],
+    "preview": ["ds4", "mflux"]
+  },
+  "gates": [
+    {
+      "id": "automated-native-suites",
+      "required": true,
+      "status": "passed",
+      "evidence": "Local Apple Silicon run: service 277 passed including the real-bookmark tests; image worker 23 passed with Metal access; Swift 59 passed; packaging 22 passed; version and locked-runtime checks passed. The artifact acceptance collector passes the complete staged app and DMG."
+    },
+    {
+      "id": "github-macos-ci",
+      "required": true,
+      "status": "pending",
+      "evidence": "The arm64 macOS 15 workflow and release workflow parse locally and now publish secret-redacted artifact acceptance reports, but the new workflow has not yet completed on GitHub."
+    },
+    {
+      "id": "guided-clean-install",
+      "required": true,
+      "status": "pending",
+      "evidence": "Requires clean signed app installation and first-run UI."
+    },
+    {
+      "id": "login-and-launchagent-lifecycle",
+      "required": true,
+      "status": "pending",
+      "evidence": "Requires logout/login on the target Apple Silicon Mac."
+    },
+    {
+      "id": "lmstudio-finder-migration",
+      "required": true,
+      "status": "pending",
+      "evidence": "Requires the current candidate to adopt a real LM Studio library through Finder, preserve aliases/load settings, and remain callable after LM Studio is stopped or removed."
+    },
+    {
+      "id": "llamacpp-real-text-and-vision",
+      "required": true,
+      "status": "pending",
+      "evidence": "Text was previously exercised; candidate vision and durable usage evidence remain required."
+    },
+    {
+      "id": "omlx-real-request-and-usage",
+      "required": true,
+      "status": "pending",
+      "evidence": "Gemma request and token accounting were previously observed; candidate build rerun remains required."
+    },
+    {
+      "id": "omlx-durable-startup-auth-recovery",
+      "required": true,
+      "status": "pending",
+      "evidence": "Requires the external oMLX service to survive login/startup with its configured model directories and prove authenticated unload/reconcile recovery on the current candidate."
+    },
+    {
+      "id": "postgres-idempotent-delivery",
+      "required": true,
+      "status": "pending",
+      "evidence": "Candidate outbox write and remote drain must be captured."
+    },
+    {
+      "id": "protected-folder-restart",
+      "required": true,
+      "status": "pending",
+      "evidence": "Requires Finder selection and a service restart on the target Mac."
+    },
+    {
+      "id": "durable-download-lifecycle",
+      "required": true,
+      "status": "pending",
+      "evidence": "Candidate download, cancel, registration retry, history removal, and managed deletion are required."
+    },
+    {
+      "id": "managed-runtime-update-rollback",
+      "required": true,
+      "status": "pending",
+      "evidence": "Earlier llama.cpp update/rollback hardware smoke passed; the current candidate must repeat activation, restart persistence, rollback, and rejected-corrupt-update recovery."
+    },
+    {
+      "id": "developer-id-notarized-dmg",
+      "required": true,
+      "status": "pending",
+      "evidence": "The 311,002,829-byte 0.9.0 arm64 ad-hoc DMG (SHA-256 352c8a17919c886d0df20285937d27a5d358e9140e9ebc5c233a30af6d8d5f12) builds, mounts read-only, and passes its paired machine-readable acceptance report, but it is not a distribution artifact. The credentialed release workflow exists; Apple signing/notarization and Sparkle private-key credentials are not available in this checkout."
+    },
+    {
+      "id": "signed-update-and-recovery",
+      "required": true,
+      "status": "pending",
+      "evidence": "Requires two Developer ID notarized builds and the production signed appcast."
+    },
+    {
+      "id": "ds4-preview-isolation",
+      "required": true,
+      "status": "passed",
+      "evidence": "Fresh Python, packaged YAML, and Swift defaults leave DS4 disabled; readiness labels it Preview; adapter/coordinator tests prove authoritative stopped absence and fail-closed unknown-process handling. Real DS4 inference remains a post-V1 Preview promotion gate."
+    },
+    {
+      "id": "mflux-preview-isolation",
+      "required": true,
+      "status": "passed",
+      "evidence": "Fresh Python, packaged YAML, and Swift defaults leave MFLUX disabled; readiness labels it Preview; worker and adapter tests cover isolated lifecycle and unmanaged-listener failure. Real cancellation/Metal-release coverage remains a post-V1 Preview promotion gate."
+    }
+  ]
+}

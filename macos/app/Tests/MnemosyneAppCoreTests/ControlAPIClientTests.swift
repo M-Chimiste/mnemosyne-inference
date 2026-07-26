@@ -8,6 +8,10 @@ func defaultControlPort() {
     #expect(ControlAPIClient.defaultBaseURL.port == 17_321)
     #expect(NativeSettings().engines.llamaCpp.enabled)
     #expect(NativeSettings().engines.llamaCpp.port == 17_325)
+    #expect(NativeSettings().server.inferencePort == 1_240)
+    #expect(!NativeSettings().engines.omlx.enabled)
+    #expect(!NativeSettings().engines.ds4.enabled)
+    #expect(!NativeSettings().engines.mflux.enabled)
     #expect(NativeSettings().schemaVersion == 2)
     #expect(NativeSettings().tokenSidecar.enabled)
 }
@@ -34,6 +38,31 @@ func loadRequestEncoding() throws {
     let body = try #require(request.httpBody)
     let payload = try JSONDecoder().decode(LoadModelRequest.self, from: body)
     #expect(payload == LoadModelRequest(model: "glm-5-2"))
+}
+
+@Test("Model self-test requests use the public-path verifier with bounded options")
+func selfTestRequestEncoding() throws {
+    let client = ControlAPIClient(
+        baseURL: URL(string: "http://localhost:17321")!,
+        adminPassword: "secret"
+    )
+    let request = try client.selfTestRequest(
+        model: "vision-model",
+        includeVision: true,
+        unloadAfter: false
+    )
+
+    #expect(request.url?.absoluteString == "http://localhost:17321/manager/self-test")
+    #expect(request.httpMethod == "POST")
+    #expect(request.value(forHTTPHeaderField: "Authorization") == "Basic YWRtaW46c2VjcmV0")
+    let body = try #require(request.httpBody)
+    let payload = try JSONDecoder.nativeSettingsDecoder().decode(
+        ModelSelfTestRequest.self,
+        from: body
+    )
+    #expect(payload.model == "vision-model")
+    #expect(payload.includeVision)
+    #expect(!payload.unloadAfter)
 }
 
 @Test("Structured configuration saves use the control endpoint and snake-case JSON")
@@ -587,6 +616,7 @@ func runtimeUpdateDecoding() throws {
       "engines":[
         {
           "engine":"omlx",
+          "release_tier":"stable",
           "display_name":"oMLX",
           "ownership":"external",
           "installed":true,
@@ -596,6 +626,7 @@ func runtimeUpdateDecoding() throws {
           "latest_upstream_version":"0.3.13",
           "latest_upstream_revision":null,
           "latest_upstream_url":"https://github.com/jundot/omlx/releases/tag/v0.3.13",
+          "official_installer_url":"https://github.com/jundot/omlx/releases/download/v0.3.13/oMLX-0.3.13-macos15-sequoia.dmg",
           "available_version":null,
           "available_revision":null,
           "release_notes_url":"https://github.com/jundot/omlx/releases/tag/v0.3.13",
@@ -607,6 +638,7 @@ func runtimeUpdateDecoding() throws {
         },
         {
           "engine":"mflux",
+          "release_tier":"preview",
           "display_name":"MFLUX",
           "ownership":"managed_or_external",
           "installed":true,
@@ -634,8 +666,11 @@ func runtimeUpdateDecoding() throws {
 
     #expect(snapshot.coreProtocol == 1)
     #expect(snapshot.engines[0].engine == .omlx)
+    #expect(snapshot.engines[0].releaseTierLabel == "STABLE")
     #expect(!snapshot.engines[0].canInstall)
+    #expect(snapshot.engines[0].officialInstallerUrl?.hasSuffix(".dmg") == true)
     #expect(snapshot.engines[1].engine == .mflux)
+    #expect(snapshot.engines[1].releaseTierLabel == "PREVIEW")
     #expect(snapshot.engines[1].availableLabel == "0.19.0-ui1")
     #expect(snapshot.engines[1].canRollback)
 }
@@ -688,12 +723,16 @@ func statusDecodeIsForwardCompatible() throws {
       "resident_model": "glm-5-2",
       "resident_engine": "omlx",
       "in_flight_requests": 2,
+      "diagnostic": "engine state needs attention",
+      "startup_error": "oMLX authentication failed",
       "token_sidecar": {
         "enabled": true,
         "node_id": "theseus",
         "node_id_source": "token_sidecar",
         "outbox_depth": 4,
         "last_flush_at": 1784462400.5,
+        "writer_ready": false,
+        "last_error": "Postgres is unavailable",
         "future_field": "ignored"
       },
       "another_future_field": true
@@ -710,6 +749,160 @@ func statusDecodeIsForwardCompatible() throws {
     #expect(snapshot.tokenSidecar?.nodeIdSource == "token_sidecar")
     #expect(snapshot.tokenSidecar?.outboxDepth == 4)
     #expect(snapshot.tokenSidecar?.lastFlushAt == 1_784_462_400.5)
+    #expect(snapshot.tokenSidecar?.writerReady == false)
+    #expect(snapshot.tokenSidecar?.lastError == "Postgres is unavailable")
+    #expect(snapshot.diagnostic == "engine state needs attention")
+    #expect(snapshot.startupError == "oMLX authentication failed")
+}
+
+@Test("Readiness and self-test payloads preserve actionable V1 health")
+func readinessAndSelfTestDecoding() throws {
+    let readinessPayload = #"""
+    {
+      "schema_version": 1,
+      "product_version": "0.9.0",
+      "core": {
+        "ready": true,
+        "state": "idle",
+        "diagnostic": null,
+        "startup_error": null,
+        "resident_alias": null,
+        "in_flight_requests": 0,
+        "queued_requests": 0,
+        "omlx_model_directory_sync_pending": false
+      },
+      "engines": [{
+        "engine": "llama.cpp",
+        "release_tier": "stable",
+        "enabled": true,
+        "installed": true,
+        "installed_version": "b10107",
+        "installed_path": "/runtimes/llama.cpp",
+        "service_state": "ready",
+        "authoritative": true,
+        "resident_models": [],
+        "ready": true,
+        "diagnostic": null
+      }, {
+        "engine": "ds4",
+        "release_tier": "preview",
+        "enabled": false,
+        "installed": true,
+        "installed_version": "abc123",
+        "installed_path": "/runtimes/ds4",
+        "service_state": "disabled",
+        "authoritative": true,
+        "resident_models": [],
+        "ready": false,
+        "diagnostic": null
+      }],
+      "storage": [{
+        "name": "internal",
+        "path": "/Models",
+        "available": true,
+        "writable": true,
+        "volume_matches": true,
+        "free_bytes": 1234,
+        "diagnostic": null
+      }],
+      "models": {"configured": 1, "callable": 1},
+      "downloads": {"active": 0, "items": []},
+      "usage": {
+        "enabled": true,
+        "node_id": "theseus",
+        "node_id_source": "computer_name",
+        "writer_ready": true,
+        "outbox_pending": 0,
+        "outbox_depth": 0,
+        "last_flush_at": null,
+        "last_flush_count": 0,
+        "last_error": null
+      },
+      "ready_for_inference": true
+    }
+    """#.data(using: .utf8)!
+    let readiness = try JSONDecoder.nativeSettingsDecoder().decode(
+        ReadinessSnapshot.self,
+        from: readinessPayload
+    )
+    #expect(readiness.readyForInference)
+    #expect(readiness.productVersion == "0.9.0")
+    #expect(readiness.engines[0].isStable)
+    #expect(readiness.engines[1].releaseTier == "preview")
+    #expect(readiness.storage[0].freeBytes == 1234)
+
+    let selfTestPayload = #"""
+    {
+      "schema_version": 1,
+      "success": true,
+      "model": "alpaca",
+      "engine": "llama.cpp",
+      "release_tier": "stable",
+      "endpoint": "/v1/chat/completions",
+      "vision": false,
+      "response_preview": "Alpacas are camelids.",
+      "response_ms": 1500,
+      "usage": {
+        "prompt_tokens": 12,
+        "completion_tokens": 7,
+        "total_tokens": 19
+      },
+      "usage_recorded": true,
+      "usage_delivery": {
+        "enabled": true,
+        "node_id": "theseus",
+        "node_id_source": "computer_name",
+        "writer_ready": true,
+        "outbox_pending": 1,
+        "outbox_depth": 1,
+        "last_flush_at": null,
+        "last_flush_count": 0,
+        "last_error": null
+      }
+    }
+    """#.data(using: .utf8)!
+    let result = try JSONDecoder.nativeSettingsDecoder().decode(
+        ModelSelfTestResult.self,
+        from: selfTestPayload
+    )
+    #expect(result.success)
+    #expect(result.engine == .llamaCpp)
+    #expect(result.usage?.totalTokens == 19)
+    #expect(result.usageRecorded == true)
+    #expect(result.completesGuidedSetup)
+
+    let imageOnlyPayload = #"""
+    {
+      "schema_version": 1,
+      "success": true,
+      "model": "preview-image",
+      "engine": "mflux",
+      "release_tier": "preview",
+      "endpoint": "/v1/images/generations",
+      "vision": false,
+      "response_preview": "1 image result(s)",
+      "response_ms": 900,
+      "usage": null,
+      "usage_recorded": null,
+      "usage_delivery": {
+        "enabled": true,
+        "node_id": "theseus",
+        "node_id_source": "computer_name",
+        "writer_ready": true,
+        "outbox_pending": 0,
+        "outbox_depth": 0,
+        "last_flush_at": null,
+        "last_flush_count": 0,
+        "last_error": null
+      }
+    }
+    """#.data(using: .utf8)!
+    let imageOnly = try JSONDecoder.nativeSettingsDecoder().decode(
+        ModelSelfTestResult.self,
+        from: imageOnlyPayload
+    )
+    #expect(imageOnly.success)
+    #expect(!imageOnly.completesGuidedSetup)
 }
 
 @Test("The catalog decoder preserves aliases and ignores future fields")

@@ -78,6 +78,7 @@ def _migration_config(
             "engines": {
                 "lmstudio": {"enabled": True},
                 "llama_cpp": {"enabled": True},
+                "omlx": {"enabled": True},
             },
             "paths": {"state_database": str(tmp_path / "state.db")},
             "storage": {

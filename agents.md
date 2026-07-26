@@ -62,6 +62,20 @@ upstream engines and must not fork or embed their serving implementations.
   repository-owned dependency manifest.
 - `macos/image-worker/` is the separately locked MFLUX runtime. It is launched only as a manager-owned child, binds loopback `:17324`, and must remain dependency-isolated from the macOS coordinator service.
 - `macos/app/` is the SwiftPM menu bar controller, typed native settings UI, secret-safe credential store, and native service bootstrap. `macos/packaging/` stages the signed app, embedded LaunchAgent plist, direct `Contents/MacOS/mnemosyne-service-bootstrap` executable, relocatable Python runtime, and verified drag-to-Applications DMG. Keep this unsandboxed `SMAppService` LaunchAgent's `BundleProgram` pointed at that direct helper; introducing a second bundle identity is unnecessary here and broke launch-requirement refresh during in-place updates. A future sandboxed or restricted-entitlement job would require its own deliberate wrapper architecture.
+- `macos/VERSION` is the only native product-version source.
+  `macos/packaging/verify_release.py`, the native packages/locks, staged app,
+  release tag, DMG name, and Sparkle appcast must agree. CI may stage ad-hoc
+  candidates, but distribution requires the credentialed signed-release
+  workflow, a GitHub-verified signed annotated tag, Developer ID hardened
+  inside-out signing, notarization/stapling, Gatekeeper assessment, and an
+  EdDSA-signed HTTPS appcast. Never put a private update key in the repository.
+- `macos/V1_SCOPE.md`, `macos/acceptance/v1.json`, `macos/RELEASE.md`, and
+  `macos/RELEASE_NOTES.md` define the Stable/Preview contract, release gates,
+  credentials, update behavior, and rollback. Do not advance
+  `macos/VERSION` to `1.0.0` while a required acceptance gate is pending.
+  Release verification must reject every 1.x build unless the ledger version
+  matches, `release_ready` is true, and every required gate is passed; 0.x
+  candidate artifacts remain prereleases.
 - `macos/INSTALL.md` is the end-user disk-image and all-engine setup path.
   `macos/config.yaml.example`, `macos/.env.example`, `macos/README.md`, and
   `macos/smoke_checks.md` are the native deployment's configuration, operator,
@@ -179,8 +193,14 @@ The live `docker-compose.yml` is intentionally machine-specific and may live out
   run it in a bounded helper behind the global empty-residency barrier, refuse
   roots/escapes/symlinks, and never delete Finder imports or hand-authored
   model paths.
-- Runtime update checks are read-only. oMLX remains externally owned; never
-  replace its app or Homebrew files. llama.cpp must come from the official
+- Runtime update checks are read-only. For oMLX, select the official DMG that
+  matches the host macOS major version and detect its app, CLI shim,
+  conventional Homebrew locations, or running server. oMLX remains externally
+  owned; never replace its app or Homebrew files. The menu app may delegate
+  an initial missing-runtime installation to an existing Homebrew only after
+  explicit user confirmation displays fixed official tap and stable install
+  commands. Do not accept arbitrary formulas/arguments, use `--HEAD`, update,
+  or reinstall through that action. llama.cpp must come from the official
   `ggml-org/llama.cpp` macOS arm64 release asset and pass published size,
   SHA-256, safe-extraction, executable, and CLI-contract checks. MFLUX must
   come from its official PyPI project and DS4 from an exact commit in
@@ -196,6 +216,13 @@ The live `docker-compose.yml` is intentionally machine-specific and may live out
 - Adapter-observed state is authoritative. An unreachable/unauthorized/incompatible adapter is not implicitly empty. Startup defaults to `unload_all`; uncertain state fails closed until `/manager/reconcile` succeeds.
 - The Mac proxy supports capability-gated Chat/Completions, Responses, Messages, Embeddings, Rerank, and Images Generations routes. MFLUX is terminated on unload/abort so Metal memory is released at the process boundary.
 - The menu app reads and writes structured configuration through the control plane. The service remains the schema authority and atomically persists validated YAML; credential values are write-only in the UI and never returned by the API. Preserve `schema_version`; an older app must refuse to save a newer schema instead of dropping unknown fields. Config snapshots carry an optimistic revision that every save must echo. Serialize saves, download-completion profile creation, and local imports through the same mutation lock; reject a stale Settings save instead of overwriting a concurrent model addition.
+- Setup & Health is the native first-run authority. It must remain usable when
+  the service is disabled or degraded, present bounded and secret-redacted
+  readiness, distinguish Stable llama.cpp/oMLX from Preview DS4/MFLUX, and
+  provide recovery actions. First-run setup completes only after its self-test
+  sends a real request through the public listener and verifies the matching
+  durable local usage row; Postgres delivery is separately authoritative from
+  writer/outbox state.
 - The ordinary Mac Models page must not create profiles from raw model or
   projector text fields. New profiles come from the engine-aware Model Library
   or Finder discovery; imported engine/source/storage/served-name/projector

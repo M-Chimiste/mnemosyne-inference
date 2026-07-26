@@ -14,6 +14,12 @@ let package = Package(
             targets: ["MnemosyneServiceBootstrap"]
         ),
     ],
+    dependencies: [
+        .package(
+            url: "https://github.com/sparkle-project/Sparkle",
+            exact: "2.9.2"
+        ),
+    ],
     targets: [
         .target(
             name: "MnemosyneAppCore",
@@ -21,7 +27,10 @@ let package = Package(
         ),
         .executableTarget(
             name: "MnemosyneMenu",
-            dependencies: ["MnemosyneAppCore"],
+            dependencies: [
+                "MnemosyneAppCore",
+                .product(name: "Sparkle", package: "Sparkle"),
+            ],
             path: "Sources/MnemosyneMenu"
         ),
         .executableTarget(

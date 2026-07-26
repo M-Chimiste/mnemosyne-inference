@@ -116,7 +116,7 @@ class LlamaCppConfig(BaseModel):
 class OMLXConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    enabled: bool = True
+    enabled: bool = False
     base_url: str = "http://127.0.0.1:17322"
     api_key_env: str = "OMLX_API_KEY"
     admin_session_env: str = "OMLX_ADMIN_SESSION"
@@ -144,7 +144,7 @@ class OMLXConfig(BaseModel):
 class DS4Config(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    enabled: bool = True
+    enabled: bool = False
     host: str = "127.0.0.1"
     port: int = Field(default=17323, ge=1024, le=65535)
     binary: str = "/Applications/DwarfStar/ds4-server"

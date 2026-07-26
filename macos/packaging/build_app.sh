@@ -6,11 +6,38 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 APP_PACKAGE="$REPO_ROOT/macos/app"
+VERSION_FILE="$REPO_ROOT/macos/VERSION"
 CONFIG="release"
 BARE=0
 PYTHON_EXPORT="${MNEMOSYNE_PYTHON_EXPORT:-$SCRIPT_DIR/_export}"
 SWIFTPM_DISABLE_SANDBOX="${MNEMOSYNE_SWIFTPM_DISABLE_SANDBOX:-0}"
 CODESIGN_IDENTITY="${CODESIGN_IDENTITY:--}"
+SPARKLE_PUBLIC_ED_KEY="${SPARKLE_PUBLIC_ED_KEY:-}"
+SPARKLE_FEED_URL="${SPARKLE_FEED_URL:-https://github.com/M-Chimiste/mnemosyne-inference/releases/latest/download/appcast.xml}"
+APP_VERSION="$(tr -d '[:space:]' < "$VERSION_FILE")"
+BUILD_NUMBER="${MNEMOSYNE_BUILD_NUMBER:-}"
+
+if [[ ! "$APP_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    echo "Invalid app version in $VERSION_FILE: $APP_VERSION" >&2
+    exit 1
+fi
+if [[ -z "$BUILD_NUMBER" ]]; then
+    BUILD_NUMBER="$(git -C "$REPO_ROOT" rev-list --count HEAD 2>/dev/null || true)"
+    BUILD_NUMBER="${BUILD_NUMBER:-1}"
+fi
+if [[ ! "$BUILD_NUMBER" =~ ^[1-9][0-9]*$ ]]; then
+    echo "MNEMOSYNE_BUILD_NUMBER must be a positive integer: $BUILD_NUMBER" >&2
+    exit 1
+fi
+if [[ "$CODESIGN_IDENTITY" == *"Developer ID Application"* \
+      && -z "$SPARKLE_PUBLIC_ED_KEY" ]]; then
+    echo "Developer ID builds require SPARKLE_PUBLIC_ED_KEY." >&2
+    exit 1
+fi
+if [[ "$SPARKLE_FEED_URL" != https://* ]]; then
+    echo "SPARKLE_FEED_URL must use HTTPS: $SPARKLE_FEED_URL" >&2
+    exit 1
+fi
 
 if [[ "${1:-}" == "debug" || "${1:-}" == "release" ]]; then
     CONFIG="$1"
@@ -60,21 +87,38 @@ APP_DIR="$STAGE_DIR/Unified Inference.app"
 LEGACY_APP_DIR="$STAGE_DIR/Mnemosyne.app"
 CONTENTS="$APP_DIR/Contents"
 RESOURCES="$CONTENTS/Resources"
+FRAMEWORKS="$CONTENTS/Frameworks"
 SERVICE_BOOTSTRAP="$CONTENTS/MacOS/mnemosyne-service-bootstrap"
 
 rm -rf "$APP_DIR" "$LEGACY_APP_DIR"
 mkdir -p \
     "$CONTENTS/MacOS" \
     "$CONTENTS/Library/LaunchAgents" \
+    "$FRAMEWORKS" \
     "$RESOURCES/Service" \
     "$RESOURCES/ImageWorker"
 
 install -m 644 "$SCRIPT_DIR/Info.plist" "$CONTENTS/Info.plist"
+/usr/libexec/PlistBuddy \
+    -c "Set :CFBundleShortVersionString $APP_VERSION" \
+    -c "Set :CFBundleVersion $BUILD_NUMBER" \
+    -c "Set :SUFeedURL $SPARKLE_FEED_URL" \
+    "$CONTENTS/Info.plist"
+if [[ -n "$SPARKLE_PUBLIC_ED_KEY" ]]; then
+    /usr/libexec/PlistBuddy \
+        -c "Add :SUPublicEDKey string $SPARKLE_PUBLIC_ED_KEY" \
+        "$CONTENTS/Info.plist"
+fi
 install -m 644 "$SCRIPT_DIR/AppIcon.icns" "$RESOURCES/AppIcon.icns"
 install -m 755 "$BIN_DIR/MnemosyneMenu" "$CONTENTS/MacOS/UnifiedInference"
 install -m 755 \
     "$BIN_DIR/mnemosyne-service-bootstrap" \
     "$SERVICE_BOOTSTRAP"
+if [[ ! -d "$BIN_DIR/Sparkle.framework" ]]; then
+    echo "Sparkle.framework was not produced beside the release executable." >&2
+    exit 1
+fi
+ditto "$BIN_DIR/Sparkle.framework" "$FRAMEWORKS/Sparkle.framework"
 install -m 644 \
     "$SCRIPT_DIR/LaunchAgents/com.mnemosyne.inference.agent.plist" \
     "$CONTENTS/Library/LaunchAgents/com.mnemosyne.inference.agent.plist"
@@ -96,6 +140,12 @@ if [[ "$BARE" -eq 0 ]]; then
     fi
     ditto "$PYTHON_EXPORT" "$RESOURCES/Python"
 fi
+
+# Source and runtime trees may contain local test bytecode. Never ship it or
+# include it in the signed resource seal; the service bootstrap also disables
+# runtime bytecode writes so ordinary launches cannot mutate the app bundle.
+find "$APP_DIR" -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete
+find "$APP_DIR" -depth -type d -name '__pycache__' -empty -delete
 
 CODESIGN_ARGS=(--force --sign "$CODESIGN_IDENTITY")
 if [[ "$CODESIGN_IDENTITY" != "-" ]]; then
@@ -124,6 +174,18 @@ sign_mach_o_tree() {
 if [[ "$BARE" -eq 0 ]]; then
     sign_mach_o_tree "$RESOURCES/Python"
 fi
+SPARKLE_FRAMEWORK="$FRAMEWORKS/Sparkle.framework"
+SPARKLE_VERSION="$SPARKLE_FRAMEWORK/Versions/B"
+codesign \
+    "${CODESIGN_ARGS[@]}" \
+    "$SPARKLE_VERSION/XPCServices/Installer.xpc"
+codesign \
+    "${CODESIGN_ARGS[@]}" \
+    --preserve-metadata=entitlements \
+    "$SPARKLE_VERSION/XPCServices/Downloader.xpc"
+codesign "${CODESIGN_ARGS[@]}" "$SPARKLE_VERSION/Autoupdate"
+codesign "${CODESIGN_ARGS[@]}" "$SPARKLE_VERSION/Updater.app"
+codesign "${CODESIGN_ARGS[@]}" "$SPARKLE_FRAMEWORK"
 codesign \
     "${CODESIGN_ARGS[@]}" \
     --identifier com.mnemosyne.inference.service \
@@ -135,8 +197,9 @@ plutil -lint \
     "$CONTENTS/Info.plist" \
     "$CONTENTS/Library/LaunchAgents/com.mnemosyne.inference.agent.plist"
 codesign --verify --deep --strict "$APP_DIR"
+python3 "$SCRIPT_DIR/verify_release.py" --app "$APP_DIR"
 
-echo "Staged $APP_DIR"
+echo "Staged Unified Inference $APP_VERSION ($BUILD_NUMBER) at $APP_DIR"
 if [[ "$CODESIGN_IDENTITY" == "-" ]]; then
     echo "Ad-hoc signature: protected-folder permission may need to be selected again after rebuilding."
 else

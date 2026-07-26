@@ -1,6 +1,6 @@
 # Mnemosyne Inference — Project Status
 
-**Last updated:** 2026-07-25
+**Last updated:** 2026-07-26
 
 ## Current state
 
@@ -65,6 +65,21 @@ the CUDA image or its `8000-8002` topology. The first implementation includes:
   directory deletion behind the global empty-residency barrier; and
 - independent setup, architecture, and Apple Silicon smoke documentation.
 
+The native product is now a 0.9.0 release candidate with one enforced version,
+a guided Setup & Health flow, bounded secret-redacted readiness, real public
+listener self-tests with durable usage verification, Stable/Preview engine
+tiers, Sparkle integration, and separate CI/signed-release workflows. The
+Python schema, packaged YAML, and Swift defaults now agree: llama.cpp is
+enabled, external oMLX remains off until configured, and Preview DS4/MFLUX are
+opt-in. The
+current private DMG is a structurally verified ad-hoc artifact
+(`Unified-Inference-0.9.0-macos-arm64.dmg`, SHA-256
+`352c8a17919c886d0df20285937d27a5d358e9140e9ebc5c233a30af6d8d5f12`);
+its mode-`0600`, secret-redacted machine-readable acceptance report passes.
+It is not the Developer ID-notarized V1 release. The precise contract and open gates are
+[the native V1 scope](../macos/V1_SCOPE.md) and
+[acceptance ledger](../macos/acceptance/v1.json).
+
 The Python suites, Swift production build, relocatable runtime export, staged
 app signing, embedded Python bootstrap, and Krea 2 Turbo MFLUX generation have
 run on the development M4 Max. The official llama.cpp b10091 arm64 artifact
@@ -73,22 +88,25 @@ real response with an existing 4.8 GB LFM2.5 GGUF on Theseus. The managed
 runtime then updated to official b10099, served a real request, rolled back to
 b10091, and served again. An external official oMLX 0.5.3 service generated
 from an existing LFM2 1B MLX model and its usage drained to the central ledger
-under `theseus`. The Developer ID-signed packaged service is installed on
-Theseus and its direct `Contents/MacOS/mnemosyne-service-bootstrap`
-LaunchAgent is running successfully through `SMAppService`.
+under `theseus`. An earlier Developer ID-signed packaged service was installed
+on Theseus and proved the direct
+`Contents/MacOS/mnemosyne-service-bootstrap` LaunchAgent through
+`SMAppService`; that historical smoke does not clear the current candidate's
+signing, notarization, clean-install, or update gates.
 
 The former LM Studio migration bridge passed a historical Theseus fallback
 check before removal. The production design no longer contacts that server:
 schema-version-1 LM Studio profiles become inert migration records, and only
 Finder-confirmed adoption into llama.cpp or oMLX can make them callable.
 
-The final native handoff is now live on Theseus. The previous
+The native handoff is live on Theseus using an installed bundle that predates
+the current 0.9.0 candidate. The previous
 `com.athena.token-sidecar` job is unloaded, Unified Inference owns the public
 loopback API on `:1240`, and the unchanged TheseusInsight client successfully
 returned content through both `lfm2.5-8b-a1b` and
 `gemma-4-26b-a4b-qat`. Imported GGUF aliases no longer expose a `-gguf`
 format suffix, central reporting is healthy under node `theseus`, and the
-Developer ID-signed menu app is installed in `/Applications`. The unavailable
+historical Developer ID-signed menu app is installed in `/Applications`. The unavailable
 external oMLX service and its profiles are disabled on this host; oMLX is also
 disabled in fresh defaults until its separately installed service is running.
 The registered background service also passed a direct restart check while
@@ -101,10 +119,15 @@ then explicitly unloaded; the coordinator and authoritative oMLX inventory
 both returned empty.
 GUI Finder-confirmed migration, durable oMLX login startup, and login-cycle
 validation remain in progress.
-The current native service suite passes 262 tests with two real-bookmark tests
-skipped in restricted runners, and the isolated MFLUX worker previously passed
-23 tests with real Metal access. All 47 current Swift tests and the Swift
-production build pass on this workstation. Real DS4 model loading,
+The current native service suite passes all 277 tests on the development Mac,
+including the two real-bookmark tests that skip in restricted runners. The
+isolated MFLUX worker passes 23 tests with
+real Metal access, the packaging suite passes 22 tests, and all 59 current
+Swift tests pass. The full relocatable build reports version 0.9.0 and its
+embedded service passes configuration validation without adding bytecode to or
+invalidating the signed app. The DMG also passes image verification, read-only
+mount/layout inspection, and deep signature verification from the mounted
+copy. Real DS4 model loading,
 cancellation-driven Metal release,
 protected-folder bookmark transfer/restart/child-`exec`, and packaged
 `SMAppService` KeepAlive/login behavior remain target-Mac smoke gates;
@@ -126,7 +149,7 @@ see
 | 8 — Verification & hardening | Automated coverage and workstation acceptance | ⚠️ Code/docs landed; workstation acceptance pending |
 | 9 — llama.cpp backend for GGUF | Auto-detected llama-server dispatch alongside vLLM | ⚠️ Code landed; CUDA workstation smoke pending |
 | 10 — Local image generation | Unified Images API via CUDA SGLang Diffusion and macOS MFLUX | ⚠️ Mac Krea 2 smoke passed; CUDA model smoke pending |
-| 11 — Native GGUF migration | Replace the Mac LM Studio dependency with managed llama.cpp and adopt existing libraries in place | ⚠️ LM Studio runtime dependency removed; service/runtime, direct GGUF, signed-package, and live LaunchAgent smoke passed; GUI import and durability pending |
+| 11 — Native GGUF migration | Replace the Mac LM Studio dependency with managed llama.cpp and adopt existing libraries in place | ⚠️ LM Studio runtime dependency removed; service/runtime, direct GGUF, historical signed-package, and live LaunchAgent smokes passed; current 0.9 candidate migration/durability/signing gates remain |
 
 ## What has landed
 
@@ -155,9 +178,13 @@ see
   `framework-mnemosyne-image` export layers plus separate service/worker
   source trees. No MLX runtime is added to Docker.
 - The native Runtime Updates page detects llama.cpp, oMLX, MFLUX, and DS4
-  versions. oMLX delegates to its official updater; llama.cpp comes from its
-  official GitHub arm64 artifact, MFLUX installs from its official PyPI project,
-  and DS4 builds from an exact official GitHub commit. Updates stage
+  versions. For oMLX it selects the official DMG matching the host macOS
+  version, detects the app, CLI shim, conventional Homebrew paths, or running
+  server, and delegates updates to oMLX. A missing oMLX runtime can instead be
+  installed through an approval-gated, argument-bounded stable Homebrew
+  action. llama.cpp comes from its official
+  GitHub arm64 artifact, MFLUX installs from its official PyPI project, and DS4
+  builds from an exact official GitHub commit. Managed updates stage
   independently, activate through the global-empty maintenance barrier, and
   retain the previous version for rollback without a repository-owned feed.
 - Unified Inference is now the native token sidecar: central reporting defaults
@@ -245,12 +272,14 @@ see
 - Missing legacy reporting identity and DSN values are atomically copied into
   Unified Inference's private `.env`, so retiring the previous token-sidecar
   LaunchAgent does not break future reporting starts.
-- The native service suite passes (`262 passed, 2 skipped`), all 47 Swift tests
-  pass, and the Swift production build completes.
+- The native service suite passes (`275 passed, 2 skipped`), all 59 Swift tests,
+  all 23 image-worker tests, and all 14 packaging tests pass, and the Swift
+  production build completes.
   A direct official-runtime LFM2.5 GGUF inference and an external oMLX LFM2 1B
-  inference both produced backend token usage on Theseus. The Developer
-  ID-signed Swift package and direct `SMAppService` helper now run successfully
-  from `/Applications`. A direct registered-service restart also returned both
+  inference both produced backend token usage on Theseus. An earlier Developer
+  ID-signed Swift package and direct `SMAppService` helper ran successfully
+  from `/Applications`; the current 0.9 candidate still requires its own signed
+  and notarized acceptance. A direct registered-service restart also returned both
   HTTP planes with empty residency and a ready `theseus` reporting sink.
   Finder-confirmed GUI import, durable oMLX login startup, login-cycle behavior,
   DS4 model loading, real protected-folder

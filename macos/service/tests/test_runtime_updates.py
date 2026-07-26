@@ -22,6 +22,8 @@ import mnemosyne_macos.runtime_updates as runtime_updates
 from mnemosyne_macos.runtime_updates import (
     RuntimeUpdateError,
     RuntimeUpdateManager,
+    _official_omlx_installer_url,
+    _omlx_cli_candidates,
     _python_subprocess_environment,
     _safe_extract,
     resolve_active_runtime,
@@ -225,6 +227,26 @@ def _official_handler(
                         "draft": False,
                         "prerelease": False,
                         "html_url": "https://github.com/jundot/omlx/releases/tag/v0.3.12",
+                        "assets": [
+                            {
+                                "name": "oMLX-0.3.12-macos15-sequoia.dmg",
+                                "browser_download_url": (
+                                    "https://github.com/jundot/omlx/releases/download/"
+                                    "v0.3.12/oMLX-0.3.12-macos15-sequoia.dmg"
+                                ),
+                                "size": 500_000_000,
+                                "digest": f"sha256:{'a' * 64}",
+                            },
+                            {
+                                "name": "oMLX-0.3.12-macos26-27.dmg",
+                                "browser_download_url": (
+                                    "https://github.com/jundot/omlx/releases/download/"
+                                    "v0.3.12/oMLX-0.3.12-macos26-27.dmg"
+                                ),
+                                "size": 500_000_000,
+                                "digest": f"sha256:{'b' * 64}",
+                            },
+                        ],
                     }
                 ],
             )
@@ -255,7 +277,15 @@ def _official_handler(
 
 
 @pytest.mark.asyncio
-async def test_update_check_uses_only_official_upstreams(tmp_path: Path) -> None:
+async def test_update_check_uses_only_official_upstreams(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        runtime_updates.platform,
+        "mac_ver",
+        lambda: ("26.0", ("", "", ""), ""),
+    )
     transport, requests = _official_handler()
     client = httpx.AsyncClient(transport=transport)
     manager = RuntimeUpdateManager(
@@ -271,10 +301,15 @@ async def test_update_check_uses_only_official_upstreams(tmp_path: Path) -> None
         assert snapshot["manifest_url"] is None
         assert snapshot["source_policy"] == "official_upstreams"
         by_engine = {item["engine"]: item for item in snapshot["engines"]}
+        assert by_engine["llama.cpp"]["release_tier"] == "stable"
+        assert by_engine["omlx"]["release_tier"] == "stable"
+        assert by_engine["mflux"]["release_tier"] == "preview"
+        assert by_engine["ds4"]["release_tier"] == "preview"
         assert by_engine["llama.cpp"]["available_version"] == "b7777"
         assert by_engine["llama.cpp"]["can_install"] is True
         assert "ggml-org/llama.cpp" in by_engine["llama.cpp"]["release_notes_url"]
         assert by_engine["omlx"]["latest_upstream_version"] == "0.3.12"
+        assert by_engine["omlx"]["official_installer_url"].endswith(".dmg")
         assert by_engine["mflux"]["available_version"] == "0.19.0"
         assert by_engine["mflux"]["can_install"] is True
         assert by_engine["ds4"]["available_revision"] == "a" * 40
@@ -288,6 +323,84 @@ async def test_update_check_uses_only_official_upstreams(tmp_path: Path) -> None
     finally:
         await manager.aclose()
         await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_installed_status_never_contacts_upstream(
+    tmp_path: Path,
+) -> None:
+    requests: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(str(request.url))
+        return httpx.Response(500)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    manager = RuntimeUpdateManager(
+        llama_cpp=LlamaCppConfig(binary=str(tmp_path / "missing-llama")),
+        omlx=OMLXConfig(base_url="http://127.0.0.1:1"),
+        mflux=MFluxConfig(),
+        ds4=DS4Config(binary=str(tmp_path / "missing-ds4")),
+        root=tmp_path / "runtimes",
+        client=client,
+    )
+    try:
+        status = await manager.installed_status()
+
+        assert set(status) == {"llama.cpp", "omlx", "mflux", "ds4"}
+        assert status["llama.cpp"]["installed"] is False
+        assert status["ds4"]["installed"] is False
+        # A bounded loopback oMLX probe is local runtime discovery, not an
+        # upstream release query. Nothing may contact GitHub or PyPI.
+        assert all(
+            httpx.URL(url).host in {"127.0.0.1", "::1", "localhost"}
+            for url in requests
+        )
+    finally:
+        await manager.aclose()
+        await client.aclose()
+
+
+def test_omlx_installer_selects_exact_then_ranged_macos_asset() -> None:
+    release = {
+        "tag_name": "v0.5.3",
+        "assets": [
+            {
+                "name": "oMLX-0.5.3-macos15-sequoia.dmg",
+                "browser_download_url": (
+                    "https://github.com/jundot/omlx/releases/download/"
+                    "v0.5.3/oMLX-0.5.3-macos15-sequoia.dmg"
+                ),
+                "size": 1,
+                "digest": f"sha256:{'a' * 64}",
+            },
+            {
+                "name": "oMLX-0.5.3-macos26-27.dmg",
+                "browser_download_url": (
+                    "https://github.com/jundot/omlx/releases/download/"
+                    "v0.5.3/oMLX-0.5.3-macos26-27.dmg"
+                ),
+                "size": 1,
+                "digest": f"sha256:{'b' * 64}",
+            },
+        ],
+    }
+
+    assert _official_omlx_installer_url(release, macos_major=15).endswith(
+        "macos15-sequoia.dmg"
+    )
+    assert _official_omlx_installer_url(release, macos_major=27).endswith(
+        "macos26-27.dmg"
+    )
+    assert _official_omlx_installer_url(release, macos_major=25) is None
+
+
+def test_omlx_cli_candidates_include_packaged_and_homebrew_locations() -> None:
+    candidates = _omlx_cli_candidates()
+
+    assert Path.home() / ".omlx" / "bin" / "omlx" in candidates
+    assert Path("/opt/homebrew/bin/omlx") in candidates
+    assert Path("/usr/local/bin/omlx") in candidates
 
 
 @pytest.mark.asyncio

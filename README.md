@@ -23,12 +23,17 @@ explicitly labeled macOS.
 | Deployment | Runtime and engines | Status |
 | --- | --- | --- |
 | CUDA/Linux | Docker, vLLM, llama.cpp, SGLang Diffusion | Feature-complete implementation and automated coverage; current engine pins and cross-backend swaps still need a CUDA-workstation release smoke. |
-| Apple Silicon | Managed llama.cpp, external oMLX, optional DS4, isolated MFLUX worker | Official llama.cpp arm64 download/integrity checks plus real GGUF and oMLX/MLX generations with token accounting have passed on Theseus. LM Studio engine support has been removed; its model directory remains only as a Finder-confirmed migration hint. Packaged-service soak, durable external-oMLX startup, and DS4 acceptance remain in progress. |
+| Apple Silicon | Managed llama.cpp, external oMLX, Preview DS4, Preview MFLUX worker | The 0.9 release candidate has complete automated native coverage and a verified private DMG. llama.cpp and oMLX are the Stable V1 engines; DS4 and MFLUX remain Preview. LM Studio engine support has been removed, while its model directory remains a Finder-confirmed migration hint. The signed/notarized release and target-Mac acceptance ledger are still open, so this is not yet V1. |
 
 Both deployments expose one stable API, keep at most one model resident, and
 use the same `/v1/images/generations` contract. Language-model usage can be
 written to SQLite and optionally forwarded through the durable Postgres
 outbox. Image requests are deliberately excluded from token accounting.
+
+The native [V1 scope](macos/V1_SCOPE.md), machine-readable
+[acceptance ledger](macos/acceptance/v1.json), and
+[release/recovery guide](macos/RELEASE.md) are the source of truth for what is
+Stable, Preview, passed, and still gated.
 
 The container runs **two HTTP planes** in one process:
 
@@ -163,8 +168,12 @@ submit and staple the image when `NOTARYTOOL_PROFILE` names credentials saved
 by `xcrun notarytool store-credentials`. See the packaging guide for the exact
 release commands.
 
-Click the brain-profile menu-bar icon and choose **Enable Service**. Approve
-the background item in System Settings if macOS asks, then verify:
+Click the brain-profile menu-bar icon and open **Settings → Setup & Health**.
+Enable the background service there, approve the background item in System
+Settings if macOS asks, and follow the engine, storage, model, and reporting
+diagnostics. The setup is considered complete only after **Run Self-Test**
+sends a real request through `:1240` and verifies the corresponding durable
+usage row. The same endpoints remain useful for command-line diagnostics:
 
 ```bash
 curl http://127.0.0.1:1240/health
@@ -176,20 +185,22 @@ The Model Library page can search engine-compatible Hugging Face models and
 download them into a GUI-selected internal or external folder before first
 use. Downloads are process-isolated, resumable, cancellable, and do not load
 the model. The app contains Unified Inference's core and isolated MFLUX worker;
-oMLX is a separate Homebrew runtime, and model weights are never embedded.
+oMLX remains separately installed through its official app or Homebrew, and
+model weights are never embedded.
 See [macos/README.md](macos/README.md) for engine preparation, storage,
 configuration, development mode, and signing details.
 
-For installation from the disk image—including the Homebrew/CLI oMLX setup
-needed for GLM-5.2 and the in-app llama.cpp, DS4, and MFLUX installation
-paths—follow [macos/INSTALL.md](macos/INSTALL.md). The oMLX GUI/DMG is not
-required.
+For installation from the disk image—including the recommended official oMLX
+app with precompiled custom kernels and the in-app llama.cpp, DS4, and MFLUX
+installation paths—follow [macos/INSTALL.md](macos/INSTALL.md). A stable
+headless Homebrew oMLX path remains available.
 
 The Runtime Updates page compares llama.cpp, oMLX, MFLUX, and DS4 with their
 official upstream projects. Unified Inference downloads the official
 `ggml-org/llama.cpp` Apple Silicon archive, verifies the asset size and
 GitHub-published SHA-256, and validates the server contract before activation.
-oMLX remains externally owned and opens its official update path. MFLUX comes
+oMLX remains externally owned; the page selects its matching official DMG and
+opens its official update path. MFLUX comes
 from its official PyPI project; DS4 is downloaded at an exact commit from
 `antirez/ds4` and built locally with the Apple toolchain. Managed updates are
 staged without replacing `Unified Inference.app`. Activation drains requests
@@ -727,3 +738,7 @@ for features that are not implemented.
   container and CUDA-host release checks.
 - [project_docs/project_status.md](project_docs/project_status.md) — current
   release status, feature history, and outstanding workstation validation.
+- [macos/V1_SCOPE.md](macos/V1_SCOPE.md) — Stable/Preview native V1 contract
+  and release gates.
+- [macos/RELEASE.md](macos/RELEASE.md) — native versioning, signed release,
+  updates, and rollback.

@@ -38,11 +38,26 @@ def test_defaults_replace_the_legacy_sidecar_port() -> None:
     assert config.engines.llama_cpp.port == 17325
     assert config.engines.llama_cpp.enabled is True
     assert config.engines.omlx.base_url.endswith(":17322")
+    assert config.engines.omlx.enabled is False
     assert config.engines.ds4.port == 17323
+    assert config.engines.ds4.enabled is False
     assert config.engines.mflux.port == 17324
+    assert config.engines.mflux.enabled is False
     assert config.engines.ds4.process_state_path.endswith("/state/ds4-process.json")
     assert config.token_sidecar.enabled is True
     assert config.token_sidecar.node_id == ""
+
+
+def test_packaged_example_has_the_intentional_v1_runtime_topology() -> None:
+    payload = yaml.safe_load(EXAMPLE_CONFIG.read_text(encoding="utf-8"))
+    packaged = MacConfig.model_validate(payload)
+
+    assert packaged.server.inference_port == 1240
+    assert packaged.server.control_port == 17321
+    assert packaged.engines.llama_cpp.enabled is True
+    assert packaged.engines.omlx.enabled is False
+    assert packaged.engines.ds4.enabled is False
+    assert packaged.engines.mflux.enabled is False
 
 
 def test_legacy_mac_node_placeholder_migrates_to_automatic_identity() -> None:
@@ -118,6 +133,7 @@ def test_ds4_process_state_path_is_configurable(tmp_path) -> None:
 def test_profiles_resolve_engine_specific_wire_names() -> None:
     config = MacConfig.model_validate(
         {
+            "engines": {"ds4": {"enabled": True}},
             "models": [
                 {"alias": "deepseek-v4", "engine": "ds4", "model": "~/ds4.gguf"},
             ]
@@ -166,10 +182,16 @@ def test_load_digest_changes_with_effective_options() -> None:
         "model": "/models/ds4.gguf",
     }
     first = MacConfig.model_validate(
-        {"models": [{**base, "load": {"context_length": 100_000}}]}
+        {
+            "engines": {"ds4": {"enabled": True}},
+            "models": [{**base, "load": {"context_length": 100_000}}],
+        }
     ).profiles()["deepseek-v4"]
     second = MacConfig.model_validate(
-        {"models": [{**base, "load": {"context_length": 200_000}}]}
+        {
+            "engines": {"ds4": {"enabled": True}},
+            "models": [{**base, "load": {"context_length": 200_000}}],
+        }
     ).profiles()["deepseek-v4"]
     assert first.key.load_config_digest != second.key.load_config_digest
 
@@ -177,7 +199,14 @@ def test_load_digest_changes_with_effective_options() -> None:
 def test_duplicate_or_conflicting_ports_are_rejected() -> None:
     with pytest.raises(ValueError, match="ports must be distinct"):
         MacConfig.model_validate(
-            {"engines": {"omlx": {"base_url": "http://127.0.0.1:1240"}}}
+            {
+                "engines": {
+                    "omlx": {
+                        "enabled": True,
+                        "base_url": "http://127.0.0.1:1240",
+                    }
+                }
+            }
         )
 
 

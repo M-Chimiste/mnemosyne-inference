@@ -17,6 +17,7 @@ from mnemosyne_macos.runtime import NativeRuntime
 def _target():
     return MacConfig.model_validate(
         {
+            "engines": {"omlx": {"enabled": True}},
             "models": [
                 {
                     "alias": "glm",

@@ -123,6 +123,28 @@ if [[ -n "$NOTARYTOOL_PROFILE" ]]; then
         echo "Rebuild the app with a non-ad-hoc CODESIGN_IDENTITY." >&2
         exit 1
     fi
+    if [[ "$APP_SIGNING_INFO" != *"Authority=Developer ID Application:"* ]]; then
+        echo "Notarization releases require a Developer ID Application signature." >&2
+        exit 1
+    fi
+    if [[ "$APP_SIGNING_INFO" == *"TeamIdentifier=not set"* ]]; then
+        echo "Notarization releases require an Apple Developer team identity." >&2
+        exit 1
+    fi
+    SPARKLE_PUBLIC_ED_KEY="$(/usr/libexec/PlistBuddy \
+        -c 'Print :SUPublicEDKey' \
+        "$INFO_PLIST" 2>/dev/null || true)"
+    SPARKLE_FEED_URL="$(/usr/libexec/PlistBuddy \
+        -c 'Print :SUFeedURL' \
+        "$INFO_PLIST" 2>/dev/null || true)"
+    if [[ -z "$SPARKLE_PUBLIC_ED_KEY" ]]; then
+        echo "Notarization releases require an embedded Sparkle public key." >&2
+        exit 1
+    fi
+    if [[ "$SPARKLE_FEED_URL" != https://* ]]; then
+        echo "Notarization releases require an HTTPS Sparkle feed." >&2
+        exit 1
+    fi
 fi
 
 WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/unified-inference-dmg.XXXXXX")"
@@ -140,6 +162,24 @@ cleanup() {
 trap cleanup EXIT
 
 mkdir -p "$SOURCE_DIR" "$MOUNT_DIR"
+
+if [[ -n "$NOTARYTOOL_PROFILE" ]]; then
+    APP_ZIP="$WORK_DIR/Unified-Inference-app.zip"
+    ditto -c -k --keepParent "$APP_PATH" "$APP_ZIP"
+    xcrun notarytool submit \
+        "$APP_ZIP" \
+        --keychain-profile "$NOTARYTOOL_PROFILE" \
+        --wait
+    xcrun stapler staple "$APP_PATH"
+    xcrun stapler validate "$APP_PATH"
+    spctl \
+        --assess \
+        --type execute \
+        --verbose=2 \
+        "$APP_PATH"
+    codesign --verify --deep --strict --verbose=2 "$APP_PATH"
+fi
+
 ditto "$APP_PATH" "$SOURCE_DIR/Unified Inference.app"
 ln -s /Applications "$SOURCE_DIR/Applications"
 
@@ -168,6 +208,12 @@ if [[ -n "$NOTARYTOOL_PROFILE" ]]; then
         --wait
     xcrun stapler staple "$TEMP_DMG"
     xcrun stapler validate "$TEMP_DMG"
+    spctl \
+        --assess \
+        --type open \
+        --context context:primary-signature \
+        --verbose=2 \
+        "$TEMP_DMG"
 fi
 
 hdiutil verify -quiet "$TEMP_DMG"
@@ -189,6 +235,14 @@ if [[ "$(readlink "$MOUNT_DIR/Applications")" != "/Applications" ]]; then
     exit 1
 fi
 codesign --verify --deep --strict --verbose=2 "$MOUNTED_APP"
+if [[ -n "$NOTARYTOOL_PROFILE" ]]; then
+    xcrun stapler validate "$MOUNTED_APP"
+    spctl \
+        --assess \
+        --type execute \
+        --verbose=2 \
+        "$MOUNTED_APP"
+fi
 
 hdiutil detach "$MOUNT_DIR" -quiet
 MOUNTED=0
@@ -196,7 +250,19 @@ MOUNTED=0
 mkdir -p "$OUTPUT_DIR"
 mv -f "$TEMP_DMG" "$OUTPUT_PATH"
 
+ACCEPTANCE_REPORT="${OUTPUT_PATH%.dmg}-acceptance.json"
+ACCEPTANCE_ARGS=(
+    --app "$APP_PATH"
+    --dmg "$OUTPUT_PATH"
+    --output "$ACCEPTANCE_REPORT"
+)
+if [[ -n "$NOTARYTOOL_PROFILE" ]]; then
+    ACCEPTANCE_ARGS+=(--require-distribution)
+fi
+python3 "$SCRIPT_DIR/collect_acceptance.py" "${ACCEPTANCE_ARGS[@]}"
+
 echo "Built $OUTPUT_PATH"
+echo "Acceptance evidence: $ACCEPTANCE_REPORT"
 echo "Volume contents verified: Unified Inference.app and Applications shortcut"
 if [[ -n "$NOTARYTOOL_PROFILE" ]]; then
     echo "DMG notarized and stapled with profile: $NOTARYTOOL_PROFILE"

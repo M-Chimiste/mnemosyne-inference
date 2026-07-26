@@ -4,6 +4,13 @@ This file is for people building the application. To install an existing disk
 image and prepare all native engines, use the
 [Mac installation guide](../INSTALL.md).
 
+`macos/VERSION` is the single native product version. Run
+`python3 macos/packaging/verify_release.py` before staging; the app plist,
+service, image worker, lock files, tag, and staged bundle must agree. Local
+ad-hoc artifacts are deliberately not distribution releases. The credentialed
+CI process, signed appcast, and recovery contract are documented in
+[release and recovery](../RELEASE.md).
+
 The native deployment has a menu controller and a long-lived background
 service plus on-demand manager-owned engine processes:
 
@@ -32,7 +39,10 @@ service plus on-demand manager-owned engine processes:
   engine or inventory bridge. The control API
   validates and atomically persists versioned structured configuration,
   private credentials stay write-only, and the UI distinguishes
-  hot-reloadable profile edits from restart-required changes.
+  hot-reloadable profile edits from restart-required changes. A missing oMLX
+  runtime can be delegated to Homebrew only after an explicit confirmation
+  displays the fixed official tap and stable install commands; arbitrary
+  formulas, `--HEAD`, replacement, and update commands are not accepted.
 - `Contents/MacOS/mnemosyne-service-bootstrap` is the directly embedded
   helper executable launched as a per-user LaunchAgent. This follows
   `SMAppService`'s bundle-relative `BundleProgram` layout instead of nesting a
@@ -99,6 +109,7 @@ lock and relocatable Python runtime.
 Validate the lock handoff without downloading or building anything:
 
 ```bash
+python3 macos/packaging/verify_release.py
 python3 macos/packaging/build_runtime.py --check-lock
 python3 macos/packaging/build_runtime.py --print-resolved
 ```
@@ -157,6 +168,16 @@ and optionally signs the compressed image, verifies it with `hdiutil`, mounts
 it read-only, and revalidates the app and shortcut before replacing the final
 artifact.
 
+Every build also writes a mode-`0600`, secret-redacted
+`Unified-Inference-<version>-macos-<architecture>-acceptance.json` beside the
+image. The local report proves app/runtime/default/signature and DMG integrity.
+The notarized path additionally requires Developer ID, hardened runtime,
+secure timestamp, Sparkle signing configuration, staple validation, and
+Gatekeeper acceptance. After installation, run
+`collect_acceptance.py --live --require-live --self-test <alias>` to add
+LaunchAgent, listener, readiness, catalog, usage, and durable self-test
+evidence without putting credentials on the command line.
+
 Notarization credentials stay in the login Keychain, not the repository. Set
 up a profile once; leaving out `--password` makes `notarytool` prompt securely
 for an Apple app-specific password:
@@ -167,8 +188,8 @@ xcrun notarytool store-credentials unified-inference-notary \
   --team-id "TEAMID"
 ```
 
-Then create, submit, wait for Apple, staple the approval ticket, and validate
-the result in one command:
+Then notarize and staple the signed app, create the disk image, notarize and
+staple the image, and Gatekeeper-assess both mounted artifacts in one command:
 
 ```bash
 CODESIGN_IDENTITY="Developer ID Application: Example Name (TEAMID)" \
@@ -218,7 +239,14 @@ Ad-hoc signing is for local development only. `CODESIGN_IDENTITY` provides
 signature stability but does not by itself implement distribution.
 Distribution still requires a Developer ID signature, hardened runtime,
 nested-code signing from the inside out, notarization, and a signed update
-mechanism.
+mechanism. The `macOS signed release` workflow enforces a GitHub-verified
+signed annotated tag, exact version agreement, the complete native suites,
+inside-out signing, notarization/stapling, Gatekeeper assessment, and an
+EdDSA-signed Sparkle appcast. It retains three feed versions; complete
+notarized DMGs remain immutable GitHub release assets for manual rollback.
+Version 0.x builds are GitHub prereleases. A 1.x build additionally fails
+closed unless every required gate in `macos/acceptance/v1.json` is passed and
+the ledger declares the release ready.
 
 ## Bundle layout
 
@@ -293,8 +321,11 @@ separately published Unified Inference artifact. The running service checks
 the official `ggml-org/llama.cpp` releases, MFLUX PyPI project, and
 `antirez/ds4` GitHub repository directly; it never relies on a
 repository-owned dependency manifest. oMLX remains externally installed, so
-the app reports its version and official update link without replacing an app
-bundle or Homebrew files.
+the app selects the official DMG matching the host macOS version, reports the
+detected app/CLI/server version, and opens the official install or update path
+without replacing an app bundle or Homebrew files. The menu app may delegate
+an initial missing-runtime installation to the user's Homebrew after explicit
+approval; Homebrew retains ownership and later updates stay external.
 
 For llama.cpp, the service selects the official macOS arm64 archive and checks
 its upstream asset name, URL, published size and SHA-256, safe extraction,

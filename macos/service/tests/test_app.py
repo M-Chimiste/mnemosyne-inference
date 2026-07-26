@@ -27,6 +27,7 @@ from mnemosyne_macos.models import (
     ServiceState,
 )
 from mnemosyne_macos.runtime import NativeRuntime
+from mnemosyne_macos.runtime import _redact_diagnostic
 
 
 class FakeAdapter(EngineAdapter):
@@ -36,6 +37,7 @@ class FakeAdapter(EngineAdapter):
         self.engine = engine
         self.residents: list[ResidentInstance] = []
         self.loads = 0
+        self.service_state = ServiceState.READY
 
     async def validate_control(self, *, deadline: Deadline) -> EngineSnapshot:
         return await self.inspect(deadline=deadline)
@@ -46,7 +48,7 @@ class FakeAdapter(EngineAdapter):
             engine=self.engine,
             residents=tuple(self.residents),
             authoritative=True,
-            service_state=ServiceState.READY,
+            service_state=self.service_state,
         )
 
     async def load(self, target: ResolvedTarget, *, deadline: Deadline) -> LoadedHandle:
@@ -80,6 +82,31 @@ class FakeAdapter(EngineAdapter):
 
     async def aclose(self) -> None:
         return None
+
+
+def test_readiness_diagnostics_redact_credentials(monkeypatch) -> None:
+    monkeypatch.setenv("OMLX_ADMIN_SESSION", "secret-session-value")
+    monkeypatch.setenv("CUSTOM_SECRET_KEY", "custom-secret-value")
+    monkeypatch.setenv("SHORT_SECRET_KEY", "xy")
+
+    redacted = _redact_diagnostic(
+        "Authorization: Bearer secret-session-value "
+        "postgresql://writer:password123@nyx/token_sidecar "
+        "https://reader:webpass@example.test/metrics "
+        "api_key=visible custom-secret-value xy",
+        secret_env_keys=("CUSTOM_SECRET_KEY", "SHORT_SECRET_KEY"),
+    )
+
+    assert "secret-session-value" not in redacted
+    assert "password123" not in redacted
+    assert "webpass" not in redacted
+    assert "visible" not in redacted
+    assert redacted == (
+        "Authorization: Bearer <redacted> "
+        "postgresql://writer:<redacted>@nyx/token_sidecar "
+        "https://reader:<redacted>@example.test/metrics "
+        "api_key=<redacted> <redacted> <redacted>"
+    )
 
 
 def _config(tmp_path, *, endpoint: Endpoint | None = None) -> MacConfig:
@@ -623,6 +650,222 @@ async def test_control_plane_lists_loads_and_unloads_models(tmp_path) -> None:
         assert unloaded.json()["resident_alias"] is None
     finally:
         await client.aclose()
+        await runtime.stop()
+        await upstream_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_readiness_exposes_bounded_actionable_health_and_release_tiers(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    class InstalledUpdateManager:
+        async def installed_status(self) -> dict:
+            return {
+                engine.value: {
+                    "installed": True,
+                    "version": "test-version",
+                    "revision": None,
+                    "path": f"/runtimes/{engine.value}",
+                }
+                for engine in EngineName
+            }
+
+        async def aclose(self) -> None:
+            return None
+
+    storage = tmp_path / "Models"
+    storage.mkdir()
+    payload = _config(tmp_path).model_dump(mode="json")
+    payload["storage"] = {
+        "default": "internal",
+        "locations": [{"name": "internal", "path": str(storage)}],
+    }
+    adapters = _adapters()
+    adapters[EngineName.LLAMA_CPP].service_state = ServiceState.STOPPED
+    runtime = NativeRuntime(
+        MacConfig.model_validate(payload),
+        adapters=adapters,
+        update_manager=InstalledUpdateManager(),  # type: ignore[arg-type]
+    )
+    await runtime.start(raise_on_degraded=True)
+    client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=create_control_app(runtime)),
+        base_url="http://mnemosyne-control.test",
+    )
+    try:
+        response = await client.get("/manager/readiness")
+
+        assert response.status_code == 200
+        readiness = response.json()
+        assert readiness["product_version"] == "0.9.0"
+        assert readiness["core"]["ready"] is True
+        assert readiness["storage"][0]["available"] is True
+        assert readiness["models"] == {"configured": 1, "callable": 1}
+        assert readiness["ready_for_inference"] is True
+        engines = {item["engine"]: item for item in readiness["engines"]}
+        assert engines["llama.cpp"]["release_tier"] == "stable"
+        assert engines["omlx"]["release_tier"] == "stable"
+        assert engines["ds4"]["release_tier"] == "preview"
+        assert engines["mflux"]["release_tier"] == "preview"
+        assert engines["llama.cpp"]["ready"] is True
+        assert engines["llama.cpp"]["service_state"] == "stopped"
+        assert engines["omlx"]["ready"] is True
+
+        monkeypatch.setenv("OMLX_ADMIN_SESSION", "menu-secret")
+        runtime.startup_error = (
+            "oMLX failed with session=menu-secret and "
+            "postgresql://writer:db-password@nyx/token_sidecar"
+        )
+        runtime.usage.last_error = "https://writer:other-password@nyx/metrics"
+        status_response = await client.get("/manager/status")
+        status_payload = status_response.json()
+        rendered = json.dumps(status_payload)
+        assert "menu-secret" not in rendered
+        assert "db-password" not in rendered
+        assert "other-password" not in rendered
+        assert "<redacted>" in rendered
+    finally:
+        await client.aclose()
+        await runtime.stop()
+
+
+@pytest.mark.asyncio
+async def test_control_self_test_uses_public_inference_path_and_verifies_usage(
+    tmp_path,
+) -> None:
+    seen: dict = {}
+
+    def upstream_handler(request: httpx.Request) -> httpx.Response:
+        seen["request"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "id": "chatcmpl-self-test",
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "Alpacas are gentle camelids.",
+                        }
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 9,
+                    "completion_tokens": 6,
+                    "total_tokens": 15,
+                },
+            },
+        )
+
+    upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(upstream_handler)
+    )
+    runtime = NativeRuntime(
+        _config(tmp_path),
+        adapters=_adapters(),
+        proxy_client=upstream_client,
+    )
+    await runtime.start(raise_on_degraded=True)
+    await runtime.self_test_client.aclose()
+    runtime.self_test_client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=create_inference_app(runtime)),
+        base_url="http://127.0.0.1:1240",
+    )
+    client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=create_control_app(runtime)),
+        base_url="http://mnemosyne-control.test",
+    )
+    try:
+        response = await client.post(
+            "/manager/self-test",
+            json={"model": "frontier"},
+        )
+
+        assert response.status_code == 200, response.text
+        result = response.json()
+        assert result["success"] is True
+        assert result["endpoint"] == "/v1/chat/completions"
+        assert result["release_tier"] == "stable"
+        assert result["response_preview"] == "Alpacas are gentle camelids."
+        assert result["usage"] == {
+            "prompt_tokens": 9,
+            "completion_tokens": 6,
+            "total_tokens": 15,
+        }
+        assert result["usage_recorded"] is True
+        assert "alpacas" in seen["request"]["messages"][0]["content"].lower()
+        assert seen["request"]["max_tokens"] == 128
+        rows = await runtime.usage.list_usage()
+        assert rows[0]["alias"] == "frontier"
+        assert rows[0]["total_tokens"] == 15
+    finally:
+        await client.aclose()
+        await runtime.stop()
+        await upstream_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_control_self_test_uses_configured_llama_projector_by_default(
+    tmp_path,
+) -> None:
+    seen: dict = {}
+
+    def upstream_handler(request: httpx.Request) -> httpx.Response:
+        seen["request"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "A red square on a light background.",
+                        }
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 24,
+                    "completion_tokens": 9,
+                    "total_tokens": 33,
+                },
+            },
+        )
+
+    payload = _config(tmp_path).model_dump(mode="json")
+    payload["models"][0].update(
+        {
+            "engine": "llama.cpp",
+            "model": "/models/vision.gguf",
+            "load": {"projector_path": "/models/mmproj-vision.gguf"},
+        }
+    )
+    upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(upstream_handler)
+    )
+    runtime = NativeRuntime(
+        MacConfig.model_validate(payload),
+        adapters=_adapters(),
+        proxy_client=upstream_client,
+    )
+    await runtime.start(raise_on_degraded=True)
+    await runtime.self_test_client.aclose()
+    runtime.self_test_client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=create_inference_app(runtime)),
+        base_url="http://127.0.0.1:1240",
+    )
+    try:
+        result = await runtime.self_test("frontier")
+
+        assert result["vision"] is True
+        content = seen["request"]["messages"][0]["content"]
+        assert content[0]["type"] == "text"
+        assert content[1]["type"] == "image_url"
+        image_url = content[1]["image_url"]["url"]
+        assert image_url.startswith("data:image/png;base64,")
+        assert len(image_url) > 200
+        assert result["usage_recorded"] is True
+    finally:
         await runtime.stop()
         await upstream_client.aclose()
 

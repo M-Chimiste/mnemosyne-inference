@@ -31,6 +31,7 @@ from uuid import uuid4
 import httpx
 
 from .config import DS4Config, LlamaCppConfig, MFluxConfig, OMLXConfig
+from .models import ENGINE_RELEASE_TIER, EngineName
 
 
 CORE_RUNTIME_PROTOCOL = 1
@@ -47,10 +48,118 @@ LLAMA_CPP_RELEASE_API_URL = (
 MAX_SOURCE_ARCHIVE_BYTES = 2 * 1024**3
 _VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$")
 _ENGINES = ("llama.cpp", "omlx", "mflux", "ds4")
+_OMLX_RELEASES_URL = "https://github.com/jundot/omlx/releases"
 
 
 class RuntimeUpdateError(RuntimeError):
     """A runtime update could not be checked, prepared, or activated."""
+
+
+def _omlx_macos_major_ranges(asset_name: str) -> tuple[range, ...]:
+    matches = re.finditer(
+        r"(?:^|[-_])macos(\d+)(?:-(\d+))?(?=$|[-_.])",
+        asset_name.casefold(),
+    )
+    ranges: list[range] = []
+    for match in matches:
+        lower = int(match.group(1))
+        upper = int(match.group(2) or lower)
+        if upper >= lower:
+            ranges.append(range(lower, upper + 1))
+    return tuple(ranges)
+
+
+def _official_omlx_installer_url(
+    release: Mapping[str, Any],
+    *,
+    macos_major: int | None = None,
+) -> str | None:
+    """Select the official DMG matching this Mac without downloading it."""
+
+    assets = release.get("assets")
+    tag = release.get("tag_name")
+    if not isinstance(assets, list) or not isinstance(tag, str):
+        return None
+    if macos_major is None:
+        version = platform.mac_ver()[0]
+        try:
+            macos_major = int(version.split(".", 1)[0]) if version else None
+        except ValueError:
+            macos_major = None
+
+    prefix = f"https://github.com/jundot/omlx/releases/download/{tag}/"
+    dmgs: list[tuple[Mapping[str, Any], tuple[range, ...]]] = []
+    for asset in assets:
+        if not isinstance(asset, Mapping):
+            continue
+        name = asset.get("name")
+        url = asset.get("browser_download_url")
+        size = asset.get("size")
+        digest = asset.get("digest")
+        if (
+            not isinstance(name, str)
+            or not name.casefold().endswith(".dmg")
+            or not isinstance(url, str)
+            or not url.startswith(prefix)
+            or not isinstance(size, int)
+            or isinstance(size, bool)
+            or size <= 0
+            or not isinstance(digest, str)
+            or not re.fullmatch(r"sha256:[0-9a-fA-F]{64}", digest)
+        ):
+            continue
+        dmgs.append((asset, _omlx_macos_major_ranges(name)))
+
+    selected: Mapping[str, Any] | None = None
+    if macos_major is not None:
+        selected = next(
+            (
+                asset
+                for asset, ranges in dmgs
+                if any(
+                    values.start == macos_major
+                    and values.stop == macos_major + 1
+                    for values in ranges
+                )
+            ),
+            None,
+        )
+        if selected is None:
+            selected = next(
+                (
+                    asset
+                    for asset, ranges in dmgs
+                    if any(macos_major in values for values in ranges)
+                ),
+                None,
+            )
+    if selected is None and len(dmgs) == 1:
+        selected = dmgs[0][0]
+    url = selected.get("browser_download_url") if selected else None
+    return str(url) if isinstance(url, str) else None
+
+
+def _omlx_cli_candidates() -> tuple[Path, ...]:
+    """Return CLI locations visible to both shells and a packaged LaunchAgent."""
+
+    candidates: list[Path] = []
+    discovered = shutil.which("omlx")
+    if discovered:
+        candidates.append(Path(discovered))
+    candidates.extend(
+        (
+            Path.home() / ".omlx" / "bin" / "omlx",
+            Path("/opt/homebrew/bin/omlx"),
+            Path("/usr/local/bin/omlx"),
+            Path("/opt/homebrew/opt/omlx/bin/omlx"),
+            Path("/usr/local/opt/omlx/bin/omlx"),
+        )
+    )
+    unique: list[Path] = []
+    for candidate in candidates:
+        if candidate not in unique:
+            unique.append(candidate)
+    return tuple(unique)
 
 
 @dataclass(frozen=True)
@@ -439,7 +548,11 @@ class RuntimeUpdateManager:
         self._client = client or httpx.AsyncClient(timeout=30, follow_redirects=True)
         self._owns_client = client is None
         self._releases: dict[str, RuntimeRelease] = {}
-        self._upstream_omlx: tuple[str | None, str | None] = (None, None)
+        self._upstream_omlx: tuple[str | None, str | None, str | None] = (
+            None,
+            None,
+            None,
+        )
         self._diagnostics: dict[str, str] = {}
         self._last_checked_at: float | None = None
         self._check_lock = asyncio.Lock()
@@ -457,7 +570,9 @@ class RuntimeUpdateManager:
         response.raise_for_status()
         return response.json()
 
-    async def _official_omlx(self) -> tuple[str | None, str | None]:
+    async def _official_omlx(
+        self,
+    ) -> tuple[str | None, str | None, str | None]:
         payload = await self._fetch_json(OMLX_RELEASES_API_URL)
         if not isinstance(payload, list):
             raise RuntimeUpdateError("official oMLX releases response was not a list")
@@ -470,11 +585,13 @@ class RuntimeUpdateManager:
             and isinstance(item.get("tag_name"), str)
         ]
         if not stable:
-            return None, "https://github.com/jundot/omlx/releases"
+            return None, _OMLX_RELEASES_URL, None
         item = max(stable, key=lambda value: _version_key(str(value["tag_name"])))
         version = str(item["tag_name"]).removeprefix("v").removeprefix(".")
-        return version, str(
-            item.get("html_url") or "https://github.com/jundot/omlx/releases"
+        return (
+            version,
+            str(item.get("html_url") or _OMLX_RELEASES_URL),
+            _official_omlx_installer_url(item),
         )
 
     async def _official_llama_cpp(self) -> RuntimeRelease:
@@ -621,12 +738,13 @@ class RuntimeUpdateManager:
                             return value.removeprefix("v"), None, self.omlx.base_url
             except (httpx.HTTPError, ValueError):
                 continue
-        executable = shutil.which("omlx")
-        if executable:
-            output = await _run_version_command(executable, "--version")
+        for executable in _omlx_cli_candidates():
+            if not executable.is_file() or not os.access(executable, os.X_OK):
+                continue
+            output = await _run_version_command(str(executable), "--version")
             match = re.search(r"\d+(?:\.\d+)+(?:[-+._A-Za-z0-9]*)?", output or "")
             if match:
-                return match.group(0), None, executable
+                return match.group(0), None, str(executable)
         return None, None, None
 
     async def _installed_llama_cpp(
@@ -730,21 +848,45 @@ class RuntimeUpdateManager:
             return installed_revision != release.source_revision
         return _version_key(release.version) > _version_key(installed_version)
 
+    async def installed_status(self) -> dict[str, dict[str, Any]]:
+        """Inspect local runtimes without contacting any upstream service."""
+
+        installed_values = await asyncio.gather(
+            self._installed_llama_cpp(),
+            self._installed_omlx(),
+            self._installed_mflux(),
+            self._installed_ds4(),
+        )
+        return {
+            engine: {
+                "installed": version is not None,
+                "version": version,
+                "revision": revision,
+                "path": path,
+            }
+            for engine, (version, revision, path) in zip(
+                _ENGINES,
+                installed_values,
+                strict=True,
+            )
+        }
+
     async def check(self, *, refresh: bool = True) -> dict[str, Any]:
         async with self._check_lock:
             if refresh or self._last_checked_at is None:
                 await self._refresh_releases()
-            installed_values = await asyncio.gather(
-                self._installed_llama_cpp(),
-                self._installed_omlx(),
-                self._installed_mflux(),
-                self._installed_ds4(),
-            )
+            local_status = await self.installed_status()
             statuses: list[dict[str, Any]] = []
-            for index, engine in enumerate(_ENGINES):
-                installed_version, installed_revision, installed_path = installed_values[index]
+            for engine in _ENGINES:
+                installed_version = local_status[engine]["version"]
+                installed_revision = local_status[engine]["revision"]
+                installed_path = local_status[engine]["path"]
                 if engine == "omlx":
-                    upstream_version, upstream_url = self._upstream_omlx
+                    (
+                        upstream_version,
+                        upstream_url,
+                        official_installer_url,
+                    ) = self._upstream_omlx
                     release = None
                     update_available = bool(
                         upstream_version
@@ -758,6 +900,7 @@ class RuntimeUpdateManager:
                     release = self._releases.get(engine)
                     upstream_version = release.version if release else None
                     upstream_url = release.release_notes_url if release else None
+                    official_installer_url = None
                     update_available = bool(
                         release
                         and self._release_is_newer(
@@ -767,6 +910,9 @@ class RuntimeUpdateManager:
                 statuses.append(
                     {
                         "engine": engine,
+                        "release_tier": ENGINE_RELEASE_TIER[
+                            EngineName(engine)
+                        ],
                         "display_name": {
                             "llama.cpp": "llama.cpp",
                             "omlx": "oMLX",
@@ -781,6 +927,7 @@ class RuntimeUpdateManager:
                         "latest_upstream_version": upstream_version,
                         "latest_upstream_revision": release.source_revision if release else None,
                         "latest_upstream_url": upstream_url,
+                        "official_installer_url": official_installer_url,
                         "available_version": release.version if release else None,
                         "available_revision": release.source_revision if release else None,
                         "release_notes_url": upstream_url,
@@ -792,7 +939,7 @@ class RuntimeUpdateManager:
                             "Version and Apple Silicon binaries come directly from official ggml-org/llama.cpp GitHub releases."
                             if engine == "llama.cpp"
                             else (
-                                "Version comes from official oMLX GitHub releases. Update with the oMLX app or Homebrew."
+                                "The official oMLX app is recommended and includes precompiled custom kernels. oMLX remains independently owned and updated."
                                 if engine == "omlx"
                                 else (
                                     "Version and dependencies come directly from the official MFLUX package on PyPI."

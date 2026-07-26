@@ -1,0 +1,102 @@
+# macOS release and recovery
+
+`macos/VERSION` is the native product version. The app bundle, coordinator
+package, isolated image worker, both lock files, release tag, DMG name, and
+Sparkle appcast must agree. Run:
+
+```bash
+python3 macos/packaging/verify_release.py
+python3 macos/packaging/verify_release.py --tag v0.9.0
+```
+
+Every staged candidate can also produce a private, secret-redacted acceptance
+report:
+
+```bash
+python3 macos/packaging/collect_acceptance.py \
+  --app "macos/app/build/Stage/Unified Inference.app" \
+  --dmg "macos/app/build/Distribution/Unified-Inference-0.9.0-macos-arm64.dmg" \
+  --output "macos/app/build/Distribution/Unified-Inference-0.9.0-macos-arm64-acceptance.json"
+```
+
+`build_dmg.sh` runs this automatically. The report verifies the app version,
+architecture, complete embedded runtime, code seal, helper identity, absence
+of Python bytecode, V1 engine defaults, DMG hash, and disk-image integrity.
+It never includes a Sparkle key, authorization header, Postgres DSN, password,
+HF token, bookmark, or arbitrary usage request body.
+
+After installing the exact candidate, capture live LaunchAgent, public/control
+listener, readiness, catalog, and usage evidence. Set the admin password only
+through the named environment variable when control authentication is enabled:
+
+```bash
+python3 macos/packaging/collect_acceptance.py \
+  --live \
+  --require-live \
+  --self-test your-model-alias \
+  --require-postgres-drain \
+  --output "$HOME/Desktop/unified-inference-live-acceptance.json"
+```
+
+The optional self-test is accepted only when inference succeeds, authoritative
+token usage is returned, and the matching durable local usage row is found.
+`--require-postgres-drain` additionally waits for a successful post-test flush
+and an empty local delivery outbox; query the central ledger by the report's
+event ID to prove the remote row and uniqueness.
+For a public release, `--require-distribution` additionally requires the
+Developer ID identity, hardened runtime, timestamp, Sparkle public key/HTTPS
+feed, notarization staple, and Gatekeeper acceptance for both app and DMG.
+
+## CI release credentials
+
+The `macOS signed release` workflow accepts only a signed
+`vMAJOR.MINOR.PATCH` tag and requires these GitHub Actions secrets:
+
+- `MACOS_DEVELOPER_ID_P12` and `MACOS_DEVELOPER_ID_PASSWORD`
+- `MACOS_DEVELOPER_ID_IDENTITY`
+- `MACOS_CI_KEYCHAIN_PASSWORD`
+- `APPLE_NOTARY_KEY_ID`, `APPLE_NOTARY_ISSUER_ID`, and
+  `APPLE_NOTARY_PRIVATE_KEY`
+- `SPARKLE_PUBLIC_ED_KEY` and `SPARKLE_PRIVATE_ED_KEY`
+
+Generate the Sparkle key once with the `generate_keys` binary from the pinned
+Sparkle artifact. Store the private export only in the release secret store;
+the public key is injected into the signed app. Never commit either Apple
+credential or the Sparkle private key.
+
+The workflow reruns all native gates, exports both locked Python layers, signs
+nested code from the inside out, notarizes/staples/Gatekeeper-assesses the app
+before imaging it, then does the same for the DMG, generates an EdDSA-signed
+appcast, writes the acceptance report and SHA-256 checksums, and publishes all
+of them as immutable GitHub release assets. The app checks the HTTPS
+`releases/latest/download/appcast.xml` feed through Sparkle.
+
+Version 0.x artifacts are published as prereleases for acceptance testing.
+`verify_release.py` requires their `candidate_version` to match
+`macos/VERSION`. For 1.x and later it additionally refuses to proceed unless
+`acceptance/v1.json` has `release_ready: true` and every required gate is
+`passed`. A tag cannot override the ledger.
+
+## Update failure and rollback
+
+Sparkle validates the EdDSA signature and Apple code identity and performs an
+atomic replacement. A download, signature, extraction, or install failure must
+leave the current application in place.
+
+Every release keeps its notarized DMG. To roll back after an application-level
+regression:
+
+1. Disable automatic update checks temporarily.
+2. Download the previous DMG from its immutable GitHub release and verify its
+   published SHA-256 checksum.
+3. Quit the menu app. The background inference service may continue until the
+   prior app refreshes its LaunchAgent registration.
+4. Replace only `/Applications/Unified Inference.app` with the notarized prior
+   bundle, then launch it and complete the registration refresh.
+5. Run Setup & Health and the real self-test before deleting the newer bundle.
+
+The rollback does not remove `~/Library/Application Support/Mnemosyne`; model
+weights, configuration, runtime installs, security-scope records, local usage,
+and the Postgres outbox remain intact. If the older app does not support the
+current configuration schema, it must refuse to save rather than overwrite
+unknown fields.
