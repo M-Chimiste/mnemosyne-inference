@@ -282,7 +282,7 @@ final class LaunchAgentRegistration: ObservableObject {
         do {
             // The SDK's async completion is invoked only after the running
             // helper has been killed, at which point re-registration is safe.
-            try await service.unregister()
+            try await unregisterService(service)
         } catch {
             guard managedState(service.status) == .notRegistered else {
                 throw error
@@ -292,6 +292,23 @@ final class LaunchAgentRegistration: ObservableObject {
             service: serviceName
         ) {
             self.managedState(service.status)
+        }
+    }
+
+    private func unregisterService(_ service: SMAppService) async throws {
+        try await withCheckedThrowingContinuation {
+            (continuation: CheckedContinuation<Void, any Error>) in
+            // Use the completion-handler API explicitly. Some macOS SDK
+            // concurrency overlays synthesize a nonisolated async overload
+            // that attempts to send this main-actor SMAppService across an
+            // isolation boundary under Swift 6 strict checking.
+            service.unregister { error in
+                if let error {
+                    continuation.resume(throwing: error)
+                } else {
+                    continuation.resume()
+                }
+            }
         }
     }
 
