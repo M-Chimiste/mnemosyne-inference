@@ -24,6 +24,7 @@ import shutil
 import signal
 import tarfile
 import tempfile
+import threading
 import time
 from typing import Any, Mapping
 from uuid import uuid4
@@ -49,6 +50,22 @@ MAX_SOURCE_ARCHIVE_BYTES = 2 * 1024**3
 _VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$")
 _ENGINES = ("llama.cpp", "omlx", "mflux", "ds4")
 _OMLX_RELEASES_URL = "https://github.com/jundot/omlx/releases"
+_LIFECYCLE_LIMIT = 256
+_LIFECYCLE_ACTION_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_LIFECYCLE_EVENT_ID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-"
+    r"[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+)
+_LIFECYCLE_FAILURE_CODES = {
+    "activation_barrier",
+    "build_or_smoke",
+    "incompatible",
+    "integrity",
+    "invalid_journal",
+    "runtime_error",
+    "unsafe_archive",
+}
+_SOURCE_REVISION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:+/=@-]{0,159}$")
 
 
 class RuntimeUpdateError(RuntimeError):
@@ -256,6 +273,70 @@ def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
             os.close(fd)
         with contextlib.suppress(FileNotFoundError):
             temporary_path.unlink()
+
+
+def _runtime_failure_code(error: BaseException) -> str:
+    text = str(error).casefold()
+    if any(
+        marker in text
+        for marker in (
+            "sha-256",
+            "checksum",
+            "digest",
+            "integrity",
+            "published size",
+            "asset size",
+        )
+    ):
+        return "integrity"
+    if any(
+        marker in text
+        for marker in (
+            "unsafe",
+            "path traversal",
+            "escaping symlink",
+            "escaping hard link",
+            "escapes its runtime folder",
+            "unexpected layout",
+            "device or fifo",
+        )
+    ):
+        return "unsafe_archive"
+    if any(
+        marker in text
+        for marker in (
+            "command failed",
+            "command timed out",
+            "build",
+            "did not produce",
+            "import",
+            "not executable",
+        )
+    ):
+        return "build_or_smoke"
+    if any(
+        marker in text
+        for marker in (
+            "not the current official",
+            "no compatible official",
+            "protocol",
+            "source revision",
+            "unsupported runtime",
+        )
+    ):
+        return "incompatible"
+    if any(
+        marker in text
+        for marker in (
+            "maintenance",
+            "drain",
+            "lease",
+            "resident",
+            "empty",
+        )
+    ):
+        return "activation_barrier"
+    return "runtime_error"
 
 
 def _validate_engine(engine: str) -> str:
@@ -557,6 +638,241 @@ class RuntimeUpdateManager:
         self._last_checked_at: float | None = None
         self._check_lock = asyncio.Lock()
         self._install_lock = asyncio.Lock()
+        self._lifecycle_lock = threading.RLock()
+        self._service_instance_id = str(uuid4())
+
+    @property
+    def _lifecycle_path(self) -> Path:
+        return self.root / "lifecycle.json"
+
+    def lifecycle_evidence(self) -> dict[str, Any]:
+        """Return bounded, credential-free runtime transition evidence."""
+
+        with self._lifecycle_lock:
+            try:
+                payload = _read_json(self._lifecycle_path)
+            except FileNotFoundError:
+                return {
+                    "schema_version": 1,
+                    "valid": True,
+                    "dropped_events": 0,
+                    "events": [],
+                }
+            except (OSError, ValueError, json.JSONDecodeError):
+                return {
+                    "schema_version": 1,
+                    "valid": False,
+                    "dropped_events": 0,
+                    "events": [],
+                    "diagnostic": "runtime lifecycle journal is unreadable",
+                }
+            dropped_events = (
+                payload.get("dropped_events") if isinstance(payload, dict) else None
+            )
+            if (
+                not isinstance(payload, dict)
+                or payload.get("schema_version") != 1
+                or not isinstance(dropped_events, int)
+                or isinstance(dropped_events, bool)
+                or dropped_events < 0
+                or not isinstance(payload.get("events"), list)
+            ):
+                return {
+                    "schema_version": 1,
+                    "valid": False,
+                    "dropped_events": 0,
+                    "events": [],
+                    "diagnostic": "runtime lifecycle journal has an unsupported schema",
+                }
+            events = payload["events"]
+            previous_sequence = 0
+            valid = len(events) <= _LIFECYCLE_LIMIT
+            for event in events:
+                if not isinstance(event, dict):
+                    valid = False
+                    break
+                sequence = event.get("sequence")
+                event_id = event.get("event_id")
+                service_instance_id = event.get("service_instance_id")
+                engine = event.get("engine")
+                action = event.get("action")
+                outcome = event.get("outcome")
+                created_at = event.get("created_at")
+                failure_code = event.get("failure_code")
+                if (
+                    not isinstance(sequence, int)
+                    or isinstance(sequence, bool)
+                    or sequence <= previous_sequence
+                    or not isinstance(event_id, str)
+                    or not _LIFECYCLE_EVENT_ID_RE.fullmatch(event_id)
+                    or not isinstance(service_instance_id, str)
+                    or not _LIFECYCLE_EVENT_ID_RE.fullmatch(service_instance_id)
+                    or engine not in _ENGINES
+                    or not isinstance(action, str)
+                    or not _LIFECYCLE_ACTION_RE.fullmatch(action)
+                    or outcome not in {"started", "succeeded", "failed"}
+                    or not isinstance(created_at, str)
+                    or (
+                        failure_code is not None
+                        and failure_code not in _LIFECYCLE_FAILURE_CODES
+                    )
+                ):
+                    valid = False
+                    break
+                try:
+                    datetime.fromisoformat(created_at)
+                except ValueError:
+                    valid = False
+                    break
+                for key in (
+                    "requested_version",
+                    "prepared_version",
+                    "active_version_before",
+                    "active_version_after",
+                ):
+                    value = event.get(key)
+                    if value is not None and (
+                        not isinstance(value, str)
+                        or not _VERSION_RE.fullmatch(value)
+                    ):
+                        valid = False
+                        break
+                source_revision = event.get("source_revision")
+                if source_revision is not None and (
+                    not isinstance(source_revision, str)
+                    or not _SOURCE_REVISION_RE.fullmatch(source_revision)
+                ):
+                    valid = False
+                if not valid:
+                    break
+                previous_sequence = sequence
+            if not valid:
+                return {
+                    "schema_version": 1,
+                    "valid": False,
+                    "dropped_events": int(dropped_events),
+                    "events": [],
+                    "diagnostic": "runtime lifecycle journal contains an invalid event",
+                }
+            return {
+                "schema_version": 1,
+                "valid": True,
+                "dropped_events": int(dropped_events),
+                "events": [dict(event) for event in events],
+            }
+
+    def record_lifecycle(
+        self,
+        *,
+        engine: str,
+        action: str,
+        outcome: str,
+        requested_version: str | None = None,
+        prepared_version: str | None = None,
+        active_version_before: str | None = None,
+        active_version_after: str | None = None,
+        source_revision: str | None = None,
+        error: BaseException | None = None,
+    ) -> dict[str, Any]:
+        """Append one bounded event without persisting arbitrary diagnostics."""
+
+        normalized = _validate_engine(engine)
+        if not _LIFECYCLE_ACTION_RE.fullmatch(action):
+            raise ValueError("runtime lifecycle action is invalid")
+        if outcome not in {"started", "succeeded", "failed"}:
+            raise ValueError("runtime lifecycle outcome is invalid")
+
+        def safe_version(value: str | None) -> str | None:
+            return value if value is not None and _VERSION_RE.fullmatch(value) else None
+
+        safe_revision = (
+            source_revision
+            if isinstance(source_revision, str)
+            and _SOURCE_REVISION_RE.fullmatch(source_revision)
+            else None
+        )
+
+        with self._lifecycle_lock:
+            existing = self.lifecycle_evidence()
+            events = (
+                [dict(event) for event in existing["events"]]
+                if existing["valid"]
+                else []
+            )
+            dropped = (
+                int(existing["dropped_events"])
+                if existing["valid"]
+                else 0
+            )
+            next_sequence = (
+                int(events[-1]["sequence"]) + 1 if events else 1
+            )
+            if not existing["valid"]:
+                events.append(
+                    {
+                        "sequence": next_sequence,
+                        "event_id": str(uuid4()),
+                        "service_instance_id": self._service_instance_id,
+                        "engine": normalized,
+                        "action": "journal_reset",
+                        "outcome": "failed",
+                        "created_at": datetime.now(timezone.utc).isoformat(),
+                        "failure_code": "invalid_journal",
+                    }
+                )
+                next_sequence += 1
+            event = {
+                "sequence": next_sequence,
+                "event_id": str(uuid4()),
+                "service_instance_id": self._service_instance_id,
+                "engine": normalized,
+                "action": action,
+                "outcome": outcome,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "requested_version": safe_version(requested_version),
+                "prepared_version": safe_version(prepared_version),
+                "active_version_before": safe_version(active_version_before),
+                "active_version_after": safe_version(active_version_after),
+                "source_revision": safe_revision,
+                "failure_code": (
+                    _runtime_failure_code(error) if error is not None else None
+                ),
+            }
+            events.append(event)
+            if len(events) > _LIFECYCLE_LIMIT:
+                overflow = len(events) - _LIFECYCLE_LIMIT
+                events = events[overflow:]
+                dropped += overflow
+            _atomic_json(
+                self._lifecycle_path,
+                {
+                    "schema_version": 1,
+                    "dropped_events": dropped,
+                    "events": events,
+                },
+            )
+            return dict(event)
+
+    def active_version(self, engine: str) -> str | None:
+        runtime = resolve_active_runtime(engine, root=self.root)
+        return runtime.version if runtime is not None else None
+
+    def record_validation(self, engine: str) -> dict[str, Any] | None:
+        normalized = _validate_engine(engine)
+        if normalized == "omlx":
+            return None
+        active = resolve_active_runtime(normalized, root=self.root)
+        if active is None:
+            return None
+        return self.record_lifecycle(
+            engine=normalized,
+            action="inference_validated",
+            outcome="succeeded",
+            prepared_version=active.version,
+            active_version_before=active.version,
+            active_version_after=active.version,
+            source_revision=active.source_revision,
+        )
 
     async def aclose(self) -> None:
         if self._owns_client:

@@ -403,6 +403,44 @@ the service, and confirm the same runtime is selected. Finally choose
 checksum, unsafe archive, failed DS4 build, or failed MFLUX import never changes
 `current.json`.
 
+For the required managed llama.cpp lifecycle proof, use two installed official
+versions: call the original version `A` and the update `B`.
+
+1. Activate `B`, then run the acceptance collector with
+   `--exercise-service-restart --self-test <alias> --expected-engine llama.cpp`.
+   This records successful inference from `B` under a different anonymous
+   service-instance ID than the activation.
+2. Choose **Roll Back** to return to `A`, then repeat that restart/self-test
+   pass. This records successful inference from `A` under a different
+   service-instance ID than the rollback.
+3. Make a private backup of inactive
+   `~/Library/Application Support/Mnemosyne/runtimes/llama.cpp/B/runtime.json`.
+   In the inactive copy only, temporarily change `entrypoint.binary` to an
+   escaping path such as `../acceptance-invalid/llama-server`. Request the
+   official `B` install again. It must be rejected before activation, the
+   lifecycle event must use the fixed `unsafe_archive` failure code, and
+   `A` must remain current. Restore the exact backed-up manifest immediately.
+   Never alter the active `A` directory.
+4. Capture the composed proof:
+
+   ```bash
+   python3 macos/packaging/collect_acceptance.py \
+     --app "/Applications/Unified Inference.app" \
+     --live --require-live \
+     --exercise-service-restart \
+     --self-test your-llamacpp-alias \
+     --expected-engine llama.cpp \
+     --require-runtime-lifecycle llama.cpp \
+     --output "$HOME/Desktop/unified-inference-runtime-acceptance.json"
+   ```
+
+The final report is accepted only if the ordered `A → B → A` transition,
+both post-restart inference events, the path-safety rejection, and the fresh
+installed-runtime snapshot all agree.
+`GET /manager/runtime-updates/evidence` is local and read-only; its bounded
+mode-`0600` journal contains fixed fields and failure codes, never raw
+exceptions or credentials.
+
 ## 12. LM Studio directory migration
 
 This gate applies only to a machine with an older LM Studio-backed

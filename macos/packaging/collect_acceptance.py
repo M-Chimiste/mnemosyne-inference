@@ -965,6 +965,192 @@ def _postgres_drained(payload: Any, *, since: float) -> bool:
     )
 
 
+def _runtime_lifecycle_summary(
+    payload: Any,
+    *,
+    engine: str,
+) -> dict[str, Any]:
+    """Require an update/restart/rollback/restart/rejection proof chain."""
+
+    journal = payload.get("journal") if isinstance(payload, dict) else None
+    installed = payload.get("installed") if isinstance(payload, dict) else None
+    events = (
+        journal.get("events")
+        if isinstance(journal, dict) and isinstance(journal.get("events"), list)
+        else []
+    )
+    last_reset = max(
+        (
+            index
+            for index, event in enumerate(events)
+            if isinstance(event, dict) and event.get("action") == "journal_reset"
+        ),
+        default=-1,
+    )
+    engine_events = [
+        event
+        for event in events[last_reset + 1 :]
+        if isinstance(event, dict) and event.get("engine") == engine
+    ]
+    installed_row = (
+        installed.get(engine)
+        if isinstance(installed, dict) and isinstance(installed.get(engine), dict)
+        else {}
+    )
+    current_version = installed_row.get("version")
+
+    def later(
+        start: int,
+        *,
+        action: str,
+        outcome: str,
+        before: object = ...,
+        after: object = ...,
+        failure_codes: set[str] | None = None,
+        different_instance_from: str | None = None,
+    ) -> tuple[int, dict[str, Any]] | None:
+        for index in range(start + 1, len(engine_events)):
+            event = engine_events[index]
+            if event.get("action") != action or event.get("outcome") != outcome:
+                continue
+            if before is not ... and event.get("active_version_before") != before:
+                continue
+            if after is not ... and event.get("active_version_after") != after:
+                continue
+            if (
+                failure_codes is not None
+                and event.get("failure_code") not in failure_codes
+            ):
+                continue
+            if (
+                different_instance_from is not None
+                and event.get("service_instance_id") == different_instance_from
+            ):
+                continue
+            return index, event
+        return None
+
+    matched: dict[str, dict[str, Any]] | None = None
+    for activation_index in range(len(engine_events) - 1, -1, -1):
+        activation = engine_events[activation_index]
+        baseline = activation.get("active_version_before")
+        updated = activation.get("active_version_after")
+        activation_instance = activation.get("service_instance_id")
+        if (
+            activation.get("action") != "activated"
+            or activation.get("outcome") != "succeeded"
+            or not isinstance(baseline, str)
+            or not isinstance(updated, str)
+            or baseline == updated
+            or not isinstance(activation_instance, str)
+        ):
+            continue
+        updated_validation = later(
+            activation_index,
+            action="inference_validated",
+            outcome="succeeded",
+            before=updated,
+            after=updated,
+            different_instance_from=activation_instance,
+        )
+        if updated_validation is None:
+            continue
+        rollback = later(
+            updated_validation[0],
+            action="rolled_back",
+            outcome="succeeded",
+            before=updated,
+            after=baseline,
+        )
+        if rollback is None:
+            continue
+        rollback_instance = rollback[1].get("service_instance_id")
+        if not isinstance(rollback_instance, str):
+            continue
+        baseline_validation = later(
+            rollback[0],
+            action="inference_validated",
+            outcome="succeeded",
+            before=baseline,
+            after=baseline,
+            different_instance_from=rollback_instance,
+        )
+        if baseline_validation is None:
+            continue
+        rejected = later(
+            baseline_validation[0],
+            action="install_rejected",
+            outcome="failed",
+            before=baseline,
+            after=baseline,
+            failure_codes={"integrity", "unsafe_archive"},
+        )
+        if rejected is None:
+            continue
+        matched = {
+            "activated": activation,
+            "updated_inference_after_restart": updated_validation[1],
+            "rolled_back": rollback[1],
+            "baseline_inference_after_restart": baseline_validation[1],
+            "corrupt_update_rejected": rejected[1],
+        }
+        break
+
+    def bounded_event(event: dict[str, Any]) -> dict[str, Any]:
+        return {
+            key: event.get(key)
+            for key in (
+                "sequence",
+                "event_id",
+                "service_instance_id",
+                "action",
+                "outcome",
+                "requested_version",
+                "prepared_version",
+                "active_version_before",
+                "active_version_after",
+                "source_revision",
+                "failure_code",
+                "created_at",
+            )
+        }
+
+    checks = {
+        "journal_valid": bool(
+            isinstance(journal, dict) and journal.get("valid") is True
+        ),
+        "complete_transition_chain": matched is not None,
+        "baseline_restored": bool(
+            matched is not None
+            and current_version
+            == matched["activated"].get("active_version_before")
+        ),
+    }
+    return {
+        "engine": engine,
+        "current_version": current_version,
+        "journal_event_count": len(events),
+        "dropped_events": (
+            journal.get("dropped_events") if isinstance(journal, dict) else None
+        ),
+        "last_journal_reset_sequence": (
+            events[last_reset].get("sequence")
+            if last_reset >= 0 and isinstance(events[last_reset], dict)
+            else None
+        ),
+        "checks": checks,
+        "matched_events": (
+            {name: bounded_event(event) for name, event in matched.items()}
+            if matched is not None
+            else None
+        ),
+        "recent_events": [
+            bounded_event(event) for event in engine_events[-25:]
+        ],
+        "accepted": all(checks.values()),
+    }
+
+
 def collect_live(
     *,
     expected_version: str,
@@ -984,6 +1170,7 @@ def collect_live(
     require_download_lifecycle: bool = False,
     require_lmstudio_adoption: str | None = None,
     require_omlx_recovery: bool = False,
+    require_runtime_lifecycle: str | None = None,
 ) -> dict[str, Any]:
     control = control_url.rstrip("/")
     public = public_url.rstrip("/")
@@ -1066,6 +1253,10 @@ def collect_live(
             },
             timeout=180,
         )
+    runtime_evidence = _json_request(
+        f"{control}/manager/runtime-updates/evidence",
+        admin_password=admin_password,
+    )
     postgres_drain: dict[str, Any] | None = None
     if require_postgres_drain and self_test_started is not None:
         deadline = time.monotonic() + postgres_timeout
@@ -1156,6 +1347,14 @@ def collect_live(
         if require_lmstudio_adoption is not None
         else None
     )
+    runtime_lifecycle = (
+        _runtime_lifecycle_summary(
+            runtime_evidence.get("payload"),
+            engine=require_runtime_lifecycle,
+        )
+        if require_runtime_lifecycle is not None
+        else None
+    )
     engine_rows = (
         readiness_payload.get("engines")
         if isinstance(readiness_payload, dict)
@@ -1195,6 +1394,7 @@ def collect_live(
         "configuration_snapshot_reachable": configuration["ok"],
         "download_evidence_reachable": install_evidence["ok"],
         "local_migration_hints_reachable": local_sources["ok"],
+        "runtime_lifecycle_evidence_reachable": runtime_evidence["ok"],
     }
     if agent_exercise is not None:
         checks[f"launch_agent_{launch_agent_exercise}"] = bool(
@@ -1247,6 +1447,16 @@ def collect_live(
             and self_test_payload.get("engine") == "omlx"
             and self_test_accepted
         )
+    if runtime_lifecycle is not None:
+        checks["managed_runtime_update_rollback_recovery"] = bool(
+            runtime_lifecycle["accepted"]
+            and agent_exercise is not None
+            and agent_exercise.get("accepted")
+            and self_test_accepted
+            and isinstance(self_test_payload, dict)
+            and self_test_payload.get("engine") == require_runtime_lifecycle
+            and self_test_payload.get("runtime_validation_recorded") is True
+        )
     result = {
         "control_url": _redact_url(control),
         "public_url": _redact_url(public),
@@ -1295,10 +1505,17 @@ def collect_live(
             "payload": local_sources.get("payload"),
             "diagnostic": local_sources.get("diagnostic"),
         },
+        "runtime_evidence": {
+            "ok": runtime_evidence["ok"],
+            "status": runtime_evidence.get("status"),
+            "summary": runtime_lifecycle,
+            "diagnostic": runtime_evidence.get("diagnostic"),
+        },
         "reconcile": reconcile,
         "protected_model": protected_model,
         "download_lifecycle": download_lifecycle,
         "lmstudio_adoption": lmstudio_adoption,
+        "runtime_lifecycle": runtime_lifecycle,
         "postgres_drain": postgres_drain,
         "self_test": self_test,
         "checks": checks,
@@ -1437,6 +1654,15 @@ def main() -> int:
             "successful oMLX self-test after core service restart"
         ),
     )
+    parser.add_argument(
+        "--require-runtime-lifecycle",
+        choices=("llama.cpp", "mflux", "ds4"),
+        metavar="ENGINE",
+        help=(
+            "require a durable managed-runtime update, restart validation, "
+            "rollback, second restart validation, and corrupt-update rejection"
+        ),
+    )
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     if args.exercise_service_restart and args.exercise_keepalive:
@@ -1455,6 +1681,7 @@ def main() -> int:
         or args.require_download_lifecycle
         or args.require_lmstudio_adoption
         or args.require_omlx_recovery
+        or args.require_runtime_lifecycle
     ):
         args.require_live = True
     if args.require_live:
@@ -1506,6 +1733,17 @@ def main() -> int:
         if args.expected_engine not in (None, "omlx"):
             parser.error("--require-omlx-recovery conflicts with --expected-engine")
         args.expected_engine = "omlx"
+    if args.require_runtime_lifecycle:
+        if launch_agent_exercise is None:
+            parser.error(
+                "--require-runtime-lifecycle requires "
+                "--exercise-service-restart or --exercise-keepalive"
+            )
+        if args.expected_engine not in (None, args.require_runtime_lifecycle):
+            parser.error(
+                "--require-runtime-lifecycle conflicts with --expected-engine"
+            )
+        args.expected_engine = args.require_runtime_lifecycle
     if args.self_test and not args.live:
         parser.error("--self-test requires --live or --require-live")
 
@@ -1551,6 +1789,7 @@ def main() -> int:
                 require_download_lifecycle=args.require_download_lifecycle,
                 require_lmstudio_adoption=args.require_lmstudio_adoption,
                 require_omlx_recovery=args.require_omlx_recovery,
+                require_runtime_lifecycle=args.require_runtime_lifecycle,
             )
             if args.live
             else None

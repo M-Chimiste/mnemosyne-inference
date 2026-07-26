@@ -23,7 +23,7 @@
       "id": "automated-native-suites",
       "required": true,
       "status": "passed",
-      "evidence": "Local Apple Silicon run: service 278 passed (276 in the restricted suite plus both real-bookmark tests with host access); image worker 23 passed with Metal access; Swift 59 passed; packaging 27 passed; version and locked-runtime checks passed. The artifact acceptance collector passes the complete staged app and DMG."
+      "evidence": "Local Apple Silicon run: service 280 passed (278 in the restricted suite plus both real-bookmark tests with host access); image worker 23 passed with Metal access; Swift 59 passed; packaging 28 passed; version and locked-runtime checks passed. The artifact acceptance collector passes the complete staged app and DMG."
     },
     {
       "id": "github-macos-ci",
@@ -89,7 +89,7 @@
       "id": "managed-runtime-update-rollback",
       "required": true,
       "status": "pending",
-      "evidence": "Earlier llama.cpp update/rollback hardware smoke passed; the current candidate must repeat activation, restart persistence, rollback, and rejected-corrupt-update recovery."
+      "evidence": "Earlier llama.cpp update/rollback hardware smoke passed. The current candidate now retains a bounded mode-0600 lifecycle journal with anonymous service-instance IDs and fixed failure codes; the strict collector requires activation, restarted inference on the update, rollback, restarted inference on the baseline, integrity/path-safety rejection, and a fresh installed snapshot proving the baseline remained active. The real target-Mac multi-pass exercise is still pending."
     },
     {
       "id": "developer-id-notarized-dmg",

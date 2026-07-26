@@ -19,6 +19,10 @@ read-only discovery hint.
   restart or KeepAlive recovery and require protected-folder reactivation,
   native LM Studio-directory adoption, oMLX reconciliation, Postgres drain,
   and the complete download lifecycle without exposing credentials.
+- Managed runtime activation, post-restart inference, rollback,
+  post-rollback inference, and corrupt-runtime rejection now leave a bounded
+  private lifecycle proof. Anonymous service-instance IDs distinguish a real
+  restart while fixed failure codes avoid retaining exception text.
 - The production pipeline supports signed Sparkle updates, enforces one
   version, and refuses release without Developer ID signing and notarization.
   Private ad-hoc candidates keep application updates disabled.

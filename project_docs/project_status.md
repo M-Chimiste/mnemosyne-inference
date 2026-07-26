@@ -63,7 +63,11 @@ the CUDA image or its `8000-8002` topology. The first implementation includes:
   UUID validation, live byte/percentage/speed progress, dismissible completed
   history, a compact persistent transition journal for target-Mac lifecycle
   evidence, residency-neutral profile creation, and exact manager-owned
-  directory deletion behind the global empty-residency barrier; and
+  directory deletion behind the global empty-residency barrier;
+- a bounded private managed-runtime lifecycle journal that distinguishes
+  service instances and proves activation, post-restart inference, rollback,
+  post-rollback inference, and fixed-code corrupt-runtime rejection without
+  retaining exception text; and
 - independent setup, architecture, and Apple Silicon smoke documentation.
 
 The native product is now a 0.9.0 release candidate with one enforced version,
@@ -123,11 +127,14 @@ validation remain in progress. The secret-redacted acceptance collector now
 has opt-in exact-label restart and KeepAlive exercises plus strict
 protected-model, oMLX recovery, LM Studio-directory adoption, Postgres drain,
 and durable download-lifecycle checks; those checks do not clear a gate until
-the candidate actually produces the required state transitions.
-The current native service suite passes all 278 tests on the development Mac,
+the candidate actually produces the required state transitions. Managed
+runtime acceptance now has the same durable treatment: the strict collector
+requires an ordered update/restart/rollback/restart/rejection chain and
+confirms the original managed version remains active.
+The current native service suite passes all 280 tests on the development Mac,
 including the two real-bookmark tests that skip in restricted runners. The
 isolated MFLUX worker passes 23 tests with
-real Metal access, the packaging suite passes 27 tests, and all 59 current
+real Metal access, the packaging suite passes 28 tests, and all 59 current
 Swift tests pass. The full relocatable build reports version 0.9.0 and its
 embedded service passes configuration validation without adding bytecode to or
 invalidating the signed app. GitHub Actions macOS CI run
@@ -281,8 +288,9 @@ see
 - Missing legacy reporting identity and DSN values are atomically copied into
   Unified Inference's private `.env`, so retiring the previous token-sidecar
   LaunchAgent does not break future reporting starts.
-- The native service suite passes (`275 passed, 2 skipped`), all 59 Swift tests,
-  all 23 image-worker tests, and all 14 packaging tests pass, and the Swift
+- The native service suite passes (`278 passed, 2 skipped` plus both skipped
+  real-bookmark tests with host access), all 59 Swift tests, all 23
+  image-worker tests, and all 28 packaging tests pass, and the Swift
   production build completes.
   A direct official-runtime LFM2.5 GGUF inference and an external oMLX LFM2 1B
   inference both produced backend token usage on Theseus. An earlier Developer

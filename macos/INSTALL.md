@@ -358,9 +358,12 @@ public or control listener, readiness contract, catalog, usage store, product
 version, or requested self-test fails.
 Release operators should then use the opt-in restart/KeepAlive, protected
 folder, LM Studio-directory adoption, oMLX recovery, Postgres drain, and
-download-lifecycle flags documented in [RELEASE.md](RELEASE.md). Those flags
-produce durable machine-readable evidence and signal only the exact registered
-LaunchAgent; ordinary users do not need to run them.
+download-lifecycle flags documented in [RELEASE.md](RELEASE.md). Managed
+runtime update/rollback qualification additionally uses
+`--require-runtime-lifecycle` after the multi-pass procedure in
+[smoke_checks.md](smoke_checks.md). Those flags produce durable
+machine-readable evidence and signal only the exact registered LaunchAgent;
+ordinary users do not need to run them.
 
 ## Updating Unified Inference
 

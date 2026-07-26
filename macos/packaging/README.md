@@ -178,12 +178,17 @@ Gatekeeper acceptance. After installation, run
 LaunchAgent, listener, readiness, catalog, usage, and durable self-test
 evidence without putting credentials on the command line. The live report also
 captures bounded configuration, storage, installed-runtime readiness, LM Studio
-directory-hint, and durable download-transition evidence. Explicit
+directory-hint, durable download-transition evidence, and the bounded
+managed-runtime lifecycle journal. Explicit
 `--exercise-service-restart` and `--exercise-keepalive` modes operate through
 the exact registered LaunchAgent label and require a new PID plus both healthy
 HTTP planes. Strict options can require protected-model reactivation, oMLX
 reconcile/auth recovery, native LM Studio-directory adoption, and the complete
-download cancel/retry/registration-retry/dismiss/delete history. See
+download cancel/retry/registration-retry/dismiss/delete history.
+`--require-runtime-lifecycle <engine>` additionally requires an ordered
+activation/restarted-inference/rollback/restarted-inference/corrupt-rejection
+chain and the original active version. Service-instance UUIDs prove the two
+restart boundaries without exposing a PID history or credentials. See
 [`../RELEASE.md`](../RELEASE.md) for the composed target-Mac commands.
 
 Notarization credentials stay in the login Keychain, not the repository. Set

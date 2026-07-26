@@ -1110,6 +1110,13 @@ def create_control_app(runtime: NativeRuntime) -> FastAPI:
         except Exception as exc:
             raise HTTPException(_error_status(exc), str(exc)) from exc
 
+    @app.get("/manager/runtime-updates/evidence")
+    async def runtime_update_evidence() -> dict:
+        try:
+            return await runtime.runtime_update_evidence()
+        except Exception as exc:
+            raise HTTPException(_error_status(exc), str(exc)) from exc
+
     @app.post("/manager/runtime-updates/{engine}/install")
     async def install_runtime_update(
         engine: str, payload: InstallRuntimeUpdateRequest

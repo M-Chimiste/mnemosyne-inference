@@ -17,6 +17,7 @@ from macos.packaging.collect_acceptance import (
     _protected_model_summary,
     _redact_text,
     _redact_url,
+    _runtime_lifecycle_summary,
     _usage_summary,
     _write_report,
     collect_live,
@@ -287,6 +288,74 @@ class AcceptanceEvidenceTests(unittest.TestCase):
             )["accepted"]
         )
 
+    def test_runtime_lifecycle_requires_restart_validated_update_and_rollback(
+        self,
+    ) -> None:
+        payload = {
+            "journal": {
+                "valid": True,
+                "dropped_events": 0,
+                "events": [
+                    {
+                        "sequence": 1,
+                        "engine": "llama.cpp",
+                        "action": "activated",
+                        "outcome": "succeeded",
+                        "service_instance_id": "instance-a",
+                        "active_version_before": "b100",
+                        "active_version_after": "b200",
+                    },
+                    {
+                        "sequence": 2,
+                        "engine": "llama.cpp",
+                        "action": "inference_validated",
+                        "outcome": "succeeded",
+                        "service_instance_id": "instance-b",
+                        "active_version_before": "b200",
+                        "active_version_after": "b200",
+                    },
+                    {
+                        "sequence": 3,
+                        "engine": "llama.cpp",
+                        "action": "rolled_back",
+                        "outcome": "succeeded",
+                        "service_instance_id": "instance-b",
+                        "active_version_before": "b200",
+                        "active_version_after": "b100",
+                    },
+                    {
+                        "sequence": 4,
+                        "engine": "llama.cpp",
+                        "action": "inference_validated",
+                        "outcome": "succeeded",
+                        "service_instance_id": "instance-c",
+                        "active_version_before": "b100",
+                        "active_version_after": "b100",
+                    },
+                    {
+                        "sequence": 5,
+                        "engine": "llama.cpp",
+                        "action": "install_rejected",
+                        "outcome": "failed",
+                        "service_instance_id": "instance-c",
+                        "active_version_before": "b100",
+                        "active_version_after": "b100",
+                        "failure_code": "integrity",
+                    },
+                ],
+            },
+            "installed": {"llama.cpp": {"version": "b100"}},
+        }
+
+        result = _runtime_lifecycle_summary(payload, engine="llama.cpp")
+
+        self.assertTrue(result["accepted"])
+        self.assertTrue(all(result["checks"].values()))
+        payload["journal"]["events"][1]["service_instance_id"] = "instance-a"
+        self.assertFalse(
+            _runtime_lifecycle_summary(payload, engine="llama.cpp")["accepted"]
+        )
+
     def test_launch_agent_exercise_requires_a_new_healthy_process(self) -> None:
         before = {
             "registered": True,
@@ -402,6 +471,61 @@ class AcceptanceEvidenceTests(unittest.TestCase):
                 }
             ]
         }
+        runtime_evidence = {
+            "journal": {
+                "valid": True,
+                "dropped_events": 0,
+                "events": [
+                    {
+                        "sequence": 1,
+                        "engine": "llama.cpp",
+                        "action": "activated",
+                        "outcome": "succeeded",
+                        "service_instance_id": "instance-a",
+                        "active_version_before": "b100",
+                        "active_version_after": "b200",
+                    },
+                    {
+                        "sequence": 2,
+                        "engine": "llama.cpp",
+                        "action": "inference_validated",
+                        "outcome": "succeeded",
+                        "service_instance_id": "instance-b",
+                        "active_version_before": "b200",
+                        "active_version_after": "b200",
+                    },
+                    {
+                        "sequence": 3,
+                        "engine": "llama.cpp",
+                        "action": "rolled_back",
+                        "outcome": "succeeded",
+                        "service_instance_id": "instance-b",
+                        "active_version_before": "b200",
+                        "active_version_after": "b100",
+                    },
+                    {
+                        "sequence": 4,
+                        "engine": "llama.cpp",
+                        "action": "inference_validated",
+                        "outcome": "succeeded",
+                        "service_instance_id": "instance-c",
+                        "active_version_before": "b100",
+                        "active_version_after": "b100",
+                    },
+                    {
+                        "sequence": 5,
+                        "engine": "llama.cpp",
+                        "action": "install_rejected",
+                        "outcome": "failed",
+                        "service_instance_id": "instance-c",
+                        "active_version_before": "b100",
+                        "active_version_after": "b100",
+                        "failure_code": "integrity",
+                    },
+                ],
+            },
+            "installed": {"llama.cpp": {"version": "b100"}},
+        }
 
         def response(url: str, **kwargs: object) -> dict[str, object]:
             if url.endswith("/health"):
@@ -436,6 +560,8 @@ class AcceptanceEvidenceTests(unittest.TestCase):
                 payload = install_evidence
             elif url.endswith("/manager/model-library/local-sources"):
                 payload = {"sources": []}
+            elif url.endswith("/manager/runtime-updates/evidence"):
+                payload = runtime_evidence
             elif url.endswith("/manager/reconcile"):
                 payload = {
                     "state": "idle",
@@ -450,6 +576,7 @@ class AcceptanceEvidenceTests(unittest.TestCase):
                     "vision": True,
                     "usage": {"total_tokens": 7},
                     "usage_recorded": True,
+                    "runtime_validation_recorded": True,
                 }
             else:
                 raise AssertionError(url)
@@ -491,12 +618,14 @@ class AcceptanceEvidenceTests(unittest.TestCase):
                 exercise_reconcile=True,
                 require_protected_model=True,
                 require_download_lifecycle=True,
+                require_runtime_lifecycle="llama.cpp",
             )
 
         self.assertTrue(result["accepted"])
         self.assertTrue(all(result["checks"].values()))
         self.assertTrue(result["protected_model"]["accepted"])
         self.assertTrue(result["download_lifecycle"]["accepted"])
+        self.assertTrue(result["runtime_lifecycle"]["accepted"])
 
     def test_report_write_is_atomic_private_and_valid_json(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

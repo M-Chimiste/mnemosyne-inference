@@ -324,6 +324,7 @@ The control plane starts with:
 - `GET /manager/usage`
 - `GET /manager/runtime-updates`
 - `POST /manager/runtime-updates/check`
+- `GET /manager/runtime-updates/evidence`
 - `POST /manager/runtime-updates/{engine}/install`
 - `POST /manager/runtime-updates/{engine}/rollback`
 
@@ -333,6 +334,14 @@ the persisted file has changed. Settings saves, completed-download profile
 creation, and local imports share one mutation lock and always reload the
 latest YAML before writing, so a stale window cannot erase a concurrently
 added model.
+
+Runtime activation and rollback also append to a mode-`0600`, bounded
+Application Support journal. It contains fixed transition fields, fixed
+failure codes, and an anonymous per-service-instance UUID—not exception text,
+credentials, request bodies, or model content. A successful self-test records
+`inference_validated` only when that engine resolves through an active managed
+runtime. `GET /manager/runtime-updates/evidence` returns that journal plus a
+fresh local installed-runtime snapshot without contacting upstream services.
 
 Inference bearer auth and control auth follow the CUDA manager's fail-safe
 behavior. Inner engine credentials are never forwarded to clients, and outer

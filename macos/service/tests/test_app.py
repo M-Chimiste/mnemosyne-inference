@@ -28,6 +28,7 @@ from mnemosyne_macos.models import (
 )
 from mnemosyne_macos.runtime import NativeRuntime
 from mnemosyne_macos.runtime import _redact_diagnostic
+from mnemosyne_macos.runtime_updates import RuntimeUpdateError
 
 
 class FakeAdapter(EngineAdapter):
@@ -357,6 +358,7 @@ async def test_runtime_update_control_routes_use_coordinator_barrier(tmp_path) -
     class FakeUpdateManager:
         def __init__(self) -> None:
             self.events: list[str] = []
+            self.current = "0.9.0"
 
         async def check(self, *, refresh: bool = True) -> dict:
             self.events.append(f"check:{refresh}")
@@ -370,10 +372,23 @@ async def test_runtime_update_control_routes_use_coordinator_barrier(tmp_path) -
 
         async def prepare(self, engine: str, version: str | None = None):
             self.events.append(f"prepare:{engine}:{version}")
-            return SimpleNamespace(release=SimpleNamespace(engine=engine))
+            if version == "corrupt":
+                raise RuntimeUpdateError("SHA-256 verification failed")
+            return SimpleNamespace(
+                release=SimpleNamespace(
+                    engine=engine,
+                    version="1.0.0",
+                    source_revision="abc",
+                ),
+                runtime=SimpleNamespace(
+                    version="1.0.0",
+                    source_revision="abc",
+                ),
+            )
 
         def activate(self, prepared):
             self.events.append(f"activate:{prepared.release.engine}")
+            self.current = "1.0.0"
             return SimpleNamespace(
                 engine=prepared.release.engine,
                 version="1.0.0",
@@ -383,12 +398,40 @@ async def test_runtime_update_control_routes_use_coordinator_barrier(tmp_path) -
 
         def rollback(self, engine: str):
             self.events.append(f"rollback:{engine}")
+            self.current = "0.9.0"
             return SimpleNamespace(
                 engine=engine,
                 version="0.9.0",
                 source_revision="old",
                 root=tmp_path / "runtime-old",
             )
+
+        def active_version(self, _engine: str) -> str:
+            return self.current
+
+        def record_lifecycle(self, **values) -> dict:
+            self.events.append(
+                f"lifecycle:{values['action']}:{values['outcome']}"
+            )
+            return dict(values)
+
+        def lifecycle_evidence(self) -> dict:
+            return {
+                "schema_version": 1,
+                "valid": True,
+                "dropped_events": 0,
+                "events": [],
+            }
+
+        async def installed_status(self) -> dict:
+            return {
+                "mflux": {
+                    "installed": True,
+                    "version": self.current,
+                    "revision": None,
+                    "path": str(tmp_path),
+                }
+            }
 
         async def aclose(self) -> None:
             return None
@@ -407,6 +450,9 @@ async def test_runtime_update_control_routes_use_coordinator_barrier(tmp_path) -
     try:
         checked = await client.post("/manager/runtime-updates/check")
         assert checked.status_code == 200
+        evidence = await client.get("/manager/runtime-updates/evidence")
+        assert evidence.status_code == 200
+        assert evidence.json()["journal"]["valid"] is True
         installed = await client.post(
             "/manager/runtime-updates/mflux/install",
             json={"version": "1.0.0"},
@@ -416,13 +462,26 @@ async def test_runtime_update_control_routes_use_coordinator_barrier(tmp_path) -
         rolled_back = await client.post("/manager/runtime-updates/mflux/rollback")
         assert rolled_back.status_code == 200
         assert rolled_back.json()["activated"]["rollback"] is True
+        rejected = await client.post(
+            "/manager/runtime-updates/mflux/install",
+            json={"version": "corrupt"},
+        )
+        assert rejected.status_code == 400
         assert updates.events == [
             "check:True",
+            "lifecycle:install_requested:started",
             "prepare:mflux:1.0.0",
+            "lifecycle:prepared:succeeded",
             "activate:mflux",
+            "lifecycle:activated:succeeded",
             "check:False",
+            "lifecycle:rollback_requested:started",
             "rollback:mflux",
+            "lifecycle:rolled_back:succeeded",
             "check:False",
+            "lifecycle:install_requested:started",
+            "prepare:mflux:corrupt",
+            "lifecycle:install_rejected:failed",
         ]
         status = await runtime.coordinator.status()
         assert status.state.value == "idle"

@@ -31,6 +31,97 @@ from mnemosyne_macos.runtime_updates import (
 
 
 @pytest.mark.asyncio
+async def test_runtime_lifecycle_journal_is_private_bounded_and_durable(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "runtimes"
+    manager = RuntimeUpdateManager(
+        omlx=OMLXConfig(),
+        mflux=MFluxConfig(),
+        ds4=DS4Config(),
+        root=root,
+    )
+    try:
+        for index in range(260):
+            manager.record_lifecycle(
+                engine="llama.cpp",
+                action="prepared",
+                outcome="succeeded",
+                prepared_version=f"b{index}",
+                active_version_before="b0",
+                active_version_after="b0",
+                source_revision="main",
+            )
+        evidence = manager.lifecycle_evidence()
+        assert evidence["valid"] is True
+        assert len(evidence["events"]) == 256
+        assert evidence["dropped_events"] == 4
+        assert evidence["events"][0]["sequence"] == 5
+        assert (root / "lifecycle.json").stat().st_mode & 0o777 == 0o600
+    finally:
+        await manager.aclose()
+
+    reopened = RuntimeUpdateManager(
+        omlx=OMLXConfig(),
+        mflux=MFluxConfig(),
+        ds4=DS4Config(),
+        root=root,
+    )
+    try:
+        assert reopened.lifecycle_evidence() == evidence
+    finally:
+        await reopened.aclose()
+
+
+@pytest.mark.asyncio
+async def test_runtime_lifecycle_recovers_corrupt_journal_without_error_text(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "runtimes"
+    root.mkdir()
+    (root / "lifecycle.json").write_text("{not-json", encoding="utf-8")
+    manager = RuntimeUpdateManager(
+        omlx=OMLXConfig(),
+        mflux=MFluxConfig(),
+        ds4=DS4Config(),
+        root=root,
+    )
+    try:
+        assert manager.lifecycle_evidence()["valid"] is False
+        manager.record_lifecycle(
+            engine="llama.cpp",
+            action="install_rejected",
+            outcome="failed",
+            requested_version="b9000",
+            active_version_before="b8123",
+            active_version_after="b8123",
+            error=RuntimeUpdateError(
+                "SHA-256 mismatch; password=must-never-be-persisted"
+            ),
+        )
+        evidence = manager.lifecycle_evidence()
+        assert evidence["valid"] is True
+        assert [event["action"] for event in evidence["events"]] == [
+            "journal_reset",
+            "install_rejected",
+        ]
+        assert evidence["events"][-1]["failure_code"] == "integrity"
+        assert (
+            runtime_updates._runtime_failure_code(
+                RuntimeUpdateError(
+                    "managed llama.cpp entrypoint escapes its runtime folder"
+                )
+            )
+            == "unsafe_archive"
+        )
+        rendered = (root / "lifecycle.json").read_text(encoding="utf-8")
+        assert "must-never-be-persisted" not in rendered
+        assert "password" not in rendered
+    finally:
+        await manager.aclose()
+
+
+@pytest.mark.asyncio
 async def test_version_probe_terminates_its_process_group_on_timeout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

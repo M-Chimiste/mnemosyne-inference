@@ -57,9 +57,13 @@ upstream engines and must not fork or embed their serving implementations.
 - `macos/service/runtime_updates.py` discovers releases directly from the
   official upstreams, verifies and installs official `ggml-org/llama.cpp`
   Apple Silicon assets, installs MFLUX from PyPI, builds an exact DS4 GitHub
-  commit, and provides atomic activation/rollback. Runtime activation must use
-  the coordinator's all-engines-empty maintenance barrier; never introduce a
-  repository-owned dependency manifest.
+  commit, and provides atomic activation/rollback. Its private bounded
+  lifecycle journal records only fixed transition fields, anonymous service
+  instance IDs, and fixed failure codes so acceptance can prove activation,
+  post-restart inference, rollback, post-rollback restart inference, and
+  corrupt-runtime rejection without persisting arbitrary diagnostics.
+  Runtime activation must use the coordinator's all-engines-empty maintenance
+  barrier; never introduce a repository-owned dependency manifest.
 - `macos/image-worker/` is the separately locked MFLUX runtime. It is launched only as a manager-owned child, binds loopback `:17324`, and must remain dependency-isolated from the macOS coordinator service.
 - `macos/app/` is the SwiftPM menu bar controller, typed native settings UI, secret-safe credential store, and native service bootstrap. `macos/packaging/` stages the signed app, embedded LaunchAgent plist, direct `Contents/MacOS/mnemosyne-service-bootstrap` executable, relocatable Python runtime, and verified drag-to-Applications DMG. Keep this unsandboxed `SMAppService` LaunchAgent's `BundleProgram` pointed at that direct helper; introducing a second bundle identity is unnecessary here and broke launch-requirement refresh during in-place updates. A future sandboxed or restricted-entitlement job would require its own deliberate wrapper architecture.
 - `macos/VERSION` is the only native product-version source.
@@ -78,7 +82,10 @@ upstream engines and must not fork or embed their serving implementations.
   only the exact registered LaunchAgent label, require a new PID and both HTTP
   planes, and never discover or signal a process by port. A migrated install
   journal `snapshot` is not evidence for transitions this candidate did not
-  observe.
+  observe. Managed-runtime acceptance must use the runtime lifecycle journal,
+  require service-instance changes before validating both activated and
+  rolled-back versions, and prove a rejected integrity/path-safety failure
+  left the baseline active.
   Release verification must reject every 1.x build unless the ledger version
   matches, `release_ready` is true, and every required gate is passed; 0.x
   candidate artifacts remain prereleases.

@@ -1524,6 +1524,30 @@ class NativeRuntime:
         elif endpoint == Endpoint.IMAGES_GENERATIONS:
             response_preview = f"{len(decoded.get('data', []))} image result(s)"
 
+        runtime_validation_recorded: bool | None = None
+        record_validation = getattr(
+            self.runtime_updates,
+            "record_validation",
+            None,
+        )
+        if callable(record_validation):
+            try:
+                validation_event = await asyncio.to_thread(
+                    record_validation,
+                    target.key.engine.value,
+                )
+                runtime_validation_recorded = (
+                    validation_event is not None
+                    if target.key.engine != EngineName.OMLX
+                    else None
+                )
+            except Exception:
+                # Inference already succeeded. A damaged or unwritable
+                # evidence journal must be visible to strict acceptance
+                # collection, but it must not turn a user request into a
+                # synthetic inference failure.
+                runtime_validation_recorded = False
+
         return {
             "schema_version": 1,
             "success": True,
@@ -1545,13 +1569,68 @@ class NativeRuntime:
             ),
             "usage_recorded": recorded is not None if usage is not None else None,
             "usage_delivery": await self.usage.status(),
+            "runtime_validation_recorded": runtime_validation_recorded,
         }
 
     async def record_usage(self, event: UsageEvent) -> None:
         await self.usage.record(event)
 
+    async def _runtime_active_version(self, engine: str) -> str | None:
+        active_version = getattr(self.runtime_updates, "active_version", None)
+        if not callable(active_version):
+            return None
+        try:
+            result = await asyncio.to_thread(active_version, engine)
+        except Exception:
+            return None
+        return result if isinstance(result, str) else None
+
+    async def _record_runtime_lifecycle(self, **values: object) -> bool:
+        recorder = getattr(self.runtime_updates, "record_lifecycle", None)
+        if not callable(recorder):
+            return False
+        try:
+            await asyncio.to_thread(recorder, **values)
+        except Exception:
+            # Runtime pointers are the source of truth. Once an activation or
+            # rollback has happened, an evidence-storage error must not
+            # masquerade as a failed pointer transition.
+            return False
+        return True
+
     async def check_runtime_updates(self, *, refresh: bool = True) -> dict:
         return await self.runtime_updates.check(refresh=refresh)
+
+    async def runtime_update_evidence(self) -> dict:
+        evidence_reader = getattr(
+            self.runtime_updates,
+            "lifecycle_evidence",
+            None,
+        )
+        if callable(evidence_reader):
+            try:
+                journal = await asyncio.to_thread(evidence_reader)
+            except Exception:
+                journal = {
+                    "schema_version": 1,
+                    "valid": False,
+                    "dropped_events": 0,
+                    "events": [],
+                    "diagnostic": "runtime lifecycle journal could not be read",
+                }
+        else:
+            journal = {
+                "schema_version": 1,
+                "valid": False,
+                "dropped_events": 0,
+                "events": [],
+                "diagnostic": "runtime lifecycle evidence is unavailable",
+            }
+        return {
+            "schema_version": 1,
+            "journal": journal,
+            "installed": await self.runtime_updates.installed_status(),
+        }
 
     async def install_runtime_update(
         self, engine: str, *, version: str | None = None
@@ -1559,18 +1638,84 @@ class NativeRuntime:
         """Stage without touching residency, then activate behind the barrier."""
 
         async with self._runtime_update_lock:
-            prepared = await self.runtime_updates.prepare(engine, version)
+            active_before = await self._runtime_active_version(engine)
+            evidence_recorded = [
+                await self._record_runtime_lifecycle(
+                    engine=engine,
+                    action="install_requested",
+                    outcome="started",
+                    requested_version=version,
+                    active_version_before=active_before,
+                    active_version_after=active_before,
+                )
+            ]
+            try:
+                prepared = await self.runtime_updates.prepare(engine, version)
+            except Exception as exc:
+                evidence_recorded.append(
+                    await self._record_runtime_lifecycle(
+                        engine=engine,
+                        action="install_rejected",
+                        outcome="failed",
+                        requested_version=version,
+                        active_version_before=active_before,
+                        active_version_after=await self._runtime_active_version(engine),
+                        error=exc,
+                    )
+                )
+                raise
+            prepared_version = prepared.runtime.version
+            evidence_recorded.append(
+                await self._record_runtime_lifecycle(
+                    engine=engine,
+                    action="prepared",
+                    outcome="succeeded",
+                    requested_version=version,
+                    prepared_version=prepared_version,
+                    active_version_before=active_before,
+                    active_version_after=active_before,
+                    source_revision=prepared.runtime.source_revision,
+                )
+            )
             activated = None
 
             async def activate(_deadline) -> None:
                 nonlocal activated
                 activated = self.runtime_updates.activate(prepared)
 
-            await self.coordinator.run_empty_maintenance(
-                activate,
-                name=f"{engine} runtime activation",
-            )
+            try:
+                await self.coordinator.run_empty_maintenance(
+                    activate,
+                    name=f"{engine} runtime activation",
+                )
+            except Exception as exc:
+                evidence_recorded.append(
+                    await self._record_runtime_lifecycle(
+                        engine=engine,
+                        action="activation_rejected",
+                        outcome="failed",
+                        requested_version=version,
+                        prepared_version=prepared_version,
+                        active_version_before=active_before,
+                        active_version_after=await self._runtime_active_version(engine),
+                        source_revision=prepared.runtime.source_revision,
+                        error=exc,
+                    )
+                )
+                raise
             assert activated is not None
+            evidence_recorded.append(
+                await self._record_runtime_lifecycle(
+                    engine=engine,
+                    action="activated",
+                    outcome="succeeded",
+                    requested_version=version,
+                    prepared_version=prepared_version,
+                    active_version_before=active_before,
+                    active_version_after=activated.version,
+                    source_revision=activated.source_revision,
+                )
+            )
             result = await self.runtime_updates.check(refresh=False)
             result["activated"] = {
                 "engine": activated.engine,
@@ -1578,21 +1723,56 @@ class NativeRuntime:
                 "source_revision": activated.source_revision,
                 "path": str(activated.root),
             }
+            result["lifecycle_evidence_recorded"] = all(evidence_recorded)
             return result
 
     async def rollback_runtime_update(self, engine: str) -> dict:
         async with self._runtime_update_lock:
+            active_before = await self._runtime_active_version(engine)
+            evidence_recorded = [
+                await self._record_runtime_lifecycle(
+                    engine=engine,
+                    action="rollback_requested",
+                    outcome="started",
+                    active_version_before=active_before,
+                    active_version_after=active_before,
+                )
+            ]
             activated = None
 
             async def rollback(_deadline) -> None:
                 nonlocal activated
                 activated = self.runtime_updates.rollback(engine)
 
-            await self.coordinator.run_empty_maintenance(
-                rollback,
-                name=f"{engine} runtime rollback",
-            )
+            try:
+                await self.coordinator.run_empty_maintenance(
+                    rollback,
+                    name=f"{engine} runtime rollback",
+                )
+            except Exception as exc:
+                evidence_recorded.append(
+                    await self._record_runtime_lifecycle(
+                        engine=engine,
+                        action="rollback_rejected",
+                        outcome="failed",
+                        active_version_before=active_before,
+                        active_version_after=await self._runtime_active_version(engine),
+                        error=exc,
+                    )
+                )
+                raise
             assert activated is not None
+            evidence_recorded.append(
+                await self._record_runtime_lifecycle(
+                    engine=engine,
+                    action="rolled_back",
+                    outcome="succeeded",
+                    prepared_version=activated.version,
+                    active_version_before=active_before,
+                    active_version_after=activated.version,
+                    source_revision=activated.source_revision,
+                )
+            )
             result = await self.runtime_updates.check(refresh=False)
             result["activated"] = {
                 "engine": activated.engine,
@@ -1601,6 +1781,7 @@ class NativeRuntime:
                 "path": str(activated.root),
                 "rollback": True,
             }
+            result["lifecycle_evidence_recorded"] = all(evidence_recorded)
             return result
 
     async def _register_installed_model(self, install: InstallRecord) -> None:

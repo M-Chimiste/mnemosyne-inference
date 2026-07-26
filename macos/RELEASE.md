@@ -75,6 +75,30 @@ read-only LM Studio directory hint. For external oMLX, combine a restart,
 `--exercise-reconcile`, `--expected-engine omlx`, and
 `--require-omlx-recovery`.
 
+Managed-runtime acceptance is accumulated across the deliberate update and
+rollback passes described in [smoke_checks.md](smoke_checks.md). The service
+keeps at most 256 fixed-field events in a mode-`0600` journal and gives each
+service process an anonymous UUID. It never stores exception text. After the
+new runtime and then the rolled-back runtime have each served from a new
+service instance, and a corrupt inactive runtime has been rejected without
+changing the baseline, collect the final proof with:
+
+```bash
+python3 macos/packaging/collect_acceptance.py \
+  --live --require-live \
+  --exercise-service-restart \
+  --self-test your-llamacpp-alias \
+  --expected-engine llama.cpp \
+  --require-runtime-lifecycle llama.cpp \
+  --output "$HOME/Desktop/unified-inference-runtime-acceptance.json"
+```
+
+The strict check requires an ordered `activated` → restarted
+`inference_validated` → `rolled_back` → restarted `inference_validated` →
+integrity/path-safety rejection chain, and confirms the original version is
+still selected. oMLX is externally owned and is deliberately excluded from
+this managed-runtime gate.
+
 For a public release, `--require-distribution` additionally requires the
 Developer ID identity, hardened runtime, timestamp, Sparkle public key/HTTPS
 feed, notarization staple, and Gatekeeper acceptance for both app and DMG.
