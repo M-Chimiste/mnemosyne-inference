@@ -349,6 +349,7 @@ same service/version/durable-usage proof in a private report:
 python3 macos/packaging/collect_acceptance.py \
   --app "/Applications/Unified Inference.app" \
   --live --require-live --self-test your-model-alias \
+  --require-guided-setup \
   --output "$HOME/Desktop/unified-inference-live-acceptance.json"
 ```
 
@@ -356,6 +357,11 @@ The report is written with mode `0600` and redacts credentials and
 credential-bearing URLs. A running Login Item alone is not accepted when the
 public or control listener, readiness contract, catalog, usage store, product
 version, or requested self-test fails.
+On a deliberate clean-install acceptance machine, reset
+`com.mnemosyne.inference.menu` before the first candidate launch.
+`--require-guided-setup` then proves that this exact version/build presented
+Setup & Health before the durable-usage self-test completed it; it does not
+accept stale setup state from an older app.
 Release operators should then use the opt-in restart/KeepAlive, protected
 folder, LM Studio-directory adoption, oMLX recovery, Postgres drain, and
 download-lifecycle flags documented in [RELEASE.md](RELEASE.md). Managed
@@ -364,6 +370,10 @@ runtime update/rollback qualification additionally uses
 [smoke_checks.md](smoke_checks.md). Those flags produce durable
 machine-readable evidence and signal only the exact registered LaunchAgent;
 ordinary users do not need to run them.
+The real logout/login or reboot pass compares the private accepted pre-cycle
+report with the post-cycle run via `--require-login-cycle-baseline`; a normal
+service restart does not change the GUI audit-session ID and cannot substitute
+for this check.
 
 ## Updating Unified Inference
 

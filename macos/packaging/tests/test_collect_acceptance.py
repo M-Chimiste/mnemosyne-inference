@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 import stat
 import tempfile
@@ -11,6 +12,9 @@ from unittest.mock import patch
 from macos.packaging.collect_acceptance import (
     _download_lifecycle_summary,
     _exercise_launch_agent,
+    _guided_setup_summary,
+    _launch_agent,
+    _login_cycle_summary,
     _lmstudio_adoption_summary,
     _packaged_engine_defaults,
     _postgres_drained,
@@ -356,6 +360,33 @@ class AcceptanceEvidenceTests(unittest.TestCase):
             _runtime_lifecycle_summary(payload, engine="llama.cpp")["accepted"]
         )
 
+    def test_guided_setup_requires_this_build_to_present_then_complete(self) -> None:
+        preferences = {
+            "didCompleteNativeSetupV1": "1",
+            "nativeSetupFirstPresentedVersionV1": "0.9.0",
+            "nativeSetupFirstPresentedBuildV1": "45",
+            "nativeSetupFirstPresentedAtV1": "100.0",
+            "nativeSetupCompletedVersionV1": "0.9.0",
+            "nativeSetupCompletedBuildV1": "45",
+            "nativeSetupCompletedAtV1": "200.0",
+        }
+
+        result = _guided_setup_summary(
+            preferences,
+            expected_version="0.9.0",
+            expected_build="45",
+        )
+
+        self.assertTrue(result["accepted"])
+        preferences["nativeSetupCompletedBuildV1"] = "44"
+        self.assertFalse(
+            _guided_setup_summary(
+                preferences,
+                expected_version="0.9.0",
+                expected_build="45",
+            )["accepted"]
+        )
+
     def test_launch_agent_exercise_requires_a_new_healthy_process(self) -> None:
         before = {
             "registered": True,
@@ -403,6 +434,104 @@ class AcceptanceEvidenceTests(unittest.TestCase):
                 f"gui/{os.getuid()}/com.mnemosyne.inference.agent",
             ],
         )
+
+    def test_launch_agent_snapshot_includes_gui_audit_session(self) -> None:
+        with patch(
+            "macos.packaging.collect_acceptance._run",
+            return_value={
+                "ok": True,
+                "returncode": 0,
+                "diagnostic": (
+                    "state = running\n"
+                    "asid = 100108\n"
+                    "runs = 3\n"
+                    "pid = 88799\n"
+                    "last exit code = 0\n"
+                ),
+            },
+        ):
+            result = _launch_agent()
+
+        self.assertEqual(result["asid"], 100108)
+        self.assertEqual(result["pid"], 88799)
+        self.assertEqual(result["state"], "running")
+
+    def test_login_cycle_requires_private_same_build_baseline_and_new_asid(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            baseline = Path(directory) / "before-login.json"
+            baseline.write_text(
+                json.dumps(
+                    {
+                        "accepted": True,
+                        "generated_at": datetime.now(timezone.utc).isoformat(),
+                        "host": "Theseus",
+                        "artifact": {
+                            "app": {
+                                "version": "0.9.0",
+                                "build": "45",
+                            }
+                        },
+                        "live": {
+                            "accepted": True,
+                            "launch_agent": {
+                                "registered": True,
+                                "state": "running",
+                                "asid": 100,
+                                "pid": 1000,
+                            },
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            baseline.chmod(0o600)
+
+            result = _login_cycle_summary(
+                baseline,
+                current_agent={
+                    "registered": True,
+                    "state": "running",
+                    "asid": 200,
+                    "pid": 2000,
+                },
+                expected_version="0.9.0",
+                expected_build="45",
+                current_host="Theseus",
+            )
+
+            self.assertTrue(result["accepted"])
+            self.assertTrue(all(result["checks"].values()))
+            self.assertFalse(
+                _login_cycle_summary(
+                    baseline,
+                    current_agent={
+                        "registered": True,
+                        "state": "running",
+                        "asid": 100,
+                        "pid": 2000,
+                    },
+                    expected_version="0.9.0",
+                    expected_build="45",
+                    current_host="Theseus",
+                )["accepted"]
+            )
+            baseline.chmod(0o644)
+            self.assertFalse(
+                _login_cycle_summary(
+                    baseline,
+                    current_agent={
+                        "registered": True,
+                        "state": "running",
+                        "asid": 200,
+                        "pid": 2000,
+                    },
+                    expected_version="0.9.0",
+                    expected_build="45",
+                    current_host="Theseus",
+                )["accepted"]
+            )
 
     def test_live_collector_composes_restart_reconcile_and_strict_evidence(
         self,
@@ -602,9 +731,22 @@ class AcceptanceEvidenceTests(unittest.TestCase):
                 "macos.packaging.collect_acceptance._exercise_launch_agent",
                 return_value={"accepted": True, "mode": "restart"},
             ),
+            patch(
+                "macos.packaging.collect_acceptance._guided_setup_preferences",
+                return_value={
+                    "didCompleteNativeSetupV1": "1",
+                    "nativeSetupFirstPresentedVersionV1": "0.9.0",
+                    "nativeSetupFirstPresentedBuildV1": "45",
+                    "nativeSetupFirstPresentedAtV1": "100",
+                    "nativeSetupCompletedVersionV1": "0.9.0",
+                    "nativeSetupCompletedBuildV1": "45",
+                    "nativeSetupCompletedAtV1": "200",
+                },
+            ),
         ):
             result = collect_live(
                 expected_version="0.9.0",
+                expected_build="45",
                 control_url="http://127.0.0.1:17321",
                 public_url="http://127.0.0.1:1240",
                 admin_password=None,
@@ -619,6 +761,7 @@ class AcceptanceEvidenceTests(unittest.TestCase):
                 require_protected_model=True,
                 require_download_lifecycle=True,
                 require_runtime_lifecycle="llama.cpp",
+                require_guided_setup=True,
             )
 
         self.assertTrue(result["accepted"])
@@ -626,6 +769,7 @@ class AcceptanceEvidenceTests(unittest.TestCase):
         self.assertTrue(result["protected_model"]["accepted"])
         self.assertTrue(result["download_lifecycle"]["accepted"])
         self.assertTrue(result["runtime_lifecycle"]["accepted"])
+        self.assertTrue(result["guided_setup"]["accepted"])
 
     def test_report_write_is_atomic_private_and_valid_json(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

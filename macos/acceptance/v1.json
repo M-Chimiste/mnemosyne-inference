@@ -23,7 +23,7 @@
       "id": "automated-native-suites",
       "required": true,
       "status": "passed",
-      "evidence": "Local Apple Silicon run: service 280 passed (278 in the restricted suite plus both real-bookmark tests with host access); image worker 23 passed with Metal access; Swift 59 passed; packaging 28 passed; version and locked-runtime checks passed. The artifact acceptance collector passes the complete staged app and DMG."
+      "evidence": "Local Apple Silicon run: service 280 passed (278 in the restricted suite plus both real-bookmark tests with host access); image worker 23 passed with Metal access; Swift 60 passed; packaging 31 passed; version and locked-runtime checks passed. The artifact acceptance collector passes the complete staged app and DMG."
     },
     {
       "id": "github-macos-ci",
@@ -35,13 +35,13 @@
       "id": "guided-clean-install",
       "required": true,
       "status": "pending",
-      "evidence": "Requires clean signed app installation and first-run UI."
+      "evidence": "The candidate app now records first presentation separately from completion with exact version/build and ordered timestamps, and the strict collector combines those markers with its durable-usage self-test. A stale completion preference cannot pass. The real clean signed installation, preference reset, and visible first-run UI pass remain pending."
     },
     {
       "id": "login-and-launchagent-lifecycle",
       "required": true,
       "status": "pending",
-      "evidence": "The acceptance collector can now prove an exact-label service restart or launchd KeepAlive recovery with a new PID and both HTTP planes before inference. The current candidate still requires install plus a real logout/login cycle on the target Apple Silicon Mac."
+      "evidence": "The acceptance collector proves exact-label restart/KeepAlive recovery and can now compare a private accepted pre-cycle report with the same host/build after logout/login or reboot. The latter requires a changed launchctl GUI audit-session ID and PID, healthy listeners, and fresh durable inference, so an ordinary restart cannot pass. The current candidate still requires the real target-Mac cycle."
     },
     {
       "id": "lmstudio-finder-migration",

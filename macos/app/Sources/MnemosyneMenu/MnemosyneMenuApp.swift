@@ -16,7 +16,6 @@ struct MnemosyneMenuApp: App {
 
 @MainActor
 final class MenuAppDelegate: NSObject, NSApplicationDelegate {
-    private let setupCompletionKey = "didCompleteNativeSetupV1"
     private let workstationName = WorkstationIdentity.current
     private let viewModel = MenuViewModel()
     private let registration = LaunchAgentRegistration()
@@ -27,9 +26,21 @@ final class MenuAppDelegate: NSObject, NSApplicationDelegate {
         registration: registration,
         markSetupCompleted: { [weak self] in
             guard let self else { return }
-            UserDefaults.standard.set(true, forKey: self.setupCompletionKey)
+            GuidedSetupEvidenceStore.recordCompletion(
+                version: self.productVersion,
+                build: self.productBuild
+            )
         }
     )
+    private var productVersion: String {
+        Bundle.main.object(
+            forInfoDictionaryKey: "CFBundleShortVersionString"
+        ) as? String ?? "unknown"
+    }
+    private var productBuild: String {
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion")
+            as? String ?? "unknown"
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApplication.shared.setActivationPolicy(.accessory)
@@ -87,9 +98,16 @@ final class MenuAppDelegate: NSObject, NSApplicationDelegate {
         popover.contentViewController = controller
 
         NSLog("Unified Inference menu bar status item installed for %@", workstationName)
-        if !UserDefaults.standard.bool(forKey: setupCompletionKey) {
+        if !UserDefaults.standard.bool(
+            forKey: GuidedSetupEvidenceStore.completionKey
+        ) {
             DispatchQueue.main.async { [weak self] in
-                self?.configurationWindowController.show()
+                guard let self else { return }
+                self.configurationWindowController.show()
+                GuidedSetupEvidenceStore.recordFirstPresentation(
+                    version: self.productVersion,
+                    build: self.productBuild
+                )
             }
         }
     }

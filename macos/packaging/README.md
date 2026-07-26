@@ -190,6 +190,17 @@ activation/restarted-inference/rollback/restarted-inference/corrupt-rejection
 chain and the original active version. Service-instance UUIDs prove the two
 restart boundaries without exposing a PID history or credentials. See
 [`../RELEASE.md`](../RELEASE.md) for the composed target-Mac commands.
+For a clean-install pass, `--require-guided-setup` requires candidate-scoped
+first-presentation and completion timestamps from the app preferences plus the
+same report's durable-usage self-test. The operator must reset the menu app's
+preferences domain before the first candidate launch; Application Support
+state is separate and remains intact.
+For logout/login or reboot acceptance, preserve an accepted private report
+from before the cycle and pass it to `--require-login-cycle-baseline`.
+The report must belong to the same host and candidate build; the exact
+LaunchAgent must return under a new GUI audit-session ID and PID before the
+current listeners and durable self-test pass. Ordinary restart exercises keep
+the same audit session and cannot satisfy this gate.
 
 Notarization credentials stay in the login Keychain, not the repository. Set
 up a profile once; leaving out `--password` makes `notarytool` prompt securely

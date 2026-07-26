@@ -27,6 +27,7 @@ DEFAULT_APP = Path("/Applications/Unified Inference.app")
 AGENT_LABEL = "com.mnemosyne.inference.agent"
 CONTROL_URL = "http://127.0.0.1:17321"
 PUBLIC_URL = "http://127.0.0.1:1240"
+PREFERENCES_DOMAIN = "com.mnemosyne.inference.menu"
 ENGINE_DEFAULTS = {
     "llama_cpp": True,
     "omlx": False,
@@ -455,6 +456,7 @@ def _launch_agent() -> dict[str, Any]:
     return {
         "registered": result["ok"],
         "state": state.group(1).strip() if state else None,
+        "asid": integer("asid"),
         "pid": integer("pid"),
         "runs": integer("runs"),
         "last_exit_code": integer("last exit code"),
@@ -1151,9 +1153,193 @@ def _runtime_lifecycle_summary(
     }
 
 
+def _guided_setup_preferences() -> dict[str, str | None]:
+    keys = (
+        "didCompleteNativeSetupV1",
+        "nativeSetupFirstPresentedVersionV1",
+        "nativeSetupFirstPresentedBuildV1",
+        "nativeSetupFirstPresentedAtV1",
+        "nativeSetupCompletedVersionV1",
+        "nativeSetupCompletedBuildV1",
+        "nativeSetupCompletedAtV1",
+    )
+    values: dict[str, str | None] = {}
+    for key in keys:
+        result = _run(
+            ["/usr/bin/defaults", "read", PREFERENCES_DOMAIN, key],
+            timeout=5,
+        )
+        value = result.get("diagnostic")
+        values[key] = (
+            str(value).strip() if result.get("ok") and value is not None else None
+        )
+    return values
+
+
+def _guided_setup_summary(
+    preferences: Any,
+    *,
+    expected_version: str,
+    expected_build: str | None,
+) -> dict[str, Any]:
+    values = preferences if isinstance(preferences, dict) else {}
+
+    def timestamp(key: str) -> float | None:
+        try:
+            return float(values.get(key))
+        except (TypeError, ValueError):
+            return None
+
+    first_at = timestamp("nativeSetupFirstPresentedAtV1")
+    completed_at = timestamp("nativeSetupCompletedAtV1")
+    first_build = values.get("nativeSetupFirstPresentedBuildV1")
+    completed_build = values.get("nativeSetupCompletedBuildV1")
+    checks = {
+        "first_run_setup_presented_by_candidate": (
+            values.get("nativeSetupFirstPresentedVersionV1")
+            == expected_version
+            and first_build == expected_build
+        ),
+        "setup_completed_by_candidate": (
+            str(values.get("didCompleteNativeSetupV1", "")).casefold()
+            in {"1", "true", "yes"}
+            and values.get("nativeSetupCompletedVersionV1") == expected_version
+            and completed_build == expected_build
+        ),
+        "presentation_precedes_completion": bool(
+            first_at is not None
+            and completed_at is not None
+            and first_at > 0
+            and completed_at >= first_at
+        ),
+    }
+    return {
+        "preferences_domain": PREFERENCES_DOMAIN,
+        "expected_version": expected_version,
+        "expected_build": expected_build,
+        "first_presented_version": values.get(
+            "nativeSetupFirstPresentedVersionV1"
+        ),
+        "first_presented_build": first_build,
+        "first_presented_at": first_at,
+        "completed_version": values.get("nativeSetupCompletedVersionV1"),
+        "completed_build": completed_build,
+        "completed_at": completed_at,
+        "checks": checks,
+        "accepted": bool(expected_build) and all(checks.values()),
+    }
+
+
+def _login_cycle_summary(
+    baseline_path: Path,
+    *,
+    current_agent: Any,
+    expected_version: str,
+    expected_build: str | None,
+    current_host: str,
+) -> dict[str, Any]:
+    diagnostic: str | None = None
+    payload: Any = None
+    try:
+        if baseline_path.is_symlink() or not baseline_path.is_file():
+            raise ValueError("baseline is not a regular report file")
+        baseline_stat = baseline_path.stat()
+        if baseline_stat.st_size <= 0 or baseline_stat.st_size > 10 * 1024 * 1024:
+            raise ValueError("baseline report size is invalid")
+        if baseline_stat.st_mode & 0o077:
+            raise ValueError("baseline report is not private")
+        payload = json.loads(baseline_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        diagnostic = "login-cycle baseline report is unavailable or invalid"
+
+    artifact = (
+        payload.get("artifact")
+        if isinstance(payload, dict) and isinstance(payload.get("artifact"), dict)
+        else {}
+    )
+    baseline_app = (
+        artifact.get("app")
+        if isinstance(artifact.get("app"), dict)
+        else {}
+    )
+    baseline_live = (
+        payload.get("live")
+        if isinstance(payload, dict) and isinstance(payload.get("live"), dict)
+        else {}
+    )
+    baseline_agent = (
+        baseline_live.get("launch_agent")
+        if isinstance(baseline_live.get("launch_agent"), dict)
+        else {}
+    )
+    baseline_asid = baseline_agent.get("asid")
+    current_asid = (
+        current_agent.get("asid") if isinstance(current_agent, dict) else None
+    )
+    baseline_generated_at = (
+        payload.get("generated_at") if isinstance(payload, dict) else None
+    )
+    try:
+        baseline_timestamp = (
+            datetime.fromisoformat(baseline_generated_at).timestamp()
+            if isinstance(baseline_generated_at, str)
+            else None
+        )
+    except ValueError:
+        baseline_timestamp = None
+    checks = {
+        "baseline_report_private_and_accepted": bool(
+            diagnostic is None
+            and isinstance(payload, dict)
+            and payload.get("accepted") is True
+            and baseline_live.get("accepted") is True
+        ),
+        "same_candidate_build": bool(
+            expected_build
+            and baseline_app.get("version") == expected_version
+            and baseline_app.get("build") == expected_build
+        ),
+        "same_target_host": bool(
+            isinstance(payload, dict) and payload.get("host") == current_host
+        ),
+        "baseline_predates_current_collection": bool(
+            baseline_timestamp is not None and baseline_timestamp <= time.time()
+        ),
+        "baseline_launch_agent_running": bool(
+            baseline_agent.get("registered")
+            and baseline_agent.get("state") == "running"
+            and isinstance(baseline_agent.get("pid"), int)
+            and isinstance(baseline_asid, int)
+        ),
+        "new_gui_audit_session": bool(
+            isinstance(baseline_asid, int)
+            and isinstance(current_asid, int)
+            and current_asid != baseline_asid
+        ),
+        "new_launch_agent_process": bool(
+            isinstance(baseline_agent.get("pid"), int)
+            and isinstance(current_agent, dict)
+            and current_agent.get("registered") is True
+            and isinstance(current_agent.get("pid"), int)
+            and current_agent.get("pid") != baseline_agent.get("pid")
+            and current_agent.get("state") == "running"
+        ),
+    }
+    return {
+        "baseline_path": _display_path(baseline_path),
+        "baseline_generated_at": baseline_generated_at,
+        "baseline_asid": baseline_asid,
+        "current_asid": current_asid,
+        "diagnostic": diagnostic,
+        "checks": checks,
+        "accepted": all(checks.values()),
+    }
+
+
 def collect_live(
     *,
     expected_version: str,
+    expected_build: str | None,
     control_url: str,
     public_url: str,
     admin_password: str | None,
@@ -1171,6 +1357,8 @@ def collect_live(
     require_lmstudio_adoption: str | None = None,
     require_omlx_recovery: bool = False,
     require_runtime_lifecycle: str | None = None,
+    require_guided_setup: bool = False,
+    login_cycle_baseline: Path | None = None,
 ) -> dict[str, Any]:
     control = control_url.rstrip("/")
     public = public_url.rstrip("/")
@@ -1355,6 +1543,15 @@ def collect_live(
         if require_runtime_lifecycle is not None
         else None
     )
+    guided_setup = (
+        _guided_setup_summary(
+            _guided_setup_preferences(),
+            expected_version=expected_version,
+            expected_build=expected_build,
+        )
+        if require_guided_setup
+        else None
+    )
     engine_rows = (
         readiness_payload.get("engines")
         if isinstance(readiness_payload, dict)
@@ -1381,6 +1578,17 @@ def collect_live(
         and reconcile_payload.get("state") in {"idle", "ready"}
     )
     agent = _launch_agent()
+    login_cycle = (
+        _login_cycle_summary(
+            login_cycle_baseline,
+            current_agent=agent,
+            expected_version=expected_version,
+            expected_build=expected_build,
+            current_host=socket.gethostname().split(".", 1)[0],
+        )
+        if login_cycle_baseline is not None
+        else None
+    )
     checks = {
         "launch_agent_running": agent["registered"] and agent["state"] == "running",
         "public_health_reachable": health["ok"],
@@ -1457,6 +1665,14 @@ def collect_live(
             and self_test_payload.get("engine") == require_runtime_lifecycle
             and self_test_payload.get("runtime_validation_recorded") is True
         )
+    if guided_setup is not None:
+        checks["guided_clean_install_completed"] = bool(
+            guided_setup["accepted"] and self_test_accepted
+        )
+    if login_cycle is not None:
+        checks["login_cycle_launchagent_recovery"] = bool(
+            login_cycle["accepted"] and self_test_accepted
+        )
     result = {
         "control_url": _redact_url(control),
         "public_url": _redact_url(public),
@@ -1516,6 +1732,8 @@ def collect_live(
         "download_lifecycle": download_lifecycle,
         "lmstudio_adoption": lmstudio_adoption,
         "runtime_lifecycle": runtime_lifecycle,
+        "guided_setup": guided_setup,
+        "login_cycle": login_cycle,
         "postgres_drain": postgres_drain,
         "self_test": self_test,
         "checks": checks,
@@ -1663,6 +1881,23 @@ def main() -> int:
             "rollback, second restart validation, and corrupt-update rejection"
         ),
     )
+    parser.add_argument(
+        "--require-guided-setup",
+        action="store_true",
+        help=(
+            "require this exact app version/build to have presented first-run "
+            "Setup & Health and completed it through the durable-usage self-test"
+        ),
+    )
+    parser.add_argument(
+        "--require-login-cycle-baseline",
+        type=Path,
+        metavar="REPORT",
+        help=(
+            "require a private accepted pre-logout report from this host/build "
+            "and a new GUI audit session before the current durable self-test"
+        ),
+    )
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     if args.exercise_service_restart and args.exercise_keepalive:
@@ -1682,6 +1917,8 @@ def main() -> int:
         or args.require_lmstudio_adoption
         or args.require_omlx_recovery
         or args.require_runtime_lifecycle
+        or args.require_guided_setup
+        or args.require_login_cycle_baseline
     ):
         args.require_live = True
     if args.require_live:
@@ -1748,18 +1985,26 @@ def main() -> int:
         parser.error("--self-test requires --live or --require-live")
 
     expected = VERSION_FILE.read_text(encoding="utf-8").strip()
+    app_evidence = collect_app(
+        args.app,
+        expected,
+        distribution=args.require_distribution,
+        allow_bare=args.allow_bare,
+    )
+    expected_build_value = app_evidence.get("build")
+    expected_build = (
+        expected_build_value
+        if isinstance(expected_build_value, str)
+        and expected_build_value.isdigit()
+        else None
+    )
     report: dict[str, Any] = {
         "schema_version": 1,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "host": socket.gethostname().split(".", 1)[0],
         "expected_version": expected,
         "artifact": {
-            "app": collect_app(
-                args.app,
-                expected,
-                distribution=args.require_distribution,
-                allow_bare=args.allow_bare,
-            ),
+            "app": app_evidence,
             "dmg": (
                 collect_dmg(
                     args.dmg,
@@ -1773,6 +2018,7 @@ def main() -> int:
         "live": (
             collect_live(
                 expected_version=expected,
+                expected_build=expected_build,
                 control_url=args.control_url,
                 public_url=args.public_url,
                 admin_password=os.environ.get(args.admin_password_env),
@@ -1790,6 +2036,8 @@ def main() -> int:
                 require_lmstudio_adoption=args.require_lmstudio_adoption,
                 require_omlx_recovery=args.require_omlx_recovery,
                 require_runtime_lifecycle=args.require_runtime_lifecycle,
+                require_guided_setup=args.require_guided_setup,
+                login_cycle_baseline=args.require_login_cycle_baseline,
             )
             if args.live
             else None

@@ -6,6 +6,9 @@ read-only discovery hint.
 
 - Guided Setup & Health verifies the service, engines, storage, configured
   models, vision support, inference, token accounting, and Postgres delivery.
+  Clean-install evidence is scoped to the exact app version/build and records
+  first presentation separately from completion, so an older preference bit
+  cannot clear the release gate.
 - llama.cpp and oMLX are the V1 Stable language engines. DS4 and MFLUX remain
   clearly labeled Preview while their remaining hardware acceptance checks are
   completed.
@@ -19,6 +22,8 @@ read-only discovery hint.
   restart or KeepAlive recovery and require protected-folder reactivation,
   native LM Studio-directory adoption, oMLX reconciliation, Postgres drain,
   and the complete download lifecycle without exposing credentials.
+  A private pre-logout report can also prove real login/reboot recovery through
+  a changed GUI audit-session ID; an ordinary restart cannot substitute.
 - Managed runtime activation, post-restart inference, rollback,
   post-rollback inference, and corrupt-runtime rejection now leave a bounded
   private lifecycle proof. Anonymous service-instance IDs distinguish a real

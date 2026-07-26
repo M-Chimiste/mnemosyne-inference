@@ -423,7 +423,13 @@ package under compatibility imports. The macOS package must never import
    typed settings, model-library discovery, and onboarding checks.
 9. Official-source, rollback-safe llama.cpp, MFLUX, and DS4 managed runtimes
    plus external oMLX update discovery.
-10. Native macOS smoke checklist for the remaining target-machine acceptance.
+10. Candidate-scoped first-presentation and successful-self-test markers make
+    the guided clean-install gate machine-verifiable without recording
+    credentials or model prompts. A private accepted pre-login report plus a
+    changed LaunchAgent GUI audit session and process ID proves a real
+    logout/login or reboot, rather than an ordinary service restart.
+11. Native macOS smoke checklist and secret-safe collector for the remaining
+    target-machine acceptance.
 
 ## External References
 

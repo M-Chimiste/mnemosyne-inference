@@ -126,15 +126,19 @@ GUI Finder-confirmed migration, durable oMLX login startup, and login-cycle
 validation remain in progress. The secret-redacted acceptance collector now
 has opt-in exact-label restart and KeepAlive exercises plus strict
 protected-model, oMLX recovery, LM Studio-directory adoption, Postgres drain,
-and durable download-lifecycle checks; those checks do not clear a gate until
-the candidate actually produces the required state transitions. Managed
-runtime acceptance now has the same durable treatment: the strict collector
-requires an ordered update/restart/rollback/restart/rejection chain and
-confirms the original managed version remains active.
+durable download-lifecycle, candidate-scoped guided-setup, and real
+login-session checks. Guided setup requires this exact version/build to record
+first presentation before durable self-test completion. Login recovery
+requires a private accepted same-host/build baseline and a changed GUI audit
+session plus PID; an ordinary restart cannot pass. Those checks do not clear a
+gate until the candidate actually produces the required state transitions.
+Managed runtime acceptance now has the same durable treatment: the strict
+collector requires an ordered update/restart/rollback/restart/rejection chain
+and confirms the original managed version remains active.
 The current native service suite passes all 280 tests on the development Mac,
 including the two real-bookmark tests that skip in restricted runners. The
 isolated MFLUX worker passes 23 tests with
-real Metal access, the packaging suite passes 28 tests, and all 59 current
+real Metal access, the packaging suite passes 31 tests, and all 60 current
 Swift tests pass. The full relocatable build reports version 0.9.0 and its
 embedded service passes configuration validation without adding bytecode to or
 invalidating the signed app. GitHub Actions macOS CI run
@@ -289,8 +293,8 @@ see
   Unified Inference's private `.env`, so retiring the previous token-sidecar
   LaunchAgent does not break future reporting starts.
 - The native service suite passes (`278 passed, 2 skipped` plus both skipped
-  real-bookmark tests with host access), all 59 Swift tests, all 23
-  image-worker tests, and all 28 packaging tests pass, and the Swift
+  real-bookmark tests with host access), all 60 Swift tests, all 23
+  image-worker tests, and all 31 packaging tests pass, and the Swift
   production build completes.
   A direct official-runtime LFM2.5 GGUF inference and an external oMLX LFM2 1B
   inference both produced backend token usage on Theseus. An earlier Developer

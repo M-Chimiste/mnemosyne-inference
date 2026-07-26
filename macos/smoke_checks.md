@@ -9,6 +9,18 @@ Start every candidate pass with the evidence collector. It is read-only unless
 `0600`. Credential-bearing fields and URLs are redacted; token counts remain
 visible:
 
+For the clean-install pass, quit the menu app and reset its preferences domain
+before launching the newly installed candidate:
+
+```bash
+defaults delete com.mnemosyne.inference.menu 2>/dev/null || true
+```
+
+This clears menu/login-item preferences only; it does not delete Application
+Support configuration, weights, bookmarks, usage, or the Postgres outbox.
+Launch the candidate, confirm Setup & Health appears automatically, complete
+its real model self-test, and add `--require-guided-setup` to the first report:
+
 ```bash
 python3 macos/packaging/collect_acceptance.py \
   --app "/Applications/Unified Inference.app" \
@@ -16,6 +28,7 @@ python3 macos/packaging/collect_acceptance.py \
   --live \
   --require-live \
   --self-test your-model-alias \
+  --require-guided-setup \
   --require-postgres-drain \
   --output "$HOME/Desktop/unified-inference-live-acceptance.json"
 ```
@@ -28,6 +41,9 @@ readiness, version matching, catalog, usage, or the requested durable self-test
 fails. The Postgres option also requires a new successful flush and an empty
 outbox; verify the corresponding `event_id` exists exactly once in the central
 ledger before clearing the remote-delivery gate.
+The guided-setup check rejects an older preference bit: the exact installed
+version and build must have recorded first presentation before completion, and
+the same report must pass the durable-usage self-test.
 
 After the ordinary UI pass, rerun the collector with the relevant strict
 scenario flags instead of translating screenshots into release claims:
@@ -51,6 +67,25 @@ python3 macos/packaging/collect_acceptance.py \
 Run a second pass with `--exercise-keepalive` to prove launchd restarted the
 exact registered job after SIGTERM. The report requires a different PID and
 both HTTP planes healthy before continuing to reconciliation and inference.
+To prove a real logout/login or reboot rather than another process restart,
+keep the accepted first report as the private baseline, complete the login
+cycle, and run:
+
+```bash
+python3 macos/packaging/collect_acceptance.py \
+  --app "/Applications/Unified Inference.app" \
+  --live --require-live \
+  --self-test your-model-alias \
+  --require-login-cycle-baseline \
+    "$HOME/Desktop/unified-inference-live-acceptance.json" \
+  --output "$HOME/Desktop/unified-inference-after-login.json"
+```
+
+The baseline must be mode `0600`, accepted, from the same host and exact app
+version/build. The registered LaunchAgent must return under a different GUI
+audit-session ID and PID, both HTTP planes must be healthy, and the current
+report must complete another durable self-test. An ordinary restart cannot
+satisfy the audit-session check.
 For the migrated-library pass add
 `--require-lmstudio-adoption <the-same-self-test-alias>` while LM Studio is
 stopped. For the oMLX pass select an oMLX alias and add

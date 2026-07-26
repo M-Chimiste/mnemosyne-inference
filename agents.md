@@ -86,6 +86,10 @@ upstream engines and must not fork or embed their serving implementations.
   require service-instance changes before validating both activated and
   rolled-back versions, and prove a rejected integrity/path-safety failure
   left the baseline active.
+  Login-cycle acceptance must compare a private accepted pre-cycle report
+  against the exact candidate on the same host and require a changed
+  `launchctl` GUI audit-session ID plus PID, healthy listeners, and a fresh
+  durable self-test. A kickstart or KeepAlive restart is not login evidence.
   Release verification must reject every 1.x build unless the ledger version
   matches, `release_ready` is true, and every required gate is passed; 0.x
   candidate artifacts remain prereleases.
@@ -235,7 +239,10 @@ The live `docker-compose.yml` is intentionally machine-specific and may live out
   provide recovery actions. First-run setup completes only after its self-test
   sends a real request through the public listener and verifies the matching
   durable local usage row; Postgres delivery is separately authoritative from
-  writer/outbox state.
+  writer/outbox state. Keep first-presentation and completion evidence scoped
+  to the exact app version/build, record presentation only after the
+  first-run window is shown, and never let a stale completion preference clear
+  clean-install acceptance.
 - The ordinary Mac Models page must not create profiles from raw model or
   projector text fields. New profiles come from the engine-aware Model Library
   or Finder discovery; imported engine/source/storage/served-name/projector

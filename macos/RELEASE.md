@@ -34,12 +34,18 @@ python3 macos/packaging/collect_acceptance.py \
   --live \
   --require-live \
   --self-test your-model-alias \
+  --require-guided-setup \
   --require-postgres-drain \
   --output "$HOME/Desktop/unified-inference-live-acceptance.json"
 ```
 
 The optional self-test is accepted only when inference succeeds, authoritative
 token usage is returned, and the matching durable local usage row is found.
+For the clean-install gate, `--require-guided-setup` additionally requires the
+exact app version/build to have auto-presented Setup & Health before that
+self-test completed it. Reset the app preferences domain before the candidate
+launch as documented in [smoke_checks.md](smoke_checks.md); an old completion
+bit cannot satisfy this check.
 `--require-postgres-drain` additionally waits for a successful post-test flush
 and an empty local delivery outbox; query the central ledger by the report's
 event ID to prove the remote row and uniqueness.
@@ -74,6 +80,13 @@ migration row to be consumed, and its storage/model to remain under a
 read-only LM Studio directory hint. For external oMLX, combine a restart,
 `--exercise-reconcile`, `--expected-engine omlx`, and
 `--require-omlx-recovery`.
+
+A real login/reboot pass uses the accepted mode-`0600` pre-logout report as
+`--require-login-cycle-baseline <report>`. The collector requires the same
+host and exact candidate build, then proves that the exact registered
+LaunchAgent returned with a different GUI audit-session ID and PID before both
+listeners and another durable self-test pass. A kickstart or KeepAlive restart
+within the same login session is deliberately insufficient.
 
 Managed-runtime acceptance is accumulated across the deliberate update and
 rollback passes described in [smoke_checks.md](smoke_checks.md). The service
