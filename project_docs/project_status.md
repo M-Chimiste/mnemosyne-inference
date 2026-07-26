@@ -75,7 +75,7 @@ enabled, external oMLX remains off until configured, and Preview DS4/MFLUX are
 opt-in. The
 current private DMG is a structurally verified ad-hoc artifact
 (`Unified-Inference-0.9.0-macos-arm64.dmg`, SHA-256
-`c470b069657e239e9222556581e831bb604bf203feb11b218b65b6084ce9de2b`);
+`a7de822f0a215fd0420b5ee802feef3f27bf7d4a5c98c26e58b8ca0a8af32b87`);
 its mode-`0600`, secret-redacted machine-readable acceptance report passes.
 It is not the Developer ID-notarized V1 release. The precise contract and open gates are
 [the native V1 scope](../macos/V1_SCOPE.md) and
@@ -131,8 +131,8 @@ real Metal access, the packaging suite passes 27 tests, and all 59 current
 Swift tests pass. The full relocatable build reports version 0.9.0 and its
 embedded service passes configuration validation without adding bytecode to or
 invalidating the signed app. GitHub Actions macOS CI run
-[30217055343](https://github.com/M-Chimiste/mnemosyne-inference/actions/runs/30217055343)
-passed the complete native matrix for implementation commit `b9884fc`,
+[30218077264](https://github.com/M-Chimiste/mnemosyne-inference/actions/runs/30218077264)
+passed the complete native matrix for implementation commit `0cc05e7`,
 including staged bare-app and acceptance-report verification. The DMG also
 passes image verification, read-only
 mount/layout inspection, and deep signature verification from the mounted

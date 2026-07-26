@@ -7,8 +7,8 @@
   "release_ready": false,
   "latest_local_artifact": {
     "filename": "Unified-Inference-0.9.0-macos-arm64.dmg",
-    "sha256": "c470b069657e239e9222556581e831bb604bf203feb11b218b65b6084ce9de2b",
-    "bytes": 309942603,
+    "sha256": "a7de822f0a215fd0420b5ee802feef3f27bf7d4a5c98c26e58b8ca0a8af32b87",
+    "bytes": 309975463,
     "signature": "ad-hoc",
     "notarized": false,
     "acceptance_report": "Unified-Inference-0.9.0-macos-arm64-acceptance.json",
@@ -29,7 +29,7 @@
       "id": "github-macos-ci",
       "required": true,
       "status": "passed",
-      "evidence": "GitHub Actions macOS CI run 30217055343 passed every version/lock, native service, image worker, packaging, Swift build/test, bare-app verification, acceptance-report, and artifact-upload step for implementation commit b9884fc. The signed release workflow remains gated separately on Apple and Sparkle credentials."
+      "evidence": "GitHub Actions macOS CI run 30218077264 passed every version/lock, native service, image worker, packaging, Swift build/test, bare-app verification, acceptance-report, and artifact-upload step for implementation commit 0cc05e7. The signed release workflow remains gated separately on Apple and Sparkle credentials."
     },
     {
       "id": "guided-clean-install",
@@ -95,7 +95,7 @@
       "id": "developer-id-notarized-dmg",
       "required": true,
       "status": "pending",
-      "evidence": "The 309,942,603-byte 0.9.0 arm64 ad-hoc DMG (SHA-256 c470b069657e239e9222556581e831bb604bf203feb11b218b65b6084ce9de2b) builds, mounts read-only, and passes its paired machine-readable acceptance report, but it is not a distribution artifact. The credentialed release workflow exists; Apple signing/notarization and Sparkle private-key credentials are not available in this checkout."
+      "evidence": "The 309,975,463-byte 0.9.0 build-43 arm64 ad-hoc DMG (SHA-256 a7de822f0a215fd0420b5ee802feef3f27bf7d4a5c98c26e58b8ca0a8af32b87) builds, mounts read-only, and passes its paired machine-readable acceptance report, but it is not a distribution artifact. The credentialed release workflow exists; Apple signing/notarization and Sparkle private-key credentials are not available in this checkout."
     },
     {
       "id": "signed-update-and-recovery",
