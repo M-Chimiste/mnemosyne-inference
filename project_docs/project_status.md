@@ -76,11 +76,13 @@ listener self-tests with durable usage verification, Stable/Preview engine
 tiers, Sparkle integration, and separate CI/signed-release workflows. The
 Python schema, packaged YAML, and Swift defaults now agree: llama.cpp is
 enabled, external oMLX remains off until configured, and Preview DS4/MFLUX are
-opt-in. The build-47 private DMG was rejected after installation: dyld could
-not resolve its packaged Sparkle framework because the menu executable lacked
-the `Contents/Frameworks` rpath. The builder and independent acceptance
-verifier now require that runtime link, and the previous hash must not be used
-while its corrected replacement is built. It was not the Developer
+opt-in. The build-47 private DMG was rejected after installation because dyld
+could not resolve its packaged Sparkle framework. Corrected build 50 adds the
+`Contents/Frameworks` rpath and is independently verified against the
+dependency, embedded framework, and load command
+(`Unified-Inference-0.9.0-macos-arm64.dmg`, SHA-256
+`c830fafaf08650eef055a7bdcff296481ff900ce2b329f6874c171ff884837ad`).
+The previous hash must not be used. Build 50 is still not the Developer
 ID-notarized V1 release. The precise contract and open gates are
 [the native V1 scope](../macos/V1_SCOPE.md) and
 [acceptance ledger](../macos/acceptance/v1.json).
@@ -142,8 +144,8 @@ real Metal access, the packaging suite passes 33 tests, and all 60 current
 Swift tests pass. The full relocatable build reports version 0.9.0 and its
 embedded service passes configuration validation without adding bytecode to or
 invalidating the signed app. GitHub Actions macOS CI run
-[30219810714](https://github.com/M-Chimiste/mnemosyne-inference/actions/runs/30219810714)
-passed the complete native matrix for implementation commit `306f4ed`,
+[30265133377](https://github.com/M-Chimiste/mnemosyne-inference/actions/runs/30265133377)
+passed the complete native matrix for implementation commit `8fd50e9`,
 including staged bare-app and acceptance-report verification. The DMG also
 passes image verification, read-only
 mount/layout inspection, and deep signature verification from the mounted

@@ -7,13 +7,13 @@
   "release_ready": false,
   "latest_local_artifact": {
     "filename": "Unified-Inference-0.9.0-macos-arm64.dmg",
-    "sha256": "a0c754a51efb8e67d16f5e1c335b5c4d21b777081ed17be988b5201a059a9b85",
-    "bytes": 309954038,
+    "sha256": "c830fafaf08650eef055a7bdcff296481ff900ce2b329f6874c171ff884837ad",
+    "bytes": 309978811,
     "signature": "ad-hoc",
     "notarized": false,
-    "launchable": false,
+    "launchable": true,
     "acceptance_report": "Unified-Inference-0.9.0-macos-arm64-acceptance.json",
-    "verification": "REJECTED after installation: build 47 crashes in dyld before applicationDidFinishLaunching because @rpath/Sparkle.framework had no Contents/Frameworks LC_RPATH. The earlier signature and artifact report did not test runtime dependency resolution. Do not use this artifact; a corrected replacement is pending."
+    "verification": "Build 50 from implementation commit 8fd50e9 supersedes rejected build 47. It was mounted read-only with the Applications shortcut; deep signature, embedded import/configuration, zero-bytecode, Sparkle dependency, packaged framework, and Contents/Frameworks LC_RPATH checks all pass in the mode-0600 secret-redacted acceptance report."
   },
   "tiers": {
     "stable": ["core", "llama.cpp", "omlx"],
@@ -30,7 +30,7 @@
       "id": "github-macos-ci",
       "required": true,
       "status": "passed",
-      "evidence": "GitHub Actions macOS CI run 30219810714 passed every version/lock, native service, image worker, packaging, Swift build/test, bare-app verification, acceptance-report, and artifact-upload step for implementation commit 306f4ed. The signed release workflow remains gated separately on Apple and Sparkle credentials."
+      "evidence": "GitHub Actions macOS CI run 30265133377 passed every version/lock, native service, image worker, packaging, Swift build/test, runtime-link-aware bare-app verification, acceptance-report, and artifact-upload step for implementation commit 8fd50e9. The signed release workflow remains gated separately on Apple and Sparkle credentials."
     },
     {
       "id": "guided-clean-install",
@@ -96,7 +96,7 @@
       "id": "developer-id-notarized-dmg",
       "required": true,
       "status": "pending",
-      "evidence": "Build 47 was rejected after a real installation exposed a missing Contents/Frameworks LC_RPATH for Sparkle. The builder now adds the bundle-relative rpath and release/artifact verification checks both the dependency and load command. A corrected ad-hoc DMG is pending; Apple signing/notarization and Sparkle private-key credentials remain unavailable in this checkout."
+      "evidence": "Build 47 was rejected after a real installation exposed a missing Contents/Frameworks LC_RPATH for Sparkle. The corrected 309,978,811-byte 0.9.0 build-50 arm64 ad-hoc DMG from implementation commit 8fd50e9 (SHA-256 c830fafaf08650eef055a7bdcff296481ff900ce2b329f6874c171ff884837ad) passes both independent runtime-link checks and its mounted mode-0600 acceptance report. It is not a distribution artifact; Apple signing/notarization and Sparkle private-key credentials remain unavailable in this checkout."
     },
     {
       "id": "signed-update-and-recovery",
