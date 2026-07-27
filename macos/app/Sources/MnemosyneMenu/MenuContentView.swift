@@ -14,9 +14,9 @@ struct MenuContentView: View {
         VStack(alignment: .leading, spacing: 12) {
             header
             Divider()
-            residentModel
             modelController
             usageDelivery
+            loadedModel
             Divider()
             backgroundService
             Divider()
@@ -83,23 +83,6 @@ struct MenuContentView: View {
     }
 
     @ViewBuilder
-    private var residentModel: some View {
-        if let model = viewModel.snapshot?.residentAlias
-            ?? viewModel.snapshot?.residentModel
-        {
-            LabeledContent("Resident model", value: model)
-            if let engine = viewModel.snapshot?.residentEngine {
-                LabeledContent("Engine", value: engine)
-            }
-            if let inFlight = viewModel.snapshot?.inFlightRequests {
-                LabeledContent("In flight", value: String(inFlight))
-            }
-        } else {
-            LabeledContent("Resident model", value: "None")
-        }
-    }
-
-    @ViewBuilder
     private var usageDelivery: some View {
         if let tokenSidecar = viewModel.snapshot?.tokenSidecar,
            tokenSidecar.enabled == true
@@ -108,6 +91,30 @@ struct MenuContentView: View {
                 "Usage outbox",
                 value: String(tokenSidecar.outboxDepth ?? 0)
             )
+        }
+    }
+
+    private var loadedModel: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 8) {
+                Text("Loaded model")
+                Text(loadedModelLabel)
+                    .frame(maxWidth: .infinity, alignment: .trailing)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .help(loadedModelLabel)
+                Button("Unload") {
+                    Task { await viewModel.unloadResidentModel() }
+                }
+                .disabled(!hasLoadedModel || viewModel.mutationInProgress)
+            }
+            if let inFlight = viewModel.snapshot?.inFlightRequests,
+               inFlight > 0
+            {
+                Text("\(inFlight) request\(inFlight == 1 ? "" : "s") in flight")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
         }
     }
 
@@ -176,18 +183,8 @@ struct MenuContentView: View {
 
     private var actions: some View {
         VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Button("Refresh") {
-                    Task { await viewModel.refresh() }
-                }
-                Button("Unload Model") {
-                    Task { await viewModel.unloadResidentModel() }
-                }
-                .disabled(
-                    viewModel.snapshot?.residentAlias == nil
-                        && viewModel.snapshot?.residentModel == nil
-                        || viewModel.mutationInProgress
-                )
+            Button("Refresh") {
+                Task { await viewModel.refresh() }
             }
             HStack {
                 Button("Open Logs") {
@@ -265,6 +262,25 @@ struct MenuContentView: View {
             return "usage reporting is not ready"
         }
         return nil
+    }
+
+    private var hasLoadedModel: Bool {
+        viewModel.snapshot?.residentAlias != nil
+            || viewModel.snapshot?.residentModel != nil
+    }
+
+    private var loadedModelLabel: String {
+        guard let model = viewModel.snapshot?.residentAlias
+                ?? viewModel.snapshot?.residentModel
+        else {
+            return "None"
+        }
+        guard let engine = viewModel.snapshot?.residentEngine,
+              !engine.isEmpty
+        else {
+            return model
+        }
+        return "\(model) · \(engine)"
     }
 
     private func openApplicationSupport(subdirectory: String?) {
