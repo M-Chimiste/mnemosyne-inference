@@ -138,7 +138,12 @@ def redact(value: Any, *, key: str | None = None) -> Any:
     return value
 
 
-def _run(arguments: list[str], *, timeout: float = 20) -> dict[str, Any]:
+def _run(
+    arguments: list[str],
+    *,
+    timeout: float = 20,
+    output_limit: int = 4000,
+) -> dict[str, Any]:
     try:
         completed = subprocess.run(
             arguments,
@@ -159,7 +164,7 @@ def _run(arguments: list[str], *, timeout: float = 20) -> dict[str, Any]:
     return {
         "ok": completed.returncode == 0,
         "returncode": completed.returncode,
-        "diagnostic": _redact_text(output[:4000]) if output else None,
+        "diagnostic": _redact_text(output[:output_limit]) if output else None,
     }
 
 
@@ -214,8 +219,14 @@ def _app_runtime_links(app: Path) -> dict[str, Any]:
         / "B"
         / "Sparkle"
     )
-    dependencies = _run(["/usr/bin/otool", "-L", str(executable)])
-    load_commands = _run(["/usr/bin/otool", "-l", str(executable)])
+    dependencies = _run(
+        ["/usr/bin/otool", "-L", str(executable)],
+        output_limit=256 * 1024,
+    )
+    load_commands = _run(
+        ["/usr/bin/otool", "-l", str(executable)],
+        output_limit=256 * 1024,
+    )
     checks = {
         "sparkle_binary_present": sparkle.is_file(),
         "sparkle_dependency_present": bool(

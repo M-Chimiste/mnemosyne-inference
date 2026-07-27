@@ -66,8 +66,16 @@ class AcceptanceEvidenceTests(unittest.TestCase):
                         ),
                     },
                 ],
-            ):
+            ) as run:
                 self.assertTrue(_app_runtime_links(app)["accepted"])
+                self.assertEqual(
+                    run.call_args_list[0].kwargs["output_limit"],
+                    256 * 1024,
+                )
+                self.assertEqual(
+                    run.call_args_list[1].kwargs["output_limit"],
+                    256 * 1024,
+                )
 
             sparkle.unlink()
             with patch(
