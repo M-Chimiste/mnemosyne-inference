@@ -293,6 +293,11 @@ final class LaunchAgentRegistration: ObservableObject {
         ) {
             self.managedState(service.status)
         }
+        try await ServiceRegistrationPolling.waitUntilSafeToReregister(
+            service: serviceName
+        ) {
+            self.managedState(service.status)
+        }
     }
 
     private func unregisterService(_ service: SMAppService) async throws {

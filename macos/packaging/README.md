@@ -243,12 +243,15 @@ and requires it to be code signed. On launch, the menu app fingerprints its
 installed signed bundle and refreshes already-enabled service and menu-login
 registrations only when that bundle has changed. Refresh uses
 `SMAppService`'s asynchronous unregister completion, waits for the terminal
-disabled state, then registers and waits for enabled or approval-required; it
-never immediately re-registers a still-running old helper. Pending refresh
-intent survives failure or cancellation and is retried on the next launch.
-This covers the former `Mnemosyne.app` filename migration and local
-ad-hoc-signed updates without restarting either registration on ordinary
-launches.
+disabled state, allows Background Task Management's launch-requirement
+invalidation to settle, then registers and waits for enabled or
+approval-required; it never immediately re-registers a still-running old
+helper. The settling interval works around a macOS Service Management race
+where the unregister completion can arrive before the old launch requirement
+has been invalidated. Pending refresh intent survives failure or cancellation
+and is retried on the next launch. This covers the former `Mnemosyne.app`
+filename migration and local ad-hoc-signed updates without restarting either
+registration on ordinary launches.
 
 For an ad-hoc-signed update, do not merge the staged directory over a running
 installation. In the old app, first disable the background service (and menu

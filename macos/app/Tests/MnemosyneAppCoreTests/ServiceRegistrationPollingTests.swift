@@ -58,3 +58,34 @@ func transitionTimeoutIsActionable() async {
     #expect(timeoutDescription?.contains("disabled state") == true)
     #expect(timeoutDescription?.contains("Login Items") == true)
 }
+
+@MainActor
+@Test("Re-registration settling refuses a service that became registered again")
+func reregistrationSettlingRequiresStableDisabledState() async {
+    var timeoutDescription: String?
+    do {
+        try await ServiceRegistrationPolling.waitUntilSafeToReregister(
+            service: "Background service",
+            settleDuration: .zero
+        ) {
+            .enabled
+        }
+    } catch let error as ServiceRegistrationPollingError {
+        timeoutDescription = error.localizedDescription
+    } catch {
+        timeoutDescription = error.localizedDescription
+    }
+
+    #expect(timeoutDescription?.contains("stable disabled state") == true)
+}
+
+@MainActor
+@Test("Re-registration settling accepts a service that stays disabled")
+func reregistrationSettlingAcceptsDisabledState() async throws {
+    try await ServiceRegistrationPolling.waitUntilSafeToReregister(
+        service: "Background service",
+        settleDuration: .zero
+    ) {
+        .notRegistered
+    }
+}

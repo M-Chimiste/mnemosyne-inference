@@ -28,6 +28,7 @@ public enum ServiceRegistrationPollingError: Error, Equatable, LocalizedError, S
 
 public enum ServiceRegistrationPolling {
     public typealias StateProbe = @MainActor () -> ManagedServiceRegistrationState
+    public static let reregistrationSettleDuration: Duration = .seconds(2)
 
     @MainActor
     public static func waitUntilUnregistered(
@@ -59,6 +60,33 @@ public enum ServiceRegistrationPolling {
             pollInterval: pollInterval,
             state: state
         ) { $0 == .enabled || $0 == .requiresApproval }
+    }
+
+    /// `SMAppService.unregister(completionHandler:)` can report completion
+    /// before Background Task Management has finished invalidating the old
+    /// launch requirement. Give macOS one full run-loop turn plus a bounded
+    /// settling interval before registering changed code again.
+    @MainActor
+    public static func waitUntilSafeToReregister(
+        service: String,
+        settleDuration: Duration = reregistrationSettleDuration,
+        state: @escaping StateProbe
+    ) async throws {
+        await Task.yield()
+        let clock = ContinuousClock()
+        try await clock.sleep(for: settleDuration)
+
+        let lastState = state()
+        if lastState == .notFound {
+            throw ServiceRegistrationPollingError.serviceNotFound(service: service)
+        }
+        guard lastState == .notRegistered else {
+            throw ServiceRegistrationPollingError.timedOut(
+                service: service,
+                expected: "a stable disabled state safe for re-registration",
+                lastState: lastState
+            )
+        }
     }
 
     @MainActor
