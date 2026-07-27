@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 from types import SimpleNamespace
 
@@ -9,6 +10,7 @@ from mnemosyne_macos.model_library import (
     download_size,
     gguf_files,
     image_profile_defaults,
+    model_details,
     recommended_models,
     search_models,
     validate_install_candidate,
@@ -186,6 +188,66 @@ def test_download_size_uses_exact_file_or_complete_snapshot(monkeypatch) -> None
     assert download_size("owner/repo", filename="model.gguf") == 100
 
 
+def test_model_details_combines_card_config_and_hub_metadata(monkeypatch) -> None:
+    class FakeCard(dict):
+        pass
+
+    class FakeAPI:
+        def __init__(self, token=None):
+            self.token = token
+
+        def model_info(self, repo_id, **kwargs):
+            assert repo_id == "owner/model"
+            assert kwargs["revision"] == "main"
+            assert "cardData" in kwargs["expand"]
+            assert "config" in kwargs["expand"]
+            return SimpleNamespace(
+                sha="resolved-commit",
+                tags=["gguf", "license:apache-2.0"],
+                config={
+                    "architectures": ["Qwen2ForCausalLM"],
+                    "max_position_embeddings": 131_072,
+                },
+                gguf={"total": 7_615_000_000},
+                card_data=FakeCard(license="apache-2.0"),
+                pipeline_tag="text-generation",
+                last_modified="2026-07-25T12:00:00Z",
+            )
+
+    class FakeFilesystem:
+        def __init__(self, token=None):
+            self.token = token
+
+        def open(self, path, mode):
+            assert mode == "rb"
+            assert path == "owner/model@resolved-commit/README.md"
+            return io.BytesIO(
+                b"# Model\n\nA long-context model for local inference."
+            )
+
+    monkeypatch.setattr("mnemosyne_macos.model_library.HfApi", FakeAPI)
+    monkeypatch.setattr(
+        "mnemosyne_macos.model_library.HfFileSystem",
+        FakeFilesystem,
+    )
+
+    details = model_details(
+        "owner/model",
+        engine=EngineName.OMLX,
+        revision="main",
+    )
+
+    assert details.resolved_revision == "resolved-commit"
+    assert details.architecture == "Qwen2ForCausalLM"
+    assert details.context_length == 131_072
+    assert details.parameter_count == 7_615_000_000
+    assert details.summary == "A long-context model for local inference."
+    assert details.model_card_markdown == (
+        "# Model\n\nA long-context model for local inference."
+    )
+    assert details.license == "apache-2.0"
+
+
 def test_llama_cpp_search_requires_exact_gguf_file_selection(monkeypatch) -> None:
     seen: dict = {}
 
@@ -301,6 +363,7 @@ def test_gguf_file_discovery_expands_shards_and_scopes_projectors(
     nested, sharded = candidates
     assert nested.download_files == ("nested/text-Q8_0.gguf",)
     assert nested.projector_options == ("nested/mmproj-text-f16.gguf",)
+    assert nested.projector_filename == "nested/mmproj-text-f16.gguf"
     assert nested.quantization == "Q8_0"
     assert nested.size_bytes == 300
     assert nested.resolved_revision == "resolved-commit"
@@ -310,6 +373,7 @@ def test_gguf_file_discovery_expands_shards_and_scopes_projectors(
         "vision-Q4_K_M-00002-of-00002.gguf",
     )
     assert sharded.projector_options == ("mmproj-vision-f16.gguf",)
+    assert sharded.projector_filename == "mmproj-vision-f16.gguf"
     assert sharded.quantization == "Q4_K_M"
     assert sharded.size_bytes == 210
     assert all("incomplete" not in (item.filename or "") for item in candidates)
@@ -333,6 +397,14 @@ def test_validate_llama_cpp_candidate_adds_only_the_selected_projector(
             return SimpleNamespace(sha="commit", siblings=siblings)
 
     monkeypatch.setattr("mnemosyne_macos.model_library.HfApi", FakeAPI)
+    monkeypatch.setattr(
+        "mnemosyne_macos.model_library.model_details",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            architecture="qwen2vl",
+            context_length=32_768,
+            parameter_count=7_000_000_000,
+        ),
+    )
 
     selected = validate_install_candidate(
         engine=EngineName.LLAMA_CPP,
@@ -347,6 +419,7 @@ def test_validate_llama_cpp_candidate_adds_only_the_selected_projector(
         "mmproj-vision-Q8_0.gguf",
     )
     assert selected.resolved_revision == "commit"
+    assert selected.context_length == 32_768
 
     with pytest.raises(ValueError, match="not published beside"):
         validate_install_candidate(
@@ -362,3 +435,12 @@ def test_validate_llama_cpp_candidate_adds_only_the_selected_projector(
             repo_id="owner/vision-GGUF",
             filename=None,
         )
+
+    text_only = validate_install_candidate(
+        engine=EngineName.LLAMA_CPP,
+        repo_id="owner/vision-GGUF",
+        filename="vision-Q4_K_M.gguf",
+        include_projector=False,
+    )
+    assert text_only.projector_filename is None
+    assert text_only.download_files == ("vision-Q4_K_M.gguf",)

@@ -78,6 +78,7 @@ def _migration_config(
             "engines": {
                 "lmstudio": {"enabled": True},
                 "llama_cpp": {"enabled": True},
+                "omlx": {"enabled": True},
             },
             "paths": {"state_database": str(tmp_path / "state.db")},
             "storage": {
@@ -158,7 +159,6 @@ async def test_lmstudio_to_llama_cpp_adoption_preserves_compatible_load_settings
     assert migrated.load.flash_attention is False
     assert migrated.load.offload_kv_cache_to_gpu is False
     assert migrated.load.projector_path == str(selected_projector.resolve())
-    assert migrated.load.num_experts is None
     assert migrated.load.projector_path != str(first_projector.resolve())
     assert runtime.installer.storage == load_config(config_path).storage
 
@@ -233,7 +233,11 @@ async def test_local_adoption_does_not_apply_a_pending_restart_configuration(
     assert persisted.models[0].engine == EngineName.LLAMA_CPP
     assert persisted.models[0].model == str(model.resolve())
     assert runtime.config == config
-    assert runtime.profiles["chat"].key.engine == EngineName.LMSTUDIO
+    assert runtime.profiles == {}
+    assert [
+        profile.alias
+        for profile in runtime.config.migration.legacy_lmstudio_profiles
+    ] == ["chat"]
     assert runtime.installer.storage == config.storage
 
 

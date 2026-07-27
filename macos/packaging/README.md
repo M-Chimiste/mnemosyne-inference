@@ -1,5 +1,20 @@
 # Native macOS packaging
 
+This file is for people building the application. To install an existing disk
+image and prepare all native engines, use the
+[Mac installation guide](../INSTALL.md).
+
+`macos/VERSION` is the single native product version. Run
+`python3 macos/packaging/verify_release.py` before staging; the app plist,
+service, image worker, lock files, tag, and staged bundle must agree. Local
+ad-hoc artifacts are deliberately not distribution releases. The credentialed
+CI process, signed appcast, and recovery contract are documented in
+[release and recovery](../RELEASE.md).
+When a staged app is supplied, the verifier also inspects the menu
+executable's Mach-O dependencies and `LC_RPATH`. The bundled Sparkle framework
+must exist and resolve through `@executable_path/../Frameworks`; a valid deep
+code signature is not sufficient if dyld cannot launch the app.
+
 The native deployment has a menu controller and a long-lived background
 service plus on-demand manager-owned engine processes:
 
@@ -22,11 +37,16 @@ service plus on-demand manager-owned engine processes:
   `scope_id` is persisted in YAML. The service preflights referenced grants on
   save, revalidates them and prunes unreferenced bookmarks at startup, and
   scoped helpers/model/download children reactivate a grant before `exec`.
-  Selection is explicit and initially empty. The older LM Studio
-  inventory remains only as a read-only migration/soak bridge. The control API
+  Model import is explicit, while compatible vision projectors are selected
+  automatically with manual and text-only choices. LM Studio model-folder
+  settings are read only to offer a migration shortcut; there is no LM Studio
+  engine or inventory bridge. The control API
   validates and atomically persists versioned structured configuration,
   private credentials stay write-only, and the UI distinguishes
-  hot-reloadable profile edits from restart-required changes.
+  hot-reloadable profile edits from restart-required changes. A missing oMLX
+  runtime can be delegated to Homebrew only after an explicit confirmation
+  displays the fixed official tap and stable install commands; arbitrary
+  formulas, `--HEAD`, replacement, and update commands are not accepted.
 - `Contents/MacOS/mnemosyne-service-bootstrap` is the directly embedded
   helper executable launched as a per-user LaunchAgent. This follows
   `SMAppService`'s bundle-relative `BundleProgram` layout instead of nesting a
@@ -42,7 +62,7 @@ service plus on-demand manager-owned engine processes:
   `framework-mnemosyne-image` Python export layer.
 
 The LaunchAgent owns the service lifetime, so **Quit Menu App** does not stop
-inference on port `17320`. Disabling the background service unregisters it and
+inference on port `1240`. Disabling the background service unregisters it and
 causes macOS to terminate the job. `KeepAlive=true` handles unexpected exits.
 
 ## Development
@@ -93,6 +113,7 @@ lock and relocatable Python runtime.
 Validate the lock handoff without downloading or building anything:
 
 ```bash
+python3 macos/packaging/verify_release.py
 python3 macos/packaging/build_runtime.py --check-lock
 python3 macos/packaging/build_runtime.py --print-resolved
 ```
@@ -128,10 +149,85 @@ CODESIGN_IDENTITY="Apple Development: Example Name (TEAMID)" \
 ```
 
 The script uses that identity for nested Mach-O files, the direct helper, and
-the outer app, then performs a deep strict verification. If a target Mac has no
-valid code-signing identity, its local build remains ad hoc. Rebuilding an
-ad-hoc app changes its code identity and macOS may require each protected model
-folder to be selected again.
+the outer app, applies hardened runtime and secure timestamps, then performs a
+deep strict verification. If a target Mac has no valid code-signing identity,
+its local build remains ad hoc. Rebuilding an ad-hoc app changes its code
+identity and macOS may require each protected model folder to be selected
+again.
+
+## Building a disk image
+
+After staging the app, create the installable disk image with:
+
+```bash
+CODESIGN_IDENTITY="Developer ID Application: Example Name (TEAMID)" \
+  macos/packaging/build_dmg.sh
+```
+
+The default output is
+`macos/app/build/Distribution/Unified-Inference-<version>-macos-<architecture>.dmg`.
+The disk image contains the signed app and an Applications shortcut for the
+usual drag-to-install workflow. The builder validates the source app, creates
+and optionally signs the compressed image, verifies it with `hdiutil`, mounts
+it read-only, and revalidates the app and shortcut before replacing the final
+artifact.
+
+Every build also writes a mode-`0600`, secret-redacted
+`Unified-Inference-<version>-macos-<architecture>-acceptance.json` beside the
+image. The local report proves app/runtime/default/signature and DMG integrity.
+The notarized path additionally requires Developer ID, hardened runtime,
+secure timestamp, Sparkle signing configuration, staple validation, and
+Gatekeeper acceptance. After installation, run
+`collect_acceptance.py --live --require-live --self-test <alias>` to add
+LaunchAgent, listener, readiness, catalog, usage, and durable self-test
+evidence without putting credentials on the command line. The live report also
+captures bounded configuration, storage, installed-runtime readiness, LM Studio
+directory-hint, durable download-transition evidence, and the bounded
+managed-runtime lifecycle journal. Explicit
+`--exercise-service-restart` and `--exercise-keepalive` modes operate through
+the exact registered LaunchAgent label and require a new PID plus both healthy
+HTTP planes. Strict options can require protected-model reactivation, oMLX
+reconcile/auth recovery, native LM Studio-directory adoption, and the complete
+download cancel/retry/registration-retry/dismiss/delete history.
+`--require-runtime-lifecycle <engine>` additionally requires an ordered
+activation/restarted-inference/rollback/restarted-inference/corrupt-rejection
+chain and the original active version. Service-instance UUIDs prove the two
+restart boundaries without exposing a PID history or credentials. See
+[`../RELEASE.md`](../RELEASE.md) for the composed target-Mac commands.
+For a clean-install pass, `--require-guided-setup` requires candidate-scoped
+first-presentation and completion timestamps from the app preferences plus the
+same report's durable-usage self-test. The operator must reset the menu app's
+preferences domain before the first candidate launch; Application Support
+state is separate and remains intact.
+For logout/login or reboot acceptance, preserve an accepted private report
+from before the cycle and pass it to `--require-login-cycle-baseline`.
+The report must belong to the same host and candidate build; the exact
+LaunchAgent must return under a new GUI audit-session ID and PID before the
+current listeners and durable self-test pass. Ordinary restart exercises keep
+the same audit session and cannot satisfy this gate.
+
+Notarization credentials stay in the login Keychain, not the repository. Set
+up a profile once; leaving out `--password` makes `notarytool` prompt securely
+for an Apple app-specific password:
+
+```bash
+xcrun notarytool store-credentials unified-inference-notary \
+  --apple-id "developer@example.com" \
+  --team-id "TEAMID"
+```
+
+Then notarize and staple the signed app, create the disk image, notarize and
+staple the image, and Gatekeeper-assess both mounted artifacts in one command:
+
+```bash
+CODESIGN_IDENTITY="Developer ID Application: Example Name (TEAMID)" \
+NOTARYTOOL_PROFILE="unified-inference-notary" \
+  macos/packaging/build_dmg.sh
+```
+
+An App Store Connect API-key-backed profile works as well. Use `--app`,
+`--output`, or `--volume-name` to override the artifact defaults, and
+`--notary-profile` instead of the environment variable when desired.
 
 For fast UI-only work, `build_app.sh debug --bare` omits Python. Do not enable
 its background service: the bootstrap intentionally exits with a clear error
@@ -147,12 +243,15 @@ and requires it to be code signed. On launch, the menu app fingerprints its
 installed signed bundle and refreshes already-enabled service and menu-login
 registrations only when that bundle has changed. Refresh uses
 `SMAppService`'s asynchronous unregister completion, waits for the terminal
-disabled state, then registers and waits for enabled or approval-required; it
-never immediately re-registers a still-running old helper. Pending refresh
-intent survives failure or cancellation and is retried on the next launch.
-This covers the former `Mnemosyne.app` filename migration and local
-ad-hoc-signed updates without restarting either registration on ordinary
-launches.
+disabled state, allows Background Task Management's launch-requirement
+invalidation to settle, then registers and waits for enabled or
+approval-required; it never immediately re-registers a still-running old
+helper. The settling interval works around a macOS Service Management race
+where the unregister completion can arrive before the old launch requirement
+has been invalidated. Pending refresh intent survives failure or cancellation
+and is retried on the next launch. This covers the former `Mnemosyne.app`
+filename migration and local ad-hoc-signed updates without restarting either
+registration on ordinary launches.
 
 For an ad-hoc-signed update, do not merge the staged directory over a running
 installation. In the old app, first disable the background service (and menu
@@ -171,7 +270,14 @@ Ad-hoc signing is for local development only. `CODESIGN_IDENTITY` provides
 signature stability but does not by itself implement distribution.
 Distribution still requires a Developer ID signature, hardened runtime,
 nested-code signing from the inside out, notarization, and a signed update
-mechanism.
+mechanism. The `macOS signed release` workflow enforces a GitHub-verified
+signed annotated tag, exact version agreement, the complete native suites,
+inside-out signing, notarization/stapling, Gatekeeper assessment, and an
+EdDSA-signed Sparkle appcast. It retains three feed versions; complete
+notarized DMGs remain immutable GitHub release assets for manual rollback.
+Version 0.x builds are GitHub prereleases. A 1.x build additionally fails
+closed unless every required gate in `macos/acceptance/v1.json` is passed and
+the ledger declares the release ready.
 
 ## Bundle layout
 
@@ -195,9 +301,10 @@ private permissions, and exports `MNEMOSYNE_MACOS_CONFIG_PATH` and
 `MNEMOSYNE_MACOS_ENV_PATH` for the service.
 
 The examples are copied only when the user files are absent. Upgrading an
-existing installation therefore preserves its aliases, storage roots, secrets,
-and temporary LM Studio migration setting. Fresh examples disable LM Studio
-and enable manager-owned llama.cpp. Runtime downloads live separately under
+existing installation therefore preserves its aliases, storage roots, and
+secrets. Schema-version migration converts old LM Studio profiles into inert
+alias/load-setting records for later Finder import and removes the engine
+configuration. Fresh examples enable manager-owned llama.cpp. Runtime downloads live separately under
 `~/Library/Application Support/Mnemosyne/runtimes/`; installing or replacing
 the app neither deletes them nor touches model libraries on internal or
 external drives.
@@ -245,8 +352,11 @@ separately published Unified Inference artifact. The running service checks
 the official `ggml-org/llama.cpp` releases, MFLUX PyPI project, and
 `antirez/ds4` GitHub repository directly; it never relies on a
 repository-owned dependency manifest. oMLX remains externally installed, so
-the app reports its version and official update link without replacing an app
-bundle or Homebrew files.
+the app selects the official DMG matching the host macOS version, reports the
+detected app/CLI/server version, and opens the official install or update path
+without replacing an app bundle or Homebrew files. The menu app may delegate
+an initial missing-runtime installation to the user's Homebrew after explicit
+approval; Homebrew retains ownership and later updates stay external.
 
 For llama.cpp, the service selects the official macOS arm64 archive and checks
 its upstream asset name, URL, published size and SHA-256, safe extraction,

@@ -1,11 +1,11 @@
 # Mnemosyne native macOS configuration.
 # Copy to ~/Library/Application Support/Mnemosyne/config.yaml.
 
-schema_version: 1
+schema_version: 2
 
 server:
   inference_bind: 127.0.0.1
-  inference_port: 17320
+  inference_port: 1240
   control_bind: 127.0.0.1
   control_port: 17321
   idle_unload_seconds: 900
@@ -20,15 +20,6 @@ server:
   control_password_env: ADMIN_PASSWORD
 
 engines:
-  # Legacy migration/soak fallback only. Fresh installs leave this disabled;
-  # an existing installation may temporarily enable it until its aliases have
-  # been adopted and validated through Models > Add Existing Models.
-  lmstudio:
-    enabled: false
-    base_url: http://127.0.0.1:1234
-    api_key_env: LMSTUDIO_API_KEY
-    request_timeout_seconds: 30
-
   # Unified Inference downloads an official Apple Silicon llama.cpp release,
   # verifies GitHub's published size and SHA-256, and owns one llama-server
   # process at a time. The managed active runtime overrides binary/working_directory.
@@ -42,11 +33,12 @@ engines:
     request_timeout_seconds: 30
     shutdown_grace_seconds: 30
 
-  # Install and run oMLX natively. Keep its port loopback-only. For strict
-  # lifecycle control, disable oMLX model pinning/TTL and either disable its
-  # inner admin auth or provide a working admin session via OMLX_ADMIN_SESSION.
+  # Optional externally owned service. Enable this only after oMLX is installed
+  # and listening on the configured loopback port. For strict lifecycle
+  # control, disable oMLX model pinning/TTL and either disable its inner admin
+  # auth or provide a working admin session via OMLX_ADMIN_SESSION.
   omlx:
-    enabled: true
+    enabled: false
     base_url: http://127.0.0.1:17322
     api_key_env: OMLX_API_KEY
     admin_session_env: OMLX_ADMIN_SESSION
@@ -54,10 +46,11 @@ engines:
     # Finder-selected MLX library roots are added here by the import flow.
     model_directories: []
 
-  # DS4 is launched and terminated by Mnemosyne. It is not a general GGUF
-  # runtime; use only GGUFs supported by the installed DwarfStar build.
+  # Preview: DS4 is launched and terminated by Mnemosyne. It is not a general
+  # GGUF runtime; opt in only after installing it and selecting supported
+  # weights.
   ds4:
-    enabled: true
+    enabled: false
     host: 127.0.0.1
     port: 17323
     binary: /Applications/DwarfStar/ds4-server
@@ -68,10 +61,10 @@ engines:
     request_timeout_seconds: 30
     shutdown_grace_seconds: 30
 
-  # MFLUX runs in a separately locked, process-isolated worker bundled with
-  # the menu app. The main service owns the worker and port 17324.
+  # Preview: MFLUX runs in a separately locked, process-isolated worker bundled
+  # with the menu app. Opt in when local image generation is wanted.
   mflux:
-    enabled: true
+    enabled: false
     host: 127.0.0.1
     port: 17324
     request_timeout_seconds: 30
@@ -94,66 +87,21 @@ storage:
     #   path: /Volumes/Athena/models
     #   volume_uuid: 00000000-0000-0000-0000-000000000000
 
-models:
-  - alias: local-qwen-gguf
-    engine: llama.cpp
-    model: ~/Library/Application Support/Mnemosyne/models/llama.cpp/publisher/model/model-Q4_K_M.gguf
-    storage: internal
-    served_model_name: local-qwen-gguf
-    load:
-      context_length: 32768
-      # Vision GGUFs select an exact, compatible projector in the GUI.
-      # projector_path: ~/Library/Application Support/Mnemosyne/models/llama.cpp/publisher/model/mmproj-BF16.gguf
-      # gpu_layers: 999
-      # ubatch_size: 512
-      # threads: 12
-      # parallel: 2
-      extra_args: []
+# Profiles are created through Model Library or Finder discovery. Fresh
+# installs intentionally contain no placeholder model files, guessed external
+# volumes, or assumed cache locations; the exact user-selected destinations
+# are preserved when a model is installed or imported.
+models: []
 
-  - alias: glm-5-2
-    engine: omlx
-    model: GLM-5.2-4bit
-    storage: internal
+# Version-1 LM Studio profiles are moved here automatically as inert alias and
+# tuning records. Add Existing Models consumes matching records when the
+# corresponding on-disk GGUF/MLX model is adopted; nothing here can load a
+# model or contact LM Studio.
+migration:
+  legacy_lmstudio_profiles: []
 
-  - alias: deepseek-v4-flash
-    engine: ds4
-    model: /Volumes/Models/ds4flash.gguf
-    served_model_name: deepseek-v4-flash
-    load:
-      context_length: 100000
-      kv_disk_directory: /Volumes/ModelCache/ds4-kv
-      kv_disk_space_mb: 8192
-      extra_args: []
-
-  - alias: qwen-image
-    engine: mflux
-    model: Qwen/Qwen-Image
-    kind: image
-    image:
-      family: qwen-image
-      quantize: 8
-      width: 1024
-      height: 1024
-      num_inference_steps: 30
-      guidance_scale: 4.0
-
-  # The Settings Model Library also creates profiles for the other exact
-  # text-to-image configurations bundled with MFLUX (FLUX.1, FLUX.2 Klein,
-  # FIBO, Z-Image, ERNIE Image, and Ideogram 4) with model-specific defaults.
-  - alias: krea-2-turbo
-    engine: mflux
-    model: krea/Krea-2-Turbo
-    kind: image
-    image:
-      family: krea-2
-      quantize: 8
-      width: 1024
-      height: 1024
-      num_inference_steps: 8
-      guidance_scale: 1.0
-
-# The DSN is secret and belongs in the environment file as
-# TOKEN_SIDECAR_POSTGRES_DSN=postgresql://...
+# The DSN is secret. Set it through Settings > Usage > Postgres connection;
+# the app stores TOKEN_SIDECAR_POSTGRES_DSN only in the private environment file.
 token_sidecar:
   enabled: true
   # Empty migrates node.id from the previous sidecar's active LaunchAgent

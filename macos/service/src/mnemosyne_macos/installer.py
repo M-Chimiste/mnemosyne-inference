@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import signal
 import sys
+import time
 from typing import Awaitable, Callable
 
 from .config import StorageConfig, StorageLocationConfig
@@ -60,6 +61,7 @@ class NativeInstaller:
         revision: str | None,
         filename: str | None,
         projector_filename: str | None = None,
+        context_length: int | None = None,
         download_files: list[str] | tuple[str, ...] = (),
         capabilities: list[str] | tuple[str, ...] | None = None,
         family: str | None,
@@ -75,6 +77,7 @@ class NativeInstaller:
             revision=revision,
             filename=filename,
             projector_filename=projector_filename,
+            context_length=context_length,
             download_files=download_files,
             capabilities=capabilities,
             family=family,
@@ -102,6 +105,7 @@ class NativeInstaller:
             status=next_status,
             error=None,
             pid=None,
+            download_speed_bps=None,
         )
         self._schedule(install_id)
         return record
@@ -122,6 +126,18 @@ class NativeInstaller:
 
     async def list(self, *, limit: int = 100) -> list[InstallRecord]:
         return await asyncio.to_thread(self.store.list, limit=limit)
+
+    async def evidence(self, *, limit: int = 100) -> list[dict[str, object]]:
+        return await asyncio.to_thread(self.store.evidence, limit=limit)
+
+    async def dismiss(self, install_id: str) -> InstallRecord:
+        record = await asyncio.to_thread(self.store.get, install_id)
+        if record.status in {"queued", "downloading", "registering"}:
+            raise ValueError("an active install cannot be removed from history")
+        return await asyncio.to_thread(self.store.dismiss, install_id)
+
+    async def latest_for_alias(self, alias: str) -> InstallRecord | None:
+        return await asyncio.to_thread(self.store.latest_for_alias, alias)
 
     def _schedule(self, install_id: str) -> None:
         if install_id in self._tasks and not self._tasks[install_id].done():
@@ -196,16 +212,34 @@ class NativeInstaller:
                     status="downloading",
                     pid=process.pid,
                     error=None,
+                    download_speed_bps=None,
                 )
                 communicate = asyncio.create_task(process.communicate())
+                previous_downloaded = record.bytes_downloaded
+                previous_sample_at = time.monotonic()
+                smoothed_speed: float | None = None
                 while not communicate.done():
                     await asyncio.sleep(1)
                     downloaded = await self._downloaded_size(record, location)
+                    sampled_at = time.monotonic()
+                    elapsed = max(0.001, sampled_at - previous_sample_at)
+                    instantaneous_speed = max(
+                        0.0,
+                        float(downloaded - previous_downloaded) / elapsed,
+                    )
+                    smoothed_speed = (
+                        instantaneous_speed
+                        if smoothed_speed is None
+                        else (smoothed_speed * 0.65) + (instantaneous_speed * 0.35)
+                    )
                     await asyncio.to_thread(
                         self.store.update,
                         install_id,
                         bytes_downloaded=downloaded,
+                        download_speed_bps=smoothed_speed,
                     )
+                    previous_downloaded = downloaded
+                    previous_sample_at = sampled_at
                 stdout, stderr = await communicate
                 downloaded = await self._downloaded_size(record, location)
                 if process.returncode != 0:
@@ -218,6 +252,7 @@ class NativeInstaller:
                     bytes_downloaded=downloaded,
                     pid=None,
                     error=None,
+                    download_speed_bps=None,
                 )
                 await self._register_downloaded(record)
         except asyncio.CancelledError:
@@ -242,6 +277,7 @@ class NativeInstaller:
                 bytes_downloaded=downloaded,
                 pid=None,
                 error=error,
+                download_speed_bps=None,
             )
             raise
         except Exception as exc:
@@ -258,6 +294,7 @@ class NativeInstaller:
                 bytes_downloaded=downloaded,
                 pid=None,
                 error=str(exc),
+                download_speed_bps=None,
             )
         finally:
             self._processes.pop(install_id, None)
@@ -274,6 +311,7 @@ class NativeInstaller:
                     record.id,
                     status="downloaded",
                     pid=None,
+                    download_speed_bps=None,
                     error=f"download completed but profile registration failed: {exc}",
                 )
                 return
@@ -283,6 +321,7 @@ class NativeInstaller:
             status="installed",
             pid=None,
             error=None,
+            download_speed_bps=None,
         )
 
     def _storage_location(self, record: InstallRecord) -> StorageLocationConfig | None:

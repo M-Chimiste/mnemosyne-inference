@@ -173,10 +173,27 @@ async def test_filesystem_probe_ensures_directory_and_measures_size(
     assert destination.is_dir()
     assert size == len(b"weights") + len(b"{}")
 
+    deleted = await probe.delete_directory(
+        root=str(root),
+        path=str(destination),
+        expected_volume_uuid=None,
+        scope_id=None,
+    )
+
+    assert deleted is True
+    assert not destination.exists()
+    assert root.is_dir()
+
 
 @pytest.mark.parametrize(
     "operation",
-    ["validate-model", "validate-projector", "ensure-directory", "directory-size"],
+    [
+        "validate-model",
+        "validate-projector",
+        "ensure-directory",
+        "directory-size",
+        "delete-directory",
+    ],
 )
 @pytest.mark.asyncio
 async def test_filesystem_probe_rejects_paths_outside_selected_root(
@@ -217,10 +234,17 @@ async def test_filesystem_probe_rejects_paths_outside_selected_root(
             expected_volume_uuid=None,
             scope_id=None,
         )
-    else:
+    elif operation == "directory-size":
         request = probe.directory_size(
             root=str(root),
             path=str(outside),
+            scope_id=None,
+        )
+    else:
+        request = probe.delete_directory(
+            root=str(root),
+            path=str(outside),
+            expected_volume_uuid=None,
             scope_id=None,
         )
 
@@ -230,6 +254,42 @@ async def test_filesystem_probe_rejects_paths_outside_selected_root(
     ):
         await request
     assert not (outside / "new-model").exists()
+
+
+@pytest.mark.asyncio
+async def test_filesystem_probe_refuses_storage_root_and_symlink_deletion(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "Models"
+    root.mkdir()
+    destination = root / "managed"
+    destination.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    link = root / "linked"
+    link.symlink_to(outside, target_is_directory=True)
+    probe = FilesystemProbe(
+        scope_root=tmp_path / "state" / "security-scopes",
+        timeout_seconds=5,
+    )
+
+    with pytest.raises(FilesystemProbeError, match="storage root"):
+        await probe.delete_directory(
+            root=str(root),
+            path=str(root),
+            expected_volume_uuid=None,
+            scope_id=None,
+        )
+    with pytest.raises(FilesystemProbeError, match="symlink"):
+        await probe.delete_directory(
+            root=str(root),
+            path=str(link),
+            expected_volume_uuid=None,
+            scope_id=None,
+        )
+
+    assert root.is_dir()
+    assert outside.is_dir()
 
 
 def _process_is_running(pid: int) -> bool:

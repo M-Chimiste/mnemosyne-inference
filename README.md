@@ -2,7 +2,7 @@
 
 ## What this is
 
-Mnemosyne Inference gives a single workstation Ollama/LMStudio-style ergonomics
+Mnemosyne Inference gives a single workstation local-model-manager experience
 on top of upstream inference engines. The repository now contains two sibling
 deployments with independent dependencies and packaging:
 
@@ -12,7 +12,8 @@ deployments with independent dependencies and packaging:
   GGUF models, coordinates oMLX for MLX models and DwarfStar (DS4) for its
   specialized DeepSeek weights, and runs MFLUX in an isolated worker. It does
   not use Docker, so MLX and Metal remain available to the host processes.
-  Start with [macos/README.md](macos/README.md).
+  Start with the [Mac installation guide](macos/INSTALL.md), then use
+  [macos/README.md](macos/README.md) as the operator and developer reference.
 
 The remainder of this README describes the CUDA deployment unless a section is
 explicitly labeled macOS.
@@ -22,12 +23,17 @@ explicitly labeled macOS.
 | Deployment | Runtime and engines | Status |
 | --- | --- | --- |
 | CUDA/Linux | Docker, vLLM, llama.cpp, SGLang Diffusion | Feature-complete implementation and automated coverage; current engine pins and cross-backend swaps still need a CUDA-workstation release smoke. |
-| Apple Silicon | Managed llama.cpp, external oMLX, optional DS4, isolated MFLUX worker | Official llama.cpp arm64 download/integrity checks plus real GGUF and oMLX/MLX generations with token accounting have passed on Theseus. GUI migration, packaged-service soak, durable external-oMLX startup, and DS4 acceptance remain in progress; LM Studio is retained only as an explicitly enabled migration fallback until that soak is accepted. |
+| Apple Silicon | Managed llama.cpp, external oMLX, Preview DS4, Preview MFLUX worker | The 0.9 release candidate has complete automated native coverage and a verified private DMG. llama.cpp and oMLX are the Stable V1 engines; DS4 and MFLUX remain Preview. LM Studio engine support has been removed, while its model directory remains a Finder-confirmed migration hint. The signed/notarized release and target-Mac acceptance ledger are still open, so this is not yet V1. |
 
 Both deployments expose one stable API, keep at most one model resident, and
 use the same `/v1/images/generations` contract. Language-model usage can be
 written to SQLite and optionally forwarded through the durable Postgres
 outbox. Image requests are deliberately excluded from token accounting.
+
+The native [V1 scope](macos/V1_SCOPE.md), machine-readable
+[acceptance ledger](macos/acceptance/v1.json), and
+[release/recovery guide](macos/RELEASE.md) are the source of truth for what is
+Stable, Preview, passed, and still gated.
 
 The container runs **two HTTP planes** in one process:
 
@@ -58,14 +64,14 @@ checks live in [project_docs/smoke_checks.md](project_docs/smoke_checks.md).
 
 ## Native macOS deployment
 
-The native service listens on `127.0.0.1:17320` for inference and
+The native service listens on `127.0.0.1:1240` for inference and
 `127.0.0.1:17321` for control. It is the workstation's token sidecar and
 enforces one resident model globally across a manager-owned llama.cpp process
 (`:17325`), oMLX (`:17322`), a manager-owned DS4 process (`:17323`), and the
-MFLUX image worker (`:17324`). LM Studio (`:1234`) is disabled on fresh
-configurations and remains available only as an explicit migration/soak
-fallback. After the service is enabled from the menu app, a per-user
-LaunchAgent keeps inference alive when the controller quits.
+MFLUX image worker (`:17324`). LM Studio is not an engine and is never
+contacted; only its configured or conventional model directory is offered as a
+read-only migration hint. After the service is enabled from the menu app, a
+per-user LaunchAgent keeps inference alive when the controller quits.
 
 `Unified Inference.app` is a menu-bar-only controller: it intentionally has no Dock
 icon or ordinary window. Launching it creates a brain-profile status icon on
@@ -96,10 +102,12 @@ the upstream command, so a background LaunchAgent can continue to use an
 approved protected or removable folder after the menu app exits.
 The Models page uses a Finder directory picker to scan an existing library in
 place. It groups GGUF shard sets, excludes projector files as primary models,
-offers explicit multimodal-projector pairing, recognizes MLX folders, and
-migrates matching aliases without copying or loading any weights. The Model
-Library provides an explicit GGUF quant/file picker before a Hugging Face
-download begins.
+automatically selects the highest-fidelity nearby vision projector with a
+text-only opt-out, recognizes MLX folders, and migrates matching aliases
+without copying or loading any weights. The Model Library shows model-card
+prose and detected architecture, context length, parameter count, and license,
+then provides an explicit GGUF quant/file picker before a Hugging Face download
+begins.
 Bookmark registration/preflight, filesystem inspection, model-path resolution,
 directory creation/measurement, and GGUF/projector validation run in killable
 subprocess groups off the asyncio event loop behind bounded deadlines. A
@@ -153,31 +161,46 @@ open "/Applications/Unified Inference.app"
 ```
 
 `build_app.sh` uses ad-hoc signing by default. Set `CODESIGN_IDENTITY` to a
-valid identity in the login keychain for a stable local signature. Theseus
-currently has no valid code-signing identity, so its local build is ad hoc and
-a rebuild may require reselecting protected model folders in Settings.
+valid identity in the login keychain for a stable local signature. A
+non-ad-hoc build uses hardened runtime and secure timestamps. Create a
+drag-to-install disk image with `macos/packaging/build_dmg.sh`; it can also
+submit and staple the image when `NOTARYTOOL_PROFILE` names credentials saved
+by `xcrun notarytool store-credentials`. See the packaging guide for the exact
+release commands.
 
-Click the brain-profile menu-bar icon and choose **Enable Service**. Approve
-the background item in System Settings if macOS asks, then verify:
+Click the brain-profile menu-bar icon and open **Settings → Setup & Health**.
+Enable the background service there, approve the background item in System
+Settings if macOS asks, and follow the engine, storage, model, and reporting
+diagnostics. The setup is considered complete only after **Run Self-Test**
+sends a real request through `:1240` and verifies the corresponding durable
+usage row. The same endpoints remain useful for command-line diagnostics:
 
 ```bash
-curl http://127.0.0.1:17320/health
-curl http://127.0.0.1:17320/v1/models
+curl http://127.0.0.1:1240/health
+curl http://127.0.0.1:1240/v1/models
 curl http://127.0.0.1:17321/manager/status
 ```
 
 The Model Library page can search engine-compatible Hugging Face models and
 download them into a GUI-selected internal or external folder before first
 use. Downloads are process-isolated, resumable, cancellable, and do not load
-the model. The app contains the runtime and worker code, not model weights.
+the model. The app contains Unified Inference's core and isolated MFLUX worker;
+oMLX remains separately installed through its official app or Homebrew, and
+model weights are never embedded.
 See [macos/README.md](macos/README.md) for engine preparation, storage,
 configuration, development mode, and signing details.
+
+For installation from the disk image—including the recommended official oMLX
+app with precompiled custom kernels and the in-app llama.cpp, DS4, and MFLUX
+installation paths—follow [macos/INSTALL.md](macos/INSTALL.md). A stable
+headless Homebrew oMLX path remains available.
 
 The Runtime Updates page compares llama.cpp, oMLX, MFLUX, and DS4 with their
 official upstream projects. Unified Inference downloads the official
 `ggml-org/llama.cpp` Apple Silicon archive, verifies the asset size and
 GitHub-published SHA-256, and validates the server contract before activation.
-oMLX remains externally owned and opens its official update path. MFLUX comes
+oMLX remains externally owned; the page selects its matching official DMG and
+opens its official update path. MFLUX comes
 from its official PyPI project; DS4 is downloaded at an exact commit from
 `antirez/ds4` and built locally with the Apple toolchain. Managed updates are
 staged without replacing `Unified Inference.app`. Activation drains requests
@@ -287,7 +310,7 @@ curl -sX POST http://localhost:8000/v1/images/generations \
   }' | jq -r '.data[0].b64_json' | base64 --decode > image.png
 ```
 
-On macOS, use `http://127.0.0.1:17320` and a configured MFLUX alias such as
+On macOS, use `http://127.0.0.1:1240` and a configured MFLUX alias such as
 `krea-2-turbo`. The private worker on `:17324` is manager-owned and must not be
 called directly.
 
@@ -314,7 +337,7 @@ Example llama.cpp chat request with thinking disabled and schema output:
 
 ```json
 {
-  "model": "local-gguf",
+  "model": "local-model",
   "messages": [{"role": "user", "content": "Return a user profile"}],
   "temperature": 0.1,
   "chat_template_kwargs": {"enable_thinking": false},
@@ -700,8 +723,8 @@ for features that are not implemented.
   official managed llama.cpp arm64 runtime has also generated successfully
   from an existing GGUF on Theseus, and an external oMLX 0.5.3 service
   generated from an MLX model with usage delivery. The packaged Finder
-  migration, LM-Studio-disabled soak, durable external-oMLX login startup, and
-  real DS4 target acceptance remain in progress.
+  migration, durable external-oMLX login startup, and real DS4 target
+  acceptance remain in progress.
 - **No runtime hard-fail when `gpus='all'` finds no GPUs.** The manager logs
   a warning and falls back to `VLLM_DEFAULT_TP`. On a real CUDA host this
   only happens if the nvidia-container-toolkit is misconfigured — fix the
@@ -715,3 +738,7 @@ for features that are not implemented.
   container and CUDA-host release checks.
 - [project_docs/project_status.md](project_docs/project_status.md) — current
   release status, feature history, and outstanding workstation validation.
+- [macos/V1_SCOPE.md](macos/V1_SCOPE.md) — Stable/Preview native V1 contract
+  and release gates.
+- [macos/RELEASE.md](macos/RELEASE.md) — native versioning, signed release,
+  updates, and rollback.

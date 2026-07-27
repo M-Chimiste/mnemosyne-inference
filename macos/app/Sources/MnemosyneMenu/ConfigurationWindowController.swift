@@ -4,11 +4,16 @@ import SwiftUI
 @MainActor
 final class ConfigurationWindowController: NSObject, NSWindowDelegate {
     private let registration: LaunchAgentRegistration
+    private let markSetupCompleted: () -> Void
     private let viewModel = SettingsViewModel()
     private var window: NSWindow?
 
-    init(registration: LaunchAgentRegistration) {
+    init(
+        registration: LaunchAgentRegistration,
+        markSetupCompleted: @escaping () -> Void = {}
+    ) {
         self.registration = registration
+        self.markSetupCompleted = markSetupCompleted
         super.init()
     }
 
@@ -40,6 +45,8 @@ final class ConfigurationWindowController: NSObject, NSWindowDelegate {
     private func makeWindow() -> NSWindow {
         let content = SettingsView(
             viewModel: viewModel,
+            registration: registration,
+            markSetupCompleted: markSetupCompleted,
             restartService: { [weak self] in
                 guard let self else { return }
                 guard self.viewModel.serviceRestartStarted() else { return }

@@ -1,0 +1,190 @@
+name: macOS signed release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing vMAJOR.MINOR.PATCH tag to release
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: macos-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: macos-15
+    timeout-minutes: 180
+    env:
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+      CODESIGN_IDENTITY: ${{ secrets.MACOS_DEVELOPER_ID_IDENTITY }}
+      SPARKLE_PUBLIC_ED_KEY: ${{ secrets.SPARKLE_PUBLIC_ED_KEY }}
+      NOTARYTOOL_PROFILE: unified-inference-ci
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          fetch-depth: 0
+
+      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b
+        with:
+          version: "0.8.17"
+          enable-cache: true
+          cache-dependency-glob: |
+            macos/service/uv.lock
+            macos/image-worker/uv.lock
+
+      - name: Verify tag and release inputs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CERTIFICATE_P12: ${{ secrets.MACOS_DEVELOPER_ID_P12 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.MACOS_DEVELOPER_ID_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.MACOS_CI_KEYCHAIN_PASSWORD }}
+          NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+          NOTARY_PRIVATE_KEY: ${{ secrets.APPLE_NOTARY_PRIVATE_KEY }}
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_ED_KEY }}
+        run: |
+          test -n "$CERTIFICATE_P12"
+          test -n "$CERTIFICATE_PASSWORD"
+          test -n "$KEYCHAIN_PASSWORD"
+          test -n "$CODESIGN_IDENTITY"
+          test -n "$NOTARY_KEY_ID"
+          test -n "$NOTARY_ISSUER_ID"
+          test -n "$NOTARY_PRIVATE_KEY"
+          test -n "$SPARKLE_PUBLIC_ED_KEY"
+          test -n "$SPARKLE_PRIVATE_KEY"
+          python3 macos/packaging/verify_release.py --tag "$RELEASE_TAG"
+          TAG_OBJECT="$(
+            gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}" \
+              --jq '.object.type + ":" + .object.sha'
+          )"
+          test "${TAG_OBJECT%%:*}" = "tag"
+          TAG_SHA="${TAG_OBJECT#*:}"
+          test "$(
+            gh api "repos/${GITHUB_REPOSITORY}/git/tags/${TAG_SHA}" \
+              --jq '.verification.verified'
+          )" = "true"
+
+      - name: Import Developer ID certificate
+        env:
+          CERTIFICATE_P12: ${{ secrets.MACOS_DEVELOPER_ID_P12 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.MACOS_DEVELOPER_ID_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.MACOS_CI_KEYCHAIN_PASSWORD }}
+        run: |
+          CERTIFICATE_PATH="$RUNNER_TEMP/developer-id.p12"
+          KEYCHAIN_PATH="$RUNNER_TEMP/unified-inference.keychain-db"
+          printf '%s' "$CERTIFICATE_P12" | base64 --decode > "$CERTIFICATE_PATH"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERTIFICATE_PATH" \
+            -P "$CERTIFICATE_PASSWORD" \
+            -A \
+            -t cert \
+            -f pkcs12 \
+            -k "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH"
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s \
+            -k "$KEYCHAIN_PASSWORD" \
+            "$KEYCHAIN_PATH"
+          security find-identity -v -p codesigning "$KEYCHAIN_PATH"
+
+      - name: Configure Apple notarization
+        env:
+          NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+          NOTARY_PRIVATE_KEY: ${{ secrets.APPLE_NOTARY_PRIVATE_KEY }}
+        run: |
+          NOTARY_KEY_PATH="$RUNNER_TEMP/AuthKey_${NOTARY_KEY_ID}.p8"
+          printf '%s' "$NOTARY_PRIVATE_KEY" > "$NOTARY_KEY_PATH"
+          xcrun notarytool store-credentials "$NOTARYTOOL_PROFILE" \
+            --key "$NOTARY_KEY_PATH" \
+            --key-id "$NOTARY_KEY_ID" \
+            --issuer "$NOTARY_ISSUER_ID"
+
+      - name: Run release test gates
+        run: |
+          uv run --project macos/service --extra dev python -m pytest -q macos/service/tests
+          uv run --project macos/image-worker --extra dev python -m pytest -q macos/image-worker/tests
+          python3 -m unittest discover -s macos/packaging/tests -v
+          cd macos/app
+          swift package resolve
+          swift test
+
+      - name: Build relocatable runtime and signed app
+        env:
+          MNEMOSYNE_BUILD_NUMBER: ${{ github.run_number }}
+        run: |
+          python3 macos/packaging/build_runtime.py
+          macos/packaging/build_app.sh release
+
+      - name: Build, notarize, staple, and verify DMG
+        run: macos/packaging/build_dmg.sh
+
+      - name: Generate signed Sparkle appcast and checksums
+        env:
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_ED_KEY }}
+        run: |
+          VERSION="$(tr -d '[:space:]' < macos/VERSION)"
+          DIST="macos/app/build/Distribution"
+          DMG="$DIST/Unified-Inference-${VERSION}-macos-arm64.dmg"
+          ACCEPTANCE="$DIST/Unified-Inference-${VERSION}-macos-arm64-acceptance.json"
+          APPCAST_TOOL="$(find macos/app/.build/artifacts -type f -path '*/bin/generate_appcast' -perm -111 -print -quit)"
+          test -x "$APPCAST_TOOL"
+          curl -fL \
+            -o "$DIST/appcast.xml" \
+            "https://github.com/M-Chimiste/mnemosyne-inference/releases/latest/download/appcast.xml" \
+            || true
+          cp macos/RELEASE_NOTES.md "${DMG%.dmg}.md"
+          printf '%s' "$SPARKLE_PRIVATE_KEY" | "$APPCAST_TOOL" \
+            --ed-key-file - \
+            --maximum-versions 3 \
+            --maximum-deltas 0 \
+            --embed-release-notes \
+            --download-url-prefix "https://github.com/M-Chimiste/mnemosyne-inference/releases/download/${RELEASE_TAG}/" \
+            --link "https://github.com/M-Chimiste/mnemosyne-inference" \
+            "$DIST"
+          shasum -a 256 "$DMG" "$DIST/appcast.xml" "$ACCEPTANCE" > "$DIST/SHA256SUMS"
+          grep -q 'sparkle:edSignature=' "$DIST/appcast.xml"
+          grep -q "Unified-Inference-${VERSION}-macos-arm64.dmg" "$DIST/appcast.xml"
+
+      - name: Publish immutable release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="$(tr -d '[:space:]' < macos/VERSION)"
+          DIST="macos/app/build/Distribution"
+          RELEASE_FLAGS=()
+          if [[ "$VERSION" == 0.* ]]; then
+            RELEASE_FLAGS+=(--prerelease)
+          fi
+          gh release create "$RELEASE_TAG" \
+            --verify-tag \
+            --title "Unified Inference ${VERSION}" \
+            --notes-file macos/RELEASE_NOTES.md \
+            "${RELEASE_FLAGS[@]}" \
+            "$DIST/Unified-Inference-${VERSION}-macos-arm64.dmg" \
+            "$DIST/Unified-Inference-${VERSION}-macos-arm64-acceptance.json" \
+            "$DIST/appcast.xml" \
+            "$DIST/SHA256SUMS"
+
+      - name: Upload release evidence
+        uses: actions/upload-artifact@v6
+        with:
+          name: Unified-Inference-${{ env.RELEASE_TAG }}-release-evidence
+          path: |
+            macos/app/build/Distribution/*.dmg
+            macos/app/build/Distribution/*-acceptance.json
+            macos/app/build/Distribution/appcast.xml
+            macos/app/build/Distribution/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 90

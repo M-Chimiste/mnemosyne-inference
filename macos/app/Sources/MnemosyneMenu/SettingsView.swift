@@ -1,9 +1,14 @@
+import Foundation
 import MnemosyneAppCore
 import SwiftUI
 
 struct SettingsView: View {
     @ObservedObject var viewModel: SettingsViewModel
+    @ObservedObject var registration: LaunchAgentRegistration
+    let markSetupCompleted: () -> Void
     let restartService: () -> Void
+    @State private var previewedCredentialDrafts: Set<ManagedCredential> = []
+    @State private var selfTestAlias = ""
 
     var body: some View {
         HStack(spacing: 0) {
@@ -29,16 +34,31 @@ struct SettingsView: View {
         } message: {
             Text("This restores every setting to the last saved value.")
         }
-        .alert("Remove this model profile?", isPresented: $viewModel.confirmRemoveModel) {
+        .alert("Remove this model?", isPresented: $viewModel.confirmRemoveModel) {
             Button("Cancel", role: .cancel) {}
-            Button("Remove Model", role: .destructive) {
+            Button("Keep Files", role: .destructive) {
                 viewModel.removeSelectedModel()
             }
+            Button("Delete Files", role: .destructive) {
+                Task { await viewModel.deleteSelectedModelFiles() }
+            }
         } message: {
-            Text("The downloaded model is not deleted; only its Unified Inference profile is removed.")
+            Text(
+                "Keep Files removes only the profile after you save. Delete Files immediately removes the profile and its app-managed download. Finder imports and manually configured paths are never eligible for file deletion."
+            )
         }
-        .sheet(isPresented: $viewModel.showLMStudioImporter) {
-            LMStudioImporterView(viewModel: viewModel)
+        .alert(
+            "Install oMLX with Homebrew?",
+            isPresented: $viewModel.confirmHomebrewOMLXInstall
+        ) {
+            Button("Cancel", role: .cancel) {}
+            Button("Install Stable oMLX") {
+                Task { await viewModel.installOMLXWithHomebrew() }
+            }
+        } message: {
+            Text(
+                "Unified Inference will run these exact commands after approval:\n\nbrew tap jundot/omlx https://github.com/jundot/omlx\nbrew install omlx\n\nHomebrew will own the installation. This never uses --HEAD or replaces an existing oMLX installation. The stable formula omits optional custom kernels; use the recommended official app when you need them."
+            )
         }
         .sheet(isPresented: $viewModel.showLocalModelImporter) {
             ExistingModelImporterView(viewModel: viewModel)
@@ -102,20 +122,56 @@ struct SettingsView: View {
     @ViewBuilder
     private var page: some View {
         if !viewModel.isLoaded {
-            VStack(spacing: 14) {
+            VStack(spacing: 16) {
                 Image(systemName: "gearshape.2")
                     .font(.system(size: 36))
                     .foregroundStyle(.secondary)
                 Text(viewModel.statusMessage)
                     .foregroundStyle(viewModel.statusColor)
                     .multilineTextAlignment(.center)
-                Button("Try Again") { Task { await viewModel.load() } }
-                    .disabled(viewModel.isWorking)
+                    .frame(maxWidth: 520)
+                if registration.agentStatus == .enabled {
+                    HStack {
+                        Button("Try Again") { Task { await viewModel.load() } }
+                            .buttonStyle(.borderedProminent)
+                            .disabled(viewModel.isWorking)
+                        Button("Restart Service") { restartService() }
+                            .disabled(viewModel.isWorking)
+                        Button("Open Logs") { openApplicationSupportLogs() }
+                    }
+                } else {
+                    Text(
+                        "Unified Inference needs its background service before Settings can inspect engines, storage, or models."
+                    )
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: 520)
+                    if registration.agentStatus == .requiresApproval {
+                        Button("Approve in Login Items") {
+                            registration.openLoginItemsSettings()
+                        }
+                        .buttonStyle(.borderedProminent)
+                    } else {
+                        Button("Enable Background Service") {
+                            Task { await enableServiceAndLoad() }
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(registration.isChangingRegistration)
+                    }
+                }
+                if let error = registration.lastError {
+                    Text(error)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: 560)
+                }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .padding(40)
         } else {
             switch viewModel.selectedSection {
+            case .setup: setupPage
             case .general: generalPage
             case .engines: enginesPage
             case .updates: runtimeUpdatesPage
@@ -126,6 +182,445 @@ struct SettingsView: View {
             case .credentials: credentialsPage
             }
         }
+    }
+
+    private var setupPage: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 18) {
+                HStack(alignment: .top) {
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text("Get this Mac ready for inference")
+                            .font(.title3.weight(.semibold))
+                        Text(
+                            "Complete the checks below, then run one real request through the public API. Advanced settings remain available in the sidebar."
+                        )
+                        .foregroundStyle(.secondary)
+                        if let version = viewModel.readinessSnapshot?.productVersion {
+                            Text("Core \(version)")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    Spacer()
+                    if viewModel.isRefreshingReadiness {
+                        ProgressView().controlSize(.small)
+                    }
+                    Button("Refresh Health") {
+                        Task { await viewModel.refreshReadiness() }
+                    }
+                    .disabled(viewModel.isRefreshingReadiness)
+                }
+
+                setupCard(
+                    title: "1. Background service",
+                    symbol: "bolt.horizontal.circle",
+                    ready: registration.agentStatus == .enabled
+                        && viewModel.readinessSnapshot?.core.ready == true
+                ) {
+                    LabeledContent(
+                        "Registration",
+                        value: registration.label(for: registration.agentStatus)
+                    )
+                    if let core = viewModel.readinessSnapshot?.core {
+                        LabeledContent("Core state", value: core.state.capitalized)
+                        if let diagnostic = core.diagnostic ?? core.startupError {
+                            Label(diagnostic, systemImage: "exclamationmark.triangle")
+                                .foregroundStyle(.orange)
+                                .textSelection(.enabled)
+                        }
+                    }
+                    HStack {
+                        if registration.agentStatus != .enabled {
+                            Button("Enable Service") {
+                                Task { await enableServiceAndLoad() }
+                            }
+                            .buttonStyle(.borderedProminent)
+                        }
+                        Button("Restart Service") { restartService() }
+                            .disabled(
+                                registration.agentStatus != .enabled
+                                    || viewModel.isWorking
+                            )
+                        Button("Reconcile Engines") {
+                            Task { await viewModel.reconcileService() }
+                        }
+                        .disabled(
+                            registration.agentStatus != .enabled
+                                || viewModel.isReconciling
+                        )
+                    }
+                }
+
+                setupCard(
+                    title: "2. Stable inference engines",
+                    symbol: "cpu",
+                    ready: stableEngineReady
+                ) {
+                    if let engines = viewModel.readinessSnapshot?.engines {
+                        ForEach(engines) { engine in
+                            engineHealthRow(engine)
+                        }
+                    } else {
+                        Text("Refresh health to inspect installed runtimes.")
+                            .foregroundStyle(.secondary)
+                    }
+                    HStack {
+                        Button("Install or Update Runtimes") {
+                            viewModel.selectedSection = .updates
+                        }
+                        Button("Configure Engines") {
+                            viewModel.selectedSection = .engines
+                        }
+                    }
+                    Text(
+                        "llama.cpp and oMLX are the supported V1 engines. DS4 and MFLUX remain Preview until their remaining hardware acceptance gates close."
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                }
+
+                setupCard(
+                    title: "3. Model storage",
+                    symbol: "externaldrive",
+                    ready: storageReady
+                ) {
+                    if let storage = viewModel.readinessSnapshot?.storage {
+                        ForEach(storage) { location in
+                            HStack {
+                                Label(
+                                    location.name,
+                                    systemImage: location.available && location.writable
+                                        ? "checkmark.circle.fill"
+                                        : "exclamationmark.triangle.fill"
+                                )
+                                .foregroundStyle(
+                                    location.available && location.writable
+                                        ? Color.green : Color.orange
+                                )
+                                Text(location.path)
+                                    .font(.system(.caption, design: .monospaced))
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                                Spacer()
+                                if let free = location.freeBytes {
+                                    Text(
+                                        ByteCountFormatter.string(
+                                            fromByteCount: free,
+                                            countStyle: .file
+                                        ) + " free"
+                                    )
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                }
+                            }
+                            if let diagnostic = location.diagnostic {
+                                Text(diagnostic)
+                                    .font(.caption)
+                                    .foregroundStyle(.orange)
+                            }
+                        }
+                    }
+                    Button("Choose Model Storage") {
+                        viewModel.selectedSection = .storage
+                    }
+                }
+
+                setupCard(
+                    title: "4. Models",
+                    symbol: "shippingbox",
+                    ready: (viewModel.readinessSnapshot?.models.callable ?? 0) > 0
+                ) {
+                    if let models = viewModel.readinessSnapshot?.models {
+                        LabeledContent(
+                            "Configured",
+                            value: models.configured.formatted()
+                        )
+                        LabeledContent("Callable", value: models.callable.formatted())
+                    }
+                    HStack {
+                        Button("Browse Model Library") {
+                            viewModel.selectedSection = .library
+                        }
+                        Button("Add Existing Models…") {
+                            Task { await viewModel.chooseExistingModelsFolder() }
+                        }
+                        .disabled(
+                            viewModel.hasUnsavedChanges
+                                || viewModel.isScanningLocalModels
+                                || viewModel.isImportingLocalModels
+                        )
+                    }
+                }
+
+                setupCard(
+                    title: "5. End-to-end verification",
+                    symbol: "checkmark.seal",
+                    ready: verifiedSelfTest
+                ) {
+                    if selfTestModels.isEmpty {
+                        Text("Add a callable model before running verification.")
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Picker("Model", selection: $selfTestAlias) {
+                            ForEach(selfTestModels, id: \.alias) { model in
+                                Text("\(model.alias) · \(model.engine.displayName)")
+                                    .tag(model.alias)
+                            }
+                        }
+                        .onAppear(perform: selectDefaultSelfTestModel)
+                        Button("Run Model Self-Test") {
+                            Task {
+                                let passed = await viewModel.runSelfTest(
+                                    model: effectiveSelfTestAlias
+                                )
+                                if passed {
+                                    markSetupCompleted()
+                                }
+                            }
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(
+                            effectiveSelfTestAlias.isEmpty
+                                || viewModel.isRunningSelfTest
+                        )
+                    }
+                    if viewModel.isRunningSelfTest {
+                        HStack {
+                            ProgressView().controlSize(.small)
+                            Text("Loading the model and waiting for a real response…")
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    if let result = viewModel.lastSelfTest {
+                        Label(
+                            result.vision
+                                ? "Vision request passed"
+                                : "Inference request passed",
+                            systemImage: "checkmark.circle.fill"
+                        )
+                        .foregroundStyle(.green)
+                        LabeledContent(
+                            "Response time",
+                            value: Duration.milliseconds(result.responseMs).formatted(
+                                .units(allowed: [.seconds, .milliseconds], width: .abbreviated)
+                            )
+                        )
+                        if let usage = result.usage {
+                            LabeledContent(
+                                "Tokens",
+                                value: "\(usage.promptTokens) prompt + \(usage.completionTokens) completion = \(usage.totalTokens)"
+                            )
+                            Label(
+                                result.usageRecorded == true
+                                    ? "Usage recorded durably"
+                                    : "Usage was not recorded",
+                                systemImage: result.usageRecorded == true
+                                    ? "checkmark.circle.fill"
+                                    : "exclamationmark.triangle.fill"
+                            )
+                            .foregroundStyle(
+                                result.usageRecorded == true ? Color.green : Color.orange
+                            )
+                        }
+                        if let preview = result.responsePreview {
+                            Text(preview)
+                                .font(.callout)
+                                .foregroundStyle(.secondary)
+                                .textSelection(.enabled)
+                        }
+                    }
+                }
+
+                setupCard(
+                    title: "Diagnostics",
+                    symbol: "stethoscope",
+                    ready: viewModel.readinessSnapshot?.core.ready == true
+                ) {
+                    if let usage = viewModel.readinessSnapshot?.usage {
+                        LabeledContent("Usage identity", value: usage.nodeId)
+                        LabeledContent(
+                            "Postgres delivery",
+                            value: usage.writerReady
+                                ? "Ready · \(usage.outboxDepth) queued"
+                                : "Not configured · local usage remains durable"
+                        )
+                        if let error = usage.lastError {
+                            Text(error)
+                                .font(.caption)
+                                .foregroundStyle(.orange)
+                                .textSelection(.enabled)
+                        }
+                    }
+                    HStack {
+                        Button("Copy Redacted Diagnostics") {
+                            copyReadinessDiagnostics()
+                        }
+                        Button("Open Logs") {
+                            openApplicationSupportLogs()
+                        }
+                    }
+                }
+            }
+            .padding(22)
+        }
+    }
+
+    private func setupCard<Content: View>(
+        title: String,
+        symbol: String,
+        ready: Bool,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 11) {
+            HStack {
+                Label(title, systemImage: symbol)
+                    .font(.headline)
+                Spacer()
+                Label(
+                    ready ? "Ready" : "Needs attention",
+                    systemImage: ready
+                        ? "checkmark.circle.fill"
+                        : "exclamationmark.circle.fill"
+                )
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(ready ? Color.green : Color.orange)
+            }
+            Divider()
+            content()
+        }
+        .padding(15)
+        .background(
+            RoundedRectangle(cornerRadius: 12)
+                .fill(Color(nsColor: .controlBackgroundColor))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 12)
+                .stroke(Color.secondary.opacity(0.16))
+        )
+    }
+
+    private func engineHealthRow(_ engine: EngineReadiness) -> some View {
+        HStack(alignment: .firstTextBaseline) {
+            Label(
+                engine.engine.displayName,
+                systemImage: engine.ready
+                    ? "checkmark.circle.fill"
+                    : engine.enabled ? "exclamationmark.triangle.fill" : "circle"
+            )
+            .foregroundStyle(
+                engine.ready ? Color.green : engine.enabled ? Color.orange : Color.secondary
+            )
+            Text(engine.releaseTier.uppercased())
+                .font(.caption2.weight(.bold))
+                .foregroundStyle(engine.isStable ? Color.blue : Color.orange)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 2)
+                .background(
+                    (engine.isStable ? Color.blue : Color.orange).opacity(0.12),
+                    in: Capsule()
+                )
+            Spacer()
+            Text(engineHealthLabel(engine))
+                .foregroundStyle(.secondary)
+            if let version = engine.installedVersion {
+                Text(version)
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private func engineHealthLabel(_ engine: EngineReadiness) -> String {
+        if !engine.enabled { return "Disabled" }
+        if !engine.installed { return "Runtime not installed" }
+        if engine.ready { return "Ready" }
+        return engine.serviceState.replacingOccurrences(of: "_", with: " ").capitalized
+    }
+
+    private var stableEngineReady: Bool {
+        viewModel.readinessSnapshot?.engines.contains {
+            $0.isStable && $0.enabled && $0.ready
+        } == true
+    }
+
+    private var storageReady: Bool {
+        viewModel.readinessSnapshot?.storage.contains {
+            $0.available && $0.writable && $0.volumeMatches
+        } == true
+    }
+
+    private var verifiedSelfTest: Bool {
+        viewModel.lastSelfTest?.completesGuidedSetup == true
+    }
+
+    private var selfTestModels: [ModelProfileSettings] {
+        viewModel.settings.models.filter {
+            $0.enabled && $0.kind != .image && engineEnabled($0.engine)
+        }
+    }
+
+    private func engineEnabled(_ engine: InferenceEngine) -> Bool {
+        switch engine {
+        case .llamaCpp:
+            viewModel.settings.engines.llamaCpp.enabled
+        case .omlx:
+            viewModel.settings.engines.omlx.enabled
+        case .ds4:
+            viewModel.settings.engines.ds4.enabled
+        case .mflux:
+            viewModel.settings.engines.mflux.enabled
+        }
+    }
+
+    private var effectiveSelfTestAlias: String {
+        if selfTestModels.contains(where: { $0.alias == selfTestAlias }) {
+            return selfTestAlias
+        }
+        return selfTestModels.first?.alias ?? ""
+    }
+
+    private func selectDefaultSelfTestModel() {
+        if selfTestAlias.isEmpty {
+            selfTestAlias = selfTestModels.first?.alias ?? ""
+        }
+    }
+
+    private func enableServiceAndLoad() async {
+        await registration.enableAgent()
+        guard registration.agentStatus == .enabled else { return }
+        for _ in 0 ..< 30 {
+            await viewModel.load()
+            if viewModel.isLoaded {
+                await viewModel.refreshReadiness()
+                return
+            }
+            try? await Task.sleep(for: .seconds(1))
+        }
+    }
+
+    private func copyReadinessDiagnostics() {
+        guard let snapshot = viewModel.readinessSnapshot else { return }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        guard let data = try? encoder.encode(snapshot),
+              let value = String(data: data, encoding: .utf8)
+        else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(value, forType: .string)
+    }
+
+    private func openApplicationSupportLogs() {
+        let root = FileManager.default.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        )[0]
+            .appending(path: "Mnemosyne", directoryHint: .isDirectory)
+            .appending(path: "logs", directoryHint: .isDirectory)
+        try? FileManager.default.createDirectory(
+            at: root,
+            withIntermediateDirectories: true
+        )
+        NSWorkspace.shared.open(root)
     }
 
     private var generalPage: some View {
@@ -299,24 +794,6 @@ struct SettingsView: View {
                 engineHeader("MFLUX", detail: "Qwen Image and Krea 2")
             }
 
-            Section {
-                Toggle(
-                    "Keep LM Studio available during migration",
-                    isOn: $viewModel.settings.engines.lmstudio.enabled
-                )
-                TextField(
-                    "LM Studio API address",
-                    text: $viewModel.settings.engines.lmstudio.baseUrl
-                )
-                LabeledContent("Request timeout") {
-                    secondsField($viewModel.settings.engines.lmstudio.requestTimeoutSeconds)
-                }
-                Text("Legacy migration source only. Use Add Existing Models to adopt its GGUF and MLX files in place, then disable this adapter for the soak period.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            } header: {
-                engineHeader("LM Studio", detail: "Temporary migration bridge")
-            }
         }
         .formStyle(.grouped)
     }
@@ -328,12 +805,13 @@ struct SettingsView: View {
                     VStack(alignment: .leading, spacing: 4) {
                         Text("Engine runtimes update independently from the menu app.")
                             .font(.headline)
-                        Text("llama.cpp comes from official GitHub releases, MFLUX from official PyPI releases, and DS4 from the official antirez repository. oMLX remains owned by its app or Homebrew installation.")
+                        Text("llama.cpp comes from official GitHub releases, MFLUX from official PyPI releases, and DS4 from the official antirez repository. For oMLX, the recommended official app includes precompiled custom kernels and owns its own updates.")
                             .font(.callout)
                             .foregroundStyle(.secondary)
                     }
                     Spacer()
-                    if viewModel.isCheckingRuntimeUpdates {
+                    if viewModel.isCheckingRuntimeUpdates
+                        || viewModel.isInstallingOMLXWithHomebrew {
                         ProgressView().controlSize(.small)
                     }
                     Button("Check Now") {
@@ -342,6 +820,7 @@ struct SettingsView: View {
                     .disabled(
                         viewModel.isCheckingRuntimeUpdates
                             || viewModel.updatingRuntimeEngine != nil
+                            || viewModel.isInstallingOMLXWithHomebrew
                     )
                 }
 
@@ -388,14 +867,41 @@ struct SettingsView: View {
             HStack(alignment: .firstTextBaseline) {
                 Text(update.displayName)
                     .font(.title3.weight(.semibold))
-                if update.updateAvailable {
-                    Text(update.canInstall ? "OFFICIAL UPDATE" : "UPSTREAM UPDATE")
+                if let tier = update.releaseTierLabel {
+                    Text(tier)
                         .font(.caption2.weight(.bold))
-                        .foregroundStyle(update.canInstall ? Color.green : Color.blue)
+                        .foregroundStyle(
+                            update.releaseTier == "stable" ? Color.green : Color.orange
+                        )
                         .padding(.horizontal, 7)
                         .padding(.vertical, 3)
                         .background(
-                            (update.canInstall ? Color.green : Color.blue).opacity(0.12),
+                            (
+                                update.releaseTier == "stable"
+                                    ? Color.green : Color.orange
+                            ).opacity(0.12),
+                            in: Capsule()
+                        )
+                }
+                if update.updateAvailable {
+                    Text(
+                        update.engine == .omlx && !update.installed
+                            ? "OFFICIAL INSTALLER"
+                            : (update.canInstall ? "OFFICIAL UPDATE" : "UPSTREAM UPDATE")
+                    )
+                        .font(.caption2.weight(.bold))
+                        .foregroundStyle(
+                            update.canInstall || (update.engine == .omlx && !update.installed)
+                                ? Color.green : Color.blue
+                        )
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 3)
+                        .background(
+                            (
+                                update.canInstall
+                                    || (update.engine == .omlx && !update.installed)
+                                    ? Color.green : Color.blue
+                            ).opacity(0.12),
                             in: Capsule()
                         )
                 } else if update.installed {
@@ -404,7 +910,9 @@ struct SettingsView: View {
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
-                if viewModel.updatingRuntimeEngine == update.engine {
+                if viewModel.updatingRuntimeEngine == update.engine
+                    || (update.engine == .omlx
+                        && viewModel.isInstallingOMLXWithHomebrew) {
                     ProgressView().controlSize(.small)
                 }
             }
@@ -438,6 +946,12 @@ struct SettingsView: View {
                 .font(.callout)
                 .foregroundStyle(.secondary)
 
+            if update.engine == .omlx, !update.installed {
+                Text("Download the official app, drag it to Applications, and start its server on 127.0.0.1:17322. Then choose Check Again. The official app avoids the fragile Homebrew HEAD custom-kernel build.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
             if let diagnostic = update.diagnostic {
                 Label(diagnostic, systemImage: "exclamationmark.triangle")
                     .font(.caption)
@@ -445,7 +959,25 @@ struct SettingsView: View {
             }
 
             HStack {
-                if update.canInstall {
+                if update.engine == .omlx,
+                   !update.installed,
+                   let target = update.officialInstallerUrl,
+                   let url = URL(string: target) {
+                    Link(
+                        "Download oMLX \(update.latestUpstreamVersion ?? "")",
+                        destination: url
+                    )
+                    .buttonStyle(.borderedProminent)
+                }
+                if update.engine == .omlx, !update.installed {
+                    Button("Install with Homebrew…") {
+                        viewModel.confirmHomebrewOMLXInstall = true
+                    }
+                    .disabled(
+                        viewModel.isInstallingOMLXWithHomebrew
+                            || viewModel.isCheckingRuntimeUpdates
+                    )
+                } else if update.canInstall {
                     Button("Install \(update.availableVersion ?? "Update")") {
                         Task { await viewModel.installRuntimeUpdate(update) }
                     }
@@ -463,10 +995,30 @@ struct SettingsView: View {
                     }
                     .disabled(viewModel.updatingRuntimeEngine != nil)
                 }
+                if update.engine == .omlx,
+                   update.installedPath?.hasSuffix(".app") == true {
+                    Button("Open oMLX") {
+                        viewModel.openOMLXApplication(update)
+                    }
+                }
+                if update.engine == .omlx {
+                    Button("Check Again") {
+                        Task { await viewModel.refreshRuntimeUpdates(force: true) }
+                    }
+                    .disabled(
+                        viewModel.isCheckingRuntimeUpdates
+                            || viewModel.updatingRuntimeEngine != nil
+                    )
+                }
                 Spacer()
                 if let target = update.releaseNotesUrl ?? update.latestUpstreamUrl,
                    let url = URL(string: target) {
-                    Link(update.engine == .omlx ? "Open Official Update" : "Release Notes", destination: url)
+                    Link(
+                        update.engine == .omlx
+                            ? (update.installed ? "Open Official Update" : "Release Notes")
+                            : "Release Notes",
+                        destination: url
+                    )
                 }
             }
         }
@@ -651,6 +1203,59 @@ struct SettingsView: View {
                                 .textSelection(.enabled)
                             Text(searchResult.compatibilityReason)
                                 .font(.callout)
+                            if viewModel.isLoadingLibraryDetails {
+                                HStack(spacing: 7) {
+                                    ProgressView().controlSize(.small)
+                                    Text("Reading model card and metadata…")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                            } else if let details = viewModel.libraryDetails {
+                                if let summary = details.summary {
+                                    Text(ModelTextMarkup.attributedString(from: summary))
+                                        .font(.callout)
+                                        .foregroundStyle(.secondary)
+                                        .textSelection(.enabled)
+                                }
+                                HStack(spacing: 8) {
+                                    if let context = details.contextLength {
+                                        modelBadge(
+                                            "\(context.formatted()) token context",
+                                            color: .blue
+                                        )
+                                    }
+                                    if let architecture = details.architecture {
+                                        modelBadge(architecture, color: .purple)
+                                    }
+                                    if let parameters = details.parameterCount {
+                                        modelBadge(
+                                            parameterCount(parameters),
+                                            color: .secondary
+                                        )
+                                    }
+                                    if let license = details.license {
+                                        modelBadge(license, color: .secondary)
+                                    }
+                                }
+                                if let markdown = details.modelCardMarkdown {
+                                    DisclosureGroup("Model card") {
+                                        ScrollView {
+                                            Text(
+                                                ModelTextMarkup.attributedString(
+                                                    from: markdown
+                                                )
+                                            )
+                                                .frame(
+                                                    maxWidth: .infinity,
+                                                    alignment: .leading
+                                                )
+                                                .textSelection(.enabled)
+                                                .padding(.vertical, 8)
+                                        }
+                                        .frame(maxHeight: 260)
+                                    }
+                                }
+                            }
                         }
 
                         Divider()
@@ -704,12 +1309,12 @@ struct SettingsView: View {
                                             set: { viewModel.selectLibraryProjector($0) }
                                         )
                                     ) {
-                                        Text("Text only (no projector)").tag("")
+                                        Text("Text only (opt out)").tag("")
                                         ForEach(model.availableProjectors, id: \.self) {
                                             Text($0).tag($0)
                                         }
                                     }
-                                    Text("Select a matching projector only for multimodal GGUF models. Pairing is explicit because a nearby filename alone does not prove compatibility.")
+                                    Text("The highest-fidelity nearby vision projector is selected automatically. Choose Text only to opt out, or select a different projector.")
                                         .font(.caption)
                                         .foregroundStyle(.secondary)
                                 }
@@ -801,22 +1406,20 @@ struct SettingsView: View {
             if !viewModel.modelInstalls.isEmpty {
                 Divider()
                 VStack(alignment: .leading, spacing: 7) {
-                    Text("Recent downloads").font(.caption.weight(.semibold))
-                    ForEach(viewModel.modelInstalls.prefix(3)) { install in
-                        HStack {
-                            Image(systemName: install.isActive ? "arrow.down.circle" : install.status == "installed" ? "checkmark.circle.fill" : "exclamationmark.circle")
-                                .foregroundStyle(install.status == "installed" ? Color.green : Color.secondary)
-                            Text(install.alias).fontWeight(.medium)
-                            Text(install.status.capitalized).foregroundStyle(.secondary)
-                            Text(byteCount(install.bytesDownloaded)).foregroundStyle(.secondary)
-                            Spacer()
-                            if install.isActive {
-                                Button("Cancel") { Task { await viewModel.cancelInstall(install) } }
-                            } else if install.canRetry {
-                                Button("Retry") { Task { await viewModel.retryInstall(install) } }
+                    HStack {
+                        Text("Recent downloads")
+                            .font(.caption.weight(.semibold))
+                        Spacer()
+                        if viewModel.modelInstalls.contains(where: { $0.status == "installed" }) {
+                            Button("Clear Completed") {
+                                Task { await viewModel.clearCompletedInstalls() }
                             }
+                            .font(.caption)
+                            .buttonStyle(.borderless)
                         }
-                        .font(.caption)
+                    }
+                    ForEach(viewModel.modelInstalls.prefix(3)) { install in
+                        downloadInstallRow(install)
                     }
                 }
                 .padding(.horizontal, 16)
@@ -885,32 +1488,6 @@ struct SettingsView: View {
                     .padding(.horizontal, 10)
                 }
 
-                if viewModel.settings.engines.lmstudio.enabled {
-                    Button {
-                        viewModel.showLMStudioImporter = true
-                        Task { await viewModel.discoverLMStudioModels() }
-                    } label: {
-                        Label(
-                            "Legacy LM Studio Inventory…",
-                            systemImage: "arrow.triangle.branch"
-                        )
-                        .frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(.bordered)
-                    .padding(.horizontal, 10)
-                    .disabled(!viewModel.canDiscoverLMStudioInventory)
-                    .help(
-                        viewModel.lmStudioInventoryAvailability.guidance
-                            ?? "Create temporary LM Studio profiles during the migration soak."
-                    )
-                    if let guidance = viewModel.lmStudioInventoryAvailability.guidance {
-                        Label(guidance, systemImage: "exclamationmark.triangle")
-                            .font(.caption)
-                            .foregroundStyle(.orange)
-                            .padding(.horizontal, 10)
-                    }
-                }
-
                 List(selection: $viewModel.selectedModelIndex) {
                     ForEach(viewModel.settings.models.indices, id: \.self) { index in
                         HStack {
@@ -927,24 +1504,33 @@ struct SettingsView: View {
                 }
                 HStack {
                     Button { viewModel.selectedSection = .library } label: {
-                        Label("Download from Model Library", systemImage: "arrow.down.circle")
+                        Image(systemName: "arrow.down.circle")
+                            .frame(width: 30, height: 18)
                     }
+                    .buttonStyle(.bordered)
+                    .frame(width: 52, height: 30)
                     .help("Download a compatible model from Hugging Face.")
                     Button {
                         viewModel.confirmRemoveModel = true
                     } label: {
-                        Label("Remove", systemImage: "minus")
+                        Image(systemName: "minus")
+                            .frame(width: 30, height: 18)
                     }
+                    .buttonStyle(.bordered)
+                    .frame(width: 52, height: 30)
                     .disabled(viewModel.selectedModelIndex == nil)
+                    .help("Remove the profile, with an optional managed-file deletion.")
                     Spacer()
                 }
-                .labelStyle(.iconOnly)
                 .padding(.horizontal, 10)
                 .padding(.bottom, 8)
             }
             .frame(width: 230)
             Divider()
             modelEditor
+        }
+        .task {
+            await viewModel.refreshModelsConfiguration()
         }
     }
 
@@ -1038,7 +1624,7 @@ struct SettingsView: View {
                     "Context length",
                     value: $viewModel.settings.models[index].load.contextLength
                 )
-                if engine == .lmstudio || engine == .llamaCpp {
+                if engine == .llamaCpp {
                     optionalIntegerField(
                         "Evaluation batch size",
                         value: $viewModel.settings.models[index].load.evalBatchSize
@@ -1047,12 +1633,6 @@ struct SettingsView: View {
                         "Flash attention",
                         value: $viewModel.settings.models[index].load.flashAttention
                     )
-                    if engine == .lmstudio {
-                        optionalIntegerField(
-                            "Active experts",
-                            value: $viewModel.settings.models[index].load.numExperts
-                        )
-                    }
                     optionalBooleanPicker(
                         "Keep KV cache on GPU",
                         value: $viewModel.settings.models[index].load.offloadKvCacheToGpu
@@ -1255,6 +1835,16 @@ struct SettingsView: View {
                 }
                 .disabled(!viewModel.settings.tokenSidecar.enabled)
             }
+            Section("Postgres connection") {
+                credentialEditor(
+                    .tokenSidecarPostgresDSN,
+                    valueLabel: "Connection URL",
+                    placeholder: "postgresql://user:password@host:5432/database"
+                )
+                Text("The host, port, database, username, and password are stored privately on this Mac. Existing values are never displayed. Leave this blank to keep the current connection, or use Clear to remove it; save and restart the service to apply a replacement.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
             Section("Privacy") {
                 Text("Language requests record token counts and model metadata. Image requests do not create token-usage records.")
                     .foregroundStyle(.secondary)
@@ -1271,65 +1861,116 @@ struct SettingsView: View {
             }
             ForEach(
                 ManagedCredential.allCases.filter {
-                    $0 != .lmStudioAPIKey
-                        || viewModel.settings.engines.lmstudio.enabled
-                        || viewModel.configuredCredentials.contains(.lmStudioAPIKey)
+                    $0 != .tokenSidecarPostgresDSN
                 }
             ) { credential in
                 Section {
-                    if viewModel.credentialsToClear.contains(credential) {
-                        HStack {
-                            Label("Will be removed when you save", systemImage: "trash")
-                                .foregroundStyle(.orange)
-                            Spacer()
-                            Button("Undo") { viewModel.undoCredentialClear(credential) }
-                        }
-                    } else {
-                        LabeledContent(
-                            viewModel.configuredCredentials.contains(credential)
-                                ? "Replacement value"
-                                : "New value"
-                        ) {
-                            SecureField(
-                                viewModel.configuredCredentials.contains(credential)
-                                    ? "Enter a replacement"
-                                    : "Enter a credential",
-                                text: viewModel.credentialBinding(credential)
-                            )
-                            .textFieldStyle(.roundedBorder)
-                            .frame(minWidth: 320)
-                            .privacySensitive()
-                            .accessibilityLabel("\(credential.displayName) value")
-                        }
-                        HStack {
-                            Label(
-                                viewModel.configuredCredentials.contains(credential)
-                                    ? "Configured" : "Not configured",
-                                systemImage: viewModel.configuredCredentials.contains(credential)
-                                    ? "checkmark.circle.fill" : "circle"
-                            )
-                            .font(.caption)
-                            .foregroundStyle(
-                                viewModel.configuredCredentials.contains(credential)
-                                    ? Color.green : Color.secondary
-                            )
-                            Spacer()
-                            if viewModel.configuredCredentials.contains(credential) {
-                                Button("Clear", role: .destructive) {
-                                    viewModel.clearCredential(credential)
-                                }
-                            }
-                        }
-                    }
-                    Text(credential.help)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                    credentialEditor(credential)
                 } header: {
                     Text(credential.displayName)
                 }
             }
         }
         .formStyle(.grouped)
+    }
+
+    @ViewBuilder
+    private func credentialEditor(
+        _ credential: ManagedCredential,
+        valueLabel: String? = nil,
+        placeholder: String? = nil
+    ) -> some View {
+        if viewModel.credentialsToClear.contains(credential) {
+            HStack {
+                Label("Will be removed when you save", systemImage: "trash")
+                    .foregroundStyle(.orange)
+                Spacer()
+                Button("Undo") { viewModel.undoCredentialClear(credential) }
+            }
+        } else {
+            LabeledContent(
+                valueLabel
+                    ?? (viewModel.configuredCredentials.contains(credential)
+                        ? "Replacement value"
+                        : "New value")
+            ) {
+                HStack(spacing: 8) {
+                    SecureField(
+                        placeholder
+                            ?? (viewModel.configuredCredentials.contains(credential)
+                                ? "Enter a replacement"
+                                : "Enter a credential"),
+                        text: viewModel.credentialBinding(credential)
+                    )
+                    .textFieldStyle(.roundedBorder)
+                    .frame(minWidth: 280)
+                    .privacySensitive()
+                    .accessibilityLabel("\(credential.displayName) value")
+
+                    Button {
+                        if previewedCredentialDrafts.contains(credential) {
+                            previewedCredentialDrafts.remove(credential)
+                        } else {
+                            previewedCredentialDrafts.insert(credential)
+                        }
+                    } label: {
+                        Image(
+                            systemName: previewedCredentialDrafts.contains(credential)
+                                ? "eye.slash" : "eye"
+                        )
+                    }
+                    .buttonStyle(.borderless)
+                    .help(
+                        previewedCredentialDrafts.contains(credential)
+                            ? "Hide pasted-value preview"
+                            : "Preview the pasted value with its secret truncated"
+                    )
+                    .accessibilityLabel(
+                        previewedCredentialDrafts.contains(credential)
+                            ? "Hide \(credential.displayName) preview"
+                            : "Show truncated \(credential.displayName) preview"
+                    )
+                    .disabled(viewModel.credentialDrafts[credential, default: ""].isEmpty)
+                }
+                .frame(minWidth: 320)
+            }
+            if previewedCredentialDrafts.contains(credential) {
+                let draft = viewModel.credentialDrafts[credential, default: ""]
+                if !draft.isEmpty {
+                    LabeledContent("Pasted value preview") {
+                        Text(CredentialDraftPreview.render(draft, for: credential))
+                            .font(.caption.monospaced())
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
+                            .truncationMode(.middle)
+                            .textSelection(.enabled)
+                            .privacySensitive()
+                    }
+                }
+            }
+            HStack {
+                Label(
+                    viewModel.configuredCredentials.contains(credential)
+                        ? "Configured" : "Not configured",
+                    systemImage: viewModel.configuredCredentials.contains(credential)
+                        ? "checkmark.circle.fill" : "circle"
+                )
+                .font(.caption)
+                .foregroundStyle(
+                    viewModel.configuredCredentials.contains(credential)
+                        ? Color.green : Color.secondary
+                )
+                Spacer()
+                if viewModel.configuredCredentials.contains(credential) {
+                    Button("Clear", role: .destructive) {
+                        viewModel.clearCredential(credential)
+                    }
+                }
+            }
+        }
+        Text(credential.help)
+            .font(.caption)
+            .foregroundStyle(.secondary)
     }
 
     private var footer: some View {
@@ -1366,6 +2007,7 @@ struct SettingsView: View {
 
     private var sectionDescription: String {
         switch viewModel.selectedSection {
+        case .setup: "First-run guidance, system health, recovery, and verification"
         case .general: "Ports, timeouts, model residency, and local storage"
         case .engines: "Choose and connect the inference engines available on this Mac"
         case .updates: "Check and install updates from each engine's official source"
@@ -1398,6 +2040,112 @@ struct SettingsView: View {
         }
     }
 
+    private func downloadInstallRow(_ install: ModelInstall) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(spacing: 8) {
+                Image(
+                    systemName: install.isActive
+                        ? "arrow.down.circle"
+                        : install.status == "installed"
+                            ? "checkmark.circle.fill"
+                            : "exclamationmark.circle"
+                )
+                .foregroundStyle(
+                    install.status == "installed" ? Color.green : Color.secondary
+                )
+                Text(install.alias)
+                    .fontWeight(.medium)
+                    .lineLimit(1)
+                Text(install.status.capitalized)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                if install.isActive {
+                    Button("Cancel") {
+                        Task { await viewModel.cancelInstall(install) }
+                    }
+                    .frame(width: 62)
+                } else {
+                    if install.canRetry {
+                        Button("Retry") {
+                            Task { await viewModel.retryInstall(install) }
+                        }
+                        .frame(width: 62)
+                    }
+                    if install.canDismiss {
+                        Button {
+                            Task { await viewModel.dismissInstall(install) }
+                        } label: {
+                            Image(systemName: "trash")
+                                .frame(width: 14)
+                        }
+                        .frame(width: 34)
+                        .help("Remove this entry from download history.")
+                    }
+                }
+            }
+
+            if install.isActive {
+                if let totalBytes = install.totalBytes, totalBytes > 0 {
+                    ProgressView(
+                        value: Double(min(install.bytesDownloaded, totalBytes)),
+                        total: Double(totalBytes)
+                    )
+                    .progressViewStyle(.linear)
+                    HStack {
+                        Text(
+                            "\(byteCount(install.bytesDownloaded)) of \(byteCount(totalBytes))"
+                        )
+                        if let fraction = install.progressFraction {
+                            Text(
+                                fraction.formatted(
+                                    .percent.precision(.fractionLength(0))
+                                )
+                            )
+                        }
+                        Spacer()
+                        downloadSpeedLabel(install)
+                    }
+                    .foregroundStyle(.secondary)
+                } else {
+                    ProgressView()
+                        .controlSize(.small)
+                    HStack {
+                        Text(byteCount(install.bytesDownloaded))
+                        Spacer()
+                        downloadSpeedLabel(install)
+                    }
+                    .foregroundStyle(.secondary)
+                }
+            } else {
+                Text(byteCount(install.bytesDownloaded))
+                    .foregroundStyle(.secondary)
+                if let error = install.error, !error.isEmpty {
+                    Text(error)
+                        .foregroundStyle(.red)
+                        .lineLimit(2)
+                }
+            }
+        }
+        .font(.caption)
+        .padding(.vertical, 2)
+    }
+
+    @ViewBuilder
+    private func downloadSpeedLabel(_ install: ModelInstall) -> some View {
+        if install.status == "downloading" {
+            if let speed = install.downloadSpeedBps, speed > 0 {
+                Text("\(byteCount(Int64(speed)))/s")
+                    .monospacedDigit()
+            } else {
+                Text("Calculating speed…")
+            }
+        } else if install.status == "registering" {
+            Text("Registering profile…")
+        } else if install.status == "queued" {
+            Text("Waiting…")
+        }
+    }
+
     private func compatibilityBadge(_ value: String) -> some View {
         let color: Color = switch value {
         case "verified": .green
@@ -1418,6 +2166,31 @@ struct SettingsView: View {
 
     private func byteCount(_ bytes: Int64) -> String {
         ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
+    }
+
+    private func parameterCount(_ value: Int64) -> String {
+        if value >= 1_000_000_000 {
+            let count = (Double(value) / 1_000_000_000).formatted(
+                .number.precision(.fractionLength(1))
+            )
+            return "\(count)B parameters"
+        }
+        if value >= 1_000_000 {
+            let count = (Double(value) / 1_000_000).formatted(
+                .number.precision(.fractionLength(1))
+            )
+            return "\(count)M parameters"
+        }
+        return "\(value.formatted()) parameters"
+    }
+
+    private func modelBadge(_ text: String, color: Color) -> some View {
+        Text(text)
+            .font(.caption2.weight(.semibold))
+            .foregroundStyle(color)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background(color.opacity(0.12), in: Capsule())
     }
 
     private func secondsField(_ value: Binding<Double>) -> some View {
@@ -1662,6 +2435,12 @@ private struct ExistingModelImporterView: View {
                                 if candidate.shardCount > 1 {
                                     Text("\(candidate.shardCount) shards")
                                 }
+                                if let context = candidate.contextLength {
+                                    Text("\(context.formatted()) token context")
+                                }
+                                if let architecture = candidate.architecture {
+                                    Text(architecture)
+                                }
                                 if !candidate.projectorOptions.isEmpty {
                                     Text("\(candidate.projectorOptions.count) projector option\(candidate.projectorOptions.count == 1 ? "" : "s")")
                                 }
@@ -1674,6 +2453,12 @@ private struct ExistingModelImporterView: View {
                                     candidate.compatibility == "unavailable"
                                         ? Color.orange : Color.secondary
                                 )
+                            if let summary = candidate.summary {
+                                Text(summary)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(3)
+                            }
                         }
                     }
 
@@ -1693,7 +2478,7 @@ private struct ExistingModelImporterView: View {
                                         candidate.id
                                     )
                                 ) {
-                                    Text("Text only (no projector)").tag("")
+                                    Text("Text only (opt out)").tag("")
                                     ForEach(candidate.projectorOptions) { projector in
                                         Text(
                                             "\(projector.filename) — "
@@ -1730,164 +2515,5 @@ private struct ExistingModelImporterView: View {
             .padding(.horizontal, 6)
             .padding(.vertical, 2)
             .background(color.opacity(0.12), in: Capsule())
-    }
-}
-
-private struct LMStudioImporterView: View {
-    @ObservedObject var viewModel: SettingsViewModel
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            HStack(alignment: .top) {
-                VStack(alignment: .leading, spacing: 4) {
-                    Label(
-                        "Legacy LM Studio Profiles",
-                        systemImage: "shippingbox.and.arrow.backward"
-                    )
-                        .font(.title2.weight(.semibold))
-                    Text("Create temporary LM Studio-backed profiles for the migration soak. Use Add Existing Models for native llama.cpp or oMLX adoption.")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                }
-                Spacer()
-                if viewModel.isDiscoveringLMStudio {
-                    ProgressView().controlSize(.small)
-                }
-            }
-            .padding(20)
-
-            Divider()
-
-            importerContent
-
-            Divider()
-
-            HStack(spacing: 10) {
-                Button("Select Unprofiled") {
-                    viewModel.selectAllUnprofiledLMStudioModels()
-                }
-                .disabled(viewModel.lmStudioInventory.isEmpty)
-
-                Button("Refresh") {
-                    Task { await viewModel.discoverLMStudioModels() }
-                }
-                .disabled(viewModel.isDiscoveringLMStudio)
-
-                Spacer()
-
-                Button("Cancel") {
-                    viewModel.showLMStudioImporter = false
-                }
-                Button(importButtonTitle) {
-                    viewModel.importSelectedLMStudioModels()
-                }
-                .buttonStyle(.borderedProminent)
-                .disabled(viewModel.selectedLMStudioKeys.isEmpty)
-            }
-            .padding(16)
-        }
-        .frame(minWidth: 720, minHeight: 520)
-    }
-
-    @ViewBuilder
-    private var importerContent: some View {
-        if !viewModel.lmStudioDiscoveryError.isEmpty {
-            VStack(spacing: 12) {
-                Image(systemName: "exclamationmark.triangle")
-                    .font(.system(size: 30))
-                    .foregroundStyle(.orange)
-                Text("LM Studio inventory is unavailable")
-                    .font(.headline)
-                Text(viewModel.lmStudioDiscoveryError)
-                    .foregroundStyle(.secondary)
-                    .multilineTextAlignment(.center)
-                Text("Make sure LM Studio's local server is running, then choose Refresh.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .padding(40)
-        } else if viewModel.isDiscoveringLMStudio && viewModel.lmStudioInventory.isEmpty {
-            VStack(spacing: 12) {
-                ProgressView()
-                Text("Reading downloaded models from LM Studio…")
-                    .foregroundStyle(.secondary)
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-        } else if viewModel.lmStudioInventory.isEmpty {
-            VStack(spacing: 12) {
-                Image(systemName: "shippingbox")
-                    .font(.system(size: 30))
-                    .foregroundStyle(.secondary)
-                Text("No downloaded LM Studio models were found.")
-                    .foregroundStyle(.secondary)
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-        } else {
-            List(viewModel.lmStudioInventory) { model in
-                Toggle(isOn: viewModel.lmStudioSelectionBinding(model.key)) {
-                    HStack(spacing: 12) {
-                        Image(systemName: model.type == "embedding" ? "point.3.connected.trianglepath.dotted" : "text.bubble")
-                            .foregroundStyle(.secondary)
-                            .frame(width: 24)
-                        VStack(alignment: .leading, spacing: 3) {
-                            HStack(spacing: 7) {
-                                Text(model.displayName).fontWeight(.medium)
-                                if model.loaded {
-                                    inventoryBadge("Loaded", color: .green)
-                                }
-                                if viewModel.isLMStudioModelProfiled(model.key) {
-                                    inventoryBadge("Already profiled", color: .secondary)
-                                }
-                                if !model.isImportable {
-                                    inventoryBadge("Unsupported type", color: .orange)
-                                }
-                            }
-                            Text(model.key)
-                                .font(.caption.monospaced())
-                                .foregroundStyle(.secondary)
-                                .lineLimit(1)
-                            Text(metadata(for: model))
-                                .font(.caption)
-                                .foregroundStyle(.tertiary)
-                                .lineLimit(1)
-                        }
-                    }
-                    .padding(.vertical, 4)
-                }
-                .toggleStyle(.checkbox)
-                .disabled(
-                    viewModel.isLMStudioModelProfiled(model.key) || !model.isImportable
-                )
-            }
-            .listStyle(.inset)
-        }
-    }
-
-    private var importButtonTitle: String {
-        let count = viewModel.selectedLMStudioKeys.count
-        return count == 1 ? "Create 1 Legacy Profile" : "Create \(count) Legacy Profiles"
-    }
-
-    private func inventoryBadge(_ text: String, color: Color) -> some View {
-        Text(text)
-            .font(.caption2.weight(.semibold))
-            .foregroundStyle(color)
-            .padding(.horizontal, 6)
-            .padding(.vertical, 2)
-            .background(color.opacity(0.12), in: Capsule())
-    }
-
-    private func metadata(for model: LMStudioDiscoveredModel) -> String {
-        var parts = [model.type.uppercased()]
-        if let format = model.format { parts.append(format.uppercased()) }
-        if let quantization = model.quantizationName { parts.append(quantization) }
-        if let parameters = model.paramsString { parts.append(parameters) }
-        if let size = model.sizeBytes {
-            parts.append(ByteCountFormatter.string(fromByteCount: size, countStyle: .file))
-        }
-        if model.vision == true { parts.append("Vision") }
-        if model.trainedForToolUse == true { parts.append("Tools") }
-        return parts.joined(separator: "  •  ")
     }
 }

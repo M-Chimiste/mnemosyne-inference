@@ -6,11 +6,13 @@ import Testing
 func defaultControlPort() {
     #expect(ControlAPIClient.defaultBaseURL.host == "127.0.0.1")
     #expect(ControlAPIClient.defaultBaseURL.port == 17_321)
-    #expect(NativeSettings().engines.lmstudio.baseUrl == "http://127.0.0.1:1234")
-    #expect(!NativeSettings().engines.lmstudio.enabled)
     #expect(NativeSettings().engines.llamaCpp.enabled)
     #expect(NativeSettings().engines.llamaCpp.port == 17_325)
-    #expect(NativeSettings().schemaVersion == 1)
+    #expect(NativeSettings().server.inferencePort == 1_240)
+    #expect(!NativeSettings().engines.omlx.enabled)
+    #expect(!NativeSettings().engines.ds4.enabled)
+    #expect(!NativeSettings().engines.mflux.enabled)
+    #expect(NativeSettings().schemaVersion == 2)
     #expect(NativeSettings().tokenSidecar.enabled)
 }
 
@@ -36,6 +38,31 @@ func loadRequestEncoding() throws {
     let body = try #require(request.httpBody)
     let payload = try JSONDecoder().decode(LoadModelRequest.self, from: body)
     #expect(payload == LoadModelRequest(model: "glm-5-2"))
+}
+
+@Test("Model self-test requests use the public-path verifier with bounded options")
+func selfTestRequestEncoding() throws {
+    let client = ControlAPIClient(
+        baseURL: URL(string: "http://localhost:17321")!,
+        adminPassword: "secret"
+    )
+    let request = try client.selfTestRequest(
+        model: "vision-model",
+        includeVision: true,
+        unloadAfter: false
+    )
+
+    #expect(request.url?.absoluteString == "http://localhost:17321/manager/self-test")
+    #expect(request.httpMethod == "POST")
+    #expect(request.value(forHTTPHeaderField: "Authorization") == "Basic YWRtaW46c2VjcmV0")
+    let body = try #require(request.httpBody)
+    let payload = try JSONDecoder.nativeSettingsDecoder().decode(
+        ModelSelfTestRequest.self,
+        from: body
+    )
+    #expect(payload.model == "vision-model")
+    #expect(payload.includeVision)
+    #expect(!payload.unloadAfter)
 }
 
 @Test("Structured configuration saves use the control endpoint and snake-case JSON")
@@ -90,7 +117,7 @@ func configurationSaveRequestEncoding() throws {
     let locations = try #require(storage["locations"] as? [[String: Any]])
     let load = try #require(models.first?["load"] as? [String: Any])
     #expect(server["inference_port"] as? Int == 17_330)
-    #expect(config["schema_version"] as? Int == 1)
+    #expect(config["schema_version"] as? Int == 2)
     #expect(load["context_length"] as? Int == 32_768)
     #expect(load["projector_path"] as? String == "/Volumes/Athena/models/mmproj.gguf")
     #expect(load["gpu_layers"] as? Int == 99)
@@ -174,9 +201,9 @@ func futureConfigurationSchemaSaveRefused() throws {
     let client = ControlAPIClient(
         baseURL: URL(string: "http://localhost:17321")!
     )
-    let settings = NativeSettings(schemaVersion: 2)
+    let settings = NativeSettings(schemaVersion: 3)
 
-    #expect(throws: ControlAPIError.unsupportedConfigurationSchema(2)) {
+    #expect(throws: ControlAPIError.unsupportedConfigurationSchema(3)) {
         _ = try client.configurationSaveRequest(
             settings: settings,
             revision: String(repeating: "f", count: 64)
@@ -184,62 +211,13 @@ func futureConfigurationSchemaSaveRefused() throws {
     }
 }
 
-@Test("LM Studio discovery uses the read-only engine inventory endpoint")
-func lmStudioDiscoveryRequest() {
-    let client = ControlAPIClient(
-        baseURL: URL(string: "http://localhost:17321")!,
-        adminPassword: "secret"
-    )
-
-    let request = client.lmStudioModelsRequest()
-
-    #expect(
-        request.url?.absoluteString
-            == "http://localhost:17321/manager/engines/lmstudio/models"
-    )
-    #expect(request.httpMethod == "GET")
-    #expect(request.httpBody == nil)
-    #expect(request.value(forHTTPHeaderField: "Authorization") == "Basic YWRtaW46c2VjcmV0")
-}
-
-@Test("LM Studio inventory metadata decodes without loaded instances")
-func lmStudioInventoryDecoding() throws {
-    let payload = #"""
-    {
-      "models": [{
-        "key":"qwen/qwen3-coder-next",
-        "display_name":"Qwen3 Coder Next",
-        "type":"llm",
-        "publisher":"qwen",
-        "architecture":"qwen3_next",
-        "quantization_name":"4bit",
-        "bits_per_weight":4,
-        "size_bytes":44856096359,
-        "params_string":"80B",
-        "max_context_length":262144,
-        "format":"mlx",
-        "vision":false,
-        "trained_for_tool_use":true,
-        "loaded":false
-      }]
-    }
-    """#.data(using: .utf8)!
-
-    let snapshot = try JSONDecoder.nativeSettingsDecoder()
-        .decode(LMStudioInventorySnapshot.self, from: payload)
-
-    #expect(snapshot.models.first?.key == "qwen/qwen3-coder-next")
-    #expect(snapshot.models.first?.sizeBytes == 44_856_096_359)
-    #expect(snapshot.models.first?.loaded == false)
-}
-
 @Test("Structured configuration decodes every engine and image setting")
 func configurationDecoding() throws {
     let payload = #"""
     {
-      "server": {"inference_bind":"127.0.0.1","inference_port":17320,"control_bind":"127.0.0.1","control_port":17321,"idle_unload_seconds":900,"startup_timeout_seconds":900,"swap_queue_timeout_seconds":300,"shutdown_grace_seconds":30,"reconcile_interval_seconds":30,"image_request_timeout_seconds":1800,"image_max_pixels":4194304,"startup_policy":"unload_all","inference_api_key_env":"INFERENCE_API_KEY","control_password_env":"ADMIN_PASSWORD"},
+      "schema_version": 2,
+      "server": {"inference_bind":"127.0.0.1","inference_port":1240,"control_bind":"127.0.0.1","control_port":17321,"idle_unload_seconds":900,"startup_timeout_seconds":900,"swap_queue_timeout_seconds":300,"shutdown_grace_seconds":30,"reconcile_interval_seconds":30,"image_request_timeout_seconds":1800,"image_max_pixels":4194304,"startup_policy":"unload_all","inference_api_key_env":"INFERENCE_API_KEY","control_password_env":"ADMIN_PASSWORD"},
       "engines": {
-        "lmstudio":{"enabled":true,"base_url":"http://127.0.0.1:1234","api_key_env":"LMSTUDIO_API_KEY","request_timeout_seconds":30},
         "llama_cpp":{"enabled":true,"host":"127.0.0.1","port":17325,"binary":"/runtime/llama-server","working_directory":"/runtime","process_state_path":"/state/llama.json","request_timeout_seconds":30,"shutdown_grace_seconds":30},
         "omlx":{"enabled":true,"base_url":"http://127.0.0.1:17322","api_key_env":"OMLX_API_KEY","admin_session_env":"OMLX_ADMIN_SESSION","request_timeout_seconds":30,"model_directories":["/Volumes/Athena/models"]},
         "ds4":{"enabled":true,"host":"127.0.0.1","port":17323,"binary":"/ds4","working_directory":"/","process_state_path":"/state","request_timeout_seconds":30,"shutdown_grace_seconds":30},
@@ -247,7 +225,8 @@ func configurationDecoding() throws {
       },
       "paths":{"state_database":"/state.db","log_directory":"/logs"},
       "storage":{"default":"athena-models","locations":[{"name":"athena-models","path":"/Volumes/Athena/models","volume_uuid":"ATHENA-UUID"}]},
-      "models":[{"alias":"qwen-image","engine":"mflux","model":"Qwen/Qwen-Image","served_model_name":null,"capabilities":["images/generations"],"load":{"context_length":null,"eval_batch_size":null,"flash_attention":null,"num_experts":null,"offload_kv_cache_to_gpu":null,"kv_disk_directory":null,"kv_disk_space_mb":null,"extra_args":[]},"kind":"image","image":{"family":"qwen-image","quantize":8,"width":1024,"height":1024,"num_inference_steps":30,"guidance_scale":4},"enabled":true}],
+      "models":[{"alias":"qwen-image","engine":"mflux","model":"Qwen/Qwen-Image","served_model_name":null,"capabilities":["images/generations"],"load":{"context_length":null,"eval_batch_size":null,"flash_attention":null,"offload_kv_cache_to_gpu":null,"kv_disk_directory":null,"kv_disk_space_mb":null,"extra_args":[]},"kind":"image","image":{"family":"qwen-image","quantize":8,"width":1024,"height":1024,"num_inference_steps":30,"guidance_scale":4},"enabled":true}],
+      "migration":{"legacy_lmstudio_profiles":[]},
       "token_sidecar":{"enabled":false,"node_id":"","flush_interval_seconds":30,"batch_size":500,"max_outbox_rows":100000,"connect_timeout_seconds":5}
     }
     """#.data(using: .utf8)!
@@ -284,6 +263,12 @@ func localModelScanDecoding() throws {
         "compatibility":"structural",
         "compatibility_reason":"Valid GGUF header.",
         "capabilities":["chat/completions","responses"],
+        "architecture":"qwen2vl",
+        "context_length":131072,
+        "parameter_count":7615000000,
+        "summary":"A local vision model.",
+        "model_card_markdown":"# Qwen\n\nA local vision model.",
+        "recommended_projector_id":"projector-1",
         "projector_options":[{
           "id":"projector-1",
           "path":"/Volumes/Athena/models/Qwen/mmproj-F16.gguf",
@@ -302,6 +287,8 @@ func localModelScanDecoding() throws {
     #expect(scan.root == "/Volumes/Athena/models")
     #expect(scan.models.first?.engine == .llamaCpp)
     #expect(scan.models.first?.projectorOptions.first?.id == "projector-1")
+    #expect(scan.models.first?.recommendedProjectorId == "projector-1")
+    #expect(scan.models.first?.contextLength == 131_072)
     #expect(scan.models.first?.existingAlias == "qwen")
     #expect(scan.models.first?.isImportable == true)
 }
@@ -334,7 +321,7 @@ func localModelRequestEncoding() throws {
         selections: [
             LocalModelImportSelection(
                 candidateId: "candidate-1",
-                alias: "qwen-gguf",
+                alias: "qwen-local",
                 projectorId: "projector-1"
             ),
         ]
@@ -399,7 +386,7 @@ func llamaCppFileSelectionDecoding() throws {
       "size_bytes":4294967296,
       "quantization":"Q4_K_M",
       "filename":"model-Q4_K_M.gguf",
-      "projector_filename":null,
+      "projector_filename":"mmproj-F16.gguf",
       "projector_options":["mmproj-F16.gguf","mmproj-Q5_K_M.gguf"],
       "download_files":["model-Q4_K_M.gguf"],
       "resolved_revision":"abc123",
@@ -412,7 +399,10 @@ func llamaCppFileSelectionDecoding() throws {
       "default_width":null,
       "default_height":null,
       "default_num_inference_steps":null,
-      "default_guidance_scale":null
+      "default_guidance_scale":null,
+      "architecture":"qwen2vl",
+      "context_length":131072,
+      "parameter_count":7615000000
     }
     """#.data(using: .utf8)!
 
@@ -420,6 +410,8 @@ func llamaCppFileSelectionDecoding() throws {
     #expect(model.engine == .llamaCpp)
     #expect(model.filename == "model-Q4_K_M.gguf")
     #expect(model.availableProjectors == ["mmproj-F16.gguf", "mmproj-Q5_K_M.gguf"])
+    #expect(model.projectorFilename == "mmproj-F16.gguf")
+    #expect(model.contextLength == 131_072)
     #expect(model.suggestedRole == .generation)
 
     let install = StartModelInstallRequest(
@@ -429,6 +421,7 @@ func llamaCppFileSelectionDecoding() throws {
         role: .generation
     )
     #expect(install.projectorFilename == "mmproj-F16.gguf")
+    #expect(install.includeProjector)
     #expect(install.revision == "abc123")
     #expect(install.capabilities == ModelRole.generation.capabilities)
 }
@@ -472,7 +465,8 @@ func modelLibraryDecoding() throws {
       "capabilities":["chat/completions","completions","responses","messages"],
       "family":null,
       "bytes_downloaded":1048576,
-      "total_bytes":null,
+      "total_bytes":4194304,
+      "download_speed_bps":524288.5,
       "error":null,
       "pid":123,
       "created_at":1,
@@ -485,6 +479,41 @@ func modelLibraryDecoding() throws {
     #expect(install.isActive)
     #expect(install.destination.hasPrefix("/Volumes/Athena/models/"))
     #expect(install.capabilities == ModelRole.generation.capabilities)
+    #expect(install.progressFraction == 0.25)
+    #expect(install.downloadSpeedBps == 524_288.5)
+}
+
+@Test("Download history removal and managed deletion use explicit DELETE requests")
+func modelDeletionRequestEncoding() throws {
+    let client = ControlAPIClient(
+        baseURL: URL(string: "http://localhost:17321")!,
+        adminPassword: "secret"
+    )
+
+    let dismissed = client.dismissModelInstallRequest(id: "install-1")
+    #expect(
+        dismissed.url?.absoluteString
+            == "http://localhost:17321/manager/model-library/installs/install-1"
+    )
+    #expect(dismissed.httpMethod == "DELETE")
+
+    let revision = String(repeating: "a", count: 64)
+    let deleted = try client.deleteManagedModelRequest(
+        alias: "qwen-model",
+        revision: revision
+    )
+    #expect(
+        deleted.url?.absoluteString
+            == "http://localhost:17321/manager/models/qwen-model"
+    )
+    #expect(deleted.httpMethod == "DELETE")
+    #expect(deleted.value(forHTTPHeaderField: "Content-Type") == "application/json")
+    let body = try #require(deleted.httpBody)
+    #expect(
+        try JSONDecoder.nativeSettingsDecoder()
+            .decode(DeleteManagedModelRequest.self, from: body)
+            == DeleteManagedModelRequest(revision: revision)
+    )
 }
 
 @Test("Downloaded weights can retry registration without appearing active")
@@ -587,6 +616,7 @@ func runtimeUpdateDecoding() throws {
       "engines":[
         {
           "engine":"omlx",
+          "release_tier":"stable",
           "display_name":"oMLX",
           "ownership":"external",
           "installed":true,
@@ -596,6 +626,7 @@ func runtimeUpdateDecoding() throws {
           "latest_upstream_version":"0.3.13",
           "latest_upstream_revision":null,
           "latest_upstream_url":"https://github.com/jundot/omlx/releases/tag/v0.3.13",
+          "official_installer_url":"https://github.com/jundot/omlx/releases/download/v0.3.13/oMLX-0.3.13-macos15-sequoia.dmg",
           "available_version":null,
           "available_revision":null,
           "release_notes_url":"https://github.com/jundot/omlx/releases/tag/v0.3.13",
@@ -607,6 +638,7 @@ func runtimeUpdateDecoding() throws {
         },
         {
           "engine":"mflux",
+          "release_tier":"preview",
           "display_name":"MFLUX",
           "ownership":"managed_or_external",
           "installed":true,
@@ -634,8 +666,11 @@ func runtimeUpdateDecoding() throws {
 
     #expect(snapshot.coreProtocol == 1)
     #expect(snapshot.engines[0].engine == .omlx)
+    #expect(snapshot.engines[0].releaseTierLabel == "STABLE")
     #expect(!snapshot.engines[0].canInstall)
+    #expect(snapshot.engines[0].officialInstallerUrl?.hasSuffix(".dmg") == true)
     #expect(snapshot.engines[1].engine == .mflux)
+    #expect(snapshot.engines[1].releaseTierLabel == "PREVIEW")
     #expect(snapshot.engines[1].availableLabel == "0.19.0-ui1")
     #expect(snapshot.engines[1].canRollback)
 }
@@ -688,12 +723,16 @@ func statusDecodeIsForwardCompatible() throws {
       "resident_model": "glm-5-2",
       "resident_engine": "omlx",
       "in_flight_requests": 2,
+      "diagnostic": "engine state needs attention",
+      "startup_error": "oMLX authentication failed",
       "token_sidecar": {
         "enabled": true,
         "node_id": "theseus",
         "node_id_source": "token_sidecar",
         "outbox_depth": 4,
         "last_flush_at": 1784462400.5,
+        "writer_ready": false,
+        "last_error": "Postgres is unavailable",
         "future_field": "ignored"
       },
       "another_future_field": true
@@ -710,6 +749,160 @@ func statusDecodeIsForwardCompatible() throws {
     #expect(snapshot.tokenSidecar?.nodeIdSource == "token_sidecar")
     #expect(snapshot.tokenSidecar?.outboxDepth == 4)
     #expect(snapshot.tokenSidecar?.lastFlushAt == 1_784_462_400.5)
+    #expect(snapshot.tokenSidecar?.writerReady == false)
+    #expect(snapshot.tokenSidecar?.lastError == "Postgres is unavailable")
+    #expect(snapshot.diagnostic == "engine state needs attention")
+    #expect(snapshot.startupError == "oMLX authentication failed")
+}
+
+@Test("Readiness and self-test payloads preserve actionable V1 health")
+func readinessAndSelfTestDecoding() throws {
+    let readinessPayload = #"""
+    {
+      "schema_version": 1,
+      "product_version": "0.9.0",
+      "core": {
+        "ready": true,
+        "state": "idle",
+        "diagnostic": null,
+        "startup_error": null,
+        "resident_alias": null,
+        "in_flight_requests": 0,
+        "queued_requests": 0,
+        "omlx_model_directory_sync_pending": false
+      },
+      "engines": [{
+        "engine": "llama.cpp",
+        "release_tier": "stable",
+        "enabled": true,
+        "installed": true,
+        "installed_version": "b10107",
+        "installed_path": "/runtimes/llama.cpp",
+        "service_state": "ready",
+        "authoritative": true,
+        "resident_models": [],
+        "ready": true,
+        "diagnostic": null
+      }, {
+        "engine": "ds4",
+        "release_tier": "preview",
+        "enabled": false,
+        "installed": true,
+        "installed_version": "abc123",
+        "installed_path": "/runtimes/ds4",
+        "service_state": "disabled",
+        "authoritative": true,
+        "resident_models": [],
+        "ready": false,
+        "diagnostic": null
+      }],
+      "storage": [{
+        "name": "internal",
+        "path": "/Models",
+        "available": true,
+        "writable": true,
+        "volume_matches": true,
+        "free_bytes": 1234,
+        "diagnostic": null
+      }],
+      "models": {"configured": 1, "callable": 1},
+      "downloads": {"active": 0, "items": []},
+      "usage": {
+        "enabled": true,
+        "node_id": "theseus",
+        "node_id_source": "computer_name",
+        "writer_ready": true,
+        "outbox_pending": 0,
+        "outbox_depth": 0,
+        "last_flush_at": null,
+        "last_flush_count": 0,
+        "last_error": null
+      },
+      "ready_for_inference": true
+    }
+    """#.data(using: .utf8)!
+    let readiness = try JSONDecoder.nativeSettingsDecoder().decode(
+        ReadinessSnapshot.self,
+        from: readinessPayload
+    )
+    #expect(readiness.readyForInference)
+    #expect(readiness.productVersion == "0.9.0")
+    #expect(readiness.engines[0].isStable)
+    #expect(readiness.engines[1].releaseTier == "preview")
+    #expect(readiness.storage[0].freeBytes == 1234)
+
+    let selfTestPayload = #"""
+    {
+      "schema_version": 1,
+      "success": true,
+      "model": "alpaca",
+      "engine": "llama.cpp",
+      "release_tier": "stable",
+      "endpoint": "/v1/chat/completions",
+      "vision": false,
+      "response_preview": "Alpacas are camelids.",
+      "response_ms": 1500,
+      "usage": {
+        "prompt_tokens": 12,
+        "completion_tokens": 7,
+        "total_tokens": 19
+      },
+      "usage_recorded": true,
+      "usage_delivery": {
+        "enabled": true,
+        "node_id": "theseus",
+        "node_id_source": "computer_name",
+        "writer_ready": true,
+        "outbox_pending": 1,
+        "outbox_depth": 1,
+        "last_flush_at": null,
+        "last_flush_count": 0,
+        "last_error": null
+      }
+    }
+    """#.data(using: .utf8)!
+    let result = try JSONDecoder.nativeSettingsDecoder().decode(
+        ModelSelfTestResult.self,
+        from: selfTestPayload
+    )
+    #expect(result.success)
+    #expect(result.engine == .llamaCpp)
+    #expect(result.usage?.totalTokens == 19)
+    #expect(result.usageRecorded == true)
+    #expect(result.completesGuidedSetup)
+
+    let imageOnlyPayload = #"""
+    {
+      "schema_version": 1,
+      "success": true,
+      "model": "preview-image",
+      "engine": "mflux",
+      "release_tier": "preview",
+      "endpoint": "/v1/images/generations",
+      "vision": false,
+      "response_preview": "1 image result(s)",
+      "response_ms": 900,
+      "usage": null,
+      "usage_recorded": null,
+      "usage_delivery": {
+        "enabled": true,
+        "node_id": "theseus",
+        "node_id_source": "computer_name",
+        "writer_ready": true,
+        "outbox_pending": 0,
+        "outbox_depth": 0,
+        "last_flush_at": null,
+        "last_flush_count": 0,
+        "last_error": null
+      }
+    }
+    """#.data(using: .utf8)!
+    let imageOnly = try JSONDecoder.nativeSettingsDecoder().decode(
+        ModelSelfTestResult.self,
+        from: imageOnlyPayload
+    )
+    #expect(imageOnly.success)
+    #expect(!imageOnly.completesGuidedSetup)
 }
 
 @Test("The catalog decoder preserves aliases and ignores future fields")

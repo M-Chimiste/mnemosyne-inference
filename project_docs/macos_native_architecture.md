@@ -6,8 +6,9 @@ Status: implemented native architecture; target-Mac acceptance remains pending.
 
 The macOS deployment provides one OpenAI/Anthropic-compatible endpoint for a
 manager-owned llama.cpp runtime, oMLX, DwarfStar (DS4), and a managed MFLUX
-image worker. LM Studio is retained only as an explicitly enabled migration
-fallback until its soak is accepted. The deployment preserves the
+image worker. LM Studio is not an inference engine; its configured and
+conventional model directories are read only as Finder-confirmed migration
+hints. The deployment preserves the
 single-resident-model behavior of the CUDA deployment while running natively so
 Apple Metal and unified memory remain available to the inference engines.
 
@@ -26,7 +27,7 @@ Default ports are deliberately outside common development defaults:
 
 | Port | Owner | Purpose | Default bind |
 | ---: | --- | --- | --- |
-| 17320 | Mnemosyne Core | Unified inference API | `127.0.0.1` |
+| 1240 | Mnemosyne Core | Unified inference API and legacy-sidecar replacement | `127.0.0.1` |
 | 17321 | Mnemosyne Core | Control/admin API | `127.0.0.1` |
 | 17322 | oMLX | Native MLX engine | `127.0.0.1` |
 | 17323 | DS4 | Managed native subprocess | `127.0.0.1` |
@@ -86,28 +87,27 @@ There is exactly one lifecycle owner: Mnemosyne Core.
   maintenance barrier. The signed app's MFLUX layer and configured DS4 paths
   remain fallbacks. oMLX remains externally installed and uses its official
   update mechanism.
-- Clients use Mnemosyne on port 17320. Direct client traffic to an inner engine
+- Clients use Mnemosyne on port 1240. Direct client traffic to an inner engine
   can violate the single-resident invariant and is unsupported.
 
-During the migration soak, LM Studio JIT loading and oMLX pinning/automatic
-loading must not create models outside the coordinator. Operators disable
-those behaviors during setup. Startup and periodic audits fail closed if an
-unexpected resident appears or an enabled engine cannot report authoritative
-state.
+oMLX pinning or automatic loading must not create models outside the
+coordinator. Operators disable those behaviors during setup. Startup and
+periodic audits fail closed if an unexpected resident appears or an enabled
+engine cannot report authoritative state.
 
 ## Model Profiles
 
 Public aliases are globally unique and explicitly select an engine. Mnemosyne
 does not infer the engine from a model name or file extension.
 
-Conceptual configuration (fresh installs disable the legacy LM Studio adapter):
+Conceptual configuration:
 
 ```yaml
-schema_version: 1
+schema_version: 2
 
 server:
   inference_bind: 127.0.0.1
-  inference_port: 17320
+  inference_port: 1240
   control_bind: 127.0.0.1
   control_port: 17321
   idle_unload_seconds: 900
@@ -115,9 +115,6 @@ server:
   swap_queue_timeout_seconds: 300
 
 engines:
-  lmstudio:
-    enabled: false
-    base_url: http://127.0.0.1:1234
   llama_cpp:
     enabled: true
     host: 127.0.0.1
@@ -136,37 +133,15 @@ engines:
     host: 127.0.0.1
     port: 17324
 
-models:
-  - alias: local-qwen
-    engine: llama.cpp
-    model: /Volumes/Athena/models/publisher/model/model-Q4_K_M.gguf
-    storage: athena-models
-    served_model_name: local-qwen
-    load:
-      context_length: 32768
-      projector_path: /Volumes/Athena/models/publisher/model/mmproj-BF16.gguf
+# Fresh installs have no model profiles. Model Library and Finder discovery
+# create profiles only after the user selects the exact model and destination;
+# the service preserves those paths instead of assuming a volume or cache root.
+models: []
 
-  - alias: glm-5-2
-    engine: omlx
-    model: GLM-5.2-4bit
-
-  - alias: deepseek-v4-flash
-    engine: ds4
-    model: /Volumes/Models/ds4flash.gguf
-    load:
-      context_length: 100000
-      kv_disk_directory: /Volumes/ModelCache/ds4-kv
-      kv_disk_space_mb: 8192
-
-  - alias: krea-2-turbo
-    engine: mflux
-    model: krea/Krea-2-Turbo
-    kind: image
-    image:
-      family: krea-2
-      quantize: 8
-      num_inference_steps: 8
-      guidance_scale: 1
+# Version-1 LM Studio profiles are converted to inert migration records and
+# consumed only when Finder import adopts their weights into a native engine.
+migration:
+  legacy_lmstudio_profiles: []
 ```
 
 Engine-specific options live below `load`. Unknown options are rejected unless
@@ -192,11 +167,10 @@ atomic profile migration. Projector GGUFs never become primary models. DS4
 profiles are always explicit because DS4 accepts only its purpose-built GGUF
 layouts. A read-only local-source route parses LM Studio's configured
 `downloadsFolder` and advertises that exact path before its documented
-`~/.lmstudio/models` default, without depending on the LM Studio adapter or
-daemon. These are only Finder preselection hints; the picker grant and bounded
+`~/.lmstudio/models` default, without contacting an LM Studio adapter, daemon,
+or API. These are only Finder preselection hints; the picker grant and bounded
 filesystem helper remain the access and validation boundary. Symlink and
-nested paths are retained rather than collapsed to a volume root. The LM
-Studio inventory remains only for the temporary soak fallback.
+nested paths are retained rather than collapsed to a volume root.
 
 ## Finder Access and Protected Paths
 
@@ -343,12 +317,14 @@ The control plane starts with:
 - `GET /manager/model-library/search`
 - `GET /manager/model-library/files`
 - `GET /manager/model-library/installs`
+- `GET /manager/model-library/install-evidence`
 - `POST /manager/model-library/installs`
 - `POST /manager/model-library/installs/{id}/cancel`
 - `POST /manager/model-library/installs/{id}/retry`
 - `GET /manager/usage`
 - `GET /manager/runtime-updates`
 - `POST /manager/runtime-updates/check`
+- `GET /manager/runtime-updates/evidence`
 - `POST /manager/runtime-updates/{engine}/install`
 - `POST /manager/runtime-updates/{engine}/rollback`
 
@@ -358,6 +334,14 @@ the persisted file has changed. Settings saves, completed-download profile
 creation, and local imports share one mutation lock and always reload the
 latest YAML before writing, so a stale window cannot erase a concurrently
 added model.
+
+Runtime activation and rollback also append to a mode-`0600`, bounded
+Application Support journal. It contains fixed transition fields, fixed
+failure codes, and an anonymous per-service-instance UUID—not exception text,
+credentials, request bodies, or model content. A successful self-test records
+`inference_validated` only when that engine resolves through an active managed
+runtime. `GET /manager/runtime-updates/evidence` returns that journal plus a
+fresh local installed-runtime snapshot without contacting upstream services.
 
 Inference bearer auth and control auth follow the CUDA manager's fail-safe
 behavior. Inner engine credentials are never forwarded to clients, and outer
@@ -428,8 +412,8 @@ package under compatibility imports. The macOS package must never import
 1. Configuration, adapter protocol, coordinator, and deterministic fake-engine
    tests.
 2. Manager-owned llama.cpp adapter, official runtime integrity checks, GGUF
-   quant/shard/projector selection, and local-library adoption tests. The LM
-   Studio adapter remains covered only for migration/soak compatibility.
+   quant/shard selection, automatic vision-projector defaults with opt-out,
+   metadata/model-card discovery, and local-library adoption tests.
 3. oMLX adapter, including explicit validation of programmatic unload auth.
 4. DS4 subprocess adapter and readiness/termination tests using a fake server.
 5. Inference proxy, endpoint capability checks, and usage normalization.
@@ -439,12 +423,17 @@ package under compatibility imports. The macOS package must never import
    typed settings, model-library discovery, and onboarding checks.
 9. Official-source, rollback-safe llama.cpp, MFLUX, and DS4 managed runtimes
    plus external oMLX update discovery.
-10. Native macOS smoke checklist for the remaining target-machine acceptance.
+10. Candidate-scoped first-presentation and successful-self-test markers make
+    the guided clean-install gate machine-verifiable without recording
+    credentials or model prompts. A private accepted pre-login report plus a
+    changed LaunchAgent GUI audit session and process ID proves a real
+    logout/login or reboot, rather than an ordinary service restart.
+11. Native macOS smoke checklist and secret-safe collector for the remaining
+    target-machine acceptance.
 
 ## External References
 
 - llama.cpp: <https://github.com/ggml-org/llama.cpp>
-- LM Studio model management (temporary migration fallback): <https://lmstudio.ai/docs/developer/rest>
 - oMLX: <https://github.com/jundot/omlx>
 - DwarfStar: <https://github.com/antirez/ds4>
 - MLX unified memory: <https://ml-explore.github.io/mlx/build/html/usage/unified_memory.html>

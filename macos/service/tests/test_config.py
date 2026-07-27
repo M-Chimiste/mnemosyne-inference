@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
+import yaml
 
 from mnemosyne_macos.config import (
     ConfigError,
@@ -9,24 +12,52 @@ from mnemosyne_macos.config import (
     load_config,
     parse_config,
     save_config,
+    suggested_model_alias,
 )
+
+
+EXAMPLE_CONFIG = Path(__file__).resolve().parents[2] / "config.yaml.example"
+
+
+def test_shipped_example_config_is_valid() -> None:
+    payload = yaml.safe_load(EXAMPLE_CONFIG.read_text(encoding="utf-8"))
+
+    config = MacConfig.model_validate(payload)
+
+    assert config.engines.omlx.enabled is False
+    assert config.models == []
+    assert config.profiles() == {}
 from mnemosyne_macos.models import Endpoint, EngineName, ModelKind
 
 
-def test_defaults_use_dedicated_port_block() -> None:
+def test_defaults_replace_the_legacy_sidecar_port() -> None:
     config = MacConfig()
-    assert config.server.inference_port == 17320
+    assert config.schema_version == 2
+    assert config.server.inference_port == 1240
     assert config.server.control_port == 17321
-    assert config.engines.lmstudio.base_url.endswith(":1234")
-    assert config.engines.lmstudio.enabled is False
     assert config.engines.llama_cpp.port == 17325
     assert config.engines.llama_cpp.enabled is True
     assert config.engines.omlx.base_url.endswith(":17322")
+    assert config.engines.omlx.enabled is False
     assert config.engines.ds4.port == 17323
+    assert config.engines.ds4.enabled is False
     assert config.engines.mflux.port == 17324
+    assert config.engines.mflux.enabled is False
     assert config.engines.ds4.process_state_path.endswith("/state/ds4-process.json")
     assert config.token_sidecar.enabled is True
     assert config.token_sidecar.node_id == ""
+
+
+def test_packaged_example_has_the_intentional_v1_runtime_topology() -> None:
+    payload = yaml.safe_load(EXAMPLE_CONFIG.read_text(encoding="utf-8"))
+    packaged = MacConfig.model_validate(payload)
+
+    assert packaged.server.inference_port == 1240
+    assert packaged.server.control_port == 17321
+    assert packaged.engines.llama_cpp.enabled is True
+    assert packaged.engines.omlx.enabled is False
+    assert packaged.engines.ds4.enabled is False
+    assert packaged.engines.mflux.enabled is False
 
 
 def test_legacy_mac_node_placeholder_migrates_to_automatic_identity() -> None:
@@ -36,7 +67,7 @@ def test_legacy_mac_node_placeholder_migrates_to_automatic_identity() -> None:
     assert config.token_sidecar.node_id == ""
 
 
-def test_parse_config_validates_in_memory_yaml_without_a_file() -> None:
+def test_parse_config_migrates_v1_lmstudio_profiles_to_inert_import_records() -> None:
     config = parse_config(
         """
         engines:
@@ -54,7 +85,12 @@ def test_parse_config_validates_in_memory_yaml_without_a_file() -> None:
         source="in-memory configuration",
     )
 
-    assert [model.alias for model in config.models] == ["local-model"]
+    assert config.schema_version == 2
+    assert config.models == []
+    assert [
+        model.alias for model in config.migration.legacy_lmstudio_profiles
+    ] == ["local-model"]
+    assert not hasattr(config.engines, "lmstudio")
 
 
 def test_parse_config_reports_source_for_invalid_yaml() -> None:
@@ -97,18 +133,46 @@ def test_ds4_process_state_path_is_configurable(tmp_path) -> None:
 def test_profiles_resolve_engine_specific_wire_names() -> None:
     config = MacConfig.model_validate(
         {
-            "engines": {"lmstudio": {"enabled": True}},
+            "engines": {"ds4": {"enabled": True}},
             "models": [
-                {"alias": "studio-model", "engine": "lmstudio", "model": "org/model"},
                 {"alias": "deepseek-v4", "engine": "ds4", "model": "~/ds4.gguf"},
             ]
         }
     )
     profiles = config.profiles()
-    assert profiles["studio-model"].wire_model == "org/model"
     assert profiles["deepseek-v4"].wire_model == "deepseek-v4"
     assert profiles["deepseek-v4"].key.engine == EngineName.DS4
     assert Endpoint.RESPONSES in profiles["deepseek-v4"].capabilities
+
+
+def test_profiles_allow_safe_dotted_legacy_aliases() -> None:
+    config = MacConfig.model_validate(
+        {
+            "models": [
+                {
+                    "alias": "lfm2.5-8b-a1b",
+                    "engine": "llama.cpp",
+                    "model": "/models/lfm.gguf",
+                    "served_model_name": "lfm2.5-8b-a1b",
+                },
+            ]
+        }
+    )
+    profiles = config.profiles()
+
+    assert profiles["lfm2.5-8b-a1b"].wire_model == "lfm2.5-8b-a1b"
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("LFM2.5-8B-A1B-GGUF", "lfm2.5-8b-a1b"),
+        ("Qwen3-Coder-Next_MLX", "qwen3-coder-next"),
+        ("gemma-4-26B-A4B-it.safetensors", "gemma-4-26b-a4b-it"),
+    ],
+)
+def test_suggested_alias_omits_weight_format(name: str, expected: str) -> None:
+    assert suggested_model_alias(name) == expected
 
 
 def test_load_digest_changes_with_effective_options() -> None:
@@ -118,10 +182,16 @@ def test_load_digest_changes_with_effective_options() -> None:
         "model": "/models/ds4.gguf",
     }
     first = MacConfig.model_validate(
-        {"models": [{**base, "load": {"context_length": 100_000}}]}
+        {
+            "engines": {"ds4": {"enabled": True}},
+            "models": [{**base, "load": {"context_length": 100_000}}],
+        }
     ).profiles()["deepseek-v4"]
     second = MacConfig.model_validate(
-        {"models": [{**base, "load": {"context_length": 200_000}}]}
+        {
+            "engines": {"ds4": {"enabled": True}},
+            "models": [{**base, "load": {"context_length": 200_000}}],
+        }
     ).profiles()["deepseek-v4"]
     assert first.key.load_config_digest != second.key.load_config_digest
 
@@ -129,7 +199,14 @@ def test_load_digest_changes_with_effective_options() -> None:
 def test_duplicate_or_conflicting_ports_are_rejected() -> None:
     with pytest.raises(ValueError, match="ports must be distinct"):
         MacConfig.model_validate(
-            {"engines": {"omlx": {"base_url": "http://127.0.0.1:17320"}}}
+            {
+                "engines": {
+                    "omlx": {
+                        "enabled": True,
+                        "base_url": "http://127.0.0.1:1240",
+                    }
+                }
+            }
         )
 
 
@@ -158,15 +235,15 @@ def test_inner_engine_urls_must_be_loopback_and_secret_free() -> None:
         MacConfig.model_validate(
             {
                 "engines": {
-                    "lmstudio": {
-                        "base_url": "http://token:secret@127.0.0.1:1234"
+                    "omlx": {
+                        "base_url": "http://token:secret@127.0.0.1:17322"
                     }
                 }
             }
         )
 
 
-def test_ds4_rejects_lmstudio_only_load_options() -> None:
+def test_ds4_rejects_llama_cpp_only_load_options() -> None:
     with pytest.raises(ValueError, match="not supported by DS4"):
         MacConfig.model_validate(
             {
@@ -236,21 +313,23 @@ def test_mflux_accepts_each_bundled_text_to_image_family() -> None:
         assert profile.family == family
 
 
-def test_image_profile_requires_enabled_mflux() -> None:
-    with pytest.raises(ValueError, match="disabled engines"):
-        MacConfig.model_validate(
-            {
-                "models": [
-                    {
-                        "alias": "qwen-image",
-                        "engine": "mflux",
-                        "model": "Qwen/Qwen-Image",
-                        "kind": "image",
-                        "image": {"family": "qwen-image"},
-                    }
-                ]
-            }
-        )
+def test_disabled_engine_profile_is_retained_but_not_resolved() -> None:
+    config = MacConfig.model_validate(
+        {
+            "models": [
+                {
+                    "alias": "qwen-image",
+                    "engine": "mflux",
+                    "model": "Qwen/Qwen-Image",
+                    "kind": "image",
+                    "image": {"family": "qwen-image"},
+                }
+            ]
+        }
+    )
+
+    assert config.models[0].enabled is True
+    assert config.profiles() == {}
 
 
 def test_storage_scope_uses_only_an_opaque_sha256_identifier() -> None:

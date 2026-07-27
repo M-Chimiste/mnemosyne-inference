@@ -2,16 +2,28 @@ import Foundation
 
 public protocol ControlAPI: Sendable {
     func status() async throws -> ServiceSnapshot
+    func readiness() async throws -> ReadinessSnapshot
+    func reconcile() async throws -> ServiceSnapshot
+    func selfTest(
+        model: String,
+        includeVision: Bool,
+        unloadAfter: Bool
+    ) async throws -> ModelSelfTestResult
     func models() async throws -> ModelCatalogSnapshot
     func load(model: String) async throws -> ServiceSnapshot
     func unload() async throws
-    func lmStudioModels() async throws -> [LMStudioDiscoveredModel]
     func storageLocations() async throws -> StorageSnapshot
     func inspectStorage(path: String, bookmarkData: Data?) async throws -> StorageStatus
     func searchLibrary(query: String, engine: InferenceEngine) async throws -> [LibraryModel]
     func libraryFiles(
         repoId: String, engine: InferenceEngine, revision: String?
     ) async throws -> [LibraryModel]
+    func libraryDetails(
+        repoId: String,
+        engine: InferenceEngine,
+        filename: String?,
+        revision: String?
+    ) async throws -> LibraryModelDetails
     func localModelSources() async throws -> [LocalModelSource]
     func scanLocalModels(path: String, bookmarkData: Data?) async throws -> LocalModelScanSnapshot
     func importLocalModels(
@@ -21,6 +33,10 @@ public protocol ControlAPI: Sendable {
     func startModelInstall(_ request: StartModelInstallRequest) async throws -> ModelInstall
     func cancelModelInstall(id: String) async throws -> ModelInstall
     func retryModelInstall(id: String) async throws -> ModelInstall
+    func dismissModelInstall(id: String) async throws
+    func deleteManagedModel(
+        alias: String, revision: String
+    ) async throws -> ConfigurationSaveResult
     func runtimeUpdates(refresh: Bool) async throws -> RuntimeUpdateSnapshot
     func checkRuntimeUpdates() async throws -> RuntimeUpdateSnapshot
     func installRuntimeUpdate(
@@ -60,6 +76,10 @@ public struct ConfigurationSaveResult: Codable, Equatable, Sendable {
     public let modelCount: Int
     public let revision: String
     public let config: NativeSettings
+}
+
+struct DeleteManagedModelRequest: Codable, Equatable, Sendable {
+    let revision: String
 }
 
 public struct ConfigurationSnapshot: Codable, Equatable, Sendable {
@@ -155,6 +175,58 @@ public struct ControlAPIClient: ControlAPI, Sendable {
         return try JSONDecoder().decode(ServiceSnapshot.self, from: data)
     }
 
+    public func readiness() async throws -> ReadinessSnapshot {
+        let request = makeRequest(path: "/manager/readiness")
+        let (data, response) = try await session.data(for: request)
+        try validate(response, data: data)
+        return try JSONDecoder.nativeSettingsDecoder().decode(
+            ReadinessSnapshot.self,
+            from: data
+        )
+    }
+
+    public func reconcile() async throws -> ServiceSnapshot {
+        let request = makeRequest(path: "/manager/reconcile", method: "POST")
+        let (data, response) = try await session.data(for: request)
+        try validate(response, data: data)
+        return try JSONDecoder().decode(ServiceSnapshot.self, from: data)
+    }
+
+    public func selfTest(
+        model: String,
+        includeVision: Bool = true,
+        unloadAfter: Bool = false
+    ) async throws -> ModelSelfTestResult {
+        let request = try selfTestRequest(
+            model: model,
+            includeVision: includeVision,
+            unloadAfter: unloadAfter
+        )
+        let (data, response) = try await session.data(for: request)
+        try validate(response, data: data)
+        return try JSONDecoder.nativeSettingsDecoder().decode(
+            ModelSelfTestResult.self,
+            from: data
+        )
+    }
+
+    func selfTestRequest(
+        model: String,
+        includeVision: Bool,
+        unloadAfter: Bool
+    ) throws -> URLRequest {
+        var request = makeRequest(path: "/manager/self-test", method: "POST")
+        request.httpBody = try JSONEncoder.nativeSettingsEncoder().encode(
+            ModelSelfTestRequest(
+                model: model,
+                includeVision: includeVision,
+                unloadAfter: unloadAfter
+            )
+        )
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        return request
+    }
+
     public func models() async throws -> ModelCatalogSnapshot {
         let request = makeRequest(path: "/manager/models")
         let (data, response) = try await session.data(for: request)
@@ -173,14 +245,6 @@ public struct ControlAPIClient: ControlAPI, Sendable {
         let request = makeRequest(path: "/manager/unload", method: "POST")
         let (data, response) = try await session.data(for: request)
         try validate(response, data: data)
-    }
-
-    public func lmStudioModels() async throws -> [LMStudioDiscoveredModel] {
-        let request = lmStudioModelsRequest()
-        let (data, response) = try await session.data(for: request)
-        try validate(response, data: data)
-        return try JSONDecoder.nativeSettingsDecoder()
-            .decode(LMStudioInventorySnapshot.self, from: data).models
     }
 
     public func storageLocations() async throws -> StorageSnapshot {
@@ -242,6 +306,42 @@ public struct ControlAPIClient: ControlAPI, Sendable {
             .decode(LibraryModelsSnapshot.self, from: data).models
     }
 
+    public func libraryDetails(
+        repoId: String,
+        engine: InferenceEngine,
+        filename: String? = nil,
+        revision: String? = nil
+    ) async throws -> LibraryModelDetails {
+        var components = URLComponents(
+            url: endpointURL("/manager/model-library/details"),
+            resolvingAgainstBaseURL: false
+        )!
+        components.queryItems = [
+            URLQueryItem(name: "engine", value: engine.rawValue),
+            URLQueryItem(name: "repo_id", value: repoId),
+        ]
+        if let filename, !filename.isEmpty {
+            components.queryItems?.append(
+                URLQueryItem(name: "filename", value: filename)
+            )
+        }
+        if let revision, !revision.isEmpty {
+            components.queryItems?.append(
+                URLQueryItem(name: "revision", value: revision)
+            )
+        }
+        var request = URLRequest(url: components.url!)
+        request.httpMethod = "GET"
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        addAuthorization(to: &request)
+        let (data, response) = try await session.data(for: request)
+        try validate(response, data: data)
+        return try JSONDecoder.nativeSettingsDecoder().decode(
+            LibraryModelDetails.self,
+            from: data
+        )
+    }
+
     public func localModelSources() async throws -> [LocalModelSource] {
         let request = localModelSourcesRequest()
         let (data, response) = try await session.data(for: request)
@@ -296,6 +396,26 @@ public struct ControlAPIClient: ControlAPI, Sendable {
 
     public func retryModelInstall(id: String) async throws -> ModelInstall {
         try await mutateInstall(id: id, action: "retry")
+    }
+
+    public func dismissModelInstall(id: String) async throws {
+        let request = dismissModelInstallRequest(id: id)
+        let (data, response) = try await session.data(for: request)
+        try validate(response, data: data)
+    }
+
+    public func deleteManagedModel(
+        alias: String,
+        revision: String
+    ) async throws -> ConfigurationSaveResult {
+        let request = try deleteManagedModelRequest(
+            alias: alias,
+            revision: revision
+        )
+        let (data, response) = try await session.data(for: request)
+        try validate(response, data: data)
+        return try JSONDecoder.nativeSettingsDecoder()
+            .decode(ConfigurationSaveResult.self, from: data)
     }
 
     public func runtimeUpdates(refresh: Bool = false) async throws -> RuntimeUpdateSnapshot {
@@ -381,10 +501,6 @@ public struct ControlAPIClient: ControlAPI, Sendable {
         request.httpBody = body
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         return request
-    }
-
-    func lmStudioModelsRequest() -> URLRequest {
-        makeRequest(path: "/manager/engines/lmstudio/models")
     }
 
     func localModelSourcesRequest() -> URLRequest {
@@ -481,6 +597,32 @@ public struct ControlAPIClient: ControlAPI, Sendable {
         let (data, response) = try await session.data(for: request)
         try validate(response, data: data)
         return try JSONDecoder.nativeSettingsDecoder().decode(ModelInstall.self, from: data)
+    }
+
+    func dismissModelInstallRequest(id: String) -> URLRequest {
+        let encodedID = id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? id
+        return makeRequest(
+            path: "/manager/model-library/installs/\(encodedID)",
+            method: "DELETE"
+        )
+    }
+
+    func deleteManagedModelRequest(
+        alias: String,
+        revision: String
+    ) throws -> URLRequest {
+        let encodedAlias =
+            alias.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed)
+            ?? alias
+        var request = makeRequest(
+            path: "/manager/models/\(encodedAlias)",
+            method: "DELETE"
+        )
+        request.httpBody = try JSONEncoder.nativeSettingsEncoder().encode(
+            DeleteManagedModelRequest(revision: revision)
+        )
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        return request
     }
 
     private func sendRuntimeUpdateRequest(

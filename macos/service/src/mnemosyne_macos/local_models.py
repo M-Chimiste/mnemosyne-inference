@@ -4,12 +4,20 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
 import re
 from typing import Any, Sequence
 
+from .model_metadata import (
+    bounded_markdown,
+    markdown_summary,
+    metadata_from_config,
+    metadata_from_gguf_stream,
+    recommended_projector,
+)
 from .models import EngineName
 
 
@@ -135,6 +143,12 @@ class LocalModel:
     compatibility: str
     compatibility_reason: str
     capabilities: tuple[str, ...]
+    architecture: str | None = None
+    context_length: int | None = None
+    parameter_count: int | None = None
+    summary: str | None = None
+    model_card_markdown: str | None = None
+    recommended_projector_id: str | None = None
     projector_options: tuple[LocalProjector, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
@@ -190,6 +204,28 @@ def _read_json_object(path: Path) -> dict[str, Any] | None:
     except (OSError, json.JSONDecodeError, UnicodeDecodeError):
         return None
     return value if isinstance(value, dict) else None
+
+
+def _read_model_card(directory: Path) -> str | None:
+    for filename in ("README.md", "readme.md", "MODEL_CARD.md", "model_card.md"):
+        path = directory / filename
+        try:
+            if path.is_file():
+                return bounded_markdown(path.read_bytes())
+        except OSError:
+            continue
+    return None
+
+
+def _gguf_capabilities(path: Path, *, has_projector: bool) -> tuple[str, ...]:
+    if has_projector:
+        return _GENERATION_CAPABILITIES
+    name = path.stem.casefold()
+    if re.search(r"(^|[-_.])rerank(?:er|ing)?($|[-_.])", name):
+        return _RERANK_CAPABILITIES
+    if re.search(r"(^|[-_.])embed(?:ding|dings)?($|[-_.])", name):
+        return _EMBEDDING_CAPABILITIES
+    return _GENERATION_CAPABILITIES
 
 
 def _sentence_transformers_embedding(directory: Path) -> bool:
@@ -513,6 +549,16 @@ def scan_local_models(
             for projector in sorted(projectors)
             if projector.parent == primary.parent
         )
+        selected_projector = recommended_projector(
+            nearby,
+            name=lambda item: item.filename,
+        )
+        try:
+            with primary.open("rb") as stream:
+                metadata = metadata_from_gguf_stream(stream)
+        except OSError:
+            metadata = metadata_from_gguf_stream(io.BytesIO())
+        model_card = _read_model_card(primary.parent)
         all_paths = tuple(str(item) for item in group)
         results.append(
             LocalModel(
@@ -527,7 +573,18 @@ def scan_local_models(
                 size_bytes=sum(item.stat().st_size for item in group),
                 compatibility=compatibility,
                 compatibility_reason=reason,
-                capabilities=("chat/completions", "completions", "responses", "messages"),
+                capabilities=_gguf_capabilities(
+                    primary,
+                    has_projector=selected_projector is not None,
+                ),
+                architecture=metadata.architecture,
+                context_length=metadata.context_length,
+                parameter_count=metadata.parameter_count,
+                summary=metadata.description or markdown_summary(model_card),
+                model_card_markdown=model_card,
+                recommended_projector_id=(
+                    selected_projector.id if selected_projector is not None else None
+                ),
                 projector_options=nearby,
             )
         )
@@ -548,6 +605,9 @@ def scan_local_models(
         compatibility, reason, capabilities = _omlx_capabilities(
             directory, config_path
         )
+        config = _read_json_object(config_path) or {}
+        metadata = metadata_from_config(config)
+        model_card = _read_model_card(directory)
         all_paths = tuple(str(item) for item in (*weights, config_path))
         results.append(
             LocalModel(
@@ -563,6 +623,11 @@ def scan_local_models(
                 compatibility=compatibility,
                 compatibility_reason=reason,
                 capabilities=capabilities,
+                architecture=metadata.architecture,
+                context_length=metadata.context_length,
+                parameter_count=metadata.parameter_count,
+                summary=markdown_summary(model_card),
+                model_card_markdown=model_card,
             )
         )
 

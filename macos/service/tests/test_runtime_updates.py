@@ -22,9 +22,103 @@ import mnemosyne_macos.runtime_updates as runtime_updates
 from mnemosyne_macos.runtime_updates import (
     RuntimeUpdateError,
     RuntimeUpdateManager,
+    _official_omlx_installer_url,
+    _omlx_cli_candidates,
+    _python_subprocess_environment,
     _safe_extract,
     resolve_active_runtime,
 )
+
+
+@pytest.mark.asyncio
+async def test_runtime_lifecycle_journal_is_private_bounded_and_durable(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "runtimes"
+    manager = RuntimeUpdateManager(
+        omlx=OMLXConfig(),
+        mflux=MFluxConfig(),
+        ds4=DS4Config(),
+        root=root,
+    )
+    try:
+        for index in range(260):
+            manager.record_lifecycle(
+                engine="llama.cpp",
+                action="prepared",
+                outcome="succeeded",
+                prepared_version=f"b{index}",
+                active_version_before="b0",
+                active_version_after="b0",
+                source_revision="main",
+            )
+        evidence = manager.lifecycle_evidence()
+        assert evidence["valid"] is True
+        assert len(evidence["events"]) == 256
+        assert evidence["dropped_events"] == 4
+        assert evidence["events"][0]["sequence"] == 5
+        assert (root / "lifecycle.json").stat().st_mode & 0o777 == 0o600
+    finally:
+        await manager.aclose()
+
+    reopened = RuntimeUpdateManager(
+        omlx=OMLXConfig(),
+        mflux=MFluxConfig(),
+        ds4=DS4Config(),
+        root=root,
+    )
+    try:
+        assert reopened.lifecycle_evidence() == evidence
+    finally:
+        await reopened.aclose()
+
+
+@pytest.mark.asyncio
+async def test_runtime_lifecycle_recovers_corrupt_journal_without_error_text(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "runtimes"
+    root.mkdir()
+    (root / "lifecycle.json").write_text("{not-json", encoding="utf-8")
+    manager = RuntimeUpdateManager(
+        omlx=OMLXConfig(),
+        mflux=MFluxConfig(),
+        ds4=DS4Config(),
+        root=root,
+    )
+    try:
+        assert manager.lifecycle_evidence()["valid"] is False
+        manager.record_lifecycle(
+            engine="llama.cpp",
+            action="install_rejected",
+            outcome="failed",
+            requested_version="b9000",
+            active_version_before="b8123",
+            active_version_after="b8123",
+            error=RuntimeUpdateError(
+                "SHA-256 mismatch; password=must-never-be-persisted"
+            ),
+        )
+        evidence = manager.lifecycle_evidence()
+        assert evidence["valid"] is True
+        assert [event["action"] for event in evidence["events"]] == [
+            "journal_reset",
+            "install_rejected",
+        ]
+        assert evidence["events"][-1]["failure_code"] == "integrity"
+        assert (
+            runtime_updates._runtime_failure_code(
+                RuntimeUpdateError(
+                    "managed llama.cpp entrypoint escapes its runtime folder"
+                )
+            )
+            == "unsafe_archive"
+        )
+        rendered = (root / "lifecycle.json").read_text(encoding="utf-8")
+        assert "must-never-be-persisted" not in rendered
+        assert "password" not in rendered
+    finally:
+        await manager.aclose()
 
 
 @pytest.mark.asyncio
@@ -60,6 +154,77 @@ async def test_version_probe_terminates_its_process_group_on_timeout(
         is None
     )
     assert signals == [(process.pid, signal.SIGTERM)]
+
+
+def test_packaged_image_python_retains_only_its_required_pythonhome(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PYTHONHOME", "/Applications/Unified/Python/cpython-3.12")
+    monkeypatch.setenv("PYTHONPATH", "/service/source:/service/site-packages")
+    monkeypatch.setenv(
+        "TEST_MFLUX_PYTHON",
+        "/Applications/Unified/Python/framework-mnemosyne-image/bin/python3",
+    )
+
+    packaged = _python_subprocess_environment(
+        "/Applications/Unified/Python/framework-mnemosyne-image/bin/python3",
+        bundled_python_env="TEST_MFLUX_PYTHON",
+    )
+    external = _python_subprocess_environment(
+        "/custom/image-venv/bin/python3",
+        bundled_python_env="TEST_MFLUX_PYTHON",
+    )
+
+    assert packaged["PYTHONHOME"] == "/Applications/Unified/Python/cpython-3.12"
+    assert "PYTHONPATH" not in packaged
+    assert "PYTHONHOME" not in external
+    assert "PYTHONPATH" not in external
+
+
+@pytest.mark.asyncio
+async def test_mflux_ensurepip_probe_uses_packaged_python_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    python = tmp_path / "framework-mnemosyne-image" / "bin" / "python3"
+    wheel = tmp_path / "pip-25.0.1-py3-none-any.whl"
+    wheel.write_bytes(b"pip fixture")
+    monkeypatch.setenv("TEST_MFLUX_PYTHON", str(python))
+    monkeypatch.setenv("PYTHONHOME", "/Applications/Unified/Python/cpython-3.12")
+    monkeypatch.setenv("PYTHONPATH", "/service/source:/service/site-packages")
+    observed: dict[str, object] = {}
+
+    async def run_version_command(
+        *argv: str,
+        timeout: float = 5.0,
+        env: dict[str, str] | None = None,
+    ) -> str:
+        observed.update(argv=argv, timeout=timeout, env=env)
+        return str(wheel)
+
+    monkeypatch.setattr(
+        runtime_updates,
+        "_run_version_command",
+        run_version_command,
+    )
+    manager = RuntimeUpdateManager(
+        omlx=OMLXConfig(base_url="http://127.0.0.1:17322"),
+        mflux=MFluxConfig(python_env="TEST_MFLUX_PYTHON"),
+        ds4=DS4Config(binary=str(tmp_path / "missing-ds4")),
+        root=tmp_path / "runtimes",
+    )
+    try:
+        assert await manager._pip_wheel(python) == wheel
+        assert observed["argv"][:2] == (str(python), "-c")
+        environment = observed["env"]
+        assert isinstance(environment, dict)
+        assert (
+            environment["PYTHONHOME"]
+            == "/Applications/Unified/Python/cpython-3.12"
+        )
+        assert "PYTHONPATH" not in environment
+    finally:
+        await manager.aclose()
 
 
 def _ds4_source_archive(revision: str) -> bytes:
@@ -153,6 +318,26 @@ def _official_handler(
                         "draft": False,
                         "prerelease": False,
                         "html_url": "https://github.com/jundot/omlx/releases/tag/v0.3.12",
+                        "assets": [
+                            {
+                                "name": "oMLX-0.3.12-macos15-sequoia.dmg",
+                                "browser_download_url": (
+                                    "https://github.com/jundot/omlx/releases/download/"
+                                    "v0.3.12/oMLX-0.3.12-macos15-sequoia.dmg"
+                                ),
+                                "size": 500_000_000,
+                                "digest": f"sha256:{'a' * 64}",
+                            },
+                            {
+                                "name": "oMLX-0.3.12-macos26-27.dmg",
+                                "browser_download_url": (
+                                    "https://github.com/jundot/omlx/releases/download/"
+                                    "v0.3.12/oMLX-0.3.12-macos26-27.dmg"
+                                ),
+                                "size": 500_000_000,
+                                "digest": f"sha256:{'b' * 64}",
+                            },
+                        ],
                     }
                 ],
             )
@@ -183,7 +368,15 @@ def _official_handler(
 
 
 @pytest.mark.asyncio
-async def test_update_check_uses_only_official_upstreams(tmp_path: Path) -> None:
+async def test_update_check_uses_only_official_upstreams(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        runtime_updates.platform,
+        "mac_ver",
+        lambda: ("26.0", ("", "", ""), ""),
+    )
     transport, requests = _official_handler()
     client = httpx.AsyncClient(transport=transport)
     manager = RuntimeUpdateManager(
@@ -199,10 +392,15 @@ async def test_update_check_uses_only_official_upstreams(tmp_path: Path) -> None
         assert snapshot["manifest_url"] is None
         assert snapshot["source_policy"] == "official_upstreams"
         by_engine = {item["engine"]: item for item in snapshot["engines"]}
+        assert by_engine["llama.cpp"]["release_tier"] == "stable"
+        assert by_engine["omlx"]["release_tier"] == "stable"
+        assert by_engine["mflux"]["release_tier"] == "preview"
+        assert by_engine["ds4"]["release_tier"] == "preview"
         assert by_engine["llama.cpp"]["available_version"] == "b7777"
         assert by_engine["llama.cpp"]["can_install"] is True
         assert "ggml-org/llama.cpp" in by_engine["llama.cpp"]["release_notes_url"]
         assert by_engine["omlx"]["latest_upstream_version"] == "0.3.12"
+        assert by_engine["omlx"]["official_installer_url"].endswith(".dmg")
         assert by_engine["mflux"]["available_version"] == "0.19.0"
         assert by_engine["mflux"]["can_install"] is True
         assert by_engine["ds4"]["available_revision"] == "a" * 40
@@ -216,6 +414,84 @@ async def test_update_check_uses_only_official_upstreams(tmp_path: Path) -> None
     finally:
         await manager.aclose()
         await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_installed_status_never_contacts_upstream(
+    tmp_path: Path,
+) -> None:
+    requests: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(str(request.url))
+        return httpx.Response(500)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    manager = RuntimeUpdateManager(
+        llama_cpp=LlamaCppConfig(binary=str(tmp_path / "missing-llama")),
+        omlx=OMLXConfig(base_url="http://127.0.0.1:1"),
+        mflux=MFluxConfig(),
+        ds4=DS4Config(binary=str(tmp_path / "missing-ds4")),
+        root=tmp_path / "runtimes",
+        client=client,
+    )
+    try:
+        status = await manager.installed_status()
+
+        assert set(status) == {"llama.cpp", "omlx", "mflux", "ds4"}
+        assert status["llama.cpp"]["installed"] is False
+        assert status["ds4"]["installed"] is False
+        # A bounded loopback oMLX probe is local runtime discovery, not an
+        # upstream release query. Nothing may contact GitHub or PyPI.
+        assert all(
+            httpx.URL(url).host in {"127.0.0.1", "::1", "localhost"}
+            for url in requests
+        )
+    finally:
+        await manager.aclose()
+        await client.aclose()
+
+
+def test_omlx_installer_selects_exact_then_ranged_macos_asset() -> None:
+    release = {
+        "tag_name": "v0.5.3",
+        "assets": [
+            {
+                "name": "oMLX-0.5.3-macos15-sequoia.dmg",
+                "browser_download_url": (
+                    "https://github.com/jundot/omlx/releases/download/"
+                    "v0.5.3/oMLX-0.5.3-macos15-sequoia.dmg"
+                ),
+                "size": 1,
+                "digest": f"sha256:{'a' * 64}",
+            },
+            {
+                "name": "oMLX-0.5.3-macos26-27.dmg",
+                "browser_download_url": (
+                    "https://github.com/jundot/omlx/releases/download/"
+                    "v0.5.3/oMLX-0.5.3-macos26-27.dmg"
+                ),
+                "size": 1,
+                "digest": f"sha256:{'b' * 64}",
+            },
+        ],
+    }
+
+    assert _official_omlx_installer_url(release, macos_major=15).endswith(
+        "macos15-sequoia.dmg"
+    )
+    assert _official_omlx_installer_url(release, macos_major=27).endswith(
+        "macos26-27.dmg"
+    )
+    assert _official_omlx_installer_url(release, macos_major=25) is None
+
+
+def test_omlx_cli_candidates_include_packaged_and_homebrew_locations() -> None:
+    candidates = _omlx_cli_candidates()
+
+    assert Path.home() / ".omlx" / "bin" / "omlx" in candidates
+    assert Path("/opt/homebrew/bin/omlx") in candidates
+    assert Path("/usr/local/bin/omlx") in candidates
 
 
 @pytest.mark.asyncio

@@ -9,15 +9,31 @@ API while moving the single resident model between a manager-owned
 projects; Mnemosyne coordinates and proxies them without modifying their model
 runtimes.
 
+For a fresh workstation, begin with the
+[end-user installation guide](INSTALL.md). It covers the Unified Inference
+disk image, model storage, every native engine, legacy LM Studio model
+adoption, and the recommended official oMLX app plus its headless Homebrew
+alternative.
+
 The runtime is deliberately not a Docker image. Docker Desktop runs ordinary
 containers in a Linux VM, so it is not the right boundary for arbitrary
 MLX/Metal processes. Mnemosyne Core and all engines run natively.
 
+The [V1 scope](V1_SCOPE.md) makes llama.cpp and oMLX Stable and keeps DS4 and
+MFLUX explicitly Preview. The [acceptance ledger](acceptance/v1.json) is the
+release truth; a 0.9 candidate is not V1 while any required gate remains
+pending. See [release and recovery](RELEASE.md) for versioning, signing,
+notarization, signed updates, and rollback.
+
 ## Current validation
 
-The relocatable runtime, signed local app bundle, embedded service bootstrap,
-and embedded MFLUX worker have been exercised on an M4 Max. A real
-`krea/Krea-2-Turbo` request through `POST :17320/v1/images/generations`
+The current 0.9.0 source passes the native service, image-worker, Swift, and
+packaging suites. A full relocatable ad-hoc app and private DMG have also been
+built and structurally reverified. They are development artifacts, not the
+Developer ID/notarized V1 distribution.
+
+Earlier hardware and packaging smokes were exercised on an M4 Max. A real
+`krea/Krea-2-Turbo` request through `POST :1240/v1/images/generations`
 returned a valid 512×512 PNG, and the request was correctly absent from token
 usage. The official llama.cpp `b10091` arm64 asset passed published-size and
 SHA-256 verification, its runtime contract was validated, and it generated a
@@ -27,17 +43,19 @@ MLX model and returned usage that drained to the central ledger under
 `theseus`. Packaged-service migration/soak, a real protected-folder transfer
 followed by helper restart and managed-child `exec`, durable oMLX login
 startup, DS4 model loading, automatic LaunchAgent restart/login behavior, and
-CUDA parity remain separate smoke gates. A Developer ID-signed bundle is now
-installed on Theseus: its direct `Contents/MacOS/mnemosyne-service-bootstrap`
-LaunchAgent is running through `SMAppService`, and both native HTTP planes
-answer from the packaged runtime. LM Studio is still available only as an
-explicitly enabled migration fallback until the native-model soak is accepted.
+CUDA parity remain separate smoke gates. An earlier Developer ID-signed bundle
+on Theseus proved that its direct
+`Contents/MacOS/mnemosyne-service-bootstrap` LaunchAgent could run through
+`SMAppService` and answer both native HTTP planes. That historical smoke does
+not substitute for signing, notarizing, and exercising the exact current
+candidate. LM Studio is not an inference engine or API dependency; only its
+on-disk model directory remains as a migration hint.
 
 ## Ports and processes
 
 | Port | Process | Role |
 | ---: | --- | --- |
-| `17320` | Mnemosyne Core | Unified OpenAI/Anthropic-compatible inference |
+| `1240` | Mnemosyne Core | Unified OpenAI/Anthropic-compatible inference; drop-in replacement for the previous token sidecar |
 | `17321` | Mnemosyne Core | Control API used by the menu bar app |
 | `17322` | oMLX | Native MLX inference and admin API |
 | `17323` | `ds4-server` | Mnemosyne-owned model process |
@@ -45,8 +63,7 @@ explicitly enabled migration fallback until the native-model soak is accepted.
 | `17325` | `llama-server` | Unified Inference-owned GGUF process |
 
 All listeners default to loopback. Ports `17326` through `17329` are reserved
-for future local engines and diagnostics. Legacy migration configurations may
-also enable LM Studio on `1234`; fresh configurations do not.
+for future local engines and diagnostics.
 
 Mnemosyne Core is a per-user LaunchAgent. `Unified Inference.app` is only a controller,
 so **Quit Menu App** does not interrupt inference. The coordinator holds a model
@@ -68,14 +85,18 @@ environment variable `MNEMOSYNE_WORKSTATION_NAME` overrides auto-detection.
 - Python 3.11–3.13 and `uv` for service development.
 - Swift 6 for menu development. Full Xcode is required for final app signing,
   `SMAppService` integration testing, and source builds of custom Metal kernels.
-- oMLX, DS4, MFLUX, and the temporary LM Studio migration adapter are optional,
-  but each engine and its model profiles must be set `enabled: false` when it
-  is not part of the installation.
+- oMLX, DS4, and MFLUX are optional. An unavailable engine should be disabled;
+  its profiles are retained but omitted from the callable model catalog until
+  the engine is enabled again.
 
-The official oMLX `.dmg` is the simplest choice for frontier model families
-because it includes its native kernels. Its current source documentation notes
-that GLM-5.2 and related custom-kernel builds need full Xcode; a plain source
-install falls back to a much slower generic path.
+The supported default path for oMLX is its official macOS app, selected from
+**Runtime Updates**. Its DMG includes precompiled custom kernels and its own
+one-click updater. A stable headless Homebrew installation is available
+through an approval-gated button that shows and runs only the official tap and
+stable install commands; the fragile `--HEAD --with-custom-kernel` source
+build is advanced-only. See
+[Install the official oMLX app](INSTALL.md#5-install-the-official-omlx-app)
+for the guided setup and headless alternative.
 
 ## Engine preparation
 
@@ -84,7 +105,7 @@ available llama.cpp runtime. Unified Inference downloads the official
 `ggml-org/llama.cpp` Apple Silicon release, verifies GitHub's published size
 and SHA-256, checks the executable and required server flags, and activates it
 only after the coordinator proves every engine empty. The private server binds
-`127.0.0.1:17325`; clients continue to use the unified API on `17320`.
+`127.0.0.1:17325`; clients continue to use the unified API on `1240`.
 
 Unified Inference records usage for all language engines and central reporting
 defaults on. During migration, it reads the previous sidecar's stable `node.id`
@@ -98,13 +119,25 @@ back to the normalized macOS Computer Name. The identifier is displayed
 read-only in Settings, while the DSN remains secret and is never returned by
 the API.
 
-Install oMLX from its official `.dmg` or Homebrew package, configure its server
-port as `17322`, and start it. For a CLI/Homebrew installation this can be done
-with the upstream `OMLX_PORT` setting:
+After installing Unified Inference, run the one-shot migration script before
+enabling clients on `:1240`:
 
 ```bash
-OMLX_PORT=17322 omlx start
+macos/retire_legacy_sidecar.sh
 ```
+
+It validates the exact `com.athena.token-sidecar` user plist, persistently
+disables and boots out that job, restarts Unified Inference, and waits for both
+native HTTP planes. It never kills an arbitrary listener on the port. The
+script retains the old plist while the new service starts so it can migrate
+the reporting identity and ledger DSN, then archives the inactive plist only
+after both APIs are reachable.
+
+Install the official oMLX app from **Runtime Updates**, configure its loopback
+server on port `17322`, and let its app own future updates. The release DMG
+includes the native kernels used by GLM-5.2 and related families. A stable
+headless Homebrew path and the advanced source-build verification are in
+[INSTALL.md](INSTALL.md#5-install-the-official-omlx-app).
 
 Disable model pinning and per-model TTL/LRU behavior for profiles managed by
 Mnemosyne. Current oMLX releases may protect unload through an admin session
@@ -112,6 +145,13 @@ even when load accepts a bearer key. The safest integration is loopback-only
 oMLX with inner admin authentication disabled and authentication enforced at
 Mnemosyne. `OMLX_API_KEY` and `OMLX_ADMIN_SESSION` remain available for an
 installation that requires them.
+
+Model profiles are retained when their engine is disabled, but omitted from
+the callable `/v1/models` catalog until that engine is enabled. This keeps the
+Settings UI available while an external engine such as oMLX is being installed
+or repaired. Older app builds rejected that state at startup; use
+`macos/enable_omlx_engine.sh` as a one-time recovery without disabling the
+configured GLM profile.
 
 oMLX remains a separately owned process. Unified Inference can register a
 configured model directory through oMLX's admin API, but its Finder bookmark
@@ -127,12 +167,10 @@ recovery fallback. Mnemosyne starts DS4 with an explicit model, context, host,
 and port and terminates only a process whose recorded identity it can prove it
 owns.
 
-An existing LM Studio installation is not required for a fresh setup. During
-the staged migration only, an older configuration may keep `engines.lmstudio`
-enabled on loopback `:1234` so unconverted aliases remain usable. Keep it
-loopback-only and disable JIT loading for direct clients. Do not remove that
-explicit fallback or its credential until the local-library import and
-packaged-service soak are accepted.
+An existing LM Studio installation is not required. Version-1 configurations
+are upgraded without starting or contacting LM Studio: legacy LM Studio
+profiles become inert alias/load-setting records and disappear from the
+callable catalog until their weights are imported into llama.cpp or oMLX.
 
 ## Model storage and Hugging Face library
 
@@ -193,11 +231,14 @@ The selected root is then organized by engine:
 
 Use **Settings → Model Library** to choose llama.cpp, oMLX, DS4, or MFLUX,
 search or pick a curated recommendation, choose one of the configured folders,
-and download. llama.cpp search first returns GGUF repositories; a second GUI
-step requires an exact quant/shard set and optionally an explicit
-same-directory multimodal projector before Download is enabled. The resolved
-Hub revision and exact file list are persisted so retries cannot silently
-change weights.
+and download. Search results and details show bounded model-card prose plus
+detected architecture, context length, parameter count, and license when the
+Hub repository, config, or GGUF provides them. llama.cpp search first returns
+GGUF repositories; a second GUI step requires an exact quant/shard set. When a
+same-directory vision projector exists, the highest-fidelity option is selected
+automatically; the user can choose another or opt out for text-only use. The
+resolved Hub revision and exact file list are persisted so retries cannot
+silently change weights.
 DS4 results are restricted to the GGUF files published for DS4. MFLUX offers
 the text-to-image configurations present in the pinned runtime: FLUX.1,
 FLUX.2 Klein, Qwen Image, Krea 2 Turbo, FIBO, Z-Image, ERNIE Image, and
@@ -213,11 +254,13 @@ library without copying weights. The action always opens `NSOpenPanel`; the
 user may select an exact nested folder such as `/Volumes/Athena/models`.
 Unified Inference rescans the folder server-side, groups complete split GGUF
 sets, excludes `mmproj` files as primary models, discovers MLX folders, and
-returns opaque candidate IDs. Nothing is selected automatically. The user
-chooses aliases and an explicit projector (or text-only) before import; the
-service rescans and validates those IDs again, records the exact folder and
-volume UUID, and atomically migrates matching legacy aliases and compatible
-load settings. Discovery and import never load a model.
+returns opaque candidate IDs. Models remain an explicit import choice, while
+the highest-fidelity same-directory projector is preselected for each vision
+candidate. The user chooses aliases and can select another projector or opt
+out for text-only use; the service rescans and validates those IDs again,
+records detected metadata plus the exact folder and volume UUID, and atomically
+migrates matching legacy aliases and compatible load settings. Discovery and
+import never load a model.
 
 The ordinary Models editor does not accept raw model IDs or projector paths.
 Engine, model source, storage, served name, projector, and image family are
@@ -229,6 +272,9 @@ Downloads run in killable child processes and persist queued, downloading,
 registering, downloaded-but-not-registered, partial, cancelled, failed, and
 installed states in SQLite. They can continue while the Settings window is
 closed, be cancelled or retried from the GUI, and never make a model resident.
+The GUI shows transferred/total bytes, percentage, a progress bar, and smoothed
+live transfer speed. Completed entries can be hidden from recent history
+without discarding the managed-download identity used for safe maintenance.
 If profile registration fails after the weights land, Retry resumes only
 registration without downloading the weights again. On completion Mnemosyne
 creates the profile and, for oMLX, safely adds the selected library directory
@@ -237,6 +283,14 @@ engine empty. Downloaded oMLX metadata is classified before registration so
 the profile advertises only its detected generation, embeddings, or rerank
 routes.
 
+Removing a model profile keeps its files by default. The separate
+**Delete Files** confirmation is available only for a completed download owned
+by Unified Inference; Finder imports and hand-authored paths are never deleted.
+Deletion drains residency, revalidates the exact configured storage and managed
+destination, removes it in a bounded helper that refuses roots, escapes, and
+symlinks, then atomically removes the profile. oMLX deletion also refreshes its
+authoritative directory inventory inside the same all-engines-empty barrier.
+
 Set `HF_TOKEN` in the private environment file for gated or private Hub repos.
 The token is write-only in Settings and is inherited only by the download
 worker; it is not stored in YAML or SQLite.
@@ -244,9 +298,12 @@ worker; it is not stored in YAML or SQLite.
 ## Engine runtime updates
 
 Open **Settings → Runtime Updates** to inspect installed and upstream versions
-of llama.cpp, oMLX, MFLUX, and DS4. oMLX owns its own installation: Unified Inference
-detects the app, Homebrew CLI, or running server version and links to the
-official stable release, but never overwrites it.
+of llama.cpp, oMLX, MFLUX, and DS4. oMLX owns its own installation: Unified
+Inference selects the official DMG matching this Mac, detects the installed
+app, CLI shim, conventional Homebrew paths, or running server, and links to
+the official stable release without overwriting it. For a missing runtime, an
+explicitly confirmed action may delegate the initial stable installation to
+Homebrew; updates and replacements remain externally owned.
 
 llama.cpp, MFLUX, and DS4 are resolved directly from their official upstreams;
 there is no Unified Inference release manifest to maintain. MFLUX versions come from the
@@ -330,9 +387,9 @@ and call `POST /manager/reconcile`.
 Smoke the API with a configured alias:
 
 ```bash
-curl http://127.0.0.1:17320/health
-curl http://127.0.0.1:17320/v1/models
-curl -X POST http://127.0.0.1:17320/v1/chat/completions \
+curl http://127.0.0.1:1240/health
+curl http://127.0.0.1:1240/v1/models
+curl -X POST http://127.0.0.1:1240/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{"model":"local-qwen","messages":[{"role":"user","content":"Hello"}]}'
 curl http://127.0.0.1:17321/manager/status
@@ -341,7 +398,7 @@ curl http://127.0.0.1:17321/manager/status
 With either example MFLUX profile enabled:
 
 ```bash
-curl -sX POST http://127.0.0.1:17320/v1/images/generations \
+curl -sX POST http://127.0.0.1:1240/v1/images/generations \
   -H 'Content-Type: application/json' \
   -d '{"model":"krea-2-turbo","prompt":"A glass greenhouse in snowfall","size":"1024x1024","n":1,"response_format":"b64_json"}' \
   | jq -r '.data[0].b64_json' | base64 --decode > image.png
@@ -380,14 +437,16 @@ CODESIGN_IDENTITY="Apple Development: Example Name (TEAMID)" \
 ```
 
 Move the app to a stable location such as `/Applications` before enabling its
-background service. Theseus currently runs a Developer ID-signed installation
-whose menu app and direct LaunchAgent helper share the same Team ID. Ad-hoc
-development builds remain supported, but rebuilding under a different code
-identity may require protected model folders to be selected again. Wider
-distribution still requires hardened runtime, notarization, and nested
-signing.
-See [packaging/README.md](packaging/README.md) for the bundle layout and build
-details.
+background service. An earlier Theseus installation proved that the menu app
+and direct LaunchAgent helper can run with the same Developer ID Team ID.
+Production builds use hardened runtime, secure timestamps, and inside-out
+nested signing.
+Ad-hoc development builds remain supported, but rebuilding under a different
+code identity may require protected model folders to be selected again. Use
+`macos/packaging/build_dmg.sh` for a verified drag-to-install artifact; setting
+`NOTARYTOOL_PROFILE` submits it to Apple and staples the accepted ticket.
+See [packaging/README.md](packaging/README.md) for the bundle layout and local
+build details, and [RELEASE.md](RELEASE.md) for the production pipeline.
 
 The app is intentionally menu-bar-only: it has no Dock icon or normal app
 window. On launch it installs a square AppKit status item using the
@@ -400,10 +459,14 @@ forward, which provides a visible entry point even when the menu-bar icon is
 hidden by a crowded display. The same window is shown once on first launch for
 discoverability; subsequent login launches remain menu-bar-only.
 
-Choose **Settings…** to open a dedicated native settings window. Its General,
-Engines, Runtime Updates, Storage, Model Library, Models, Usage, and
-Credentials pages expose ordinary toggles, folder/model pickers, and labeled
-fields instead of YAML. The control service remains the schema authority:
+Choose **Settings…** to open a dedicated native settings window. **Setup &
+Health** guides service registration, Stable and Preview engine readiness,
+storage, model setup, and reporting. Its real self-test uses the public
+listener and verifies the durable local usage row before first-run setup is
+marked complete. General, Engines, Runtime Updates, Storage, Model Library,
+Models, Usage, and Credentials expose ordinary toggles, folder/model pickers,
+and labeled fields instead of YAML. The control service remains the schema
+authority:
 `GET /manager/config` supplies normalized settings and
 `PUT /manager/config` validates and atomically writes `config.yaml` with mode
 `0600`. Each snapshot includes an optimistic content revision that the UI
@@ -421,14 +484,14 @@ uses `POST /manager/model-library/local-scan` plus
 `~/.lmstudio/settings.json` `downloadsFolder` and offers that exact path, then
 the documented `~/.lmstudio/models` default, as convenient Finder-backed scan
 shortcuts. Source discovery neither requires the LM Studio engine nor contacts
-its server. It does not inspect model weights: Finder still confirms the
+its server, load an adapter, or require an API credential. It does not inspect model weights: Finder still confirms the
 folder and the bounded filesystem helper performs the scan. This preserves
 nested and symlink paths used for external SSD libraries. Results are initially
-unselected, show engine, quant, size, compatibility, exact path, and whether an
-alias will be migrated, and offer explicit projector selection for multimodal
-use. A newly adopted profile does not become resident until a client requests
-its alias. The legacy LM Studio inventory endpoint remains only during the
-migration soak and is not the primary import workflow.
+unselected, show engine, quant, size, compatibility, detected model metadata,
+exact path, and whether an alias will be migrated. Vision candidates
+automatically select a projector while retaining manual and text-only choices.
+A newly adopted profile does not become resident until a client requests its
+alias.
 
 The Storage page displays the exact selected directory, containing mount,
 free space, and availability. Add/change actions always use `NSOpenPanel`, so
@@ -484,9 +547,13 @@ Inference's private `.env` before the legacy LaunchAgent is retired.
 `token_sidecar.node_id` is only an explicit override; leave it empty to keep
 Theseus, Metis, Athena, and other machines aligned during the transition.
 
-Set the secret DSN only in Unified Inference's `.env`. Existing installations
-inherit and persist it from the previous sidecar's LaunchAgent during
-migration:
+Set or replace the secret DSN through **Settings → Usage → Postgres
+connection**. The field is write-only: the app stores it in Unified
+Inference's private mode-`0600` `.env`, reports only whether it is configured,
+leaves it unchanged when the editor is blank, and requires an explicit
+**Clear** action to remove it. A service restart applies a replacement.
+Existing installations inherit and persist it from the previous sidecar's
+LaunchAgent during migration. The equivalent private-file form is:
 
 ```dotenv
 TOKEN_SIDECAR_POSTGRES_DSN=postgresql://writer:password@server/token_sidecar

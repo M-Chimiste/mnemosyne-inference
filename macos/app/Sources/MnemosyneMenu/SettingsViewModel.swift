@@ -6,6 +6,7 @@ import SwiftUI
 @MainActor
 final class SettingsViewModel: ObservableObject {
     enum Section: String, CaseIterable, Identifiable {
+        case setup = "Setup & Health"
         case general = "General"
         case engines = "Engines"
         case updates = "Runtime Updates"
@@ -19,6 +20,7 @@ final class SettingsViewModel: ObservableObject {
 
         var symbol: String {
             switch self {
+            case .setup: "checklist"
             case .general: "gearshape"
             case .engines: "cpu"
             case .updates: "arrow.triangle.2.circlepath.circle"
@@ -38,16 +40,15 @@ final class SettingsViewModel: ObservableObject {
         case error
     }
 
-    @Published var selectedSection: Section = .general
+    @Published var selectedSection: Section = .setup
     @Published var settings = NativeSettings()
     @Published var selectedModelIndex: Int?
     @Published var credentialDrafts: [ManagedCredential: String] = [:]
     @Published var credentialsToClear: Set<ManagedCredential> = []
     @Published var confirmDiscard = false
     @Published var confirmRemoveModel = false
-    @Published var showLMStudioImporter = false
+    @Published var confirmHomebrewOMLXInstall = false
     @Published var showLocalModelImporter = false
-    @Published var selectedLMStudioKeys: Set<String> = []
     @Published var selectedLocalModelIDs: Set<String> = []
     @Published var localModelAliases: [String: String] = [:]
     @Published var localModelProjectors: [String: String] = [:]
@@ -61,23 +62,28 @@ final class SettingsViewModel: ObservableObject {
     @Published private(set) var storageStatuses: [String: StorageStatus] = [:]
     @Published private(set) var libraryModels: [LibraryModel] = []
     @Published private(set) var libraryFileOptions: [LibraryModel] = []
+    @Published private(set) var libraryDetails: LibraryModelDetails?
     @Published private(set) var modelInstalls: [ModelInstall] = []
     @Published private(set) var runtimeUpdateSnapshot: RuntimeUpdateSnapshot?
+    @Published private(set) var readinessSnapshot: ReadinessSnapshot?
+    @Published private(set) var lastSelfTest: ModelSelfTestResult?
+    @Published private(set) var isRefreshingReadiness = false
+    @Published private(set) var isReconciling = false
+    @Published private(set) var isRunningSelfTest = false
     @Published private(set) var tokenReportingNodeID = ""
     @Published private(set) var tokenReportingIdentitySource = "computer_name"
     @Published private(set) var isCheckingRuntimeUpdates = false
     @Published private(set) var updatingRuntimeEngine: InferenceEngine?
+    @Published private(set) var isInstallingOMLXWithHomebrew = false
     @Published private(set) var isSearchingLibrary = false
     @Published private(set) var isLoadingLibraryFiles = false
+    @Published private(set) var isLoadingLibraryDetails = false
     @Published private(set) var localModelSources: [LocalModelSource] = []
     @Published private(set) var localModelScan: LocalModelScanSnapshot?
     @Published private(set) var localModelScanError = ""
     @Published private(set) var localModelImportError = ""
     @Published private(set) var isScanningLocalModels = false
     @Published private(set) var isImportingLocalModels = false
-    @Published private(set) var lmStudioInventory: [LMStudioDiscoveredModel] = []
-    @Published private(set) var lmStudioDiscoveryError = ""
-    @Published private(set) var isDiscoveringLMStudio = false
     @Published private(set) var configuredCredentials: Set<ManagedCredential> = []
     @Published private(set) var isWorking = false
     @Published private(set) var isLoaded = false
@@ -94,6 +100,9 @@ final class SettingsViewModel: ObservableObject {
     private var configurationRevision = ""
     private var appliedConfigurationRevision = ""
     private var libraryFileRequestID: UUID?
+    private var libraryDetailsRequestID: UUID?
+    private var installMonitorTask: Task<Void, Never>?
+    private var configurationRefreshPending = false
 
     init(
         configuration: ControlConnectionConfiguration = .load(),
@@ -116,20 +125,6 @@ final class SettingsViewModel: ObservableObject {
 
     var configurationSchemaIsSupported: Bool {
         settings.schemaVersion <= NativeSettings.supportedSchemaVersion
-    }
-
-    var lmStudioInventoryAvailability: LMStudioInventoryAvailability {
-        LMStudioInventoryAvailability.evaluate(
-            draft: settings.engines.lmstudio,
-            saved: savedSettings.engines.lmstudio,
-            savedRevision: configurationRevision,
-            appliedRevision: appliedConfigurationRevision,
-            restartRequired: requiresRestart
-        )
-    }
-
-    var canDiscoverLMStudioInventory: Bool {
-        lmStudioInventoryAvailability.canOpen && !isDiscoveringLMStudio
     }
 
     var statusColor: Color {
@@ -168,6 +163,7 @@ final class SettingsViewModel: ObservableObject {
             savedSettings = loaded
             configurationRevision = snapshot.revision
             appliedConfigurationRevision = snapshot.appliedRevision
+            configurationRefreshPending = false
             selectedLibraryStorage = loaded.storage.default
             configuredCredentials = credentialStatus.configured
             credentialDrafts = [:]
@@ -196,9 +192,82 @@ final class SettingsViewModel: ObservableObject {
             Task { await refreshModelLibrary() }
             Task { await refreshLocalModelSources() }
             Task { await refreshRuntimeUpdates() }
+            Task { await refreshReadiness() }
         } catch {
             isLoaded = false
             setStatus("Could not load settings: \(error.localizedDescription)", tone: .error)
+        }
+    }
+
+    func refreshReadiness() async {
+        guard !isRefreshingReadiness else { return }
+        isRefreshingReadiness = true
+        defer { isRefreshingReadiness = false }
+        do {
+            readinessSnapshot = try await client.readiness()
+        } catch {
+            setStatus(
+                "Could not refresh system health: \(error.localizedDescription)",
+                tone: .warning
+            )
+        }
+    }
+
+    func reconcileService() async {
+        guard !isReconciling else { return }
+        isReconciling = true
+        setStatus("Reconciling engine residency…", tone: .normal)
+        defer { isReconciling = false }
+        do {
+            _ = try await client.reconcile()
+            await refreshReadiness()
+            setStatus("Every enabled engine reported authoritative state.", tone: .success)
+        } catch {
+            setStatus(
+                "Could not reconcile engine state: \(error.localizedDescription)",
+                tone: .error
+            )
+        }
+    }
+
+    @discardableResult
+    func runSelfTest(model: String) async -> Bool {
+        guard !model.isEmpty, !isRunningSelfTest else { return false }
+        isRunningSelfTest = true
+        lastSelfTest = nil
+        setStatus("Testing \(model) through the public inference API…", tone: .normal)
+        defer { isRunningSelfTest = false }
+        do {
+            let result = try await client.selfTest(
+                model: model,
+                includeVision: true,
+                unloadAfter: false
+            )
+            lastSelfTest = result
+            await refreshReadiness()
+            if result.usage == nil {
+                setStatus(
+                    "\(model) responded, but it returned no token usage. Choose a language model that reports usage to complete setup.",
+                    tone: .warning
+                )
+            } else if result.usageRecorded != true {
+                setStatus(
+                    "\(model) responded, but its token usage was not recorded.",
+                    tone: .warning
+                )
+            } else {
+                setStatus(
+                    "\(model) passed its \(result.vision ? "vision" : "inference") self-test.",
+                    tone: .success
+                )
+            }
+            return result.completesGuidedSetup
+        } catch {
+            setStatus(
+                "Model self-test failed: \(error.localizedDescription)",
+                tone: .error
+            )
+            return false
         }
     }
 
@@ -210,6 +279,9 @@ final class SettingsViewModel: ObservableObject {
             selectedModelIndex = settings.models.isEmpty ? nil : 0
         }
         setStatus("Unsaved changes were discarded.", tone: .normal)
+        if configurationRefreshPending {
+            Task { await refreshModelsConfiguration() }
+        }
     }
 
     func save() async {
@@ -227,6 +299,7 @@ final class SettingsViewModel: ObservableObject {
             settings = result.config
             savedSettings = result.config
             configurationRevision = result.revision
+            configurationRefreshPending = false
             if result.applied {
                 appliedConfigurationRevision = result.revision
             }
@@ -418,7 +491,7 @@ final class SettingsViewModel: ObservableObject {
     }
 
     func refreshModelLibrary() async {
-        guard libraryEngine != .lmstudio, !isSearchingLibrary else { return }
+        guard !isSearchingLibrary else { return }
         isSearchingLibrary = true
         defer { isSearchingLibrary = false }
         do {
@@ -426,10 +499,14 @@ final class SettingsViewModel: ObservableObject {
             async let installs = client.modelInstalls()
             libraryModels = try await found
             modelInstalls = try await installs
+            if modelInstalls.contains(where: \.isActive) {
+                beginInstallMonitoring()
+            }
             if !libraryModels.contains(where: { $0.id == selectedLibraryModelID }) {
                 selectedLibraryModelID = libraryModels.first?.id
             }
             await refreshLibraryFilesForSelection()
+            await refreshLibraryDetailsForSelection()
             synchronizeLibraryRole()
         } catch {
             setStatus("Could not browse models: \(error.localizedDescription)", tone: .error)
@@ -437,10 +514,10 @@ final class SettingsViewModel: ObservableObject {
     }
 
     func selectLibraryEngine(_ engine: InferenceEngine) {
-        guard engine != .lmstudio else { return }
         libraryEngine = engine
         libraryModels = []
         libraryFileOptions = []
+        libraryDetails = nil
         selectedLibraryModelID = nil
         selectedLibraryFileID = nil
         selectedLibraryProjector = ""
@@ -452,16 +529,21 @@ final class SettingsViewModel: ObservableObject {
         guard selectedLibraryModelID != id else { return }
         selectedLibraryModelID = id
         libraryFileOptions = []
+        libraryDetails = nil
         selectedLibraryFileID = nil
         selectedLibraryProjector = ""
         synchronizeLibraryRole()
-        Task { await refreshLibraryFilesForSelection() }
+        Task {
+            await refreshLibraryFilesForSelection()
+            await refreshLibraryDetailsForSelection()
+        }
     }
 
     func selectLibraryFile(id: String?) {
         selectedLibraryFileID = id
-        selectedLibraryProjector = ""
+        selectedLibraryProjector = selectedLibraryModel?.projectorFilename ?? ""
         synchronizeLibraryRole()
+        Task { await refreshLibraryDetailsForSelection() }
     }
 
     func selectLibraryProjector(_ filename: String) {
@@ -491,12 +573,14 @@ final class SettingsViewModel: ObservableObject {
                     model: model,
                     storage: selectedLibraryStorage,
                     projectorFilename: nonempty(selectedLibraryProjector),
+                    includeProjector: model.availableProjectors.isEmpty
+                        || !selectedLibraryProjector.isEmpty,
                     role: selectedLibraryRole
                 )
             )
             modelInstalls.insert(install, at: 0)
             setStatus("Download started. You can close this window; the background service owns it.", tone: .success)
-            Task { await monitorActiveInstalls() }
+            beginInstallMonitoring()
         } catch {
             setStatus("Could not start download: \(error.localizedDescription)", tone: .error)
         }
@@ -513,15 +597,68 @@ final class SettingsViewModel: ObservableObject {
 
     func retryInstall(_ install: ModelInstall) async {
         do {
-            _ = try await client.retryModelInstall(id: install.id)
-            await monitorActiveInstalls()
+            let retried = try await client.retryModelInstall(id: install.id)
+            if let index = modelInstalls.firstIndex(where: { $0.id == retried.id }) {
+                modelInstalls[index] = retried
+            } else {
+                modelInstalls.insert(retried, at: 0)
+            }
+            beginInstallMonitoring()
         } catch {
             setStatus("Could not retry download: \(error.localizedDescription)", tone: .error)
         }
     }
 
+    func dismissInstall(_ install: ModelInstall) async {
+        guard install.canDismiss else { return }
+        do {
+            try await client.dismissModelInstall(id: install.id)
+            modelInstalls.removeAll { $0.id == install.id }
+            setStatus("Removed \(install.alias) from download history.", tone: .success)
+        } catch {
+            setStatus(
+                "Could not remove download history: \(error.localizedDescription)",
+                tone: .error
+            )
+        }
+    }
+
+    func clearCompletedInstalls() async {
+        let completed = modelInstalls.filter { $0.status == "installed" }
+        guard !completed.isEmpty else { return }
+        var removedIDs: Set<String> = []
+        do {
+            for install in completed {
+                try await client.dismissModelInstall(id: install.id)
+                removedIDs.insert(install.id)
+            }
+            modelInstalls.removeAll { removedIDs.contains($0.id) }
+            setStatus(
+                "Cleared \(removedIDs.count) completed download\(removedIDs.count == 1 ? "" : "s") from history.",
+                tone: .success
+            )
+        } catch {
+            modelInstalls.removeAll { removedIDs.contains($0.id) }
+            setStatus(
+                "Some completed downloads could not be cleared: \(error.localizedDescription)",
+                tone: .error
+            )
+        }
+    }
+
+    func refreshModelsConfiguration() async {
+        await refreshConfigurationFromService(
+            announceModelChanges: false,
+            deferWhenDirty: false
+        )
+    }
+
     func refreshRuntimeUpdates(force: Bool = false) async {
-        guard !isCheckingRuntimeUpdates, updatingRuntimeEngine == nil else { return }
+        guard
+            !isCheckingRuntimeUpdates,
+            updatingRuntimeEngine == nil,
+            !isInstallingOMLXWithHomebrew
+        else { return }
         isCheckingRuntimeUpdates = true
         defer { isCheckingRuntimeUpdates = false }
         do {
@@ -533,6 +670,67 @@ final class SettingsViewModel: ObservableObject {
             }
         } catch {
             setStatus("Could not check runtime updates: \(error.localizedDescription)", tone: .warning)
+        }
+    }
+
+    func installOMLXWithHomebrew() async {
+        guard
+            !isInstallingOMLXWithHomebrew,
+            updatingRuntimeEngine == nil
+        else { return }
+        guard let executable = HomebrewOMLXInstaller.executableURL() else {
+            setStatus(
+                "Homebrew was not found. Use the recommended official oMLX app installer instead.",
+                tone: .warning
+            )
+            return
+        }
+
+        isInstallingOMLXWithHomebrew = true
+        defer { isInstallingOMLXWithHomebrew = false }
+        do {
+            setStatus("Adding the official oMLX Homebrew tap…", tone: .normal)
+            _ = try await HomebrewOMLXInstaller.run(
+                executableURL: executable,
+                arguments: HomebrewOMLXInstaller.commands[0]
+            )
+            setStatus("Installing the stable oMLX Homebrew formula…", tone: .normal)
+            _ = try await HomebrewOMLXInstaller.run(
+                executableURL: executable,
+                arguments: HomebrewOMLXInstaller.commands[1]
+            )
+            runtimeUpdateSnapshot = try await client.checkRuntimeUpdates()
+            setStatus(
+                "oMLX was installed with Homebrew. Configure and start it on 127.0.0.1:17322, then enable the engine.",
+                tone: .success
+            )
+        } catch {
+            setStatus(
+                "Could not install oMLX with Homebrew: \(error.localizedDescription)",
+                tone: .error
+            )
+        }
+    }
+
+    func openOMLXApplication(_ update: EngineRuntimeUpdate) {
+        guard
+            update.engine == .omlx,
+            let installedPath = update.installedPath,
+            installedPath.hasSuffix(".app")
+        else {
+            setStatus(
+                "The installed oMLX application could not be located.",
+                tone: .warning
+            )
+            return
+        }
+        if NSWorkspace.shared.open(URL(fileURLWithPath: installedPath)) {
+            setStatus(
+                "Opened oMLX. Start its server on 127.0.0.1:17322, then check again.",
+                tone: .success
+            )
+        } else {
+            setStatus("Could not open oMLX at \(installedPath).", tone: .error)
         }
     }
 
@@ -614,101 +812,11 @@ final class SettingsViewModel: ObservableObject {
             return [.generation]
         case .mflux:
             return [.image]
-        case .lmstudio:
-            return []
         }
     }
 
     func storageStatus(for name: String) -> StorageStatus? {
         storageStatuses[name]
-    }
-
-    func discoverLMStudioModels() async {
-        guard !isDiscoveringLMStudio else { return }
-        guard lmStudioInventoryAvailability.canOpen else {
-            let guidance = lmStudioInventoryAvailability.guidance
-                ?? "LM Studio inventory is not available yet."
-            lmStudioInventory = []
-            selectedLMStudioKeys = []
-            lmStudioDiscoveryError = guidance
-            setStatus(guidance, tone: .warning)
-            return
-        }
-        isDiscoveringLMStudio = true
-        lmStudioDiscoveryError = ""
-        defer { isDiscoveringLMStudio = false }
-        do {
-            lmStudioInventory = try await client.lmStudioModels().sorted {
-                $0.displayName.localizedStandardCompare($1.displayName) == .orderedAscending
-            }
-            selectedLMStudioKeys = []
-        } catch {
-            lmStudioInventory = []
-            selectedLMStudioKeys = []
-            lmStudioDiscoveryError = error.localizedDescription
-        }
-    }
-
-    func isLMStudioModelProfiled(_ key: String) -> Bool {
-        profiledLMStudioKeys.contains(key)
-    }
-
-    func lmStudioSelectionBinding(_ key: String) -> Binding<Bool> {
-        Binding(
-            get: { self.selectedLMStudioKeys.contains(key) },
-            set: { selected in
-                if selected {
-                    self.selectedLMStudioKeys.insert(key)
-                } else {
-                    self.selectedLMStudioKeys.remove(key)
-                }
-            }
-        )
-    }
-
-    func selectAllUnprofiledLMStudioModels() {
-        let profiled = profiledLMStudioKeys
-        selectedLMStudioKeys = Set(
-            lmStudioInventory.lazy
-                .filter { $0.isImportable && !profiled.contains($0.key) }
-                .map(\.key)
-        )
-    }
-
-    func importSelectedLMStudioModels() {
-        var aliases = Set(settings.models.map(\.alias))
-        let profiled = profiledLMStudioKeys
-        let selected = lmStudioInventory.filter {
-            selectedLMStudioKeys.contains($0.key) && !profiled.contains($0.key)
-        }
-        guard !selected.isEmpty else { return }
-
-        var firstAddedIndex: Int?
-        for model in selected {
-            let alias = uniqueAlias(for: model.key, existing: &aliases)
-            let capabilities = model.type == "embedding"
-                ? ModelRole.embeddings.capabilities
-                : ModelRole.generation.capabilities
-            settings.models.append(
-                ModelProfileSettings(
-                    alias: alias,
-                    engine: .lmstudio,
-                    model: model.key,
-                    capabilities: capabilities
-                )
-            )
-            firstAddedIndex = firstAddedIndex ?? settings.models.count - 1
-        }
-
-        if let firstAddedIndex {
-            selectedModelIndex = firstAddedIndex
-        }
-        selectedLMStudioKeys = []
-        showLMStudioImporter = false
-        setStatus(
-            "Added \(selected.count) LM Studio profiles. Save settings to apply them.",
-            tone: .normal
-        )
     }
 
     func refreshLocalModelSources() async {
@@ -782,8 +890,7 @@ final class SettingsViewModel: ObservableObject {
                 }
                 let base = suggestedAlias(
                     for: candidate.displayName,
-                    fallback: candidate.engine == .llamaCpp
-                        ? "local-gguf" : "local-mlx"
+                    fallback: "local-model"
                 )
                 var alias = base
                 var suffix = 2
@@ -795,6 +902,11 @@ final class SettingsViewModel: ObservableObject {
                 aliases[candidate.id] = alias
             }
             localModelAliases = aliases
+            localModelProjectors = Dictionary(
+                uniqueKeysWithValues: scan.models.compactMap { candidate in
+                    candidate.recommendedProjectorId.map { (candidate.id, $0) }
+                }
+            )
             // Selection is deliberately empty. Model adoption is always an
             // explicit per-row choice, even when every candidate is compatible.
             selectedLocalModelIDs = []
@@ -837,10 +949,13 @@ final class SettingsViewModel: ObservableObject {
         else { return }
         let selected = scan.models.filter { selectedLocalModelIDs.contains($0.id) }
         let selections = selected.map { candidate in
-            LocalModelImportSelection(
+            let projectorID = nonempty(localModelProjectors[candidate.id])
+            return LocalModelImportSelection(
                 candidateId: candidate.id,
                 alias: nonempty(localModelAliases[candidate.id]),
-                projectorId: nonempty(localModelProjectors[candidate.id])
+                projectorId: projectorID,
+                includeProjector: candidate.projectorOptions.isEmpty
+                    || projectorID != nil
             )
         }
         isImportingLocalModels = true
@@ -893,6 +1008,54 @@ final class SettingsViewModel: ObservableObject {
         }
     }
 
+    func deleteSelectedModelFiles() async {
+        guard
+            let index = selectedModelIndex,
+            settings.models.indices.contains(index)
+        else {
+            return
+        }
+        guard !hasUnsavedChanges else {
+            setStatus(
+                "Save or discard pending settings before deleting model files.",
+                tone: .warning
+            )
+            return
+        }
+
+        let alias = settings.models[index].alias
+        isWorking = true
+        setStatus("Deleting \(alias) and its managed files…", tone: .normal)
+        defer { isWorking = false }
+        do {
+            let result = try await client.deleteManagedModel(
+                alias: alias,
+                revision: configurationRevision
+            )
+            settings = result.config
+            savedSettings = result.config
+            configurationRevision = result.revision
+            appliedConfigurationRevision = result.revision
+            requiresRestart = result.restartRequired
+            configurationRefreshPending = false
+            modelInstalls.removeAll { $0.alias == alias }
+            if settings.models.isEmpty {
+                selectedModelIndex = nil
+            } else {
+                selectedModelIndex = min(index, settings.models.count - 1)
+            }
+            setStatus(
+                "Deleted \(alias), removed its profile, and released its model storage.",
+                tone: .success
+            )
+        } catch {
+            setStatus(
+                "Could not delete \(alias): \(error.localizedDescription)",
+                tone: .error
+            )
+        }
+    }
+
     func selectRole(_ role: ModelRole, for index: Int) {
         guard settings.models.indices.contains(index) else { return }
         settings.models[index].applyRole(role)
@@ -932,7 +1095,7 @@ final class SettingsViewModel: ObservableObject {
         switch engine {
         case .mflux:
             .image
-        case .lmstudio, .llamaCpp, .omlx, .ds4:
+        case .llamaCpp, .omlx, .ds4:
             .generation
         }
     }
@@ -971,6 +1134,7 @@ final class SettingsViewModel: ObservableObject {
             libraryFileRequestID = nil
             isLoadingLibraryFiles = false
             libraryFileOptions = []
+            libraryDetails = nil
             selectedLibraryFileID = nil
             selectedLibraryProjector = ""
             synchronizeLibraryRole()
@@ -998,6 +1162,8 @@ final class SettingsViewModel: ObservableObject {
             if !files.contains(where: { $0.id == selectedLibraryFileID }) {
                 selectedLibraryFileID = nil
                 selectedLibraryProjector = ""
+            } else {
+                selectedLibraryProjector = selectedLibraryModel?.projectorFilename ?? ""
             }
             synchronizeLibraryRole()
         } catch {
@@ -1013,20 +1179,145 @@ final class SettingsViewModel: ObservableObject {
         }
     }
 
-    private func refreshInstalls() async {
+    private func refreshLibraryDetailsForSelection() async {
+        guard let model = selectedLibraryModel ?? selectedLibrarySearchResult else {
+            libraryDetailsRequestID = nil
+            libraryDetails = nil
+            isLoadingLibraryDetails = false
+            return
+        }
+        let requestID = UUID()
+        libraryDetailsRequestID = requestID
+        isLoadingLibraryDetails = true
+        defer {
+            if libraryDetailsRequestID == requestID {
+                isLoadingLibraryDetails = false
+            }
+        }
+        do {
+            let details = try await client.libraryDetails(
+                repoId: model.repoId,
+                engine: model.engine,
+                filename: model.filename,
+                revision: model.resolvedRevision
+            )
+            guard libraryDetailsRequestID == requestID else { return }
+            libraryDetails = details
+        } catch {
+            guard libraryDetailsRequestID == requestID else { return }
+            libraryDetails = nil
+        }
+    }
+
+    @discardableResult
+    private func refreshInstalls() async -> Bool {
         do {
             modelInstalls = try await client.modelInstalls()
+            return true
         } catch {
             setStatus("Could not refresh downloads: \(error.localizedDescription)", tone: .warning)
+            return false
+        }
+    }
+
+    private func beginInstallMonitoring() {
+        guard installMonitorTask == nil else { return }
+        installMonitorTask = Task { [weak self] in
+            await self?.monitorActiveInstalls()
         }
     }
 
     private func monitorActiveInstalls() async {
-        for _ in 0 ..< 240 {
-            await refreshInstalls()
-            if !modelInstalls.contains(where: \.isActive) { return }
-            try? await Task.sleep(for: .seconds(2))
-            if Task.isCancelled { return }
+        var observationState = ModelInstallMonitorState(installs: modelInstalls)
+        defer { installMonitorTask = nil }
+
+        while !Task.isCancelled {
+            let refreshed = await refreshInstalls()
+            if refreshed {
+                let observation = observationState.observe(modelInstalls)
+                var refreshedConfiguration = false
+                if !observation.newlyInstalledAliases.isEmpty {
+                    await refreshConfigurationFromService(
+                        announceModelChanges: true,
+                        deferWhenDirty: true
+                    )
+                    refreshedConfiguration = true
+                }
+                if !observation.hasActiveInstalls {
+                    if !refreshedConfiguration {
+                        await refreshConfigurationFromService(
+                            announceModelChanges: true,
+                            deferWhenDirty: true
+                        )
+                    }
+                    return
+                }
+            }
+
+            do {
+                try await Task.sleep(for: .seconds(2))
+            } catch {
+                return
+            }
+        }
+    }
+
+    private func refreshConfigurationFromService(
+        announceModelChanges: Bool,
+        deferWhenDirty: Bool
+    ) async {
+        guard !hasUnsavedChanges else {
+            if deferWhenDirty {
+                configurationRefreshPending = true
+                setStatus(
+                    "A downloaded model is ready. Save or discard your pending settings to refresh Models safely.",
+                    tone: .warning
+                )
+            }
+            return
+        }
+
+        do {
+            let snapshot = try await client.configuration()
+            let previousAliases = Set(savedSettings.models.map(\.alias))
+            let selectedAlias = selectedModelIndex.flatMap { index in
+                settings.models.indices.contains(index)
+                    ? settings.models[index].alias
+                    : nil
+            }
+            let addedAliases = snapshot.config.models.map(\.alias).filter {
+                !previousAliases.contains($0)
+            }
+
+            settings = snapshot.config
+            savedSettings = snapshot.config
+            configurationRevision = snapshot.revision
+            appliedConfigurationRevision = snapshot.appliedRevision
+            requiresRestart = snapshot.restartRequired
+            selectedLibraryStorage = snapshot.config.storage.default
+            configurationRefreshPending = false
+
+            selectedModelIndex = selectedAlias.flatMap { alias in
+                settings.models.firstIndex { $0.alias == alias }
+            } ?? addedAliases.first.flatMap { alias in
+                settings.models.firstIndex { $0.alias == alias }
+            } ?? (settings.models.isEmpty ? nil : 0)
+
+            if announceModelChanges, !addedAliases.isEmpty {
+                let noun = addedAliases.count == 1 ? "model" : "models"
+                setStatus(
+                    "\(addedAliases.count) downloaded \(noun) added to Models.",
+                    tone: .success
+                )
+            }
+        } catch {
+            if deferWhenDirty {
+                configurationRefreshPending = true
+            }
+            setStatus(
+                "Could not refresh installed models: \(error.localizedDescription)",
+                tone: .warning
+            )
         }
     }
 
@@ -1052,46 +1343,27 @@ final class SettingsViewModel: ObservableObject {
         return candidate
     }
 
-    private var profiledLMStudioKeys: Set<String> {
-        Set(
-            settings.models.lazy
-                .filter { $0.engine == .lmstudio }
-                .map(\.model)
-        )
-    }
-
-    private func uniqueAlias(for modelKey: String, existing: inout Set<String>) -> String {
-        let lowered = modelKey.lowercased()
-        var alias = lowered
-            .map { character -> Character in
-                character.isASCII && (character.isLetter || character.isNumber)
-                    ? character : "-"
-            }
-            .reduce(into: "") { result, character in
-                if character != "-" || result.last != "-" { result.append(character) }
-            }
-            .trimmingCharacters(in: CharacterSet(charactersIn: "-"))
-        if alias.isEmpty { alias = "lmstudio-model" }
-        let base = alias
-        var suffix = 2
-        while existing.contains(alias) {
-            alias = "\(base)-\(suffix)"
-            suffix += 1
-        }
-        existing.insert(alias)
-        return alias
-    }
-
     private func suggestedAlias(for name: String, fallback: String) -> String {
-        var alias = name.lowercased()
+        var source = name.lowercased()
+        for suffix in ["-safetensors", ".safetensors", "_safetensors", "-gguf", ".gguf", "_gguf", "-mlx", ".mlx", "_mlx"] {
+            if source.hasSuffix(suffix) {
+                source.removeLast(suffix.count)
+                break
+            }
+        }
+        var alias = source
             .map { character -> Character in
-                character.isASCII && (character.isLetter || character.isNumber)
-                    ? character : "-"
+                if character.isASCII && (character.isLetter || character.isNumber) {
+                    return character
+                }
+                return character == "." ? "." : "-"
             }
             .reduce(into: "") { result, character in
-                if character != "-" || result.last != "-" { result.append(character) }
+                if (character != "-" && character != ".") || result.last != character {
+                    result.append(character)
+                }
             }
-            .trimmingCharacters(in: CharacterSet(charactersIn: "-"))
+            .trimmingCharacters(in: CharacterSet(charactersIn: ".-"))
         if alias.isEmpty { alias = fallback }
         return alias
     }

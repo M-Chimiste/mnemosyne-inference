@@ -68,7 +68,7 @@ public extension ModelProfileSettings {
             switch engine {
             case .llamaCpp, .ds4:
                 return .generation
-            case .lmstudio, .omlx:
+            case .omlx:
                 return nil
             case .mflux:
                 return .image
@@ -97,8 +97,6 @@ public extension ModelProfileSettings {
     /// llama.cpp's embeddings or reranking modes.
     var availableRoles: [ModelRole] {
         switch engine {
-        case .lmstudio:
-            [.generation, .embeddings]
         case .llamaCpp:
             if let projectorPath = load.projectorPath,
                !projectorPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {

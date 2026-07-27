@@ -5,8 +5,9 @@ single-workstation deployments. The CUDA deployment runs vLLM, llama.cpp, or
 SGLang Diffusion in a
 container; the native Apple Silicon deployment owns an official llama.cpp
 server for GGUF, coordinates oMLX and DS4, and uses a process-isolated MFLUX
-worker without Docker. LM Studio remains only as an explicitly enabled
-migration/soak fallback. Both remain thin managers around
+worker without Docker. LM Studio is not an inference engine; its configured
+and conventional model folders remain read-only migration hints. Both
+deployments remain thin managers around
 upstream engines and must not fork or embed their serving implementations.
 
 ## Repository Shape
@@ -22,7 +23,7 @@ upstream engines and must not fork or embed their serving implementations.
 - `pg_writer.py` and `scripts/probe_token_sidecar_schema.py` implement and inspect the optional Postgres token-usage sink; SQLite remains the local system of record and durable outbox.
 - `project_docs/project_status.md` records current release status and feature history; `project_docs/smoke_checks.md` is the manual GPU-host checklist for behavior pytest cannot exercise.
 - `macos/service/` is an independent Python package for the native inference/control planes, engine adapters, lease-based global residency coordinator, and durable usage outbox. Its dependencies and lock file stay below that directory.
-- `macos/service/storage.py`, `model_library.py`, `install_store.py`, `installer.py`, and `download_worker.py` implement exact nested-folder/volume validation, engine-aware Hugging Face discovery, and process-isolated durable native downloads. Managed downloads must remain residency-neutral.
+- `macos/service/storage.py`, `model_library.py`, `install_store.py`, `installer.py`, and `download_worker.py` implement exact nested-folder/volume validation, engine-aware Hugging Face discovery, and process-isolated durable native downloads. The install store retains a compact transition journal so target-Mac cancel/retry/registration/dismiss/delete acceptance remains provable after UI history is hidden. Managed downloads must remain residency-neutral.
 - `macos/service/local_models.py` scans Finder-selected GGUF/MLX libraries without loading or copying weights. `macos/service/engines/llamacpp.py` translates typed profiles into a manager-owned upstream `llama-server` process while reusing the hardened managed-process ownership proof.
 - `macos/service/security_scopes.py` consumes Finder-created transfer
   bookmarks and creates receiver-owned durable bookmarks for protected model
@@ -43,15 +44,60 @@ upstream engines and must not fork or embed their serving implementations.
   persists missing values into Unified Inference's private `.env`. Unified
   Inference is the native token sidecar; the legacy process is not in the
   inference path and must not remain a permanent reporting dependency.
+- Keep configured model profiles when an engine is disabled, but exclude them
+  from the resolved/callable catalog until that engine is enabled. An external
+  engine being unavailable must not make the control plane or Settings UI
+  unable to start.
+- `macos/retire_legacy_sidecar.sh` validates and persistently disables the
+  exact `com.athena.token-sidecar` user job, boots it out, restarts Unified
+  Inference, and archives the inactive plist only after both native HTTP
+  planes are reachable. Preserve the plist until the service has inherited
+  and persisted its node identity and ledger DSN; never kill an arbitrary
+  listener on `:1240`.
 - `macos/service/runtime_updates.py` discovers releases directly from the
   official upstreams, verifies and installs official `ggml-org/llama.cpp`
   Apple Silicon assets, installs MFLUX from PyPI, builds an exact DS4 GitHub
-  commit, and provides atomic activation/rollback. Runtime activation must use
-  the coordinator's all-engines-empty maintenance barrier; never introduce a
-  repository-owned dependency manifest.
+  commit, and provides atomic activation/rollback. Its private bounded
+  lifecycle journal records only fixed transition fields, anonymous service
+  instance IDs, and fixed failure codes so acceptance can prove activation,
+  post-restart inference, rollback, post-rollback restart inference, and
+  corrupt-runtime rejection without persisting arbitrary diagnostics.
+  Runtime activation must use the coordinator's all-engines-empty maintenance
+  barrier; never introduce a repository-owned dependency manifest.
 - `macos/image-worker/` is the separately locked MFLUX runtime. It is launched only as a manager-owned child, binds loopback `:17324`, and must remain dependency-isolated from the macOS coordinator service.
-- `macos/app/` is the SwiftPM menu bar controller, typed native settings UI, secret-safe credential store, and native service bootstrap. `macos/packaging/` stages the signed app, embedded LaunchAgent plist, direct `Contents/MacOS/mnemosyne-service-bootstrap` executable, and relocatable Python runtime. Keep this unsandboxed `SMAppService` LaunchAgent's `BundleProgram` pointed at that direct helper; introducing a second bundle identity is unnecessary here and broke launch-requirement refresh during in-place updates. A future sandboxed or restricted-entitlement job would require its own deliberate wrapper architecture.
-- `macos/config.yaml.example`, `macos/.env.example`, `macos/README.md`, and `macos/smoke_checks.md` are the native deployment's setup and validation surface. Mac settings must not be added to the external CUDA compose file.
+- `macos/app/` is the SwiftPM menu bar controller, typed native settings UI, secret-safe credential store, and native service bootstrap. `macos/packaging/` stages the signed app, embedded LaunchAgent plist, direct `Contents/MacOS/mnemosyne-service-bootstrap` executable, relocatable Python runtime, and verified drag-to-Applications DMG. Keep this unsandboxed `SMAppService` LaunchAgent's `BundleProgram` pointed at that direct helper; introducing a second bundle identity is unnecessary here and broke launch-requirement refresh during in-place updates. A future sandboxed or restricted-entitlement job would require its own deliberate wrapper architecture.
+- `macos/VERSION` is the only native product-version source.
+  `macos/packaging/verify_release.py`, the native packages/locks, staged app,
+  release tag, DMG name, and Sparkle appcast must agree. CI may stage ad-hoc
+  candidates, but distribution requires the credentialed signed-release
+  workflow, a GitHub-verified signed annotated tag, Developer ID hardened
+  inside-out signing, notarization/stapling, Gatekeeper assessment, and an
+  EdDSA-signed HTTPS appcast. Never put a private update key in the repository.
+- `macos/V1_SCOPE.md`, `macos/acceptance/v1.json`, `macos/RELEASE.md`, and
+  `macos/RELEASE_NOTES.md` define the Stable/Preview contract, release gates,
+  credentials, update behavior, and rollback. Do not advance
+  `macos/VERSION` to `1.0.0` while a required acceptance gate is pending.
+  `macos/packaging/collect_acceptance.py` is the secret-redacted artifact/live
+  evidence collector. Its opt-in restart and KeepAlive exercises must address
+  only the exact registered LaunchAgent label, require a new PID and both HTTP
+  planes, and never discover or signal a process by port. A migrated install
+  journal `snapshot` is not evidence for transitions this candidate did not
+  observe. Managed-runtime acceptance must use the runtime lifecycle journal,
+  require service-instance changes before validating both activated and
+  rolled-back versions, and prove a rejected integrity/path-safety failure
+  left the baseline active.
+  Login-cycle acceptance must compare a private accepted pre-cycle report
+  against the exact candidate on the same host and require a changed
+  `launchctl` GUI audit-session ID plus PID, healthy listeners, and a fresh
+  durable self-test. A kickstart or KeepAlive restart is not login evidence.
+  Release verification must reject every 1.x build unless the ledger version
+  matches, `release_ready` is true, and every required gate is passed; 0.x
+  candidate artifacts remain prereleases.
+- `macos/INSTALL.md` is the end-user disk-image and all-engine setup path.
+  `macos/config.yaml.example`, `macos/.env.example`, `macos/README.md`, and
+  `macos/smoke_checks.md` are the native deployment's configuration, operator,
+  development, and validation surface. Mac settings must not be added to the
+  external CUDA compose file.
 - `agents.md` is the single repository guide for coding assistants and contributors. Keep it aligned with code, examples, and verification commands when architecture or workflows change.
 
 The live `docker-compose.yml` is intentionally machine-specific and may live outside this repo. The CLI expects it under `$VLLM_COMPOSE_DIR`, defaulting to `~/vllm-manager`. Use `docker-compose.example.yml` as the maintained template. If a change affects ports, env vars, volumes, container names, build args, or mounts, call out the required external compose changes.
@@ -85,7 +131,7 @@ The live `docker-compose.yml` is intentionally machine-specific and may live out
 
 ### Native macOS deployment
 
-- Inference is on `127.0.0.1:17320`, control is on `127.0.0.1:17321`, oMLX uses `:17322`, the manager-owned DS4 child uses `:17323`, the manager-owned MFLUX worker uses `:17324`, and manager-owned llama.cpp uses `:17325`. Reserve `17326-17329` for later native services. Legacy migration configs may explicitly keep LM Studio on `:1234`; fresh configs disable it.
+- Inference is on `127.0.0.1:1240` so Unified Inference is a drop-in replacement for the previous token sidecar; control is on `127.0.0.1:17321`, oMLX uses `:17322`, the manager-owned DS4 child uses `:17323`, the manager-owned MFLUX worker uses `:17324`, and manager-owned llama.cpp uses `:17325`. Reserve `17320` and `17326-17329` for later native services. The legacy sidecar must be booted out and persistently disabled or removed before Unified Inference binds `:1240`; merely unloading it lets it return at the next login.
 - A per-user LaunchAgent owns Mnemosyne Core. The controller uses an explicit AppKit `NSStatusItem` with a SwiftUI popover; quitting it must not terminate inference. `SMAppService.agent` registers the embedded plist and the bootstrap must `execve` the bundled Python without daemonizing.
 - `ResidencyCoordinator` owns the cross-engine invariant. A request holds an epoch-tagged model lease through its complete stream. FIFO queuing stops old-target admission once a switch is pending, drains active leases, proves all enabled adapters empty, loads one target, and proves exactly one ready manager-owned resident.
 - oMLX is an external loopback service controlled through its native lifecycle APIs. llama.cpp and DS4 are model-specific process groups started by Mnemosyne. Never kill an unknown PID or listener; persisted managed-process identity must match executable, argv, start identity, and process group before recovery or signaling.
@@ -102,21 +148,23 @@ The live `docker-compose.yml` is intentionally machine-specific and may live out
   reporting defaults on. During migration, it may inherit `node.id` and the
   ledger DSN from the previous sidecar's LaunchAgent; explicit native values
   win. Persist missing inherited values into the private native `.env` before
-  retiring that LaunchAgent. Keep the Settings identity read-only and never
-  expose or log the DSN.
+  retiring that LaunchAgent. Keep the Settings identity read-only. The Usage
+  page may replace or clear the Postgres DSN only through a write-only secure
+  field backed by the private `.env`; never return, prefill, or log the DSN.
 - The primary local migration surface is the read-only
   `GET /manager/model-library/local-sources` hint list, followed by
   Finder-driven `POST /manager/model-library/local-scan` and explicit
   `POST /manager/model-library/imports`. Source hints read LM Studio's
   configured download root and documented default without contacting its
-  server, probing model paths, or requiring its adapter to be enabled.
+  server or probing model paths. There is no LM Studio adapter, credential,
+  control endpoint, or runnable profile. Version-1 LM Studio profiles migrate
+  into inert alias/load-setting records that the Finder import consumes.
   Finder must still confirm the exact folder before bookmark creation or
   scanning. Scan again before persisting opaque candidate/projector IDs; never
   preselect every candidate, load a model, copy weights, treat `mmproj` as a
   primary model, or replace an exact nested/symlink path with its resolved
   target or mount root. Preserve matching aliases and compatible load
-  settings. The LM Studio inventory endpoint remains only for the temporary
-  soak fallback.
+  settings.
 - The native Storage UI always uses the macOS directory picker. Preserve the exact selected folder (including paths such as `/Volumes/Athena/models`) separately from the containing mount and its UUID; never replace it with the volume root or make users type it.
 - The menu app must create an ordinary bookmark while its `NSOpenPanel` grant
   is live. Its implicit extension is the Apple-supported single interprocess
@@ -141,18 +189,35 @@ The live `docker-compose.yml` is intentionally machine-specific and may live out
   process group and fail closed with an actionable permission/volume diagnostic
   while both HTTP planes remain responsive.
 - Native Hugging Face installs are engine-aware and durable. llama.cpp search
-  requires explicit GGUF quant/shard selection and explicit optional projector
-  pairing, pins the resolved Hub revision, and downloads only that exact file
-  set. DS4 and MFLUX use verified curated candidates; oMLX search exposes
+  requires explicit GGUF quant/shard selection, automatically selects the
+  highest-fidelity same-directory vision projector when present, and retains
+  explicit text-only opt-out/manual projector selection. Discovery shows a
+  bounded model-card preview plus architecture, context length, parameter
+  count, and license when Hub/config/GGUF metadata provides them. Detected GGUF
+  context length and selected projector persist into the created profile.
+  Exact revisions and file sets remain pinned. DS4 and MFLUX use verified
+  curated candidates; oMLX search exposes
   metadata-derived compatibility honestly and downloaded snapshots must be
   classified before profile registration so they advertise only detected
   generation, embeddings, or rerank routes. Downloads run out of process,
   never load a model, and oMLX directory changes run only through the
   coordinator's all-engines-empty maintenance barrier. Treat
   downloaded-but-not-registered weights as a durable retryable state; retry
-  profile registration without redownloading them.
-- Runtime update checks are read-only. oMLX remains externally owned; never
-  replace its app or Homebrew files. llama.cpp must come from the official
+  profile registration without redownloading them. Report durable byte/total
+  progress and smoothed transfer speed. Hiding completed history must retain
+  internal managed-download provenance. File deletion is an explicit separate
+  action limited to an exact app-managed destination under configured storage;
+  run it in a bounded helper behind the global empty-residency barrier, refuse
+  roots/escapes/symlinks, and never delete Finder imports or hand-authored
+  model paths.
+- Runtime update checks are read-only. For oMLX, select the official DMG that
+  matches the host macOS major version and detect its app, CLI shim,
+  conventional Homebrew locations, or running server. oMLX remains externally
+  owned; never replace its app or Homebrew files. The menu app may delegate
+  an initial missing-runtime installation to an existing Homebrew only after
+  explicit user confirmation displays fixed official tap and stable install
+  commands. Do not accept arbitrary formulas/arguments, use `--HEAD`, update,
+  or reinstall through that action. llama.cpp must come from the official
   `ggml-org/llama.cpp` macOS arm64 release asset and pass published size,
   SHA-256, safe-extraction, executable, and CLI-contract checks. MFLUX must
   come from its official PyPI project and DS4 from an exact commit in
@@ -168,6 +233,16 @@ The live `docker-compose.yml` is intentionally machine-specific and may live out
 - Adapter-observed state is authoritative. An unreachable/unauthorized/incompatible adapter is not implicitly empty. Startup defaults to `unload_all`; uncertain state fails closed until `/manager/reconcile` succeeds.
 - The Mac proxy supports capability-gated Chat/Completions, Responses, Messages, Embeddings, Rerank, and Images Generations routes. MFLUX is terminated on unload/abort so Metal memory is released at the process boundary.
 - The menu app reads and writes structured configuration through the control plane. The service remains the schema authority and atomically persists validated YAML; credential values are write-only in the UI and never returned by the API. Preserve `schema_version`; an older app must refuse to save a newer schema instead of dropping unknown fields. Config snapshots carry an optimistic revision that every save must echo. Serialize saves, download-completion profile creation, and local imports through the same mutation lock; reject a stale Settings save instead of overwriting a concurrent model addition.
+- Setup & Health is the native first-run authority. It must remain usable when
+  the service is disabled or degraded, present bounded and secret-redacted
+  readiness, distinguish Stable llama.cpp/oMLX from Preview DS4/MFLUX, and
+  provide recovery actions. First-run setup completes only after its self-test
+  sends a real request through the public listener and verifies the matching
+  durable local usage row; Postgres delivery is separately authoritative from
+  writer/outbox state. Keep first-presentation and completion evidence scoped
+  to the exact app version/build, record presentation only after the
+  first-run window is shown, and never let a stale completion preference clear
+  clean-install acceptance.
 - The ordinary Mac Models page must not create profiles from raw model or
   projector text fields. New profiles come from the engine-aware Model Library
   or Finder discovery; imported engine/source/storage/served-name/projector
@@ -177,6 +252,11 @@ The live `docker-compose.yml` is intentionally machine-specific and may live out
   `CODESIGN_IDENTITY` for a stable signing identity. Do not imply
   durable protected-folder grants survive arbitrary ad-hoc rebuilds; after a
   code-identity change, the user may need to reselect the folder.
+  Every non-system dynamic framework copied into `Contents/Frameworks` must
+  have a matching bundle-relative executable rpath. Release verification must
+  inspect both the dependency and `LC_RPATH`; deep code-signature validation
+  alone does not prove that the app can reach
+  `applicationDidFinishLaunching`.
 - Mac usage events normalize OpenAI, Responses, and Anthropic token shapes and atomically write local analytics plus the SQLite Postgres outbox. The central schema and retry/idempotency behavior match the CUDA deployment.
 - Image requests intentionally do not emit token-usage records. Do not add image prompt/output policy hooks; this repository is a local homelab tool.
 
@@ -268,7 +348,7 @@ Install and cache operations:
 ```bash
 ./vllm-ctl install qwen-coder Qwen/Qwen2.5-Coder-7B-Instruct --storage nvme-fast
 ./vllm-ctl install TheBloke/Some-GGUF --list-gguf
-./vllm-ctl install local-gguf org/repo-gguf --backend llama.cpp --gguf-filename model.Q4_K_M.gguf
+./vllm-ctl install local-model org/repo-gguf --backend llama.cpp --gguf-filename model.Q4_K_M.gguf
 ./vllm-ctl install qwen-image Qwen/Qwen-Image --backend sglang-diffusion --gpus 0
 ./vllm-ctl install-status
 ./vllm-ctl install-status qwen-coder
@@ -364,4 +444,5 @@ When behavior touches process launch, ports, engine argv construction, Docker mo
 9. `Dockerfile`, `config.yaml.example`, `.env.example`, and `docker-compose.example.yml`
 10. `ui/src/`
 11. `project_docs/smoke_checks.md` for CUDA-host validation
-12. `macos/README.md`, then `project_docs/macos_native_architecture.md`, for the native sibling
+12. `macos/INSTALL.md`, `macos/README.md`, then
+    `project_docs/macos_native_architecture.md`, for the native sibling

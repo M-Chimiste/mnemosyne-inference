@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import ipaddress
 import json
@@ -26,7 +27,12 @@ from .models import (
 from .sidecar_discovery import LEGACY_AUTOMATIC_NODE_IDS
 
 
-_ALIAS_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+_ALIAS_RE = re.compile(r"^[a-z0-9]+(?:[.-][a-z0-9]+)*$")
+_IMAGE_FAMILY_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+_MODEL_FORMAT_SUFFIX_RE = re.compile(
+    r"(?:[._\s-]+(?:gguf|mlx|safetensors))+$",
+    re.IGNORECASE,
+)
 _STORAGE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 _APP_SUPPORT = Path.home() / "Library" / "Application Support" / "Mnemosyne"
 
@@ -35,11 +41,28 @@ class ConfigError(RuntimeError):
     pass
 
 
+def suggested_model_alias(
+    name: str,
+    *,
+    fallback: str = "model",
+    max_length: int = 64,
+) -> str:
+    """Build a client-facing alias without leaking the weight format."""
+
+    without_format = _MODEL_FORMAT_SUFFIX_RE.sub("", name.strip())
+    alias = re.sub(r"[^a-z0-9.]+", "-", without_format.casefold())
+    alias = re.sub(r"-+", "-", alias)
+    alias = re.sub(r"\.+", ".", alias)
+    alias = re.sub(r"(?:\.-|-\.)+", "-", alias).strip(".-")
+    alias = alias[:max_length].rstrip(".-")
+    return alias if alias and _ALIAS_RE.fullmatch(alias) else fallback
+
+
 class ServerConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     inference_bind: str = "127.0.0.1"
-    inference_port: int = Field(default=17320, ge=1024, le=65535)
+    inference_port: int = Field(default=1240, ge=1024, le=65535)
     control_bind: str = "127.0.0.1"
     control_port: int = Field(default=17321, ge=1024, le=65535)
     idle_unload_seconds: int | None = Field(default=900, ge=1)
@@ -60,22 +83,6 @@ class ServerConfig(BaseModel):
         if self.startup_policy != "unload_all":
             raise ValueError("only startup_policy='unload_all' is currently supported")
         return self
-
-
-class LMStudioConfig(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    # Kept only as a migration source while existing profiles are moved to
-    # manager-owned llama.cpp or oMLX. Fresh installs do not depend on it.
-    enabled: bool = False
-    base_url: str = "http://127.0.0.1:1234"
-    api_key_env: str = "LMSTUDIO_API_KEY"
-    request_timeout_seconds: float = Field(default=30, gt=0)
-
-    @field_validator("base_url")
-    @classmethod
-    def _loopback_only(cls, value: str) -> str:
-        return _validate_loopback_url(value, engine="LM Studio")
 
 
 class LlamaCppConfig(BaseModel):
@@ -109,7 +116,7 @@ class LlamaCppConfig(BaseModel):
 class OMLXConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    enabled: bool = True
+    enabled: bool = False
     base_url: str = "http://127.0.0.1:17322"
     api_key_env: str = "OMLX_API_KEY"
     admin_session_env: str = "OMLX_ADMIN_SESSION"
@@ -137,7 +144,7 @@ class OMLXConfig(BaseModel):
 class DS4Config(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    enabled: bool = True
+    enabled: bool = False
     host: str = "127.0.0.1"
     port: int = Field(default=17323, ge=1024, le=65535)
     binary: str = "/Applications/DwarfStar/ds4-server"
@@ -185,7 +192,6 @@ class MFluxConfig(BaseModel):
 class EnginesConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    lmstudio: LMStudioConfig = Field(default_factory=LMStudioConfig)
     llama_cpp: LlamaCppConfig = Field(default_factory=LlamaCppConfig)
     omlx: OMLXConfig = Field(default_factory=OMLXConfig)
     ds4: DS4Config = Field(default_factory=DS4Config)
@@ -198,7 +204,6 @@ class ModelLoadConfig(BaseModel):
     context_length: int | None = Field(default=None, gt=0)
     eval_batch_size: int | None = Field(default=None, gt=0)
     flash_attention: bool | None = None
-    num_experts: int | None = Field(default=None, gt=0)
     offload_kv_cache_to_gpu: bool | None = None
     projector_path: str | None = None
     gpu_layers: int | None = Field(default=None, ge=0)
@@ -209,6 +214,31 @@ class ModelLoadConfig(BaseModel):
     kv_disk_directory: str | None = None
     kv_disk_space_mb: int | None = Field(default=None, gt=0)
     extra_args: list[str] = Field(default_factory=list)
+
+
+class LegacyLMStudioLoadConfig(ModelLoadConfig):
+    """Settings retained only until a v1 profile is adopted from local files."""
+
+    num_experts: int | None = Field(default=None, gt=0)
+
+
+class LegacyLMStudioProfile(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    alias: str
+    model: str
+    served_model_name: str | None = None
+    capabilities: set[Endpoint] | None = None
+    load: LegacyLMStudioLoadConfig = Field(default_factory=LegacyLMStudioLoadConfig)
+    enabled: bool = True
+
+
+class MigrationConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    legacy_lmstudio_profiles: list[LegacyLMStudioProfile] = Field(
+        default_factory=list
+    )
 
 
 class ImageProfileConfig(BaseModel):
@@ -224,7 +254,7 @@ class ImageProfileConfig(BaseModel):
     @field_validator("family")
     @classmethod
     def _valid_family(cls, value: str) -> str:
-        if not _ALIAS_RE.fullmatch(value):
+        if not _IMAGE_FAMILY_RE.fullmatch(value):
             raise ValueError(
                 "image family must contain lowercase letters, digits, and hyphens"
             )
@@ -250,7 +280,7 @@ class ModelProfile(BaseModel):
     def _valid_alias(cls, value: str) -> str:
         if not _ALIAS_RE.fullmatch(value):
             raise ValueError(
-                "alias must contain lowercase letters, digits, and hyphens and start with alphanumeric"
+                "alias must contain lowercase letters, digits, dots, and hyphens in alphanumeric segments"
             )
         return value
 
@@ -298,7 +328,6 @@ class ModelProfile(BaseModel):
                 self.load.context_length,
                 self.load.eval_batch_size,
                 self.load.flash_attention,
-                self.load.num_experts,
                 self.load.offload_kv_cache_to_gpu,
                 self.load.projector_path,
                 self.load.gpu_layers,
@@ -314,7 +343,6 @@ class ModelProfile(BaseModel):
             for value in (
                 self.load.eval_batch_size,
                 self.load.flash_attention,
-                self.load.num_experts,
                 self.load.offload_kv_cache_to_gpu,
                 self.load.projector_path,
                 self.load.gpu_layers,
@@ -324,22 +352,8 @@ class ModelProfile(BaseModel):
                 self.load.pooling,
             )
         ):
-            raise ValueError("llama.cpp/LM Studio load settings are not supported by DS4")
-        if self.engine == EngineName.LMSTUDIO and any(
-            value is not None
-            for value in (
-                self.load.projector_path,
-                self.load.gpu_layers,
-                self.load.ubatch_size,
-                self.load.threads,
-                self.load.parallel,
-                self.load.pooling,
-            )
-        ):
-            raise ValueError("llama.cpp load settings require engine='llama.cpp'")
+            raise ValueError("llama.cpp load settings are not supported by DS4")
         if self.engine == EngineName.LLAMA_CPP:
-            if self.load.num_experts is not None:
-                raise ValueError("num_experts is an LM Studio-only load setting")
             capabilities = self.capabilities or set(DEFAULT_CAPABILITIES[EngineName.LLAMA_CPP])
             generation = capabilities & {
                 Endpoint.CHAT_COMPLETIONS,
@@ -526,13 +540,64 @@ class StorageConfig(BaseModel):
 class MacConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    schema_version: Literal[1] = 1
+    schema_version: Literal[2] = 2
     server: ServerConfig = Field(default_factory=ServerConfig)
     engines: EnginesConfig = Field(default_factory=EnginesConfig)
     paths: PathsConfig = Field(default_factory=PathsConfig)
     storage: StorageConfig = Field(default_factory=StorageConfig)
     models: list[ModelProfile] = Field(default_factory=list)
+    migration: MigrationConfig = Field(default_factory=MigrationConfig)
     token_sidecar: TokenSidecarConfig = Field(default_factory=TokenSidecarConfig)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_v1_lmstudio_configuration(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        raw = copy.deepcopy(value)
+        version = raw.get("schema_version", 1)
+        if version != 1:
+            return raw
+
+        engines = raw.get("engines")
+        if isinstance(engines, dict):
+            engines.pop("lmstudio", None)
+
+        migrated_profiles: list[dict[str, Any]] = []
+        retained_profiles: list[Any] = []
+        models = raw.get("models", [])
+        if isinstance(models, list):
+            for profile in models:
+                if isinstance(profile, dict) and profile.get("engine") == "lmstudio":
+                    migrated_profiles.append(
+                        {
+                            key: item
+                            for key, item in profile.items()
+                            if key
+                            in {
+                                "alias",
+                                "model",
+                                "served_model_name",
+                                "capabilities",
+                                "load",
+                                "enabled",
+                            }
+                        }
+                    )
+                else:
+                    retained_profiles.append(profile)
+            raw["models"] = retained_profiles
+
+        migration = raw.get("migration")
+        if not isinstance(migration, dict):
+            migration = {}
+        previous = migration.get("legacy_lmstudio_profiles")
+        if isinstance(previous, list):
+            migrated_profiles = [*previous, *migrated_profiles]
+        migration["legacy_lmstudio_profiles"] = migrated_profiles
+        raw["migration"] = migration
+        raw["schema_version"] = 2
+        return raw
 
     @model_validator(mode="after")
     def _validate_cross_references(self) -> "MacConfig":
@@ -540,24 +605,6 @@ class MacConfig(BaseModel):
         if len(aliases) != len(set(aliases)):
             duplicates = sorted({alias for alias in aliases if aliases.count(alias) > 1})
             raise ValueError(f"duplicate model aliases: {duplicates}")
-
-        enabled_engines = {
-            EngineName.LMSTUDIO: self.engines.lmstudio.enabled,
-            EngineName.LLAMA_CPP: self.engines.llama_cpp.enabled,
-            EngineName.OMLX: self.engines.omlx.enabled,
-            EngineName.DS4: self.engines.ds4.enabled,
-            EngineName.MFLUX: self.engines.mflux.enabled,
-        }
-        disabled_references = sorted(
-            profile.alias
-            for profile in self.models
-            if profile.enabled and not enabled_engines[profile.engine]
-        )
-        if disabled_references:
-            raise ValueError(
-                "enabled model profiles reference disabled engines: "
-                f"{disabled_references}"
-            )
 
         storage_names = {location.name for location in self.storage.locations}
         invalid_storage = sorted(
@@ -586,8 +633,6 @@ class MacConfig(BaseModel):
             "inference": self.server.inference_port,
             "control": self.server.control_port,
         }
-        if self.engines.lmstudio.enabled:
-            ports["lmstudio"] = _url_port(self.engines.lmstudio.base_url)
         if self.engines.llama_cpp.enabled:
             ports["llama.cpp"] = self.engines.llama_cpp.port
         if self.engines.omlx.enabled:
@@ -604,11 +649,19 @@ class MacConfig(BaseModel):
             raise ValueError(f"configured Mnemosyne ports must be distinct: {conflicts}")
         return self
 
+    def engine_enabled(self, engine: EngineName) -> bool:
+        return {
+            EngineName.LLAMA_CPP: self.engines.llama_cpp.enabled,
+            EngineName.OMLX: self.engines.omlx.enabled,
+            EngineName.DS4: self.engines.ds4.enabled,
+            EngineName.MFLUX: self.engines.mflux.enabled,
+        }[engine]
+
     def profiles(self) -> dict[str, ResolvedTarget]:
         locations = {location.name: location for location in self.storage.locations}
         profiles: dict[str, ResolvedTarget] = {}
         for profile in self.models:
-            if not profile.enabled:
+            if not profile.enabled or not self.engine_enabled(profile.engine):
                 continue
             location = locations.get(profile.storage) if profile.storage else None
             profiles[profile.alias] = profile.resolve(

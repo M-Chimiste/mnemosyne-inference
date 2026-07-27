@@ -4,6 +4,101 @@ Run these checks on the target Apple Silicon workstation. Automated tests use
 fake engines and cannot validate Metal memory release, upstream API drift,
 LaunchAgent behavior, or model quality.
 
+Start every candidate pass with the evidence collector. It is read-only unless
+`--self-test` is supplied, and it writes the report atomically with mode
+`0600`. Credential-bearing fields and URLs are redacted; token counts remain
+visible:
+
+For the clean-install pass, quit the menu app and reset its preferences domain
+before launching the newly installed candidate:
+
+```bash
+defaults delete com.mnemosyne.inference.menu 2>/dev/null || true
+```
+
+This clears menu/login-item preferences only; it does not delete Application
+Support configuration, weights, bookmarks, usage, or the Postgres outbox.
+Launch the candidate, confirm Setup & Health appears automatically, complete
+its real model self-test, and add `--require-guided-setup` to the first report:
+
+```bash
+python3 macos/packaging/collect_acceptance.py \
+  --app "/Applications/Unified Inference.app" \
+  --dmg "/path/to/Unified-Inference-0.9.0-macos-arm64.dmg" \
+  --live \
+  --require-live \
+  --self-test your-model-alias \
+  --require-guided-setup \
+  --require-postgres-drain \
+  --output "$HOME/Desktop/unified-inference-live-acceptance.json"
+```
+
+When control authentication is enabled, export its password as
+`MNEMOSYNE_ADMIN_PASSWORD` for this command only. Do not pass the value on the
+command line. Attach the resulting report to the acceptance ledger evidence;
+a registered/running LaunchAgent does not pass when either HTTP plane,
+readiness, version matching, catalog, usage, or the requested durable self-test
+fails. The Postgres option also requires a new successful flush and an empty
+outbox; verify the corresponding `event_id` exists exactly once in the central
+ledger before clearing the remote-delivery gate.
+The guided-setup check rejects an older preference bit: the exact installed
+version and build must have recorded first presentation before completion, and
+the same report must pass the durable-usage self-test.
+
+After the ordinary UI pass, rerun the collector with the relevant strict
+scenario flags instead of translating screenshots into release claims:
+
+```bash
+python3 macos/packaging/collect_acceptance.py \
+  --app "/Applications/Unified Inference.app" \
+  --dmg "/path/to/Unified-Inference-0.9.0-macos-arm64.dmg" \
+  --require-live \
+  --exercise-service-restart \
+  --exercise-reconcile \
+  --self-test protected-vision-alias \
+  --expected-engine llama.cpp \
+  --require-vision \
+  --require-protected-model \
+  --require-download-lifecycle \
+  --require-postgres-drain \
+  --output "$HOME/Desktop/unified-inference-restart-acceptance.json"
+```
+
+Run a second pass with `--exercise-keepalive` to prove launchd restarted the
+exact registered job after SIGTERM. The report requires a different PID and
+both HTTP planes healthy before continuing to reconciliation and inference.
+To prove a real logout/login or reboot rather than another process restart,
+keep the accepted first report as the private baseline, complete the login
+cycle, and run:
+
+```bash
+python3 macos/packaging/collect_acceptance.py \
+  --app "/Applications/Unified Inference.app" \
+  --live --require-live \
+  --self-test your-model-alias \
+  --require-login-cycle-baseline \
+    "$HOME/Desktop/unified-inference-live-acceptance.json" \
+  --output "$HOME/Desktop/unified-inference-after-login.json"
+```
+
+The baseline must be mode `0600`, accepted, from the same host and exact app
+version/build. The registered LaunchAgent must return under a different GUI
+audit-session ID and PID, both HTTP planes must be healthy, and the current
+report must complete another durable self-test. An ordinary restart cannot
+satisfy the audit-session check.
+For the migrated-library pass add
+`--require-lmstudio-adoption <the-same-self-test-alias>` while LM Studio is
+stopped. For the oMLX pass select an oMLX alias and add
+`--require-omlx-recovery --expected-engine omlx`; this combination requires a
+service restart/KeepAlive exercise and `--exercise-reconcile`.
+
+The download check reads the durable install transition journal. It needs
+real target-Mac records proving cancellation followed by retry and completion,
+downloaded-weight registration retry without another download, completed
+history dismissal, exact revision pinning, and managed deletion. An upgraded
+database receives only a `snapshot` event, which is deliberately insufficient
+to clear transitions that were not observed by this candidate.
+
 ## 1. Configuration and listeners
 
 ```bash
@@ -11,26 +106,32 @@ uv run --project macos/service mnemosyne-macos --check-config \
   --config "$HOME/Library/Application Support/Mnemosyne/config.yaml" \
   --env "$HOME/Library/Application Support/Mnemosyne/.env"
 lsof -nP \
-  -iTCP:1234 \
-  -iTCP:17320 -iTCP:17321 -iTCP:17322 -iTCP:17323 \
+  -iTCP:1240 -iTCP:17321 -iTCP:17322 -iTCP:17323 \
   -iTCP:17324 -iTCP:17325 \
   -sTCP:LISTEN
 ```
 
-Confirm Unified Inference owns `17320`/`17321` and every inner listener is
+Confirm Unified Inference owns `1240`/`17321` and every inner listener is
 loopback-only. oMLX owns `17322` when that optional engine is enabled.
 Manager-owned DS4, MFLUX, and llama.cpp should be absent from `17323`,
-`17324`, and `17325` while unloaded. An older migration installation may still
-have LM Studio on `1234`, but a fresh configuration does not require it. The
-previous token sidecar is not required in the inference path.
+`17324`, and `17325` while unloaded. LM Studio is not part of the inference
+topology. The previous token sidecar is not required in the inference path.
 
 With every configured engine empty, confirm both status and the aggregate model
 catalog remain available:
 
 ```bash
 curl -s http://127.0.0.1:17321/manager/status | jq
-curl -s http://127.0.0.1:17320/v1/models | jq
+curl -s http://127.0.0.1:17321/manager/readiness | jq
+curl -s http://127.0.0.1:1240/v1/models | jq
 ```
+
+Open **Settings → Setup & Health** and compare it with the readiness payload.
+Confirm the product version matches `macos/VERSION`, diagnostics contain no
+credential or URI password, manager-owned stopped engines are described as
+available when their runtime is installed, external oMLX is not described as
+ready unless its authoritative service responds, and DS4/MFLUX are labeled
+Preview rather than Stable.
 
 ## 2. Local-library adoption
 
@@ -40,14 +141,17 @@ existing library directory, including a nested external path such as
 
 Confirm:
 
-- no candidate is selected automatically;
+- no model is selected for import automatically;
 - complete split-GGUF sets appear as one candidate and incomplete sets are
   unavailable;
 - `mmproj` files appear only as projector choices, never as primary models;
 - MLX directories and GGUF models are assigned to oMLX and llama.cpp
   respectively;
-- every selected model has an editable, unique alias and every GGUF has an
-  explicit **Text only (no projector)** or same-directory projector choice;
+- every selected model has an editable, unique alias; a vision GGUF
+  preselects the highest-fidelity same-directory projector and offers another
+  projector or **Text only (opt out)**;
+- architecture, context length, parameter count, and summary are shown when
+  discoverable from GGUF/config/model-card metadata;
 - importing does not copy model files, contact an engine load/unload endpoint,
   or make a process resident;
 - the exact selected directory and containing-volume UUID are persisted;
@@ -100,7 +204,7 @@ Install llama.cpp from **Settings → Runtime Updates**, then request an adopted
 GGUF alias through the unified API:
 
 ```bash
-curl -s http://127.0.0.1:17320/v1/chat/completions \
+curl -s http://127.0.0.1:1240/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{"model":"local-qwen","messages":[{"role":"user","content":"Reply with one short sentence."}]}' \
   | jq
@@ -129,15 +233,29 @@ fail-closed ownership/port error and never signals that process.
 
 In **Settings → Model Library**, choose llama.cpp and search for a GGUF
 repository. Confirm Download remains disabled until an exact quant/shard set is
-selected. Select an optional projector only from the same repository directory,
-choose a GUI-configured storage folder, and start a small download.
+selected. Confirm the model-card preview and detected architecture, context
+length, parameter count, and license match the repository metadata. When the
+repository publishes a vision projector beside the selected GGUF, confirm the
+highest-fidelity option is selected automatically; then exercise both a manual
+choice and **Text only (opt out)**. Choose a GUI-configured storage folder and
+start a small download.
 
 Confirm the install record pins the resolved Hub revision and exact primary
 shards/projector, survives closing and reopening Settings, and creates a
-profile without loading it. Exercise cancel and retry, then verify no unrelated
-files are downloaded and no partial install is advertised as available. Repeat
-with a gated repository to prove the write-only `HF_TOKEN` reaches only the
-download worker.
+profile without loading it. While it runs, confirm transferred/total bytes,
+percentage, the progress bar, and transfer speed update without reopening the
+window. Exercise cancel and retry, then clear the completed history row and
+verify the model profile and files remain. Remove that profile with
+**Keep Files** and verify only configuration changes; separately use
+**Delete Files** on an app-managed test download and verify its exact directory
+and profile disappear. Confirm Finder-imported profiles cannot delete files,
+and no unrelated files are touched. Repeat with a gated repository to prove
+the write-only `HF_TOKEN` reaches only the download worker.
+
+Afterward, `GET /manager/model-library/install-evidence` must show the
+candidate-observed state transitions, including hidden/deleted rows, without
+credentials or arbitrary worker output. The ordinary installs endpoint remains
+the dismissible UI view.
 
 ## 5. oMLX lifecycle
 
@@ -185,7 +303,7 @@ any enabled adapter has uncertain state.
 
 ## 8. MFLUX image lifecycle
 
-Request each configured MFLUX alias through `POST :17320/v1/images/generations`.
+Request each configured MFLUX alias through `POST :1240/v1/images/generations`.
 Confirm the worker appears only on loopback `:17324`, produces a valid base64
 PNG, and exactly one model process is resident. While a long image is running,
 cancel the client and verify the worker exits and Metal memory returns. Repeat
@@ -234,9 +352,9 @@ section.
 
 - launching the installed app creates exactly one visible brain-profile status
   item and logs `Unified Inference menu bar status item installed`;
-- **Settings…** opens a separate resizable window with General, Engines,
-  Runtime Updates, Storage, Model Library, Models, Usage, and Credentials
-  pages; the pages use native controls rather than a raw file editor,
+- **Settings…** opens a separate resizable window with Setup & Health, General,
+  Engines, Runtime Updates, Storage, Model Library, Models, Usage, and
+  Credentials pages; the pages use native controls rather than a raw file editor,
   add profiles only through Model Library or Finder discovery, remove profiles
   correctly, and warn before discarding unsaved edits;
 - **Storage → Add Model Folder…** opens the native directory chooser; selecting
@@ -250,20 +368,21 @@ section.
   different volume at the same path and confirm the UUID mismatch fails closed;
 - **Model Library** exposes engine and model choices through pickers/lists,
   never a raw repository or storage-path field; start a small compatible test
-  download, close/reopen Settings, then confirm progress persists and
-  cancel/retry work without making any model resident;
+  download, confirm bytes/total, percentage, progress, and speed update live,
+  then close/reopen Settings and confirm progress persists and cancel/retry
+  work without making any model resident;
 - **Models → Add Existing Models…** always opens the directory picker and uses
   the explicit, initially-unselected workflow from section 2;
 - **Models → Detected model folders** lists LM Studio's configured
-  `downloadsFolder` before `~/.lmstudio/models`, even while the LM Studio
-  migration engine is disabled and its server is stopped; selecting either is
-  still a Finder-confirmed scan, not an automatic model load;
+  `downloadsFolder` before `~/.lmstudio/models`, without contacting an LM
+  Studio process; selecting either is still a Finder-confirmed scan, not an
+  automatic model load;
 - existing model engine/source/storage/served-name/projector/family fields are
   read-only; there is no raw model or projector path editor and endpoint
   routing uses only the typed Generation, Embeddings, Rerank, or Image role
   choices valid for that engine;
-- **Legacy LM Studio Inventory…** appears only as the temporary migration
-  bridge and remains read-only/residency-neutral;
+- there is no LM Studio engine toggle, credential, inventory action, callable
+  profile, or request to `:1234`;
 - a deliberately invalid field combination is rejected without overwriting
   `config.yaml`; an older app refuses to save a newer `schema_version`;
   model-only changes apply without restart, while an engine, storage, or port
@@ -280,8 +399,17 @@ section.
 - clicking the item opens the controller popover while the app remains absent
   from the Dock;
 - reopening the already-running app brings the Settings window forward;
-- a fresh preferences domain presents Settings once on first launch and does
-  not present it again on an ordinary login launch;
+- a fresh preferences domain presents Setup & Health on first launch and does
+  not mark setup complete merely because the window opened or the service
+  registered;
+- select a configured alias and run the Setup & Health self-test. Confirm it
+  calls the public `:1240` listener with the alpaca prompt, selects the profile's
+  vision projector when present, shows the response/route/timing/token result,
+  and finds the matching durable local usage row. Its Postgres status must
+  distinguish writer readiness and outbox depth from an actually drained
+  central event;
+- only after that successful self-test does an ordinary login launch stop
+  presenting the setup window automatically;
 - the service survives **Quit Menu App**;
 - the menu app can list/load/unload configured aliases after reopening;
 - disabling the background service unregisters the LaunchAgent;
@@ -310,47 +438,81 @@ the service, and confirm the same runtime is selected. Finally choose
 checksum, unsafe archive, failed DS4 build, or failed MFLUX import never changes
 `current.json`.
 
-## 12. LM Studio migration soak
+For the required managed llama.cpp lifecycle proof, use two installed official
+versions: call the original version `A` and the update `B`.
 
-This gate applies only to a machine migrating an older LM Studio-backed
-configuration. Before the soak, keep the legacy adapter explicitly enabled and
-confirm its read-only inventory lists downloaded models without loading any:
+1. Activate `B`, then run the acceptance collector with
+   `--exercise-service-restart --self-test <alias> --expected-engine llama.cpp`.
+   This records successful inference from `B` under a different anonymous
+   service-instance ID than the activation.
+2. Choose **Roll Back** to return to `A`, then repeat that restart/self-test
+   pass. This records successful inference from `A` under a different
+   service-instance ID than the rollback.
+3. Make a private backup of inactive
+   `~/Library/Application Support/Mnemosyne/runtimes/llama.cpp/B/runtime.json`.
+   In the inactive copy only, temporarily change `entrypoint.binary` to an
+   escaping path such as `../acceptance-invalid/llama-server`. Request the
+   official `B` install again. It must be rejected before activation, the
+   lifecycle event must use the fixed `unsafe_archive` failure code, and
+   `A` must remain current. Restore the exact backed-up manifest immediately.
+   Never alter the active `A` directory.
+4. Capture the composed proof:
 
-```bash
-curl -s http://127.0.0.1:17321/manager/engines/lmstudio/models \
-  | jq '{count: (.models | length), loaded: [.models[] | select(.loaded)]}'
-```
+   ```bash
+   python3 macos/packaging/collect_acceptance.py \
+     --app "/Applications/Unified Inference.app" \
+     --live --require-live \
+     --exercise-service-restart \
+     --self-test your-llamacpp-alias \
+     --expected-engine llama.cpp \
+     --require-runtime-lifecycle llama.cpp \
+     --output "$HOME/Desktop/unified-inference-runtime-acceptance.json"
+   ```
 
-Create only the representative temporary profiles needed for the soak; do not
-profile or download every model merely to test the bridge. Exercise at least
-one existing language model and, when present, one embeddings model. Confirm
-non-streaming, streaming with `stream_options.include_usage=true`, repeated
-load, same-engine swap, and explicit `POST :17321/manager/unload`. After
-unload, both `/manager/status` and the LM Studio inventory must report no
-resident model. Verify the resulting local usage rows identify backend
-`lmstudio` and the durable reporting outbox drains normally.
+The final report is accepted only if the ordered `A → B → A` transition,
+both post-restart inference events, the path-safety rejection, and the fresh
+installed-runtime snapshot all agree.
+`GET /manager/runtime-updates/evidence` is local and read-only; its bounded
+mode-`0600` journal contains fixed fields and failure codes, never raw
+exceptions or credentials.
 
-If the previous token sidecar is still present during migration, its health and
-existing `:1240` inference behavior may be checked separately. Unified
-Inference must continue to reach LM Studio directly on `:1234` and account for
-requests received on `:17320`; do not make the previous sidecar a permanent
-dependency of the new service.
+## 12. LM Studio directory migration
 
-Adopt the existing model library with
-**Add Existing Models…**, verify matching aliases and compatible settings were
-preserved, and test each migrated alias through its native llama.cpp or oMLX
-engine.
+This gate applies only to a machine with an older LM Studio-backed
+configuration or model library.
 
-Then disable **Keep LM Studio available during migration**, save, and restart
-the background service. Confirm:
+1. Stop LM Studio before starting Unified Inference.
+2. Open the upgraded schema-version-2 configuration and confirm there is no
+   `engines.lmstudio` block. Old LM Studio profiles should appear only under
+   `migration.legacy_lmstudio_profiles` and must not appear in `/v1/models`.
+3. Confirm **Detected model folders** offers the configured
+   `downloadsFolder`, then `~/.lmstudio/models`, without opening either path
+   until Finder selection.
+4. Adopt the library with **Add Existing Models…** and verify matching aliases
+   and compatible load settings are preserved. Imported records must disappear
+   from the inert migration list.
+5. Exercise each imported alias through native llama.cpp or oMLX, including
+   non-streaming, streaming usage, explicit unload, service restart, and a
+   login cycle.
 
-- every migrated alias works after repeated unloads, service restarts, and a
-  login cycle;
-- status and logs show no Unified Inference traffic to `:1234`;
-- no model is missing merely because LM Studio itself is stopped; and
-- token accounting, central delivery, and strict cross-engine residency remain
-  correct for the entire soak period.
+Throughout the check, confirm logs and network inspection show no request to
+`:1234`, and that stopping or uninstalling LM Studio has no effect on the
+catalog, residency, or token accounting.
 
-LM Studio adapter/configuration/credential/inventory removal is a later,
-operator-accepted cleanup. Do not remove that fallback merely because the
-short smoke passes.
+## 13. Signed application update and rollback
+
+This gate requires two Developer ID-notarized builds with the production
+Sparkle public key and signed HTTPS appcast. It cannot be cleared with ad-hoc
+artifacts.
+
+1. Install the older notarized DMG and complete Setup & Health.
+2. Publish the candidate to a non-public test feed signed by the matching
+   Sparkle private key. **Check for Updates…** must validate its EdDSA signature
+   and Apple code identity, replace the app, refresh service registration, and
+   preserve Application Support data.
+3. Serve an altered archive and an invalidly signed appcast in turn. Both must
+   be rejected with the older installed app left intact.
+4. Install the previous immutable notarized DMG over the app bundle without
+   deleting `~/Library/Application Support/Mnemosyne`, then rerun Setup &
+   Health. Configuration, weights, runtimes, bookmarks, usage, and outbox state
+   must remain available.

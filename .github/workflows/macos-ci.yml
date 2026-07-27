@@ -1,0 +1,77 @@
+name: macOS V1 CI
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/macos-*.yml"
+      - "macos/**"
+  push:
+    branches: ["main"]
+    paths:
+      - ".github/workflows/macos-*.yml"
+      - "macos/**"
+
+concurrency:
+  group: macos-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    name: Native service, app, and package
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b
+        with:
+          version: "0.8.17"
+          enable-cache: true
+          cache-dependency-glob: |
+            macos/service/uv.lock
+            macos/image-worker/uv.lock
+
+      - name: Verify locked native version and runtime inputs
+        run: |
+          python3 macos/packaging/verify_release.py
+          python3 macos/packaging/build_runtime.py --check-lock
+          python3 macos/packaging/build_runtime.py --print-resolved
+
+      - name: Test native Python service
+        run: uv run --project macos/service --extra dev python -m pytest -q macos/service/tests
+
+      - name: Test isolated MFLUX worker
+        run: uv run --project macos/image-worker --extra dev python -m pytest -q macos/image-worker/tests
+
+      - name: Test packaging logic
+        run: python3 -m unittest discover -s macos/packaging/tests -v
+
+      - name: Build and test menu app
+        working-directory: macos/app
+        run: |
+          swift package resolve
+          swift build
+          swift test
+
+      - name: Stage and verify ad-hoc app
+        env:
+          MNEMOSYNE_BUILD_NUMBER: ${{ github.run_number }}
+        run: |
+          macos/packaging/build_app.sh release --bare
+          python3 macos/packaging/collect_acceptance.py \
+            --app "macos/app/build/Stage/Unified Inference.app" \
+            --allow-bare \
+            --output macos/app/build/Stage/bare-acceptance.json
+
+      - name: Upload verified bare app
+        uses: actions/upload-artifact@v6
+        with:
+          name: Unified-Inference-bare-${{ github.sha }}
+          path: |
+            macos/app/build/Stage/Unified Inference.app
+            macos/app/build/Stage/bare-acceptance.json
+          if-no-files-found: error
+          retention-days: 7

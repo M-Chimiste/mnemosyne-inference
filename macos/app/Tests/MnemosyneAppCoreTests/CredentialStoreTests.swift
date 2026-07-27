@@ -56,3 +56,67 @@ func credentialClearing() throws {
     #expect(!contents.contains("ADMIN_PASSWORD"))
     #expect(contents.contains("UNMANAGED=preserved"))
 }
+
+@Test("Postgres ledger connection is managed as a write-only credential")
+func postgresLedgerCredentialLifecycle() throws {
+    let temporary = FileManager.default.temporaryDirectory
+        .appending(path: UUID().uuidString, directoryHint: .isDirectory)
+    defer { try? FileManager.default.removeItem(at: temporary) }
+    try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: true)
+    let url = temporary.appending(path: ".env")
+    let original = "postgresql://writer:old-secret@ledger.local:5432/usage"
+    try Data("TOKEN_SIDECAR_POSTGRES_DSN=\(original)\n".utf8).write(to: url)
+    let store = CredentialStore(environmentURL: url)
+
+    let status = try store.status()
+
+    #expect(status.configured == [.tokenSidecarPostgresDSN])
+
+    let replacement = "postgresql://writer:new-secret@ledger.local:5432/usage?sslmode=require"
+    try store.apply(
+        replacements: [.tokenSidecarPostgresDSN: replacement],
+        clearing: []
+    )
+
+    var contents = try String(contentsOf: url, encoding: .utf8)
+    #expect(contents.contains("TOKEN_SIDECAR_POSTGRES_DSN=\(replacement)"))
+    #expect(!contents.contains(original))
+    let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+    #expect((attributes[.posixPermissions] as? NSNumber)?.intValue == 0o600)
+
+    try store.apply(replacements: [:], clearing: [.tokenSidecarPostgresDSN])
+
+    contents = try String(contentsOf: url, encoding: .utf8)
+    #expect(!contents.contains("TOKEN_SIDECAR_POSTGRES_DSN"))
+    #expect(try store.status().configured.isEmpty)
+}
+
+@Test("Postgres draft previews preserve connection details and truncate the password")
+func postgresCredentialDraftPreview() {
+    let value = """
+    postgresql://writer:super-secret@nyx:5432/token_sidecar?sslmode=require
+    """
+
+    let preview = CredentialDraftPreview.render(
+        value,
+        for: .tokenSidecarPostgresDSN
+    )
+
+    #expect(
+        preview
+            == "postgresql://writer:supe •••• cret@nyx:5432/token_sidecar?… · password 12 characters"
+    )
+    #expect(!preview.contains("super-secret"))
+    #expect(!preview.contains("sslmode"))
+}
+
+@Test("Opaque credential previews expose only short prefix and suffix checks")
+func opaqueCredentialDraftPreview() {
+    let preview = CredentialDraftPreview.render(
+        "hf_abcdefghijklmnopqrstuvwxyz",
+        for: .huggingFaceToken
+    )
+
+    #expect(preview == "hf_abcdefghi •••• tuvwxyz · 29 characters")
+    #expect(!preview.contains("bcdefghijklmnopqrstuv"))
+}

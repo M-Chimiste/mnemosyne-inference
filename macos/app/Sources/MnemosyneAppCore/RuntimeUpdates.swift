@@ -24,6 +24,7 @@ public struct RuntimeUpdateSnapshot: Codable, Equatable, Sendable {
 
 public struct EngineRuntimeUpdate: Codable, Equatable, Identifiable, Sendable {
     public let engine: InferenceEngine
+    public let releaseTier: String?
     public let displayName: String
     public let ownership: String
     public let installed: Bool
@@ -33,6 +34,7 @@ public struct EngineRuntimeUpdate: Codable, Equatable, Identifiable, Sendable {
     public let latestUpstreamVersion: String?
     public let latestUpstreamRevision: String?
     public let latestUpstreamUrl: String?
+    public let officialInstallerUrl: String?
     public let availableVersion: String?
     public let availableRevision: String?
     public let releaseNotesUrl: String?
@@ -43,6 +45,10 @@ public struct EngineRuntimeUpdate: Codable, Equatable, Identifiable, Sendable {
     public let diagnostic: String?
 
     public var id: InferenceEngine { engine }
+
+    public var releaseTierLabel: String? {
+        releaseTier?.uppercased()
+    }
 
     public var installedLabel: String {
         installedVersion ?? (installed ? "Detected" : "Not installed")

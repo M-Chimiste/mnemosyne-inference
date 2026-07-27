@@ -14,9 +14,8 @@ from mnemosyne_macos.app import (
     create_control_app,
     create_inference_app,
 )
-from mnemosyne_macos.config import LMStudioConfig, MacConfig, load_config, save_config
+from mnemosyne_macos.config import MacConfig, load_config, save_config
 from mnemosyne_macos.engines.base import Deadline, EngineAdapter
-from mnemosyne_macos.engines.lmstudio import LMStudioAdapter
 from mnemosyne_macos.models import (
     Endpoint,
     EngineName,
@@ -28,6 +27,8 @@ from mnemosyne_macos.models import (
     ServiceState,
 )
 from mnemosyne_macos.runtime import NativeRuntime
+from mnemosyne_macos.runtime import _redact_diagnostic
+from mnemosyne_macos.runtime_updates import RuntimeUpdateError
 
 
 class FakeAdapter(EngineAdapter):
@@ -37,6 +38,7 @@ class FakeAdapter(EngineAdapter):
         self.engine = engine
         self.residents: list[ResidentInstance] = []
         self.loads = 0
+        self.service_state = ServiceState.READY
 
     async def validate_control(self, *, deadline: Deadline) -> EngineSnapshot:
         return await self.inspect(deadline=deadline)
@@ -47,7 +49,7 @@ class FakeAdapter(EngineAdapter):
             engine=self.engine,
             residents=tuple(self.residents),
             authoritative=True,
-            service_state=ServiceState.READY,
+            service_state=self.service_state,
         )
 
     async def load(self, target: ResolvedTarget, *, deadline: Deadline) -> LoadedHandle:
@@ -83,10 +85,35 @@ class FakeAdapter(EngineAdapter):
         return None
 
 
+def test_readiness_diagnostics_redact_credentials(monkeypatch) -> None:
+    monkeypatch.setenv("OMLX_ADMIN_SESSION", "secret-session-value")
+    monkeypatch.setenv("CUSTOM_SECRET_KEY", "custom-secret-value")
+    monkeypatch.setenv("SHORT_SECRET_KEY", "xy")
+
+    redacted = _redact_diagnostic(
+        "Authorization: Bearer secret-session-value "
+        "postgresql://writer:password123@nyx/token_sidecar "
+        "https://reader:webpass@example.test/metrics "
+        "api_key=visible custom-secret-value xy",
+        secret_env_keys=("CUSTOM_SECRET_KEY", "SHORT_SECRET_KEY"),
+    )
+
+    assert "secret-session-value" not in redacted
+    assert "password123" not in redacted
+    assert "webpass" not in redacted
+    assert "visible" not in redacted
+    assert redacted == (
+        "Authorization: Bearer <redacted> "
+        "postgresql://writer:<redacted>@nyx/token_sidecar "
+        "https://reader:<redacted>@example.test/metrics "
+        "api_key=<redacted> <redacted> <redacted>"
+    )
+
+
 def _config(tmp_path, *, endpoint: Endpoint | None = None) -> MacConfig:
     model: dict = {
         "alias": "frontier",
-        "engine": "lmstudio",
+        "engine": "omlx",
         "model": "publisher/upstream-model",
     }
     if endpoint is not None:
@@ -94,7 +121,7 @@ def _config(tmp_path, *, endpoint: Endpoint | None = None) -> MacConfig:
     return MacConfig.model_validate(
         {
             "server": {"idle_unload_seconds": None},
-            "engines": {"lmstudio": {"enabled": True}},
+            "engines": {"omlx": {"enabled": True}},
             "paths": {"state_database": str(tmp_path / "state.db")},
             "models": [model],
         }
@@ -232,7 +259,7 @@ async def test_non_streaming_proxy_rewrites_model_strips_credentials_and_records
         rows = await runtime.usage.list_usage()
         assert len(rows) == 1
         assert rows[0]["alias"] == "frontier"
-        assert rows[0]["backend"] == "lmstudio"
+        assert rows[0]["backend"] == "omlx"
         assert rows[0]["total_tokens"] == 6
     finally:
         await client.aclose()
@@ -331,6 +358,7 @@ async def test_runtime_update_control_routes_use_coordinator_barrier(tmp_path) -
     class FakeUpdateManager:
         def __init__(self) -> None:
             self.events: list[str] = []
+            self.current = "0.9.0"
 
         async def check(self, *, refresh: bool = True) -> dict:
             self.events.append(f"check:{refresh}")
@@ -344,10 +372,23 @@ async def test_runtime_update_control_routes_use_coordinator_barrier(tmp_path) -
 
         async def prepare(self, engine: str, version: str | None = None):
             self.events.append(f"prepare:{engine}:{version}")
-            return SimpleNamespace(release=SimpleNamespace(engine=engine))
+            if version == "corrupt":
+                raise RuntimeUpdateError("SHA-256 verification failed")
+            return SimpleNamespace(
+                release=SimpleNamespace(
+                    engine=engine,
+                    version="1.0.0",
+                    source_revision="abc",
+                ),
+                runtime=SimpleNamespace(
+                    version="1.0.0",
+                    source_revision="abc",
+                ),
+            )
 
         def activate(self, prepared):
             self.events.append(f"activate:{prepared.release.engine}")
+            self.current = "1.0.0"
             return SimpleNamespace(
                 engine=prepared.release.engine,
                 version="1.0.0",
@@ -357,12 +398,40 @@ async def test_runtime_update_control_routes_use_coordinator_barrier(tmp_path) -
 
         def rollback(self, engine: str):
             self.events.append(f"rollback:{engine}")
+            self.current = "0.9.0"
             return SimpleNamespace(
                 engine=engine,
                 version="0.9.0",
                 source_revision="old",
                 root=tmp_path / "runtime-old",
             )
+
+        def active_version(self, _engine: str) -> str:
+            return self.current
+
+        def record_lifecycle(self, **values) -> dict:
+            self.events.append(
+                f"lifecycle:{values['action']}:{values['outcome']}"
+            )
+            return dict(values)
+
+        def lifecycle_evidence(self) -> dict:
+            return {
+                "schema_version": 1,
+                "valid": True,
+                "dropped_events": 0,
+                "events": [],
+            }
+
+        async def installed_status(self) -> dict:
+            return {
+                "mflux": {
+                    "installed": True,
+                    "version": self.current,
+                    "revision": None,
+                    "path": str(tmp_path),
+                }
+            }
 
         async def aclose(self) -> None:
             return None
@@ -381,6 +450,9 @@ async def test_runtime_update_control_routes_use_coordinator_barrier(tmp_path) -
     try:
         checked = await client.post("/manager/runtime-updates/check")
         assert checked.status_code == 200
+        evidence = await client.get("/manager/runtime-updates/evidence")
+        assert evidence.status_code == 200
+        assert evidence.json()["journal"]["valid"] is True
         installed = await client.post(
             "/manager/runtime-updates/mflux/install",
             json={"version": "1.0.0"},
@@ -390,13 +462,26 @@ async def test_runtime_update_control_routes_use_coordinator_barrier(tmp_path) -
         rolled_back = await client.post("/manager/runtime-updates/mflux/rollback")
         assert rolled_back.status_code == 200
         assert rolled_back.json()["activated"]["rollback"] is True
+        rejected = await client.post(
+            "/manager/runtime-updates/mflux/install",
+            json={"version": "corrupt"},
+        )
+        assert rejected.status_code == 400
         assert updates.events == [
             "check:True",
+            "lifecycle:install_requested:started",
             "prepare:mflux:1.0.0",
+            "lifecycle:prepared:succeeded",
             "activate:mflux",
+            "lifecycle:activated:succeeded",
             "check:False",
+            "lifecycle:rollback_requested:started",
             "rollback:mflux",
+            "lifecycle:rolled_back:succeeded",
             "check:False",
+            "lifecycle:install_requested:started",
+            "prepare:mflux:corrupt",
+            "lifecycle:install_rejected:failed",
         ]
         status = await runtime.coordinator.status()
         assert status.state.value == "idle"
@@ -527,7 +612,7 @@ async def test_cancelled_stream_with_close_failure_releases_model_lease(tmp_path
             "query_string": b"",
             "headers": [(b"content-type", b"application/json")],
             "client": ("127.0.0.1", 50000),
-            "server": ("127.0.0.1", 17320),
+            "server": ("127.0.0.1", 1240),
         },
         receive,
     )
@@ -629,41 +714,38 @@ async def test_control_plane_lists_loads_and_unloads_models(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_control_plane_discovers_downloaded_lmstudio_models_without_loading(
+async def test_readiness_exposes_bounded_actionable_health_and_release_tiers(
     tmp_path,
+    monkeypatch,
 ) -> None:
-    requests: list[tuple[str, str]] = []
+    class InstalledUpdateManager:
+        async def installed_status(self) -> dict:
+            return {
+                engine.value: {
+                    "installed": True,
+                    "version": "test-version",
+                    "revision": None,
+                    "path": f"/runtimes/{engine.value}",
+                }
+                for engine in EngineName
+            }
 
-    def lmstudio_handler(request: httpx.Request) -> httpx.Response:
-        requests.append((request.method, request.url.path))
-        return httpx.Response(
-            200,
-            json={
-                "models": [
-                    {
-                        "type": "llm",
-                        "key": "qwen/qwen3-coder-next",
-                        "display_name": "Qwen3 Coder Next",
-                        "loaded_instances": [],
-                        "format": "mlx",
-                    }
-                ]
-            },
-        )
+        async def aclose(self) -> None:
+            return None
 
-    lmstudio_client = httpx.AsyncClient(transport=httpx.MockTransport(lmstudio_handler))
+    storage = tmp_path / "Models"
+    storage.mkdir()
+    payload = _config(tmp_path).model_dump(mode="json")
+    payload["storage"] = {
+        "default": "internal",
+        "locations": [{"name": "internal", "path": str(storage)}],
+    }
     adapters = _adapters()
-    adapters[EngineName.LMSTUDIO] = LMStudioAdapter(
-        LMStudioConfig(),
-        client=lmstudio_client,
-    )
-    upstream_client = httpx.AsyncClient(
-        transport=httpx.MockTransport(lambda _r: httpx.Response(500))
-    )
+    adapters[EngineName.LLAMA_CPP].service_state = ServiceState.STOPPED
     runtime = NativeRuntime(
-        _config(tmp_path),
+        MacConfig.model_validate(payload),
         adapters=adapters,
-        proxy_client=upstream_client,
+        update_manager=InstalledUpdateManager(),  # type: ignore[arg-type]
     )
     await runtime.start(raise_on_degraded=True)
     client = httpx.AsyncClient(
@@ -671,18 +753,180 @@ async def test_control_plane_discovers_downloaded_lmstudio_models_without_loadin
         base_url="http://mnemosyne-control.test",
     )
     try:
-        response = await client.get("/manager/engines/lmstudio/models")
+        response = await client.get("/manager/readiness")
 
         assert response.status_code == 200
-        assert response.json()["models"][0]["key"] == "qwen/qwen3-coder-next"
-        assert response.json()["models"][0]["loaded"] is False
-        assert all(method == "GET" for method, _ in requests)
-        assert all(path == "/api/v1/models" for _, path in requests)
+        readiness = response.json()
+        assert readiness["product_version"] == "0.9.0"
+        assert readiness["core"]["ready"] is True
+        assert readiness["storage"][0]["available"] is True
+        assert readiness["models"] == {"configured": 1, "callable": 1}
+        assert readiness["ready_for_inference"] is True
+        engines = {item["engine"]: item for item in readiness["engines"]}
+        assert engines["llama.cpp"]["release_tier"] == "stable"
+        assert engines["omlx"]["release_tier"] == "stable"
+        assert engines["ds4"]["release_tier"] == "preview"
+        assert engines["mflux"]["release_tier"] == "preview"
+        assert engines["llama.cpp"]["ready"] is True
+        assert engines["llama.cpp"]["service_state"] == "stopped"
+        assert engines["omlx"]["ready"] is True
+
+        monkeypatch.setenv("OMLX_ADMIN_SESSION", "menu-secret")
+        runtime.startup_error = (
+            "oMLX failed with session=menu-secret and "
+            "postgresql://writer:db-password@nyx/token_sidecar"
+        )
+        runtime.usage.last_error = "https://writer:other-password@nyx/metrics"
+        status_response = await client.get("/manager/status")
+        status_payload = status_response.json()
+        rendered = json.dumps(status_payload)
+        assert "menu-secret" not in rendered
+        assert "db-password" not in rendered
+        assert "other-password" not in rendered
+        assert "<redacted>" in rendered
+    finally:
+        await client.aclose()
+        await runtime.stop()
+
+
+@pytest.mark.asyncio
+async def test_control_self_test_uses_public_inference_path_and_verifies_usage(
+    tmp_path,
+) -> None:
+    seen: dict = {}
+
+    def upstream_handler(request: httpx.Request) -> httpx.Response:
+        seen["request"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "id": "chatcmpl-self-test",
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "Alpacas are gentle camelids.",
+                        }
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 9,
+                    "completion_tokens": 6,
+                    "total_tokens": 15,
+                },
+            },
+        )
+
+    upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(upstream_handler)
+    )
+    runtime = NativeRuntime(
+        _config(tmp_path),
+        adapters=_adapters(),
+        proxy_client=upstream_client,
+    )
+    await runtime.start(raise_on_degraded=True)
+    await runtime.self_test_client.aclose()
+    runtime.self_test_client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=create_inference_app(runtime)),
+        base_url="http://127.0.0.1:1240",
+    )
+    client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=create_control_app(runtime)),
+        base_url="http://mnemosyne-control.test",
+    )
+    try:
+        response = await client.post(
+            "/manager/self-test",
+            json={"model": "frontier"},
+        )
+
+        assert response.status_code == 200, response.text
+        result = response.json()
+        assert result["success"] is True
+        assert result["endpoint"] == "/v1/chat/completions"
+        assert result["release_tier"] == "stable"
+        assert result["response_preview"] == "Alpacas are gentle camelids."
+        assert result["usage"] == {
+            "prompt_tokens": 9,
+            "completion_tokens": 6,
+            "total_tokens": 15,
+        }
+        assert result["usage_recorded"] is True
+        assert "alpacas" in seen["request"]["messages"][0]["content"].lower()
+        assert seen["request"]["max_tokens"] == 128
+        rows = await runtime.usage.list_usage()
+        assert rows[0]["alias"] == "frontier"
+        assert rows[0]["total_tokens"] == 15
     finally:
         await client.aclose()
         await runtime.stop()
         await upstream_client.aclose()
-        await lmstudio_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_control_self_test_uses_configured_llama_projector_by_default(
+    tmp_path,
+) -> None:
+    seen: dict = {}
+
+    def upstream_handler(request: httpx.Request) -> httpx.Response:
+        seen["request"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "A red square on a light background.",
+                        }
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 24,
+                    "completion_tokens": 9,
+                    "total_tokens": 33,
+                },
+            },
+        )
+
+    payload = _config(tmp_path).model_dump(mode="json")
+    payload["models"][0].update(
+        {
+            "engine": "llama.cpp",
+            "model": "/models/vision.gguf",
+            "load": {"projector_path": "/models/mmproj-vision.gguf"},
+        }
+    )
+    upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(upstream_handler)
+    )
+    runtime = NativeRuntime(
+        MacConfig.model_validate(payload),
+        adapters=_adapters(),
+        proxy_client=upstream_client,
+    )
+    await runtime.start(raise_on_degraded=True)
+    await runtime.self_test_client.aclose()
+    runtime.self_test_client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=create_inference_app(runtime)),
+        base_url="http://127.0.0.1:1240",
+    )
+    try:
+        result = await runtime.self_test("frontier")
+
+        assert result["vision"] is True
+        content = seen["request"]["messages"][0]["content"]
+        assert content[0]["type"] == "text"
+        assert content[1]["type"] == "image_url"
+        image_url = content[1]["image_url"]["url"]
+        assert image_url.startswith("data:image/png;base64,")
+        assert len(image_url) > 200
+        assert result["usage_recorded"] is True
+    finally:
+        await runtime.stop()
+        await upstream_client.aclose()
 
 
 @pytest.mark.asyncio
@@ -714,7 +958,7 @@ async def test_control_plane_reads_saves_and_applies_structured_configuration(tm
 
         edited = config.model_dump(mode="json")
         edited["models"].append(
-            {"alias": "second-model", "engine": "lmstudio", "model": "publisher/second"}
+            {"alias": "second-model", "engine": "omlx", "model": "publisher/second"}
         )
         saved = await client.put(
             "/manager/config", json={"config": edited, "revision": revision}
@@ -742,6 +986,115 @@ async def test_control_plane_reads_saves_and_applies_structured_configuration(tm
         )
         assert invalid.status_code == 400
         assert config_path.read_text(encoding="utf-8") == invalid_document
+    finally:
+        await client.aclose()
+        await runtime.stop()
+        await upstream_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_control_plane_deletes_only_an_exact_managed_model_destination(
+    tmp_path,
+) -> None:
+    model_root = tmp_path / "Models"
+    destination = model_root / "llama.cpp" / "owner" / "model-GGUF"
+    destination.mkdir(parents=True)
+    model_path = destination / "model-Q4_K_M.gguf"
+    model_path.write_bytes(b"GGUFmanaged")
+    config = MacConfig.model_validate(
+        {
+            "server": {"idle_unload_seconds": None},
+            "engines": {"llama_cpp": {"enabled": True}},
+            "paths": {"state_database": str(tmp_path / "state.db")},
+            "storage": {
+                "default": "internal",
+                "locations": [{"name": "internal", "path": str(model_root)}],
+            },
+            "models": [
+                {
+                    "alias": "managed-model",
+                    "engine": "llama.cpp",
+                    "model": str(model_path),
+                    "storage": "internal",
+                }
+            ],
+        }
+    )
+    config_path = tmp_path / "config.yaml"
+    save_config(config, config_path)
+    upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _r: httpx.Response(500))
+    )
+    runtime = NativeRuntime(
+        config,
+        config_path=config_path,
+        adapters=_adapters(),
+        proxy_client=upstream_client,
+    )
+    await runtime.start(raise_on_degraded=True)
+    install = runtime.installer.store.create(
+        repo_id="owner/model-GGUF",
+        engine="llama.cpp",
+        storage="internal",
+        alias="managed-model",
+        destination=str(destination),
+        revision="abc123",
+        filename=model_path.name,
+        family=None,
+        total_bytes=model_path.stat().st_size,
+    )
+    runtime.installer.store.update(
+        install.id,
+        status="installed",
+        bytes_downloaded=model_path.stat().st_size,
+    )
+    client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=create_control_app(runtime)),
+        base_url="http://mnemosyne-control.test",
+    )
+    try:
+        dismissed = await client.delete(
+            f"/manager/model-library/installs/{install.id}"
+        )
+        assert dismissed.status_code == 204
+        assert (await client.get("/manager/model-library/installs")).json() == {
+            "installs": []
+        }
+        evidence_before_delete = (
+            await client.get("/manager/model-library/install-evidence")
+        ).json()
+        assert evidence_before_delete["schema_version"] == 1
+        assert evidence_before_delete["installs"][0]["dismissed"] is True
+        assert evidence_before_delete["installs"][0]["events"][-1]["event"] == (
+            "history_dismissed"
+        )
+
+        revision = (await client.get("/manager/config")).json()["revision"]
+        deleted = await client.request(
+            "DELETE",
+            "/manager/models/managed-model",
+            json={"revision": revision},
+        )
+
+        assert deleted.status_code == 200, deleted.text
+        assert deleted.json()["deleted_files"] is True
+        assert deleted.json()["model_count"] == 0
+        assert not destination.exists()
+        assert model_root.is_dir()
+        assert load_config(config_path).models == []
+        assert runtime.model_list() == []
+        assert await runtime.installer.list() == []
+        assert runtime.installer.store.latest_for_alias("managed-model").status == "deleted"
+        evidence_after_delete = (
+            await client.get("/manager/model-library/install-evidence")
+        ).json()
+        assert [
+            (event["event"], event["status"])
+            for event in evidence_after_delete["installs"][0]["events"][-2:]
+        ] == [
+            ("history_dismissed", "installed"),
+            ("status", "deleted"),
+        ]
     finally:
         await client.aclose()
         await runtime.stop()

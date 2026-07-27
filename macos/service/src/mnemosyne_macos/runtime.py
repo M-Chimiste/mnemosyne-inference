@@ -15,6 +15,7 @@ from typing import Mapping
 
 import httpx
 
+from . import __version__
 from .config import (
     ImageProfileConfig,
     MacConfig,
@@ -23,16 +24,22 @@ from .config import (
     StorageLocationConfig,
     load_config,
     save_config,
+    suggested_model_alias,
 )
 from .coordinator import CoordinatorStatus, ResidencyCoordinator
-from .engines.base import EngineAdapter
+from .engines.base import Deadline, EngineAdapter
 from .engines.ds4 import DS4Adapter
-from .engines.lmstudio import LMStudioAdapter
 from .engines.llamacpp import LlamaCppAdapter
 from .engines.mflux import MFluxAdapter
 from .engines.omlx import OMLXAdapter
 from .filesystem import FilesystemProbe, FilesystemProbeError
-from .models import Endpoint, EngineName, ResolvedTarget
+from .models import (
+    ENGINE_RELEASE_TIER,
+    Endpoint,
+    EngineName,
+    ResolvedTarget,
+    ServiceState,
+)
 from .install_store import InstallRecord
 from .installer import NativeInstaller
 from .local_models import (
@@ -40,7 +47,7 @@ from .local_models import (
     LocalModelError,
     mark_omlx_id_conflicts,
 )
-from .usage import UsageEvent
+from .usage import UsageEvent, normalize_usage
 from .usage_delivery import UsageService
 from .runtime_updates import RuntimeUpdateManager
 from .scope_process import SecurityScopeProcess
@@ -57,6 +64,54 @@ class RestartRequired(RuntimeConfigurationError):
 
 class ConfigurationConflict(RuntimeConfigurationError):
     pass
+
+
+_SELF_TEST_VISION_IMAGE = (
+    "data:image/png;base64,"
+    "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAAcklEQVR42u3a"
+    "oQ0AIAwAwQ6GZv9UswEaDStUkvTEL3D64+y8nQsAAAAAAAAAAAAAAACUWnN8"
+    "HQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADA"
+    "KAkAAAAAAAAAAAAAQHOAB/FKxe8qaK5EAAAAAElFTkSuQmCC"
+)
+
+
+def _redact_diagnostic(
+    value: str | None,
+    *,
+    secret_env_keys: tuple[str, ...] = (),
+) -> str | None:
+    if value is None:
+        return None
+    redacted = value
+    for key in (
+        "INFERENCE_API_KEY",
+        "ADMIN_PASSWORD",
+        "OMLX_API_KEY",
+        "OMLX_ADMIN_SESSION",
+        "HF_TOKEN",
+        "HUGGING_FACE_HUB_TOKEN",
+        "TOKEN_SIDECAR_POSTGRES_DSN",
+        *secret_env_keys,
+    ):
+        secret = os.environ.get(key, "")
+        if secret:
+            redacted = redacted.replace(secret, "<redacted>")
+    redacted = re.sub(
+        r"(?i)((?:postgres(?:ql)?|https?)://[^:/\s]+:)[^@\s]+@",
+        r"\1<redacted>@",
+        redacted,
+    )
+    redacted = re.sub(
+        r"(?i)\b(authorization:\s*(?:bearer|basic)\s+)\S+",
+        r"\1<redacted>",
+        redacted,
+    )
+    redacted = re.sub(
+        r"(?i)\b(api[_-]?key|token|password|secret|session)=([^&\s]+)",
+        r"\1=<redacted>",
+        redacted,
+    )
+    return redacted
 
 
 def configuration_revision(config: MacConfig) -> str:
@@ -116,6 +171,32 @@ def _lexical_path(value: str | Path) -> str:
     )
 
 
+def _path_is_within(root: str | Path, candidate: str | Path) -> bool:
+    root_value = _lexical_path(root)
+    candidate_value = _lexical_path(candidate)
+    try:
+        return os.path.commonpath([root_value, candidate_value]) == root_value
+    except ValueError:
+        return False
+
+
+def _profile_uses_install_destination(
+    profile: ModelProfile,
+    install: InstallRecord,
+) -> bool:
+    destination = _lexical_path(install.destination)
+    if profile.engine in {EngineName.LLAMA_CPP, EngineName.DS4}:
+        if not _path_is_within(destination, profile.model):
+            return False
+        projector = profile.load.projector_path
+        return projector is None or _path_is_within(destination, projector)
+    if profile.engine == EngineName.MFLUX:
+        return _lexical_path(profile.model) == destination
+    if profile.engine == EngineName.OMLX:
+        return profile.model == Path(destination).name
+    return False
+
+
 def _storage_scope_for_path(
     config: MacConfig,
     value: str | Path,
@@ -143,8 +224,6 @@ def build_adapters(
     security_scope_root: str | Path | None = None,
 ) -> dict[EngineName, EngineAdapter]:
     adapters: dict[EngineName, EngineAdapter] = {}
-    if config.engines.lmstudio.enabled:
-        adapters[EngineName.LMSTUDIO] = LMStudioAdapter(config.engines.lmstudio)
     if config.engines.llama_cpp.enabled:
         adapters[EngineName.LLAMA_CPP] = LlamaCppAdapter(
             config.engines.llama_cpp,
@@ -179,6 +258,7 @@ class NativeRuntime:
         env_path: str | Path | None = None,
         adapters: Mapping[EngineName, EngineAdapter] | None = None,
         proxy_client: httpx.AsyncClient | None = None,
+        self_test_client: httpx.AsyncClient | None = None,
         usage_service: UsageService | None = None,
         update_manager: RuntimeUpdateManager | None = None,
         runtime_root: str | Path | None = None,
@@ -237,6 +317,11 @@ class NativeRuntime:
         )
         self.proxy_client = proxy_client or httpx.AsyncClient(timeout=None)
         self._owns_proxy_client = proxy_client is None
+        self.self_test_client = self_test_client or httpx.AsyncClient(
+            timeout=None,
+            trust_env=False,
+        )
+        self._owns_self_test_client = self_test_client is None
         self.usage = usage_service or UsageService.open(
             config.paths.state_database,
             config.token_sidecar,
@@ -335,7 +420,11 @@ class NativeRuntime:
                         if self._owns_proxy_client:
                             await self.proxy_client.aclose()
                     finally:
-                        await asyncio.to_thread(self.security_scopes.close)
+                        try:
+                            if self._owns_self_test_client:
+                                await self.self_test_client.aclose()
+                        finally:
+                            await asyncio.to_thread(self.security_scopes.close)
 
     async def _activate_configured_security_scopes(self) -> None:
         referenced: set[str] = set()
@@ -413,6 +502,139 @@ class NativeRuntime:
                 self.profiles = config.profiles()
                 self.installer.storage = config.storage
             return restart_required, revision
+
+    async def delete_managed_model(
+        self,
+        alias: str,
+        *,
+        expected_revision: str,
+    ) -> tuple[MacConfig, str, bool]:
+        """Delete one app-managed download and remove its profile atomically.
+
+        The install ledger supplies the exact manager-owned destination. Finder
+        imports and hand-authored profiles deliberately cannot use this path.
+        The coordinator maintenance barrier prevents a new lease from opening
+        while the bounded filesystem helper removes the directory.
+        """
+
+        if self.config_path is None:
+            raise RuntimeConfigurationError("runtime has no configured YAML path")
+
+        removed_files = False
+        updated_config: MacConfig | None = None
+
+        async def remove(deadline) -> None:
+            nonlocal removed_files, updated_config
+            async with self._reload_lock:
+                fresh = load_config(self.config_path, env_path=self.env_path)
+                current_revision = configuration_revision(fresh)
+                if expected_revision != current_revision:
+                    raise ConfigurationConflict(
+                        "settings changed while this window was open; reload them before deleting"
+                    )
+                profile = next(
+                    (item for item in fresh.models if item.alias == alias),
+                    None,
+                )
+                if profile is None:
+                    raise KeyError(f"unknown model alias '{alias}'")
+                install = await self.installer.latest_for_alias(alias)
+                if install is None or install.status != "installed":
+                    raise RuntimeConfigurationError(
+                        "model files can only be deleted for a completed download "
+                        "owned by Unified Inference"
+                    )
+                if profile.engine.value != install.engine:
+                    raise RuntimeConfigurationError(
+                        "the model profile no longer matches its managed download"
+                    )
+                location = next(
+                    (
+                        item
+                        for item in fresh.storage.locations
+                        if item.name == install.storage
+                    ),
+                    None,
+                )
+                if (
+                    location is None
+                    or profile.storage != install.storage
+                    or not _profile_uses_install_destination(profile, install)
+                ):
+                    raise RuntimeConfigurationError(
+                        "the model profile no longer points at its managed download"
+                    )
+
+                removed_files = await self.filesystem.delete_directory(
+                    root=location.path,
+                    path=install.destination,
+                    expected_volume_uuid=location.volume_uuid,
+                    scope_id=location.scope_id,
+                )
+                updated_config = fresh.model_copy(
+                    update={
+                        "models": [
+                            item for item in fresh.models if item.alias != alias
+                        ]
+                    }
+                )
+                updated_config = MacConfig.model_validate(
+                    updated_config.model_dump(mode="json")
+                )
+                save_config(updated_config, self.config_path)
+                self.config = updated_config
+                self.profiles = updated_config.profiles()
+                self.installer.storage = updated_config.storage
+                await asyncio.to_thread(
+                    self.installer.store.update,
+                    install.id,
+                    status="deleted",
+                    hidden=1,
+                    pid=None,
+                    download_speed_bps=None,
+                    error=None,
+                )
+
+                if profile.engine == EngineName.OMLX:
+                    adapter = self.adapters.get(EngineName.OMLX)
+                    if isinstance(adapter, OMLXAdapter):
+                        directories: list[str] = []
+                        for item in updated_config.storage.locations:
+                            try:
+                                model_root = await self.filesystem.ensure_directory(
+                                    root=item.path,
+                                    path=os.path.join(
+                                        item.path,
+                                        EngineName.OMLX.value,
+                                    ),
+                                    expected_volume_uuid=item.volume_uuid,
+                                    scope_id=item.scope_id,
+                                )
+                            except FilesystemProbeError:
+                                continue
+                            directories.append(model_root)
+                        directories.extend(
+                            updated_config.engines.omlx.model_directories
+                        )
+                        directories = list(dict.fromkeys(directories))
+                        if directories:
+                            self._omlx_directory_sync_pending = True
+                            await adapter.register_model_directories(
+                                directories,
+                                deadline=deadline,
+                            )
+                        self._omlx_directory_sync_pending = False
+
+        await self.coordinator.run_empty_maintenance(
+            remove,
+            name=f"delete managed model {alias}",
+        )
+        assert updated_config is not None
+        return (
+            updated_config,
+            configuration_revision(updated_config),
+            removed_files,
+        )
 
     async def register_security_scope(self, path: str, bookmark_data: str) -> str:
         return (await self.security_scope_process.register(path, bookmark_data)).id
@@ -658,8 +880,13 @@ class NativeRuntime:
                 )
 
             models = list(fresh.models)
+            legacy_profiles = list(
+                fresh.migration.legacy_lmstudio_profiles
+            )
             imported: list[dict[str, str | bool | None]] = []
-            planned_aliases = {profile.alias for profile in models}
+            planned_aliases = {
+                profile.alias for profile in [*models, *legacy_profiles]
+            }
             needs_omlx = False
             for selection, candidate_id in zip(selections, ids, strict=True):
                 candidate = by_id[candidate_id]
@@ -670,10 +897,6 @@ class NativeRuntime:
                         index
                         for index, profile in enumerate(models)
                         if (
-                            profile.engine == EngineName.LMSTUDIO
-                            and profile.model == candidate.source_key
-                        )
-                        or (
                             profile.engine == EngineName.LLAMA_CPP
                             and _lexical_path(profile.model)
                             == _lexical_path(candidate.model_path)
@@ -688,22 +911,33 @@ class NativeRuntime:
                     None,
                 )
                 existing = models[existing_index] if existing_index is not None else None
+                legacy = next(
+                    (
+                        profile
+                        for profile in legacy_profiles
+                        if profile.model == candidate.source_key
+                    ),
+                    None,
+                )
+                prior = existing or legacy
                 requested_alias = str(selection.get("alias") or "").strip()
-                alias = requested_alias or (existing.alias if existing else "")
+                alias = requested_alias or (prior.alias if prior else "")
                 if not alias:
-                    alias = re.sub(
-                        r"[^a-z0-9]+", "-", candidate.display_name.casefold()
-                    ).strip("-") or "local-model"
+                    alias = suggested_model_alias(
+                        candidate.display_name,
+                        fallback="local-model",
+                    )
                     base_alias = alias
                     suffix = 2
                     while alias in planned_aliases:
                         alias = f"{base_alias}-{suffix}"
                         suffix += 1
-                if alias in planned_aliases and (existing is None or alias != existing.alias):
+                if alias in planned_aliases and (prior is None or alias != prior.alias):
                     raise LocalModelError(f"model alias '{alias}' is already in use")
 
                 if candidate.engine == EngineName.LLAMA_CPP.value:
                     projector_id = selection.get("projector_id")
+                    include_projector = selection.get("include_projector", True) is not False
                     projector = next(
                         (
                             item
@@ -716,12 +950,23 @@ class NativeRuntime:
                         raise LocalModelError(
                             "the selected projector changed; scan the folder again"
                         )
-                    prior = existing.load if existing is not None else ModelLoadConfig()
-                    compatible_load = prior.model_dump(mode="python")
-                    # These settings belong to LM Studio/DS4 and have no
-                    # llama-server equivalent. Preserve every other typed
-                    # option, including advanced llama.cpp tuning and
-                    # extra_args, when re-adopting an existing profile.
+                    if (
+                        projector is None
+                        and include_projector
+                        and candidate.recommended_projector_id is not None
+                    ):
+                        projector = next(
+                            (
+                                item
+                                for item in candidate.projector_options
+                                if item.id == candidate.recommended_projector_id
+                            ),
+                            None,
+                        )
+                    prior_load = prior.load if prior is not None else ModelLoadConfig()
+                    compatible_load = prior_load.model_dump(mode="python")
+                    # Retain compatible tuning from an active or migrated
+                    # profile while removing options llama-server cannot use.
                     compatible_load.pop("num_experts", None)
                     compatible_load.pop("kv_disk_directory", None)
                     compatible_load.pop("kv_disk_space_mb", None)
@@ -729,9 +974,9 @@ class NativeRuntime:
                     if (
                         existing is not None
                         and existing.engine == EngineName.LLAMA_CPP
-                        and prior.projector_path is not None
+                        and prior_load.projector_path is not None
                     ):
-                        previous = _lexical_path(prior.projector_path)
+                        previous = _lexical_path(prior_load.projector_path)
                         matching_projector = next(
                             (
                                 item
@@ -743,17 +988,26 @@ class NativeRuntime:
                         if matching_projector is not None:
                             prior_projector = matching_projector.path
                     compatible_load["projector_path"] = (
-                        projector.path if projector is not None else prior_projector
+                        projector.path
+                        if projector is not None
+                        else prior_projector
+                        if include_projector
+                        else None
                     )
+                    if (
+                        compatible_load.get("context_length") is None
+                        and candidate.context_length is not None
+                    ):
+                        compatible_load["context_length"] = candidate.context_length
                     load = ModelLoadConfig.model_validate(compatible_load)
-                    capabilities = (
-                        existing.capabilities
-                        if existing is not None
-                        and existing.capabilities
+                    preserved_capabilities = (
+                        prior.capabilities
+                        if prior is not None
+                        and prior.capabilities
                         and not (
-                            existing.capabilities
+                            prior.capabilities
                             & {Endpoint.EMBEDDINGS, Endpoint.RERANK}
-                            and existing.capabilities
+                            and prior.capabilities
                             & {
                                 Endpoint.CHAT_COMPLETIONS,
                                 Endpoint.COMPLETIONS,
@@ -763,6 +1017,10 @@ class NativeRuntime:
                         )
                         else None
                     )
+                    detected_capabilities = {
+                        Endpoint(value) for value in candidate.capabilities
+                    }
+                    capabilities = preserved_capabilities or detected_capabilities
                     profile = ModelProfile(
                         alias=alias,
                         engine=EngineName.LLAMA_CPP,
@@ -771,7 +1029,7 @@ class NativeRuntime:
                         served_model_name=alias,
                         capabilities=capabilities,
                         load=load,
-                        enabled=existing.enabled if existing is not None else True,
+                        enabled=prior.enabled if prior is not None else True,
                     )
                 else:
                     needs_omlx = True
@@ -806,7 +1064,7 @@ class NativeRuntime:
                         capabilities={
                             Endpoint(value) for value in candidate.capabilities
                         },
-                        enabled=existing.enabled if existing is not None else True,
+                        enabled=prior.enabled if prior is not None else True,
                     )
                 if existing_index is None:
                     models.append(profile)
@@ -816,6 +1074,11 @@ class NativeRuntime:
                         planned_aliases.remove(existing.alias)
                         planned_aliases.add(alias)
                     models[existing_index] = profile
+                if legacy is not None:
+                    legacy_profiles.remove(legacy)
+                    if alias != legacy.alias:
+                        planned_aliases.discard(legacy.alias)
+                        planned_aliases.add(alias)
                 imported.append(
                     {
                         "candidate_id": candidate.id,
@@ -827,7 +1090,7 @@ class NativeRuntime:
                             if profile.engine == EngineName.LLAMA_CPP
                             else None
                         ),
-                        "migrated": existing is not None,
+                        "migrated": prior is not None,
                     }
                 )
 
@@ -850,15 +1113,25 @@ class NativeRuntime:
                 restart_required = restart_required or not engines.omlx.enabled
                 engines = engines.model_copy(update={"omlx": omlx})
             storage = fresh.storage.model_copy(update={"locations": locations})
+            migration = fresh.migration.model_copy(
+                update={"legacy_lmstudio_profiles": legacy_profiles}
+            )
             new_config = fresh.model_copy(
-                update={"engines": engines, "storage": storage, "models": models}
+                update={
+                    "engines": engines,
+                    "storage": storage,
+                    "models": models,
+                    "migration": migration,
+                }
             )
             # Force a full validation pass after model_copy's intentionally
             # lightweight construction and before the atomic write.
             new_config = MacConfig.model_validate(new_config.model_dump(mode="json"))
             save_config(new_config, self.config_path)
             adapters_available = all(
-                profile.engine in self.adapters for profile in new_config.models if profile.enabled
+                profile.engine in self.adapters
+                for profile in new_config.models
+                if profile.enabled and new_config.engine_enabled(profile.engine)
             )
             if adapters_available and not restart_required:
                 self.config = new_config
@@ -868,7 +1141,7 @@ class NativeRuntime:
         if needs_omlx and not restart_required:
             await self._sync_omlx_model_directories()
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "imported": imported,
             "restart_required": restart_required,
             "revision": configuration_revision(new_config),
@@ -878,9 +1151,23 @@ class NativeRuntime:
     async def status(self) -> dict:
         value: CoordinatorStatus = await self.coordinator.status()
         payload = asdict(value)
+        secret_env_keys = (
+            self.config.server.inference_api_key_env,
+            self.config.server.control_password_env,
+            self.config.engines.omlx.api_key_env,
+            self.config.engines.omlx.admin_session_env,
+        )
+
+        def redact(value: str | None) -> str | None:
+            return _redact_diagnostic(
+                value,
+                secret_env_keys=secret_env_keys,
+            )
+
+        payload["diagnostic"] = redact(payload.get("diagnostic"))
         payload["status"] = payload["state"]
         payload["in_flight_requests"] = payload["inflight"]
-        payload["startup_error"] = self.startup_error
+        payload["startup_error"] = redact(self.startup_error)
         payload["omlx_model_directory_sync_pending"] = (
             self._omlx_directory_sync_pending
         )
@@ -888,14 +1175,462 @@ class NativeRuntime:
             "inference": self.config.server.inference_port,
             "control": self.config.server.control_port,
         }
-        payload["token_sidecar"] = await self.usage.status()
+        usage_status = await self.usage.status()
+        usage_status["last_error"] = redact(usage_status.get("last_error"))
+        payload["token_sidecar"] = usage_status
         return payload
+
+    async def readiness(self) -> dict:
+        """Return bounded, actionable setup and health state without upstream checks."""
+
+        coordinator = await self.status()
+        runtime_status = await self.runtime_updates.installed_status()
+        secret_env_keys = (
+            self.config.server.inference_api_key_env,
+            self.config.server.control_password_env,
+            self.config.engines.omlx.api_key_env,
+            self.config.engines.omlx.admin_session_env,
+        )
+
+        def redact(value: str | None) -> str | None:
+            return _redact_diagnostic(
+                value,
+                secret_env_keys=secret_env_keys,
+            )
+
+        async def inspect_engine(engine: EngineName) -> dict:
+            enabled = self.config.engine_enabled(engine)
+            release_tier = ENGINE_RELEASE_TIER[engine]
+            installed = runtime_status.get(engine.value, {})
+            if not enabled:
+                return {
+                    "engine": engine.value,
+                    "release_tier": release_tier,
+                    "enabled": False,
+                    "installed": bool(installed.get("installed")),
+                    "installed_version": installed.get("version"),
+                    "installed_path": installed.get("path"),
+                    "service_state": "disabled",
+                    "authoritative": True,
+                    "resident_models": [],
+                    "ready": False,
+                    "diagnostic": None,
+                }
+            adapter = self.adapters.get(engine)
+            if adapter is None:
+                return {
+                    "engine": engine.value,
+                    "release_tier": release_tier,
+                    "enabled": True,
+                    "installed": bool(installed.get("installed")),
+                    "installed_version": installed.get("version"),
+                    "installed_path": installed.get("path"),
+                    "service_state": "unavailable",
+                    "authoritative": False,
+                    "resident_models": [],
+                    "ready": False,
+                    "diagnostic": "enabled engine has no configured adapter",
+                }
+            try:
+                async with asyncio.timeout(5):
+                    snapshot = await adapter.inspect(deadline=Deadline.after(5))
+                available_states = {ServiceState.READY}
+                if engine != EngineName.OMLX:
+                    # Manager-owned engines are intentionally stopped while
+                    # idle. An installed runtime plus authoritative empty
+                    # state means it is available to launch, not unhealthy.
+                    available_states.add(ServiceState.STOPPED)
+                ready = (
+                    bool(installed.get("installed"))
+                    and snapshot.authoritative
+                    and snapshot.service_state in available_states
+                )
+                return {
+                    "engine": engine.value,
+                    "release_tier": release_tier,
+                    "enabled": True,
+                    "installed": bool(installed.get("installed")),
+                    "installed_version": installed.get("version"),
+                    "installed_path": installed.get("path"),
+                    "service_state": snapshot.service_state.value,
+                    "authoritative": snapshot.authoritative,
+                    "resident_models": [
+                        item.canonical_model_id for item in snapshot.residents
+                    ],
+                    "ready": ready,
+                    "diagnostic": redact(snapshot.diagnostic),
+                }
+            except TimeoutError:
+                return {
+                    "engine": engine.value,
+                    "release_tier": release_tier,
+                    "enabled": True,
+                    "installed": bool(installed.get("installed")),
+                    "installed_version": installed.get("version"),
+                    "installed_path": installed.get("path"),
+                    "service_state": "unreachable",
+                    "authoritative": False,
+                    "resident_models": [],
+                    "ready": False,
+                    "diagnostic": "engine health inspection timed out after 5 seconds",
+                }
+            except Exception as exc:
+                return {
+                    "engine": engine.value,
+                    "release_tier": release_tier,
+                    "enabled": True,
+                    "installed": bool(installed.get("installed")),
+                    "installed_version": installed.get("version"),
+                    "installed_path": installed.get("path"),
+                    "service_state": "unreachable",
+                    "authoritative": False,
+                    "resident_models": [],
+                    "ready": False,
+                    "diagnostic": redact(str(exc)),
+                }
+
+        engine_rows = await asyncio.gather(*(inspect_engine(engine) for engine in EngineName))
+        storage_results = await asyncio.gather(
+            *(
+                self.filesystem.inspect(
+                    location.path,
+                    name=location.name,
+                    expected_volume_uuid=location.volume_uuid,
+                    scope_id=location.scope_id,
+                )
+                for location in self.config.storage.locations
+            ),
+            return_exceptions=True,
+        )
+        storage_rows: list[dict] = []
+        for location, result in zip(
+            self.config.storage.locations,
+            storage_results,
+            strict=True,
+        ):
+            if isinstance(result, BaseException):
+                storage_rows.append(
+                    {
+                        "name": location.name,
+                        "path": location.path,
+                        "available": False,
+                        "writable": False,
+                        "volume_matches": False,
+                        "free_bytes": None,
+                        "diagnostic": redact(str(result)),
+                    }
+                )
+            else:
+                storage_rows.append(
+                    {
+                        "name": location.name,
+                        "path": result.path,
+                        "available": (
+                            result.exists
+                            and result.is_directory
+                            and result.volume_matches
+                        ),
+                        "writable": result.writable,
+                        "volume_matches": result.volume_matches,
+                        "free_bytes": result.free_bytes,
+                        "diagnostic": redact(result.diagnostic),
+                    }
+                )
+
+        active_installs = [
+            item.to_dict()
+            for item in await self.installer.list(limit=100)
+            if item.status in {"queued", "downloading", "registering", "cancelling"}
+        ]
+        core_ready = (
+            coordinator["state"] in {"idle", "ready"}
+            and coordinator["diagnostic"] is None
+            and coordinator["startup_error"] is None
+        )
+        stable_engines = [
+            item
+            for item in engine_rows
+            if item["release_tier"] == "stable" and item["enabled"] and item["ready"]
+        ]
+        storage_ready = any(
+            item["available"] and item["writable"] for item in storage_rows
+        )
+        usage_status = dict(coordinator["token_sidecar"])
+        usage_status["last_error"] = redact(usage_status.get("last_error"))
+        return {
+            "schema_version": 1,
+            "product_version": __version__,
+            "core": {
+                "ready": core_ready,
+                "state": coordinator["state"],
+                "diagnostic": redact(coordinator["diagnostic"]),
+                "startup_error": redact(coordinator["startup_error"]),
+                "resident_alias": coordinator["resident_alias"],
+                "in_flight_requests": coordinator["in_flight_requests"],
+                "queued_requests": coordinator["queued"],
+                "omlx_model_directory_sync_pending": coordinator[
+                    "omlx_model_directory_sync_pending"
+                ],
+            },
+            "engines": engine_rows,
+            "storage": storage_rows,
+            "models": {
+                "configured": len(self.profiles),
+                "callable": len(self.model_list()),
+            },
+            "downloads": {
+                "active": len(active_installs),
+                "items": active_installs,
+            },
+            "usage": usage_status,
+            "ready_for_inference": bool(
+                core_ready and stable_engines and storage_ready and self.model_list()
+            ),
+        }
+
+    def _self_test_base_url(self) -> str:
+        bind = self.config.server.inference_bind
+        if bind in {"0.0.0.0", "*"}:
+            bind = "127.0.0.1"
+        elif bind in {"::", "[::]"}:
+            bind = "::1"
+        host = f"[{bind.strip('[]')}]" if ":" in bind else bind
+        return f"http://{host}:{self.config.server.inference_port}"
+
+    async def self_test(
+        self,
+        alias: str,
+        *,
+        include_vision: bool = True,
+        unload_after: bool = False,
+    ) -> dict:
+        """Exercise the public inference listener and verify durable usage."""
+
+        target = await self.resolve_target(alias)
+        started_monotonic = time.monotonic()
+        started_wall = time.time()
+        headers = {"Content-Type": "application/json"}
+        inference_key = os.environ.get(
+            self.config.server.inference_api_key_env,
+            "",
+        ).strip()
+        if inference_key:
+            headers["Authorization"] = f"Bearer {inference_key}"
+
+        vision = bool(
+            include_vision
+            and target.key.engine == EngineName.LLAMA_CPP
+            and target.load_options.get("projector_path")
+        )
+        if Endpoint.CHAT_COMPLETIONS in target.capabilities:
+            endpoint = Endpoint.CHAT_COMPLETIONS
+            content: str | list[dict[str, object]]
+            if vision:
+                content = [
+                    {
+                        "type": "text",
+                        "text": "Describe the test image in one short sentence.",
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": _SELF_TEST_VISION_IMAGE},
+                    },
+                ]
+            else:
+                content = "Tell me about alpacas in 5 sentences or less."
+            payload: dict[str, object] = {
+                "model": alias,
+                "messages": [{"role": "user", "content": content}],
+                "stream": False,
+                "max_tokens": 128,
+            }
+        elif Endpoint.EMBEDDINGS in target.capabilities:
+            endpoint = Endpoint.EMBEDDINGS
+            payload = {"model": alias, "input": "alpacas"}
+        elif Endpoint.RERANK in target.capabilities:
+            endpoint = Endpoint.RERANK
+            payload = {
+                "model": alias,
+                "query": "alpacas",
+                "documents": ["Alpacas are camelids.", "The ocean is salty."],
+            }
+        elif Endpoint.IMAGES_GENERATIONS in target.capabilities:
+            endpoint = Endpoint.IMAGES_GENERATIONS
+            payload = {
+                "model": alias,
+                "prompt": "A simple icon of an alpaca.",
+                "size": "256x256",
+                "num_inference_steps": 1,
+                "response_format": "b64_json",
+            }
+        else:
+            raise RuntimeConfigurationError(
+                f"model '{alias}' has no endpoint supported by the self-test"
+            )
+
+        try:
+            response = await self.self_test_client.post(
+                f"{self._self_test_base_url()}/v1/{endpoint.value}",
+                headers=headers,
+                json=payload,
+                timeout=max(
+                    self.config.server.startup_timeout_seconds
+                    + self.config.server.swap_queue_timeout_seconds,
+                    self.config.server.image_request_timeout_seconds
+                    if endpoint == Endpoint.IMAGES_GENERATIONS
+                    else 60,
+                ),
+            )
+            response.raise_for_status()
+            decoded = response.json()
+            if not isinstance(decoded, dict):
+                raise RuntimeConfigurationError(
+                    "self-test response was not a JSON object"
+                )
+        except httpx.HTTPStatusError as exc:
+            detail = exc.response.text[:1000]
+            raise RuntimeConfigurationError(
+                f"self-test returned HTTP {exc.response.status_code}: {detail}"
+            ) from exc
+        except (httpx.HTTPError, ValueError) as exc:
+            raise RuntimeConfigurationError(f"self-test request failed: {exc}") from exc
+        finally:
+            if unload_after:
+                await self.coordinator.unload()
+
+        usage = normalize_usage(decoded, endpoint=f"/v1/{endpoint.value}")
+        usage_rows = await self.usage.list_usage(limit=100)
+        recorded = next(
+            (
+                row
+                for row in usage_rows
+                if row.get("alias") == alias
+                and float(row.get("ts") or 0) >= started_wall
+            ),
+            None,
+        )
+        response_preview: str | None = None
+        if endpoint == Endpoint.CHAT_COMPLETIONS:
+            try:
+                response_preview = str(
+                    decoded["choices"][0]["message"]["content"]
+                )[:2_000]
+            except (KeyError, IndexError, TypeError):
+                response_preview = None
+        elif endpoint == Endpoint.EMBEDDINGS:
+            response_preview = f"{len(decoded.get('data', []))} embedding result(s)"
+        elif endpoint == Endpoint.RERANK:
+            response_preview = f"{len(decoded.get('results', []))} rerank result(s)"
+        elif endpoint == Endpoint.IMAGES_GENERATIONS:
+            response_preview = f"{len(decoded.get('data', []))} image result(s)"
+
+        runtime_validation_recorded: bool | None = None
+        record_validation = getattr(
+            self.runtime_updates,
+            "record_validation",
+            None,
+        )
+        if callable(record_validation):
+            try:
+                validation_event = await asyncio.to_thread(
+                    record_validation,
+                    target.key.engine.value,
+                )
+                runtime_validation_recorded = (
+                    validation_event is not None
+                    if target.key.engine != EngineName.OMLX
+                    else None
+                )
+            except Exception:
+                # Inference already succeeded. A damaged or unwritable
+                # evidence journal must be visible to strict acceptance
+                # collection, but it must not turn a user request into a
+                # synthetic inference failure.
+                runtime_validation_recorded = False
+
+        return {
+            "schema_version": 1,
+            "success": True,
+            "model": alias,
+            "engine": target.key.engine.value,
+            "release_tier": ENGINE_RELEASE_TIER[target.key.engine],
+            "endpoint": f"/v1/{endpoint.value}",
+            "vision": vision,
+            "response_preview": response_preview,
+            "response_ms": (time.monotonic() - started_monotonic) * 1000,
+            "usage": (
+                {
+                    "prompt_tokens": usage.prompt_tokens,
+                    "completion_tokens": usage.completion_tokens,
+                    "total_tokens": usage.total_tokens,
+                }
+                if usage is not None
+                else None
+            ),
+            "usage_recorded": recorded is not None if usage is not None else None,
+            "usage_delivery": await self.usage.status(),
+            "runtime_validation_recorded": runtime_validation_recorded,
+        }
 
     async def record_usage(self, event: UsageEvent) -> None:
         await self.usage.record(event)
 
+    async def _runtime_active_version(self, engine: str) -> str | None:
+        active_version = getattr(self.runtime_updates, "active_version", None)
+        if not callable(active_version):
+            return None
+        try:
+            result = await asyncio.to_thread(active_version, engine)
+        except Exception:
+            return None
+        return result if isinstance(result, str) else None
+
+    async def _record_runtime_lifecycle(self, **values: object) -> bool:
+        recorder = getattr(self.runtime_updates, "record_lifecycle", None)
+        if not callable(recorder):
+            return False
+        try:
+            await asyncio.to_thread(recorder, **values)
+        except Exception:
+            # Runtime pointers are the source of truth. Once an activation or
+            # rollback has happened, an evidence-storage error must not
+            # masquerade as a failed pointer transition.
+            return False
+        return True
+
     async def check_runtime_updates(self, *, refresh: bool = True) -> dict:
         return await self.runtime_updates.check(refresh=refresh)
+
+    async def runtime_update_evidence(self) -> dict:
+        evidence_reader = getattr(
+            self.runtime_updates,
+            "lifecycle_evidence",
+            None,
+        )
+        if callable(evidence_reader):
+            try:
+                journal = await asyncio.to_thread(evidence_reader)
+            except Exception:
+                journal = {
+                    "schema_version": 1,
+                    "valid": False,
+                    "dropped_events": 0,
+                    "events": [],
+                    "diagnostic": "runtime lifecycle journal could not be read",
+                }
+        else:
+            journal = {
+                "schema_version": 1,
+                "valid": False,
+                "dropped_events": 0,
+                "events": [],
+                "diagnostic": "runtime lifecycle evidence is unavailable",
+            }
+        return {
+            "schema_version": 1,
+            "journal": journal,
+            "installed": await self.runtime_updates.installed_status(),
+        }
 
     async def install_runtime_update(
         self, engine: str, *, version: str | None = None
@@ -903,18 +1638,84 @@ class NativeRuntime:
         """Stage without touching residency, then activate behind the barrier."""
 
         async with self._runtime_update_lock:
-            prepared = await self.runtime_updates.prepare(engine, version)
+            active_before = await self._runtime_active_version(engine)
+            evidence_recorded = [
+                await self._record_runtime_lifecycle(
+                    engine=engine,
+                    action="install_requested",
+                    outcome="started",
+                    requested_version=version,
+                    active_version_before=active_before,
+                    active_version_after=active_before,
+                )
+            ]
+            try:
+                prepared = await self.runtime_updates.prepare(engine, version)
+            except Exception as exc:
+                evidence_recorded.append(
+                    await self._record_runtime_lifecycle(
+                        engine=engine,
+                        action="install_rejected",
+                        outcome="failed",
+                        requested_version=version,
+                        active_version_before=active_before,
+                        active_version_after=await self._runtime_active_version(engine),
+                        error=exc,
+                    )
+                )
+                raise
+            prepared_version = prepared.runtime.version
+            evidence_recorded.append(
+                await self._record_runtime_lifecycle(
+                    engine=engine,
+                    action="prepared",
+                    outcome="succeeded",
+                    requested_version=version,
+                    prepared_version=prepared_version,
+                    active_version_before=active_before,
+                    active_version_after=active_before,
+                    source_revision=prepared.runtime.source_revision,
+                )
+            )
             activated = None
 
             async def activate(_deadline) -> None:
                 nonlocal activated
                 activated = self.runtime_updates.activate(prepared)
 
-            await self.coordinator.run_empty_maintenance(
-                activate,
-                name=f"{engine} runtime activation",
-            )
+            try:
+                await self.coordinator.run_empty_maintenance(
+                    activate,
+                    name=f"{engine} runtime activation",
+                )
+            except Exception as exc:
+                evidence_recorded.append(
+                    await self._record_runtime_lifecycle(
+                        engine=engine,
+                        action="activation_rejected",
+                        outcome="failed",
+                        requested_version=version,
+                        prepared_version=prepared_version,
+                        active_version_before=active_before,
+                        active_version_after=await self._runtime_active_version(engine),
+                        source_revision=prepared.runtime.source_revision,
+                        error=exc,
+                    )
+                )
+                raise
             assert activated is not None
+            evidence_recorded.append(
+                await self._record_runtime_lifecycle(
+                    engine=engine,
+                    action="activated",
+                    outcome="succeeded",
+                    requested_version=version,
+                    prepared_version=prepared_version,
+                    active_version_before=active_before,
+                    active_version_after=activated.version,
+                    source_revision=activated.source_revision,
+                )
+            )
             result = await self.runtime_updates.check(refresh=False)
             result["activated"] = {
                 "engine": activated.engine,
@@ -922,21 +1723,56 @@ class NativeRuntime:
                 "source_revision": activated.source_revision,
                 "path": str(activated.root),
             }
+            result["lifecycle_evidence_recorded"] = all(evidence_recorded)
             return result
 
     async def rollback_runtime_update(self, engine: str) -> dict:
         async with self._runtime_update_lock:
+            active_before = await self._runtime_active_version(engine)
+            evidence_recorded = [
+                await self._record_runtime_lifecycle(
+                    engine=engine,
+                    action="rollback_requested",
+                    outcome="started",
+                    active_version_before=active_before,
+                    active_version_after=active_before,
+                )
+            ]
             activated = None
 
             async def rollback(_deadline) -> None:
                 nonlocal activated
                 activated = self.runtime_updates.rollback(engine)
 
-            await self.coordinator.run_empty_maintenance(
-                rollback,
-                name=f"{engine} runtime rollback",
-            )
+            try:
+                await self.coordinator.run_empty_maintenance(
+                    rollback,
+                    name=f"{engine} runtime rollback",
+                )
+            except Exception as exc:
+                evidence_recorded.append(
+                    await self._record_runtime_lifecycle(
+                        engine=engine,
+                        action="rollback_rejected",
+                        outcome="failed",
+                        active_version_before=active_before,
+                        active_version_after=await self._runtime_active_version(engine),
+                        error=exc,
+                    )
+                )
+                raise
             assert activated is not None
+            evidence_recorded.append(
+                await self._record_runtime_lifecycle(
+                    engine=engine,
+                    action="rolled_back",
+                    outcome="succeeded",
+                    prepared_version=activated.version,
+                    active_version_before=active_before,
+                    active_version_after=activated.version,
+                    source_revision=activated.source_revision,
+                )
+            )
             result = await self.runtime_updates.check(refresh=False)
             result["activated"] = {
                 "engine": activated.engine,
@@ -945,6 +1781,7 @@ class NativeRuntime:
                 "path": str(activated.root),
                 "rollback": True,
             }
+            result["lifecycle_evidence_recorded"] = all(evidence_recorded)
             return result
 
     async def _register_installed_model(self, install: InstallRecord) -> None:
@@ -970,6 +1807,8 @@ class NativeRuntime:
                 )
             model = str(Path(install.destination) / install.filename)
             load = {}
+            if install.context_length is not None:
+                load["context_length"] = install.context_length
             if install.projector_filename:
                 load["projector_path"] = str(
                     Path(install.destination) / install.projector_filename

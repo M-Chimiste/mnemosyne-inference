@@ -15,7 +15,7 @@ import httpx
 from .base import AdapterError, Deadline, EngineAdapter
 from .http import _is_connection_refused
 from ..config import MFluxConfig
-from ..runtime_updates import resolve_active_runtime
+from ..runtime_updates import _python_subprocess_environment, resolve_active_runtime
 from ..scoped_process import wrap_scoped_argv
 from ..models import (
     Endpoint,
@@ -84,13 +84,10 @@ class MFluxAdapter(EngineAdapter):
         return configured or sys.executable
 
     def _environment(self) -> dict[str, str]:
-        env = os.environ.copy()
-        # The worker runs in an independent Python layer. In particular, the
-        # packaged service sets PYTHONHOME and PYTHONPATH for its base layer;
-        # inheriting either would prevent the image virtual environment from
-        # finding its own stdlib extensions and dependencies.
-        env.pop("PYTHONHOME", None)
-        env.pop("PYTHONPATH", None)
+        env = _python_subprocess_environment(
+            self._python(),
+            bundled_python_env=self.config.python_env,
+        )
         managed = self._managed_runtime()
         paths: list[str] = []
         if managed is not None:

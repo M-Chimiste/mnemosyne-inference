@@ -155,6 +155,27 @@ async def test_worker_environment_isolated_from_service_python(
 
 
 @pytest.mark.asyncio
+async def test_packaged_worker_retains_bundled_pythonhome(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image_python = "/Applications/Unified/Python/framework-mnemosyne-image/bin/python3"
+    monkeypatch.setenv("PYTHONHOME", "/Applications/Unified/Python/cpython-3.12")
+    monkeypatch.setenv("PYTHONPATH", "/service/source:/service/site-packages")
+    monkeypatch.setenv("MNEMOSYNE_MFLUX_PYTHON", image_python)
+    monkeypatch.setenv("MNEMOSYNE_MFLUX_PYTHONPATH", "/image/worker/source")
+
+    client = httpx.AsyncClient()
+    adapter = MFluxAdapter(MFluxConfig(enabled=True), client=client)
+    try:
+        environment = adapter._environment()
+        assert adapter._python() == image_python
+        assert environment["PYTHONHOME"] == "/Applications/Unified/Python/cpython-3.12"
+        assert environment["PYTHONPATH"] == "/image/worker/source"
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_scoped_worker_uses_service_launcher_then_isolated_image_python(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

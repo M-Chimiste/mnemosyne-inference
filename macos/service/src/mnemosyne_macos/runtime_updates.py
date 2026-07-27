@@ -24,6 +24,7 @@ import shutil
 import signal
 import tarfile
 import tempfile
+import threading
 import time
 from typing import Any, Mapping
 from uuid import uuid4
@@ -31,6 +32,7 @@ from uuid import uuid4
 import httpx
 
 from .config import DS4Config, LlamaCppConfig, MFluxConfig, OMLXConfig
+from .models import ENGINE_RELEASE_TIER, EngineName
 
 
 CORE_RUNTIME_PROTOCOL = 1
@@ -47,10 +49,134 @@ LLAMA_CPP_RELEASE_API_URL = (
 MAX_SOURCE_ARCHIVE_BYTES = 2 * 1024**3
 _VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$")
 _ENGINES = ("llama.cpp", "omlx", "mflux", "ds4")
+_OMLX_RELEASES_URL = "https://github.com/jundot/omlx/releases"
+_LIFECYCLE_LIMIT = 256
+_LIFECYCLE_ACTION_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_LIFECYCLE_EVENT_ID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-"
+    r"[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+)
+_LIFECYCLE_FAILURE_CODES = {
+    "activation_barrier",
+    "build_or_smoke",
+    "incompatible",
+    "integrity",
+    "invalid_journal",
+    "runtime_error",
+    "unsafe_archive",
+}
+_SOURCE_REVISION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:+/=@-]{0,159}$")
 
 
 class RuntimeUpdateError(RuntimeError):
     """A runtime update could not be checked, prepared, or activated."""
+
+
+def _omlx_macos_major_ranges(asset_name: str) -> tuple[range, ...]:
+    matches = re.finditer(
+        r"(?:^|[-_])macos(\d+)(?:-(\d+))?(?=$|[-_.])",
+        asset_name.casefold(),
+    )
+    ranges: list[range] = []
+    for match in matches:
+        lower = int(match.group(1))
+        upper = int(match.group(2) or lower)
+        if upper >= lower:
+            ranges.append(range(lower, upper + 1))
+    return tuple(ranges)
+
+
+def _official_omlx_installer_url(
+    release: Mapping[str, Any],
+    *,
+    macos_major: int | None = None,
+) -> str | None:
+    """Select the official DMG matching this Mac without downloading it."""
+
+    assets = release.get("assets")
+    tag = release.get("tag_name")
+    if not isinstance(assets, list) or not isinstance(tag, str):
+        return None
+    if macos_major is None:
+        version = platform.mac_ver()[0]
+        try:
+            macos_major = int(version.split(".", 1)[0]) if version else None
+        except ValueError:
+            macos_major = None
+
+    prefix = f"https://github.com/jundot/omlx/releases/download/{tag}/"
+    dmgs: list[tuple[Mapping[str, Any], tuple[range, ...]]] = []
+    for asset in assets:
+        if not isinstance(asset, Mapping):
+            continue
+        name = asset.get("name")
+        url = asset.get("browser_download_url")
+        size = asset.get("size")
+        digest = asset.get("digest")
+        if (
+            not isinstance(name, str)
+            or not name.casefold().endswith(".dmg")
+            or not isinstance(url, str)
+            or not url.startswith(prefix)
+            or not isinstance(size, int)
+            or isinstance(size, bool)
+            or size <= 0
+            or not isinstance(digest, str)
+            or not re.fullmatch(r"sha256:[0-9a-fA-F]{64}", digest)
+        ):
+            continue
+        dmgs.append((asset, _omlx_macos_major_ranges(name)))
+
+    selected: Mapping[str, Any] | None = None
+    if macos_major is not None:
+        selected = next(
+            (
+                asset
+                for asset, ranges in dmgs
+                if any(
+                    values.start == macos_major
+                    and values.stop == macos_major + 1
+                    for values in ranges
+                )
+            ),
+            None,
+        )
+        if selected is None:
+            selected = next(
+                (
+                    asset
+                    for asset, ranges in dmgs
+                    if any(macos_major in values for values in ranges)
+                ),
+                None,
+            )
+    if selected is None and len(dmgs) == 1:
+        selected = dmgs[0][0]
+    url = selected.get("browser_download_url") if selected else None
+    return str(url) if isinstance(url, str) else None
+
+
+def _omlx_cli_candidates() -> tuple[Path, ...]:
+    """Return CLI locations visible to both shells and a packaged LaunchAgent."""
+
+    candidates: list[Path] = []
+    discovered = shutil.which("omlx")
+    if discovered:
+        candidates.append(Path(discovered))
+    candidates.extend(
+        (
+            Path.home() / ".omlx" / "bin" / "omlx",
+            Path("/opt/homebrew/bin/omlx"),
+            Path("/usr/local/bin/omlx"),
+            Path("/opt/homebrew/opt/omlx/bin/omlx"),
+            Path("/usr/local/opt/omlx/bin/omlx"),
+        )
+    )
+    unique: list[Path] = []
+    for candidate in candidates:
+        if candidate not in unique:
+            unique.append(candidate)
+    return tuple(unique)
 
 
 @dataclass(frozen=True)
@@ -147,6 +273,70 @@ def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
             os.close(fd)
         with contextlib.suppress(FileNotFoundError):
             temporary_path.unlink()
+
+
+def _runtime_failure_code(error: BaseException) -> str:
+    text = str(error).casefold()
+    if any(
+        marker in text
+        for marker in (
+            "sha-256",
+            "checksum",
+            "digest",
+            "integrity",
+            "published size",
+            "asset size",
+        )
+    ):
+        return "integrity"
+    if any(
+        marker in text
+        for marker in (
+            "unsafe",
+            "path traversal",
+            "escaping symlink",
+            "escaping hard link",
+            "escapes its runtime folder",
+            "unexpected layout",
+            "device or fifo",
+        )
+    ):
+        return "unsafe_archive"
+    if any(
+        marker in text
+        for marker in (
+            "command failed",
+            "command timed out",
+            "build",
+            "did not produce",
+            "import",
+            "not executable",
+        )
+    ):
+        return "build_or_smoke"
+    if any(
+        marker in text
+        for marker in (
+            "not the current official",
+            "no compatible official",
+            "protocol",
+            "source revision",
+            "unsupported runtime",
+        )
+    ):
+        return "incompatible"
+    if any(
+        marker in text
+        for marker in (
+            "maintenance",
+            "drain",
+            "lease",
+            "resident",
+            "empty",
+        )
+    ):
+        return "activation_barrier"
+    return "runtime_error"
 
 
 def _validate_engine(engine: str) -> str:
@@ -317,14 +507,42 @@ def _clean_subprocess_environment() -> dict[str, str]:
     return environment
 
 
-async def _run_version_command(*argv: str, timeout: float = 5.0) -> str | None:
+def _python_subprocess_environment(
+    python: str | Path,
+    *,
+    bundled_python_env: str,
+) -> dict[str, str]:
+    """Isolate Python layers while retaining the packaged stdlib location.
+
+    The relocatable image-layer interpreter uses the same bundled CPython
+    runtime as the service and needs the bootstrap-provided ``PYTHONHOME`` to
+    locate that stdlib. Development virtualenvs and arbitrary configured
+    interpreters must not inherit it.
+    """
+
+    environment = _clean_subprocess_environment()
+    bundled_python = os.environ.get(bundled_python_env, "").strip()
+    python_home = os.environ.get("PYTHONHOME", "").strip()
+    if bundled_python and python_home:
+        selected = Path(python).expanduser().resolve(strict=False)
+        bundled = Path(bundled_python).expanduser().resolve(strict=False)
+        if selected == bundled:
+            environment["PYTHONHOME"] = python_home
+    return environment
+
+
+async def _run_version_command(
+    *argv: str,
+    timeout: float = 5.0,
+    env: Mapping[str, str] | None = None,
+) -> str | None:
     try:
         process = await asyncio.create_subprocess_exec(
             *argv,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             stdin=asyncio.subprocess.DEVNULL,
-            env=_clean_subprocess_environment(),
+            env=dict(env) if env is not None else _clean_subprocess_environment(),
             start_new_session=True,
         )
     except OSError:
@@ -411,11 +629,250 @@ class RuntimeUpdateManager:
         self._client = client or httpx.AsyncClient(timeout=30, follow_redirects=True)
         self._owns_client = client is None
         self._releases: dict[str, RuntimeRelease] = {}
-        self._upstream_omlx: tuple[str | None, str | None] = (None, None)
+        self._upstream_omlx: tuple[str | None, str | None, str | None] = (
+            None,
+            None,
+            None,
+        )
         self._diagnostics: dict[str, str] = {}
         self._last_checked_at: float | None = None
         self._check_lock = asyncio.Lock()
         self._install_lock = asyncio.Lock()
+        self._lifecycle_lock = threading.RLock()
+        self._service_instance_id = str(uuid4())
+
+    @property
+    def _lifecycle_path(self) -> Path:
+        return self.root / "lifecycle.json"
+
+    def lifecycle_evidence(self) -> dict[str, Any]:
+        """Return bounded, credential-free runtime transition evidence."""
+
+        with self._lifecycle_lock:
+            try:
+                payload = _read_json(self._lifecycle_path)
+            except FileNotFoundError:
+                return {
+                    "schema_version": 1,
+                    "valid": True,
+                    "dropped_events": 0,
+                    "events": [],
+                }
+            except (OSError, ValueError, json.JSONDecodeError):
+                return {
+                    "schema_version": 1,
+                    "valid": False,
+                    "dropped_events": 0,
+                    "events": [],
+                    "diagnostic": "runtime lifecycle journal is unreadable",
+                }
+            dropped_events = (
+                payload.get("dropped_events") if isinstance(payload, dict) else None
+            )
+            if (
+                not isinstance(payload, dict)
+                or payload.get("schema_version") != 1
+                or not isinstance(dropped_events, int)
+                or isinstance(dropped_events, bool)
+                or dropped_events < 0
+                or not isinstance(payload.get("events"), list)
+            ):
+                return {
+                    "schema_version": 1,
+                    "valid": False,
+                    "dropped_events": 0,
+                    "events": [],
+                    "diagnostic": "runtime lifecycle journal has an unsupported schema",
+                }
+            events = payload["events"]
+            previous_sequence = 0
+            valid = len(events) <= _LIFECYCLE_LIMIT
+            for event in events:
+                if not isinstance(event, dict):
+                    valid = False
+                    break
+                sequence = event.get("sequence")
+                event_id = event.get("event_id")
+                service_instance_id = event.get("service_instance_id")
+                engine = event.get("engine")
+                action = event.get("action")
+                outcome = event.get("outcome")
+                created_at = event.get("created_at")
+                failure_code = event.get("failure_code")
+                if (
+                    not isinstance(sequence, int)
+                    or isinstance(sequence, bool)
+                    or sequence <= previous_sequence
+                    or not isinstance(event_id, str)
+                    or not _LIFECYCLE_EVENT_ID_RE.fullmatch(event_id)
+                    or not isinstance(service_instance_id, str)
+                    or not _LIFECYCLE_EVENT_ID_RE.fullmatch(service_instance_id)
+                    or engine not in _ENGINES
+                    or not isinstance(action, str)
+                    or not _LIFECYCLE_ACTION_RE.fullmatch(action)
+                    or outcome not in {"started", "succeeded", "failed"}
+                    or not isinstance(created_at, str)
+                    or (
+                        failure_code is not None
+                        and failure_code not in _LIFECYCLE_FAILURE_CODES
+                    )
+                ):
+                    valid = False
+                    break
+                try:
+                    datetime.fromisoformat(created_at)
+                except ValueError:
+                    valid = False
+                    break
+                for key in (
+                    "requested_version",
+                    "prepared_version",
+                    "active_version_before",
+                    "active_version_after",
+                ):
+                    value = event.get(key)
+                    if value is not None and (
+                        not isinstance(value, str)
+                        or not _VERSION_RE.fullmatch(value)
+                    ):
+                        valid = False
+                        break
+                source_revision = event.get("source_revision")
+                if source_revision is not None and (
+                    not isinstance(source_revision, str)
+                    or not _SOURCE_REVISION_RE.fullmatch(source_revision)
+                ):
+                    valid = False
+                if not valid:
+                    break
+                previous_sequence = sequence
+            if not valid:
+                return {
+                    "schema_version": 1,
+                    "valid": False,
+                    "dropped_events": int(dropped_events),
+                    "events": [],
+                    "diagnostic": "runtime lifecycle journal contains an invalid event",
+                }
+            return {
+                "schema_version": 1,
+                "valid": True,
+                "dropped_events": int(dropped_events),
+                "events": [dict(event) for event in events],
+            }
+
+    def record_lifecycle(
+        self,
+        *,
+        engine: str,
+        action: str,
+        outcome: str,
+        requested_version: str | None = None,
+        prepared_version: str | None = None,
+        active_version_before: str | None = None,
+        active_version_after: str | None = None,
+        source_revision: str | None = None,
+        error: BaseException | None = None,
+    ) -> dict[str, Any]:
+        """Append one bounded event without persisting arbitrary diagnostics."""
+
+        normalized = _validate_engine(engine)
+        if not _LIFECYCLE_ACTION_RE.fullmatch(action):
+            raise ValueError("runtime lifecycle action is invalid")
+        if outcome not in {"started", "succeeded", "failed"}:
+            raise ValueError("runtime lifecycle outcome is invalid")
+
+        def safe_version(value: str | None) -> str | None:
+            return value if value is not None and _VERSION_RE.fullmatch(value) else None
+
+        safe_revision = (
+            source_revision
+            if isinstance(source_revision, str)
+            and _SOURCE_REVISION_RE.fullmatch(source_revision)
+            else None
+        )
+
+        with self._lifecycle_lock:
+            existing = self.lifecycle_evidence()
+            events = (
+                [dict(event) for event in existing["events"]]
+                if existing["valid"]
+                else []
+            )
+            dropped = (
+                int(existing["dropped_events"])
+                if existing["valid"]
+                else 0
+            )
+            next_sequence = (
+                int(events[-1]["sequence"]) + 1 if events else 1
+            )
+            if not existing["valid"]:
+                events.append(
+                    {
+                        "sequence": next_sequence,
+                        "event_id": str(uuid4()),
+                        "service_instance_id": self._service_instance_id,
+                        "engine": normalized,
+                        "action": "journal_reset",
+                        "outcome": "failed",
+                        "created_at": datetime.now(timezone.utc).isoformat(),
+                        "failure_code": "invalid_journal",
+                    }
+                )
+                next_sequence += 1
+            event = {
+                "sequence": next_sequence,
+                "event_id": str(uuid4()),
+                "service_instance_id": self._service_instance_id,
+                "engine": normalized,
+                "action": action,
+                "outcome": outcome,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "requested_version": safe_version(requested_version),
+                "prepared_version": safe_version(prepared_version),
+                "active_version_before": safe_version(active_version_before),
+                "active_version_after": safe_version(active_version_after),
+                "source_revision": safe_revision,
+                "failure_code": (
+                    _runtime_failure_code(error) if error is not None else None
+                ),
+            }
+            events.append(event)
+            if len(events) > _LIFECYCLE_LIMIT:
+                overflow = len(events) - _LIFECYCLE_LIMIT
+                events = events[overflow:]
+                dropped += overflow
+            _atomic_json(
+                self._lifecycle_path,
+                {
+                    "schema_version": 1,
+                    "dropped_events": dropped,
+                    "events": events,
+                },
+            )
+            return dict(event)
+
+    def active_version(self, engine: str) -> str | None:
+        runtime = resolve_active_runtime(engine, root=self.root)
+        return runtime.version if runtime is not None else None
+
+    def record_validation(self, engine: str) -> dict[str, Any] | None:
+        normalized = _validate_engine(engine)
+        if normalized == "omlx":
+            return None
+        active = resolve_active_runtime(normalized, root=self.root)
+        if active is None:
+            return None
+        return self.record_lifecycle(
+            engine=normalized,
+            action="inference_validated",
+            outcome="succeeded",
+            prepared_version=active.version,
+            active_version_before=active.version,
+            active_version_after=active.version,
+            source_revision=active.source_revision,
+        )
 
     async def aclose(self) -> None:
         if self._owns_client:
@@ -429,7 +886,9 @@ class RuntimeUpdateManager:
         response.raise_for_status()
         return response.json()
 
-    async def _official_omlx(self) -> tuple[str | None, str | None]:
+    async def _official_omlx(
+        self,
+    ) -> tuple[str | None, str | None, str | None]:
         payload = await self._fetch_json(OMLX_RELEASES_API_URL)
         if not isinstance(payload, list):
             raise RuntimeUpdateError("official oMLX releases response was not a list")
@@ -442,11 +901,13 @@ class RuntimeUpdateManager:
             and isinstance(item.get("tag_name"), str)
         ]
         if not stable:
-            return None, "https://github.com/jundot/omlx/releases"
+            return None, _OMLX_RELEASES_URL, None
         item = max(stable, key=lambda value: _version_key(str(value["tag_name"])))
         version = str(item["tag_name"]).removeprefix("v").removeprefix(".")
-        return version, str(
-            item.get("html_url") or "https://github.com/jundot/omlx/releases"
+        return (
+            version,
+            str(item.get("html_url") or _OMLX_RELEASES_URL),
+            _official_omlx_installer_url(item),
         )
 
     async def _official_llama_cpp(self) -> RuntimeRelease:
@@ -593,12 +1054,13 @@ class RuntimeUpdateManager:
                             return value.removeprefix("v"), None, self.omlx.base_url
             except (httpx.HTTPError, ValueError):
                 continue
-        executable = shutil.which("omlx")
-        if executable:
-            output = await _run_version_command(executable, "--version")
+        for executable in _omlx_cli_candidates():
+            if not executable.is_file() or not os.access(executable, os.X_OK):
+                continue
+            output = await _run_version_command(str(executable), "--version")
             match = re.search(r"\d+(?:\.\d+)+(?:[-+._A-Za-z0-9]*)?", output or "")
             if match:
-                return match.group(0), None, executable
+                return match.group(0), None, str(executable)
         return None, None, None
 
     async def _installed_llama_cpp(
@@ -627,6 +1089,12 @@ class RuntimeUpdateManager:
         ).strip()
         return Path(configured).expanduser() if configured else None
 
+    def _mflux_environment(self, python: Path) -> dict[str, str]:
+        return _python_subprocess_environment(
+            python,
+            bundled_python_env=self.mflux.python_env,
+        )
+
     def _mflux_worker_source(self) -> Path | None:
         value = os.environ.get(self.mflux.source_path_env, "").strip()
         source = Path(value).expanduser() if value else None
@@ -647,7 +1115,12 @@ class RuntimeUpdateManager:
             "r=u.get('vcs_info',{}).get('commit_id'); "
             "print(json.dumps({'version':d.version,'revision':r}))"
         )
-        output = await _run_version_command(str(python), "-c", script)
+        output = await _run_version_command(
+            str(python),
+            "-c",
+            script,
+            env=self._mflux_environment(python),
+        )
         if not output:
             return None, None, str(python)
         try:
@@ -691,21 +1164,45 @@ class RuntimeUpdateManager:
             return installed_revision != release.source_revision
         return _version_key(release.version) > _version_key(installed_version)
 
+    async def installed_status(self) -> dict[str, dict[str, Any]]:
+        """Inspect local runtimes without contacting any upstream service."""
+
+        installed_values = await asyncio.gather(
+            self._installed_llama_cpp(),
+            self._installed_omlx(),
+            self._installed_mflux(),
+            self._installed_ds4(),
+        )
+        return {
+            engine: {
+                "installed": version is not None,
+                "version": version,
+                "revision": revision,
+                "path": path,
+            }
+            for engine, (version, revision, path) in zip(
+                _ENGINES,
+                installed_values,
+                strict=True,
+            )
+        }
+
     async def check(self, *, refresh: bool = True) -> dict[str, Any]:
         async with self._check_lock:
             if refresh or self._last_checked_at is None:
                 await self._refresh_releases()
-            installed_values = await asyncio.gather(
-                self._installed_llama_cpp(),
-                self._installed_omlx(),
-                self._installed_mflux(),
-                self._installed_ds4(),
-            )
+            local_status = await self.installed_status()
             statuses: list[dict[str, Any]] = []
-            for index, engine in enumerate(_ENGINES):
-                installed_version, installed_revision, installed_path = installed_values[index]
+            for engine in _ENGINES:
+                installed_version = local_status[engine]["version"]
+                installed_revision = local_status[engine]["revision"]
+                installed_path = local_status[engine]["path"]
                 if engine == "omlx":
-                    upstream_version, upstream_url = self._upstream_omlx
+                    (
+                        upstream_version,
+                        upstream_url,
+                        official_installer_url,
+                    ) = self._upstream_omlx
                     release = None
                     update_available = bool(
                         upstream_version
@@ -719,6 +1216,7 @@ class RuntimeUpdateManager:
                     release = self._releases.get(engine)
                     upstream_version = release.version if release else None
                     upstream_url = release.release_notes_url if release else None
+                    official_installer_url = None
                     update_available = bool(
                         release
                         and self._release_is_newer(
@@ -728,6 +1226,9 @@ class RuntimeUpdateManager:
                 statuses.append(
                     {
                         "engine": engine,
+                        "release_tier": ENGINE_RELEASE_TIER[
+                            EngineName(engine)
+                        ],
                         "display_name": {
                             "llama.cpp": "llama.cpp",
                             "omlx": "oMLX",
@@ -742,6 +1243,7 @@ class RuntimeUpdateManager:
                         "latest_upstream_version": upstream_version,
                         "latest_upstream_revision": release.source_revision if release else None,
                         "latest_upstream_url": upstream_url,
+                        "official_installer_url": official_installer_url,
                         "available_version": release.version if release else None,
                         "available_revision": release.source_revision if release else None,
                         "release_notes_url": upstream_url,
@@ -753,7 +1255,7 @@ class RuntimeUpdateManager:
                             "Version and Apple Silicon binaries come directly from official ggml-org/llama.cpp GitHub releases."
                             if engine == "llama.cpp"
                             else (
-                                "Version comes from official oMLX GitHub releases. Update with the oMLX app or Homebrew."
+                                "The official oMLX app is recommended and includes precompiled custom kernels. oMLX remains independently owned and updated."
                                 if engine == "omlx"
                                 else (
                                     "Version and dependencies come directly from the official MFLUX package on PyPI."
@@ -811,7 +1313,12 @@ class RuntimeUpdateManager:
             "import ensurepip,pathlib; "
             "print(next((pathlib.Path(ensurepip.__file__).parent/'_bundled').glob('pip-*.whl')))"
         )
-        output = await _run_version_command(str(python), "-c", script)
+        output = await _run_version_command(
+            str(python),
+            "-c",
+            script,
+            env=self._mflux_environment(python),
+        )
         if not output:
             raise RuntimeUpdateError("the MFLUX Python runtime does not include ensurepip")
         wheel = Path(output.splitlines()[-1])
@@ -840,7 +1347,7 @@ class RuntimeUpdateManager:
             worker / "mnemosyne_mflux_worker",
         )
         pip_wheel = await self._pip_wheel(python)
-        environment = _clean_subprocess_environment()
+        environment = self._mflux_environment(python)
         environment["PYTHONPATH"] = str(pip_wheel)
         await _run_checked(
             str(python),
@@ -1002,7 +1509,7 @@ class RuntimeUpdateManager:
         paths = [runtime.path("worker_path")]
         if "site_packages" in runtime.entrypoint:
             paths.insert(0, runtime.path("site_packages"))
-        environment = _clean_subprocess_environment()
+        environment = self._mflux_environment(python)
         environment["PYTHONPATH"] = os.pathsep.join(str(path) for path in paths)
         await _run_checked(
             str(python),

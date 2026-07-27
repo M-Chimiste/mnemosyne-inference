@@ -8,11 +8,18 @@ from typing import Any, Mapping
 
 
 class EngineName(StrEnum):
-    LMSTUDIO = "lmstudio"
     LLAMA_CPP = "llama.cpp"
     OMLX = "omlx"
     DS4 = "ds4"
     MFLUX = "mflux"
+
+
+ENGINE_RELEASE_TIER: dict[EngineName, str] = {
+    EngineName.LLAMA_CPP: "stable",
+    EngineName.OMLX: "stable",
+    EngineName.DS4: "preview",
+    EngineName.MFLUX: "preview",
+}
 
 
 class Endpoint(StrEnum):
@@ -31,15 +38,6 @@ class ModelKind(StrEnum):
 
 
 DEFAULT_CAPABILITIES: dict[EngineName, frozenset[Endpoint]] = {
-    EngineName.LMSTUDIO: frozenset(
-        {
-            Endpoint.CHAT_COMPLETIONS,
-            Endpoint.COMPLETIONS,
-            Endpoint.RESPONSES,
-            Endpoint.MESSAGES,
-            Endpoint.EMBEDDINGS,
-        }
-    ),
     EngineName.LLAMA_CPP: frozenset(
         {
             Endpoint.CHAT_COMPLETIONS,

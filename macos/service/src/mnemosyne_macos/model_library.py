@@ -2,13 +2,21 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 import os
 import re
 from typing import Any, Iterable
 
-from huggingface_hub import HfApi
+from huggingface_hub import HfApi, HfFileSystem
 
+from .model_metadata import (
+    ModelMetadata,
+    bounded_markdown,
+    markdown_summary,
+    metadata_from_config,
+    metadata_from_gguf_stream,
+    recommended_projector,
+)
 from .models import EngineName
 from .runtime_updates import resolve_active_runtime
 
@@ -40,6 +48,27 @@ class LibraryModel:
     default_height: int | None = None
     default_num_inference_steps: int | None = None
     default_guidance_scale: float | None = None
+    architecture: str | None = None
+    context_length: int | None = None
+    parameter_count: int | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True, slots=True)
+class LibraryModelDetails:
+    repo_id: str
+    resolved_revision: str | None
+    architecture: str | None
+    context_length: int | None
+    parameter_count: int | None
+    summary: str | None
+    model_card_markdown: str | None
+    license: str | None
+    pipeline_tag: str | None
+    tags: tuple[str, ...]
+    last_modified: str | None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -383,6 +412,195 @@ def image_profile_defaults(model: LibraryModel) -> dict[str, Any]:
     }
 
 
+def _hub_path(repo_id: str, filename: str, revision: str | None) -> str:
+    revision_suffix = f"@{revision}" if revision else ""
+    return f"{repo_id}{revision_suffix}/{filename}"
+
+
+def _hub_file_bytes(
+    filesystem: HfFileSystem,
+    repo_id: str,
+    filename: str,
+    *,
+    revision: str | None,
+    limit: int,
+) -> bytes | None:
+    try:
+        with filesystem.open(
+            _hub_path(repo_id, filename, revision),
+            "rb",
+        ) as stream:
+            value = stream.read(limit + 1)
+    except Exception:
+        return None
+    return value[:limit] if isinstance(value, bytes) else None
+
+
+def _mapping_metadata(value: Any) -> ModelMetadata:
+    """Read common Hub GGUF summary keys without assuming one API shape."""
+
+    if not isinstance(value, dict):
+        return ModelMetadata()
+
+    def nested_value(*keys: str) -> Any:
+        wanted = {key.casefold().replace("-", "_") for key in keys}
+        pending: list[Any] = [value]
+        while pending:
+            current = pending.pop()
+            if not isinstance(current, dict):
+                continue
+            for key, item in current.items():
+                normalized = str(key).casefold().replace("-", "_")
+                if normalized in wanted:
+                    return item
+                if isinstance(item, dict):
+                    pending.append(item)
+        return None
+
+    raw_architecture = nested_value("architecture", "general.architecture")
+    architecture = (
+        raw_architecture.strip()
+        if isinstance(raw_architecture, str) and raw_architecture.strip()
+        else None
+    )
+    return ModelMetadata(
+        architecture=architecture,
+        context_length=_bounded_context(
+            nested_value(
+                "context_length",
+                "contextLength",
+                "max_position_embeddings",
+            )
+        ),
+        parameter_count=_optional_int(
+            nested_value("total", "parameter_count", "parameterCount", "parameters")
+        ),
+    )
+
+
+def _card_license(card_data: Any, tags: tuple[str, ...]) -> str | None:
+    raw: Any = None
+    if hasattr(card_data, "get"):
+        try:
+            raw = card_data.get("license")
+        except Exception:
+            raw = None
+    if isinstance(raw, list):
+        raw = ", ".join(str(value) for value in raw if value)
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
+    return next(
+        (
+            tag.split(":", 1)[1]
+            for tag in tags
+            if tag.casefold().startswith("license:") and ":" in tag
+        ),
+        None,
+    )
+
+
+def model_details(
+    repo_id: str,
+    *,
+    engine: EngineName,
+    filename: str | None = None,
+    revision: str | None = None,
+    token: str | None = None,
+) -> LibraryModelDetails:
+    """Fetch one selected model's bounded card and structured metadata."""
+
+    resolved_token = token or _hf_token()
+    api = HfApi(token=resolved_token)
+    info = api.model_info(
+        repo_id,
+        revision=revision,
+        expand=[
+            "cardData",
+            "config",
+            "gguf",
+            "lastModified",
+            "pipeline_tag",
+            "sha",
+            "tags",
+        ],
+    )
+    resolved_revision_value = getattr(info, "sha", None) or revision
+    resolved_revision = (
+        str(resolved_revision_value)
+        if resolved_revision_value is not None
+        else None
+    )
+    tags = tuple(str(value) for value in (getattr(info, "tags", None) or []))
+    config = getattr(info, "config", None)
+    config_metadata = (
+        metadata_from_config(config) if isinstance(config, dict) else ModelMetadata()
+    )
+    hub_gguf_metadata = _mapping_metadata(getattr(info, "gguf", None))
+
+    filesystem = HfFileSystem(token=resolved_token)
+    card_bytes = _hub_file_bytes(
+        filesystem,
+        repo_id,
+        "README.md",
+        revision=resolved_revision,
+        limit=96 * 1024,
+    )
+    model_card = bounded_markdown(card_bytes)
+
+    file_metadata = ModelMetadata()
+    if engine == EngineName.LLAMA_CPP and filename:
+        try:
+            with filesystem.open(
+                _hub_path(repo_id, filename, resolved_revision),
+                "rb",
+            ) as stream:
+                file_metadata = metadata_from_gguf_stream(stream)
+        except Exception:
+            file_metadata = ModelMetadata()
+
+    last_modified = getattr(info, "last_modified", None)
+    if last_modified is not None and hasattr(last_modified, "isoformat"):
+        last_modified_value = last_modified.isoformat()
+    else:
+        last_modified_value = (
+            str(last_modified) if last_modified is not None else None
+        )
+    architecture = (
+        file_metadata.architecture
+        or config_metadata.architecture
+        or hub_gguf_metadata.architecture
+    )
+    context_length = (
+        file_metadata.context_length
+        or config_metadata.context_length
+        or hub_gguf_metadata.context_length
+    )
+    parameter_count = (
+        file_metadata.parameter_count
+        or config_metadata.parameter_count
+        or hub_gguf_metadata.parameter_count
+    )
+    summary = (
+        file_metadata.description
+        or markdown_summary(model_card)
+        or config_metadata.description
+    )
+    pipeline = getattr(info, "pipeline_tag", None)
+    return LibraryModelDetails(
+        repo_id=repo_id,
+        resolved_revision=resolved_revision,
+        architecture=architecture,
+        context_length=context_length,
+        parameter_count=parameter_count,
+        summary=summary,
+        model_card_markdown=model_card,
+        license=_card_license(getattr(info, "card_data", None), tags),
+        pipeline_tag=pipeline if isinstance(pipeline, str) else None,
+        tags=tags[:64],
+        last_modified=last_modified_value,
+    )
+
+
 def search_models(
     query: str,
     *,
@@ -393,8 +611,6 @@ def search_models(
     """Search only the portion of the Hub that the selected engine can use."""
 
     normalized = query.strip().casefold()
-    if engine == EngineName.LMSTUDIO:
-        return []
     if engine == EngineName.LLAMA_CPP:
         api = HfApi(token=token or _hf_token())
         raw_models: Iterable[Any] = api.list_models(
@@ -494,6 +710,7 @@ def validate_install_candidate(
     repo_id: str,
     filename: str | None,
     projector_filename: str | None = None,
+    include_projector: bool = True,
     revision: str | None = None,
     token: str | None = None,
 ) -> LibraryModel:
@@ -521,19 +738,39 @@ def validate_install_candidate(
         candidate = next((item for item in candidates if item.filename == filename), None)
         if candidate is None:
             raise ValueError("the selected GGUF file is not an installable primary model")
-        if projector_filename is not None:
-            if projector_filename not in candidate.projector_options:
+        selected_projector = projector_filename
+        if include_projector and selected_projector is None:
+            selected_projector = candidate.projector_filename
+        if not include_projector and projector_filename is not None:
+            raise ValueError(
+                "a projector filename cannot be supplied when vision is disabled"
+            )
+        if selected_projector is not None:
+            if selected_projector not in candidate.projector_options:
                 raise ValueError(
                     "the selected projector is not published beside that GGUF model"
                 )
-            files = tuple((*candidate.download_files, projector_filename))
-            candidate = LibraryModel(
-                **{
-                    **candidate.to_dict(),
-                    "projector_filename": projector_filename,
-                    "download_files": files,
-                }
+            files = tuple((*candidate.download_files, selected_projector))
+            candidate = replace(
+                candidate,
+                projector_filename=selected_projector,
+                download_files=files,
             )
+        else:
+            candidate = replace(candidate, projector_filename=None)
+        details = model_details(
+            repo_id,
+            engine=engine,
+            filename=filename,
+            revision=candidate.resolved_revision or revision,
+            token=token,
+        )
+        candidate = replace(
+            candidate,
+            architecture=details.architecture,
+            context_length=details.context_length,
+            parameter_count=details.parameter_count,
+        )
         return candidate
     if engine != EngineName.OMLX:
         raise ValueError(f"{engine.value} downloads are limited to verified models")
@@ -667,8 +904,10 @@ def gguf_files(
             for value in projectors
             if value.rpartition("/")[0] == directory
         )
-        # Pairing is always explicit. A nearby file named mmproj is a useful
-        # option, but filename proximity alone is not proof of compatibility.
+        selected_projector = recommended_projector(
+            nearby_projectors,
+            name=lambda value: value.rsplit("/", 1)[-1],
+        )
         download_files = group
         results.append(
             LibraryModel(
@@ -684,7 +923,7 @@ def gguf_files(
                 size_bytes=sum(sizes[name] for name in download_files),
                 quantization=_gguf_quantization(filename),
                 filename=filename,
-                projector_filename=None,
+                projector_filename=selected_projector,
                 projector_options=nearby_projectors,
                 download_files=tuple(download_files),
                 resolved_revision=(
@@ -706,6 +945,11 @@ def _hf_token() -> str | None:
 
 def _optional_int(value: Any) -> int | None:
     return int(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
+def _bounded_context(value: Any) -> int | None:
+    parsed = _optional_int(value)
+    return parsed if parsed is not None and 0 < parsed <= 10_000_000 else None
 
 
 def _suggested_role(
@@ -746,8 +990,10 @@ def _quantization(repo_id: str, tags: set[str]) -> str | None:
 
 __all__ = [
     "LibraryModel",
+    "LibraryModelDetails",
     "download_size",
     "image_profile_defaults",
+    "model_details",
     "gguf_files",
     "recommended_models",
     "search_models",

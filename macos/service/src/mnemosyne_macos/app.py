@@ -10,7 +10,6 @@ import json
 import logging
 import os
 from pathlib import Path
-import re
 import time
 from typing import Any, Mapping
 
@@ -19,10 +18,10 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
-from .config import MacConfig
+from . import __version__
+from .config import MacConfig, suggested_model_alias
 from .coordinator import CoordinatorError, QueueTimeout
-from .engines.base import AdapterError, Deadline
-from .engines.lmstudio import LMStudioAdapter
+from .engines.base import AdapterError
 from .filesystem import FilesystemProbeError
 from .image_api import ImageRequestError, normalize_image_request
 from .local_models import LocalModelError
@@ -31,6 +30,7 @@ from .model_library import (
     download_size,
     gguf_files,
     image_profile_defaults,
+    model_details,
     recommended_models,
     search_models,
     validate_install_candidate,
@@ -69,9 +69,22 @@ class LoadRequest(BaseModel):
     model: str
 
 
+class ModelSelfTestRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    model: str
+    include_vision: bool = True
+    unload_after: bool = False
+
+
 class SaveConfigurationRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     config: dict[str, Any]
+    revision: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+
+
+class DeleteManagedModelRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     revision: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
 
 
@@ -85,6 +98,7 @@ class InstallModelRequest(BaseModel):
     revision: str | None = None
     filename: str | None = None
     projector_filename: str | None = None
+    include_projector: bool = True
     capabilities: set[Endpoint] | None = None
 
 
@@ -160,6 +174,7 @@ class LocalModelImportSelection(BaseModel):
     candidate_id: str
     alias: str | None = None
     projector_id: str | None = None
+    include_projector: bool = True
 
 
 class LocalModelImportRequest(BaseModel):
@@ -371,6 +386,7 @@ def create_inference_app(runtime: NativeRuntime) -> FastAPI:
         status = await runtime.status()
         return {
             "status": "ok" if status["state"] in {"idle", "ready"} else "degraded",
+            "version": __version__,
             "state": status["state"],
             "model_loaded": status["resident_alias"] is not None,
         }
@@ -599,6 +615,10 @@ def create_control_app(runtime: NativeRuntime) -> FastAPI:
     async def status() -> dict:
         return await runtime.status()
 
+    @app.get("/manager/readiness")
+    async def readiness() -> dict:
+        return await runtime.readiness()
+
     @app.get("/manager/models")
     async def models() -> dict:
         status_value = await runtime.coordinator.status()
@@ -607,18 +627,25 @@ def create_control_app(runtime: NativeRuntime) -> FastAPI:
             "resident_alias": status_value.resident_alias,
         }
 
-    @app.get("/manager/engines/lmstudio/models")
-    async def lmstudio_models() -> dict:
-        adapter = runtime.adapters.get(EngineName.LMSTUDIO)
-        if not isinstance(adapter, LMStudioAdapter):
-            raise HTTPException(409, "LM Studio is not enabled")
+    @app.delete("/manager/models/{alias}")
+    async def delete_managed_model(
+        alias: str,
+        payload: DeleteManagedModelRequest,
+    ) -> dict:
         try:
-            models = await adapter.inventory(
-                deadline=Deadline.after(
-                    runtime.config.engines.lmstudio.request_timeout_seconds
-                )
+            config, revision, deleted_files = await runtime.delete_managed_model(
+                alias,
+                expected_revision=payload.revision,
             )
-            return {"models": models}
+            return {
+                "saved": True,
+                "applied": True,
+                "restart_required": False,
+                "model_count": len(config.models),
+                "revision": revision,
+                "config": config.model_dump(mode="json"),
+                "deleted_files": deleted_files,
+            }
         except Exception as exc:
             raise HTTPException(_error_status(exc), str(exc)) from exc
 
@@ -714,10 +741,6 @@ def create_control_app(runtime: NativeRuntime) -> FastAPI:
                         profile
                         for profile in runtime.config.models
                         if (
-                            profile.engine == EngineName.LMSTUDIO
-                            and profile.model == candidate.source_key
-                        )
-                        or (
                             profile.engine == EngineName.LLAMA_CPP
                             and _lexical_path(profile.model)
                             == _lexical_path(candidate.model_path)
@@ -730,11 +753,22 @@ def create_control_app(runtime: NativeRuntime) -> FastAPI:
                     ),
                     None,
                 )
-                value["existing_alias"] = existing.alias if existing else None
-                value["already_imported"] = bool(
-                    existing is not None
-                    and existing.engine.value == candidate.engine
+                legacy = next(
+                    (
+                        profile
+                        for profile in runtime.config.migration.legacy_lmstudio_profiles
+                        if profile.model == candidate.source_key
+                    ),
+                    None,
                 )
+                value["existing_alias"] = (
+                    existing.alias
+                    if existing is not None
+                    else legacy.alias
+                    if legacy is not None
+                    else None
+                )
+                value["already_imported"] = existing is not None
                 rows.append(value)
             return {
                 "schema_version": 1,
@@ -771,11 +805,6 @@ def create_control_app(runtime: NativeRuntime) -> FastAPI:
         q: str = Query(default="", max_length=200),
         limit: int = Query(default=20, ge=1, le=50),
     ) -> dict:
-        if engine == EngineName.LMSTUDIO:
-            raise HTTPException(
-                400,
-                "LM Studio downloads stay in LM Studio; use its discovered-model inventory",
-            )
         try:
             models = await asyncio.to_thread(
                 search_models,
@@ -805,12 +834,43 @@ def create_control_app(runtime: NativeRuntime) -> FastAPI:
         except Exception as exc:
             raise HTTPException(502, f"Hugging Face file discovery failed: {exc}") from exc
 
+    @app.get("/manager/model-library/details")
+    async def library_details(
+        engine: EngineName,
+        repo_id: str = Query(..., min_length=3, max_length=300),
+        filename: str | None = Query(default=None, max_length=500),
+        revision: str | None = Query(default=None, max_length=200),
+    ) -> dict:
+        try:
+            details = await asyncio.to_thread(
+                model_details,
+                repo_id,
+                engine=engine,
+                filename=filename,
+                revision=revision,
+            )
+            return details.to_dict()
+        except Exception as exc:
+            raise HTTPException(
+                502,
+                f"Hugging Face model details failed: {exc}",
+            ) from exc
+
     @app.get("/manager/model-library/installs")
     async def library_installs(
         limit: int = Query(default=100, ge=1, le=500),
     ) -> dict:
         records = await runtime.installer.list(limit=limit)
         return {"installs": [record.to_dict() for record in records]}
+
+    @app.get("/manager/model-library/install-evidence")
+    async def library_install_evidence(
+        limit: int = Query(default=100, ge=1, le=500),
+    ) -> dict:
+        return {
+            "schema_version": 1,
+            "installs": await runtime.installer.evidence(limit=limit),
+        }
 
     @app.get("/manager/model-library/installs/{install_id}")
     async def library_install(install_id: str) -> dict:
@@ -821,11 +881,6 @@ def create_control_app(runtime: NativeRuntime) -> FastAPI:
 
     @app.post("/manager/model-library/installs", status_code=202)
     async def library_install_start(payload: InstallModelRequest) -> dict:
-        if payload.engine == EngineName.LMSTUDIO:
-            raise HTTPException(
-                400,
-                "LM Studio models must be downloaded and managed by LM Studio",
-            )
         try:
             candidate = await asyncio.to_thread(
                 validate_install_candidate,
@@ -833,6 +888,7 @@ def create_control_app(runtime: NativeRuntime) -> FastAPI:
                 repo_id=payload.repo_id,
                 filename=payload.filename,
                 projector_filename=payload.projector_filename,
+                include_projector=payload.include_projector,
                 revision=payload.revision,
             )
             capabilities = _validated_install_capabilities(
@@ -904,7 +960,9 @@ def create_control_app(runtime: NativeRuntime) -> FastAPI:
             elif payload.engine == EngineName.LLAMA_CPP:
                 if not candidate.filename:
                     raise ValueError("select an exact GGUF file")
-                load: dict[str, str] = {}
+                load: dict[str, Any] = {}
+                if candidate.context_length is not None:
+                    load["context_length"] = candidate.context_length
                 if candidate.projector_filename:
                     load["projector_path"] = str(
                         destination / candidate.projector_filename
@@ -934,6 +992,7 @@ def create_control_app(runtime: NativeRuntime) -> FastAPI:
                 revision=candidate.resolved_revision or payload.revision,
                 filename=payload.filename,
                 projector_filename=candidate.projector_filename,
+                context_length=candidate.context_length,
                 download_files=candidate.download_files,
                 capabilities=tuple(
                     sorted(endpoint.value for endpoint in capabilities)
@@ -960,6 +1019,20 @@ def create_control_app(runtime: NativeRuntime) -> FastAPI:
     async def library_install_retry(install_id: str) -> dict:
         try:
             return (await runtime.installer.retry(install_id)).to_dict()
+        except KeyError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+
+    @app.delete(
+        "/manager/model-library/installs/{install_id}",
+        status_code=204,
+        response_class=Response,
+    )
+    async def library_install_dismiss(install_id: str) -> Response:
+        try:
+            await runtime.installer.dismiss(install_id)
+            return Response(status_code=204)
         except KeyError as exc:
             raise HTTPException(404, str(exc)) from exc
         except ValueError as exc:
@@ -1004,6 +1077,17 @@ def create_control_app(runtime: NativeRuntime) -> FastAPI:
         except Exception as exc:
             raise HTTPException(_error_status(exc), str(exc)) from exc
 
+    @app.post("/manager/self-test")
+    async def self_test(payload: ModelSelfTestRequest) -> dict:
+        try:
+            return await runtime.self_test(
+                payload.model,
+                include_vision=payload.include_vision,
+                unload_after=payload.unload_after,
+            )
+        except Exception as exc:
+            raise HTTPException(_error_status(exc), str(exc)) from exc
+
     @app.post("/manager/reload")
     async def reload_config() -> dict:
         try:
@@ -1023,6 +1107,13 @@ def create_control_app(runtime: NativeRuntime) -> FastAPI:
     async def check_runtime_updates() -> dict:
         try:
             return await runtime.check_runtime_updates(refresh=True)
+        except Exception as exc:
+            raise HTTPException(_error_status(exc), str(exc)) from exc
+
+    @app.get("/manager/runtime-updates/evidence")
+    async def runtime_update_evidence() -> dict:
+        try:
+            return await runtime.runtime_update_evidence()
         except Exception as exc:
             raise HTTPException(_error_status(exc), str(exc)) from exc
 
@@ -1089,8 +1180,7 @@ def create_control_app(runtime: NativeRuntime) -> FastAPI:
 
 
 def _available_alias(name: str, existing: set[str]) -> str:
-    base = re.sub(r"[^a-z0-9]+", "-", name.casefold()).strip("-") or "model"
-    base = base[:64].rstrip("-") or "model"
+    base = suggested_model_alias(name)
     candidate = base
     number = 2
     while candidate in existing:

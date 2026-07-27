@@ -1,6 +1,6 @@
 # Mnemosyne Inference — Project Status
 
-**Last updated:** 2026-07-23
+**Last updated:** 2026-07-26
 
 ## Current state
 
@@ -22,15 +22,23 @@ validation of the current pins and end-to-end backend swaps; see
 
 An isolated native macOS track is implemented, with frontier text-engine,
 protected-storage, and migration-soak acceptance still pending. It lives
-entirely below `macos/`, uses dedicated ports `17320-17325`, and does not alter
+entirely below `macos/`, replaces the previous sidecar on `1240`, uses
+`17321-17325` for control and inner engines, and does not alter
 the CUDA image or its `8000-8002` topology. The first implementation includes:
 
 - a separately locked FastAPI service with inference and control planes;
 - a FIFO, epoch-lease coordinator that drains streams and verifies strict
   single-model residency across manager-owned llama.cpp/DS4/MFLUX and external oMLX;
 - official-source managed llama.cpp plus native oMLX lifecycle integration and
-  manager-owned DS4/MFLUX subprocesses; the LM Studio adapter is now disabled
-  by default and retained only for migration soak;
+  manager-owned DS4/MFLUX subprocesses; LM Studio engine, credential, and
+  inventory support has been removed, leaving only read-only model-directory
+  migration hints;
+- packaged MFLUX discovery, installation, smoke checks, and worker launch retain
+  the relocatable image interpreter's required `PYTHONHOME` only when that
+  exact bundled interpreter is selected, while continuing to strip inherited
+  Python paths from external runtimes;
+- fresh native configuration starts with an empty model catalog so profiles
+  come only from Model Library downloads or Finder-confirmed exact locations;
 - OpenAI/Responses/Anthropic usage normalization plus an atomic SQLite
   analytics/Postgres-outbox path;
 - a per-user LaunchAgent bundle, native Python bootstrap, and explicit AppKit
@@ -38,8 +46,9 @@ the CUDA image or its `8000-8002` topology. The first implementation includes:
 - a structured native settings window for server, engine, exact GUI-selected
   model storage, Hugging Face discovery/downloads, model, usage, and write-only
   credential settings, including Finder-driven in-place GGUF/MLX discovery,
-  LM Studio settings/default-folder hints that work with its engine stopped,
-  explicit quant/projector selection, and alias-preserving migration;
+  LM Studio settings/default-folder hints that never contact its engine,
+  model-card and GGUF/config metadata, exact quant selection, automatic vision
+  projector selection with opt-out, and alias-preserving migration;
 - receiver-owned durable Finder bookmarks stored privately across LaunchAgent
   restarts and scoped child `exec`, with bounded killable receipt/reactivation,
   configuration-save preflight, startup revalidation/pruning, only SHA-256
@@ -51,8 +60,32 @@ the CUDA image or its `8000-8002` topology. The first implementation includes:
 - process-isolated, durable, cancellable native downloads with DS4/MFLUX
   verified recommendations, exact llama.cpp GGUF shard/projector downloads,
   oMLX compatibility signals, nested external-folder support, containing-volume
-  UUID validation, and residency-neutral profile creation; and
+  UUID validation, live byte/percentage/speed progress, dismissible completed
+  history, a compact persistent transition journal for target-Mac lifecycle
+  evidence, residency-neutral profile creation, and exact manager-owned
+  directory deletion behind the global empty-residency barrier;
+- a bounded private managed-runtime lifecycle journal that distinguishes
+  service instances and proves activation, post-restart inference, rollback,
+  post-rollback inference, and fixed-code corrupt-runtime rejection without
+  retaining exception text; and
 - independent setup, architecture, and Apple Silicon smoke documentation.
+
+The native product is now a 0.9.0 release candidate with one enforced version,
+a guided Setup & Health flow, bounded secret-redacted readiness, real public
+listener self-tests with durable usage verification, Stable/Preview engine
+tiers, Sparkle integration, and separate CI/signed-release workflows. The
+Python schema, packaged YAML, and Swift defaults now agree: llama.cpp is
+enabled, external oMLX remains off until configured, and Preview DS4/MFLUX are
+opt-in. The build-47 private DMG was rejected after installation because dyld
+could not resolve its packaged Sparkle framework. Corrected build 50 adds the
+`Contents/Frameworks` rpath and is independently verified against the
+dependency, embedded framework, and load command
+(`Unified-Inference-0.9.0-macos-arm64.dmg`, SHA-256
+`c830fafaf08650eef055a7bdcff296481ff900ce2b329f6874c171ff884837ad`).
+The previous hash must not be used. Build 50 is still not the Developer
+ID-notarized V1 release. The precise contract and open gates are
+[the native V1 scope](../macos/V1_SCOPE.md) and
+[acceptance ledger](../macos/acceptance/v1.json).
 
 The Python suites, Swift production build, relocatable runtime export, staged
 app signing, embedded Python bootstrap, and Krea 2 Turbo MFLUX generation have
@@ -62,20 +95,27 @@ real response with an existing 4.8 GB LFM2.5 GGUF on Theseus. The managed
 runtime then updated to official b10099, served a real request, rolled back to
 b10091, and served again. An external official oMLX 0.5.3 service generated
 from an existing LFM2 1B MLX model and its usage drained to the central ledger
-under `theseus`. The Developer ID-signed packaged service is installed on
-Theseus and its direct `Contents/MacOS/mnemosyne-service-bootstrap`
-LaunchAgent is running successfully through `SMAppService`.
+under `theseus`. An earlier Developer ID-signed packaged service was installed
+on Theseus and proved the direct
+`Contents/MacOS/mnemosyne-service-bootstrap` LaunchAgent through
+`SMAppService`; that historical smoke does not clear the current candidate's
+signing, notarization, clean-install, or update gates.
 
-The explicitly enabled LM Studio migration bridge has also passed a live
-Theseus fallback check against the existing `:1234` server. Its native
-inventory exposed all 13 downloaded models without loading them (eight GGUF,
-five MLX, including one embedding model). Representative existing language
-and embedding profiles then passed non-streaming, streaming-with-usage,
-768-dimensional embeddings, same-engine swap, repeat load, and explicit
-unload through Unified Inference. The previous `:1240` sidecar remained
-healthy and served the already-resident language model, while Unified
-Inference recorded its own calls under backend `lmstudio` and drained the
-central-reporting outbox. No weights were downloaded or copied for this check.
+The former LM Studio migration bridge passed a historical Theseus fallback
+check before removal. The production design no longer contacts that server:
+schema-version-1 LM Studio profiles become inert migration records, and only
+Finder-confirmed adoption into llama.cpp or oMLX can make them callable.
+
+The native handoff is live on Theseus using an installed bundle that predates
+the current 0.9.0 candidate. The previous
+`com.athena.token-sidecar` job is unloaded, Unified Inference owns the public
+loopback API on `:1240`, and the unchanged TheseusInsight client successfully
+returned content through both `lfm2.5-8b-a1b` and
+`gemma-4-26b-a4b-qat`. Imported GGUF aliases no longer expose a `-gguf`
+format suffix, central reporting is healthy under node `theseus`, and the
+historical Developer ID-signed menu app is installed in `/Applications`. The unavailable
+external oMLX service and its profiles are disabled on this host; oMLX is also
+disabled in fresh defaults until its separately installed service is running.
 The registered background service also passed a direct restart check while
 idle: `launchctl` advanced from run 2/PID 87693 to run 3/PID 94187, both native
 HTTP planes returned, `/health` reported `ok`, residency remained empty, and
@@ -84,14 +124,33 @@ restart, the existing `lfm2-1b-mlx` alias streamed `restart-ok` through the
 native proxy with 17 prompt and 4 completion tokens, flushed one usage row,
 then explicitly unloaded; the coordinator and authoritative oMLX inventory
 both returned empty.
-GUI Finder-confirmed migration, durable oMLX login startup, login-cycle
-validation, and the LM Studio-disabled soak remain in progress.
-The native service and package-layout suites pass all 268 tests on the target
-host (the two
-real-bookmark tests skip in restricted runners), and the isolated MFLUX worker
-passes 23 tests with real Metal
-access. All 50 Swift tests and the Swift production build pass on this
-workstation. Real DS4 model loading, cancellation-driven Metal release,
+GUI Finder-confirmed migration, durable oMLX login startup, and login-cycle
+validation remain in progress. The secret-redacted acceptance collector now
+has opt-in exact-label restart and KeepAlive exercises plus strict
+protected-model, oMLX recovery, LM Studio-directory adoption, Postgres drain,
+durable download-lifecycle, candidate-scoped guided-setup, and real
+login-session checks. Guided setup requires this exact version/build to record
+first presentation before durable self-test completion. Login recovery
+requires a private accepted same-host/build baseline and a changed GUI audit
+session plus PID; an ordinary restart cannot pass. Those checks do not clear a
+gate until the candidate actually produces the required state transitions.
+Managed runtime acceptance now has the same durable treatment: the strict
+collector requires an ordered update/restart/rollback/restart/rejection chain
+and confirms the original managed version remains active.
+The current native service suite passes all 280 tests on the development Mac,
+including the two real-bookmark tests that skip in restricted runners. The
+isolated MFLUX worker passes 23 tests with
+real Metal access, the packaging suite passes 33 tests, and all 60 current
+Swift tests pass. The full relocatable build reports version 0.9.0 and its
+embedded service passes configuration validation without adding bytecode to or
+invalidating the signed app. GitHub Actions macOS CI run
+[30265133377](https://github.com/M-Chimiste/mnemosyne-inference/actions/runs/30265133377)
+passed the complete native matrix for implementation commit `8fd50e9`,
+including staged bare-app and acceptance-report verification. The DMG also
+passes image verification, read-only
+mount/layout inspection, and deep signature verification from the mounted
+copy. Real DS4 model loading,
+cancellation-driven Metal release,
 protected-folder bookmark transfer/restart/child-`exec`, and packaged
 `SMAppService` KeepAlive/login behavior remain target-Mac smoke gates;
 see
@@ -112,7 +171,7 @@ see
 | 8 — Verification & hardening | Automated coverage and workstation acceptance | ⚠️ Code/docs landed; workstation acceptance pending |
 | 9 — llama.cpp backend for GGUF | Auto-detected llama-server dispatch alongside vLLM | ⚠️ Code landed; CUDA workstation smoke pending |
 | 10 — Local image generation | Unified Images API via CUDA SGLang Diffusion and macOS MFLUX | ⚠️ Mac Krea 2 smoke passed; CUDA model smoke pending |
-| 11 — Native GGUF migration | Replace the Mac LM Studio dependency with managed llama.cpp and adopt existing libraries in place | ⚠️ Service/runtime, direct GGUF, signed-package, live LaunchAgent, and legacy LM Studio fallback smoke passed; GUI import, durability, and disabled soak pending |
+| 11 — Native GGUF migration | Replace the Mac LM Studio dependency with managed llama.cpp and adopt existing libraries in place | ⚠️ LM Studio runtime dependency removed; service/runtime, direct GGUF, historical signed-package, and live LaunchAgent smokes passed; current 0.9 candidate migration/durability/signing gates remain |
 
 ## What has landed
 
@@ -141,17 +200,20 @@ see
   `framework-mnemosyne-image` export layers plus separate service/worker
   source trees. No MLX runtime is added to Docker.
 - The native Runtime Updates page detects llama.cpp, oMLX, MFLUX, and DS4
-  versions. oMLX delegates to its official updater; llama.cpp comes from its
-  official GitHub arm64 artifact, MFLUX installs from its official PyPI project,
-  and DS4 builds from an exact official GitHub commit. Updates stage
+  versions. For oMLX it selects the official DMG matching the host macOS
+  version, detects the app, CLI shim, conventional Homebrew paths, or running
+  server, and delegates updates to oMLX. A missing oMLX runtime can instead be
+  installed through an approval-gated, argument-bounded stable Homebrew
+  action. llama.cpp comes from its official
+  GitHub arm64 artifact, MFLUX installs from its official PyPI project, and DS4
+  builds from an exact official GitHub commit. Managed updates stage
   independently, activate through the global-empty maintenance barrier, and
   retain the previous version for rollback without a repository-owned feed.
 - Unified Inference is now the native token sidecar: central reporting defaults
-  on for every language engine. While explicitly enabled for migration, the
-  legacy LM Studio adapter reaches its native `:1234` API directly rather than
-  traversing the previous sidecar. Existing machines can migrate that
+  on for every language engine. Existing machines can migrate the previous
   sidecar's canonical `node.id` and ledger DSN from its LaunchAgent; Settings
-  displays only the effective identity.
+  displays only the effective identity. LM Studio is not in the reporting or
+  request path.
 - Automated request, routing, catalog, runtime, macOS adapter, worker,
   CUDA-web-UI, and packaging checks pass. The native Swift production build
   passes; its Swift Testing target still requires full Xcode. A bundled-runtime
@@ -160,8 +222,10 @@ see
 
 **Phase 11**
 
-- Fresh native configurations disable LM Studio and enable a manager-owned
-  llama.cpp adapter on loopback `:17325`. The adapter uses the hardened
+- Native configurations contain no LM Studio engine and enable a manager-owned
+  llama.cpp adapter on loopback `:17325`. Schema-version-1 LM Studio profiles
+  are retained only as inert migration metadata until Finder adoption. The
+  adapter uses the hardened
   PID/process-group/start-identity/argv ownership proof and preserves the
   global lease-based residency invariant. Survivor records now retain storage
   root, scope ID, and volume UUID so restart validation can reconstruct the
@@ -203,39 +267,46 @@ see
   facts are read-only, and API routing is selected through typed,
   engine-constrained Generation, Embeddings, Rerank, or Image roles rather
   than raw paths and arbitrary endpoint checkboxes.
-- Hugging Face GGUF search now requires an exact quant/shard selection and an
-  explicit optional same-directory projector. Downloads persist the resolved
-  revision and exact file list before creating a llama.cpp profile. oMLX
+- Hugging Face discovery now shows bounded model-card prose and architecture,
+  context length, parameter count, and license when Hub/config/GGUF metadata
+  provides them. GGUF search requires an exact quant/shard selection and
+  automatically selects the highest-fidelity same-directory vision projector,
+  with manual selection and text-only opt-out. Detected context length and the
+  selected projector persist into the llama.cpp profile. Downloads persist the
+  resolved revision and exact file list before profile creation. oMLX
   downloads are scanned before registration and receive only metadata-derived
   generation, embeddings, or rerank capabilities. Completed weights enter a
   durable registration state, so a failed/interrupted profile write can be
-  retried without downloading the model again.
+  retried without downloading the model again. The native GUI renders
+  transferred/total bytes, percentage, progress, and smoothed transfer speed.
+  Hiding completed history preserves internal managed-download provenance;
+  explicit file deletion is restricted to that exact app-owned destination,
+  refuses roots/escapes/symlinks, and never applies to Finder imports.
 - Runtime version probes, installs, and activation helpers all use bounded
   process-group cleanup; timeout or cancellation cannot leave an updater child
   running.
-- Cross-engine migration clears LM Studio-specific wire names when an alias
-  becomes an oMLX profile. oMLX directory rescans authoritatively unload any
+- Migration consumes the inert legacy record and clears LM Studio-specific wire
+  names when an alias becomes a native profile. oMLX directory rescans
+  authoritatively unload any
   pinned models preloaded by the official reload API before the maintenance
   barrier reopens, and a maintenance drain timeout enters an explicit
   recoverable degraded state rather than silently wedging admission.
 - Missing legacy reporting identity and DSN values are atomically copied into
   Unified Inference's private `.env`, so retiring the previous token-sidecar
   LaunchAgent does not break future reporting starts.
-- The focused adapter/scanner/updater/import/security-scope coverage and the
-  full native service plus package-layout suites pass (`268 passed`), and all
-  50 Swift tests pass.
+- The native service suite passes (`278 passed, 2 skipped` plus both skipped
+  real-bookmark tests with host access), all 60 Swift tests, all 23
+  image-worker tests, and all 31 packaging tests pass, and the Swift
+  production build completes.
   A direct official-runtime LFM2.5 GGUF inference and an external oMLX LFM2 1B
-  inference both produced backend token usage on Theseus. The Developer
-  ID-signed Swift package and direct `SMAppService` helper now run successfully
-  from `/Applications`. The live LM Studio migration bridge also passed native
-  inventory, language/embedding routing, streaming usage, swap/reload, and
-  explicit unload against existing weights while the previous `:1240` sidecar
-  remained available. A direct registered-service restart also returned both
+  inference both produced backend token usage on Theseus. An earlier Developer
+  ID-signed Swift package and direct `SMAppService` helper ran successfully
+  from `/Applications`; the current 0.9 candidate still requires its own signed
+  and notarized acceptance. A direct registered-service restart also returned both
   HTTP planes with empty residency and a ready `theseus` reporting sink.
   Finder-confirmed GUI import, durable oMLX login startup, login-cycle behavior,
   DS4 model loading, real protected-folder
-  helper/restart/child-`exec` validation, and the LM Studio-disabled soak are
-  the remaining acceptance steps.
+  helper/restart/child-`exec` validation are the remaining acceptance steps.
 
 **Phase 0**
 
