@@ -8,7 +8,7 @@ struct MenuContentView: View {
     @ObservedObject var viewModel: MenuViewModel
     @ObservedObject var registration: LaunchAgentRegistration
     let openConfiguration: () -> Void
-    let checkForUpdates: () -> Void
+    let checkForUpdates: (() -> Void)?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -183,21 +183,25 @@ struct MenuContentView: View {
 
     private var actions: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Button("Refresh") {
-                Task { await viewModel.refresh() }
+            HStack {
+                Button("Refresh") {
+                    Task { await viewModel.refresh() }
+                }
+                if let checkForUpdates {
+                    Button("Check for App Updates…") {
+                        checkForUpdates()
+                    }
+                }
             }
             HStack {
-                Button("Open Logs") {
+                Button("Logs") {
                     openApplicationSupport(subdirectory: "logs")
-                }
-                Button("Check for Updates…") {
-                    checkForUpdates()
                 }
                 Button("Settings…") {
                     openConfiguration()
                 }
                 Spacer()
-                Button("Quit Menu App") {
+                Button("Quit") {
                     NSApplication.shared.terminate(nil)
                 }
             }

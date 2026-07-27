@@ -79,6 +79,12 @@ final class MenuAppDelegate: NSObject, NSApplicationDelegate {
         item.isVisible = true
         statusItem = item
 
+        let checkForUpdates: (() -> Void)? =
+            updaterController == nil
+                ? nil
+                : { [weak self] in
+                    self?.checkForUpdates()
+                }
         let controller = NSHostingController(
             rootView: MenuContentView(
                 workstationName: workstationName,
@@ -87,9 +93,7 @@ final class MenuAppDelegate: NSObject, NSApplicationDelegate {
                 openConfiguration: { [weak self] in
                     self?.configurationWindowController.show()
                 },
-                checkForUpdates: { [weak self] in
-                    self?.checkForUpdates()
-                }
+                checkForUpdates: checkForUpdates
             )
         )
         controller.sizingOptions = [.preferredContentSize]
