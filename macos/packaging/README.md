@@ -10,6 +10,10 @@ service, image worker, lock files, tag, and staged bundle must agree. Local
 ad-hoc artifacts are deliberately not distribution releases. The credentialed
 CI process, signed appcast, and recovery contract are documented in
 [release and recovery](../RELEASE.md).
+When a staged app is supplied, the verifier also inspects the menu
+executable's Mach-O dependencies and `LC_RPATH`. The bundled Sparkle framework
+must exist and resolve through `@executable_path/../Frameworks`; a valid deep
+code signature is not sufficient if dyld cannot launch the app.
 
 The native deployment has a menu controller and a long-lived background
 service plus on-demand manager-owned engine processes:

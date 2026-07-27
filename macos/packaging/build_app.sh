@@ -89,6 +89,7 @@ CONTENTS="$APP_DIR/Contents"
 RESOURCES="$CONTENTS/Resources"
 FRAMEWORKS="$CONTENTS/Frameworks"
 SERVICE_BOOTSTRAP="$CONTENTS/MacOS/mnemosyne-service-bootstrap"
+MENU_EXECUTABLE="$CONTENTS/MacOS/UnifiedInference"
 
 rm -rf "$APP_DIR" "$LEGACY_APP_DIR"
 mkdir -p \
@@ -110,7 +111,7 @@ if [[ -n "$SPARKLE_PUBLIC_ED_KEY" ]]; then
         "$CONTENTS/Info.plist"
 fi
 install -m 644 "$SCRIPT_DIR/AppIcon.icns" "$RESOURCES/AppIcon.icns"
-install -m 755 "$BIN_DIR/MnemosyneMenu" "$CONTENTS/MacOS/UnifiedInference"
+install -m 755 "$BIN_DIR/MnemosyneMenu" "$MENU_EXECUTABLE"
 install -m 755 \
     "$BIN_DIR/mnemosyne-service-bootstrap" \
     "$SERVICE_BOOTSTRAP"
@@ -119,6 +120,12 @@ if [[ ! -d "$BIN_DIR/Sparkle.framework" ]]; then
     exit 1
 fi
 ditto "$BIN_DIR/Sparkle.framework" "$FRAMEWORKS/Sparkle.framework"
+if [[ "$(/usr/bin/otool -l "$MENU_EXECUTABLE")" != \
+      *"path @executable_path/../Frameworks "* ]]; then
+    /usr/bin/install_name_tool \
+        -add_rpath "@executable_path/../Frameworks" \
+        "$MENU_EXECUTABLE"
+fi
 install -m 644 \
     "$SCRIPT_DIR/LaunchAgents/com.mnemosyne.inference.agent.plist" \
     "$CONTENTS/Library/LaunchAgents/com.mnemosyne.inference.agent.plist"
@@ -190,7 +197,7 @@ codesign \
     "${CODESIGN_ARGS[@]}" \
     --identifier com.mnemosyne.inference.service \
     "$SERVICE_BOOTSTRAP"
-codesign "${CODESIGN_ARGS[@]}" "$CONTENTS/MacOS/UnifiedInference"
+codesign "${CODESIGN_ARGS[@]}" "$MENU_EXECUTABLE"
 codesign "${CODESIGN_ARGS[@]}" "$APP_DIR"
 
 plutil -lint \

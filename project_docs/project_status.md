@@ -76,11 +76,12 @@ listener self-tests with durable usage verification, Stable/Preview engine
 tiers, Sparkle integration, and separate CI/signed-release workflows. The
 Python schema, packaged YAML, and Swift defaults now agree: llama.cpp is
 enabled, external oMLX remains off until configured, and Preview DS4/MFLUX are
-opt-in. The current private DMG is a structurally verified ad-hoc artifact
-(`Unified-Inference-0.9.0-macos-arm64.dmg`, SHA-256
-`a0c754a51efb8e67d16f5e1c335b5c4d21b777081ed17be988b5201a059a9b85`);
-its mode-`0600`, secret-redacted machine-readable acceptance report passes.
-It is not the Developer ID-notarized V1 release. The precise contract and open gates are
+opt-in. The build-47 private DMG was rejected after installation: dyld could
+not resolve its packaged Sparkle framework because the menu executable lacked
+the `Contents/Frameworks` rpath. The builder and independent acceptance
+verifier now require that runtime link, and the previous hash must not be used
+while its corrected replacement is built. It was not the Developer
+ID-notarized V1 release. The precise contract and open gates are
 [the native V1 scope](../macos/V1_SCOPE.md) and
 [acceptance ledger](../macos/acceptance/v1.json).
 
@@ -137,7 +138,7 @@ and confirms the original managed version remains active.
 The current native service suite passes all 280 tests on the development Mac,
 including the two real-bookmark tests that skip in restricted runners. The
 isolated MFLUX worker passes 23 tests with
-real Metal access, the packaging suite passes 31 tests, and all 60 current
+real Metal access, the packaging suite passes 33 tests, and all 60 current
 Swift tests pass. The full relocatable build reports version 0.9.0 and its
 embedded service passes configuration validation without adding bytecode to or
 invalidating the signed app. GitHub Actions macOS CI run

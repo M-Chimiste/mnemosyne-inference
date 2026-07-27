@@ -1,10 +1,18 @@
 from __future__ import annotations
 
 import plistlib
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from macos.packaging.verify_release import _validate_acceptance
+from macos.packaging.verify_release import (
+    APP_FRAMEWORK_RPATH,
+    SPARKLE_DEPENDENCY,
+    _validate_acceptance,
+    _validate_app_runtime_links,
+)
 
 
 PACKAGING_ROOT = Path(__file__).resolve().parents[1]
@@ -135,6 +143,68 @@ class AppLayoutTests(unittest.TestCase):
         self.assertIn("--preserve-metadata=entitlements", script)
         self.assertIn('"$SPARKLE_VERSION/Updater.app"', script)
         self.assertIn('codesign "${CODESIGN_ARGS[@]}" "$SPARKLE_FRAMEWORK"', script)
+        self.assertIn(
+            '-add_rpath "@executable_path/../Frameworks"',
+            script,
+        )
+
+    def test_release_verifier_requires_resolvable_packaged_sparkle(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            app = Path(directory) / "Unified Inference.app"
+            executable = app / "Contents" / "MacOS" / "UnifiedInference"
+            sparkle = (
+                app
+                / "Contents"
+                / "Frameworks"
+                / "Sparkle.framework"
+                / "Versions"
+                / "B"
+                / "Sparkle"
+            )
+            executable.parent.mkdir(parents=True)
+            sparkle.parent.mkdir(parents=True)
+            executable.touch()
+            sparkle.touch()
+            valid = [
+                subprocess.CompletedProcess(
+                    args=[],
+                    returncode=0,
+                    stdout=f"{SPARKLE_DEPENDENCY}\\n",
+                    stderr="",
+                ),
+                subprocess.CompletedProcess(
+                    args=[],
+                    returncode=0,
+                    stdout=f"path {APP_FRAMEWORK_RPATH} (offset 12)\\n",
+                    stderr="",
+                ),
+            ]
+            with patch(
+                "macos.packaging.verify_release.subprocess.run",
+                side_effect=valid,
+            ):
+                _validate_app_runtime_links(app)
+
+            missing_rpath = [
+                valid[0],
+                subprocess.CompletedProcess(
+                    args=[],
+                    returncode=0,
+                    stdout="path @loader_path (offset 12)\\n",
+                    stderr="",
+                ),
+            ]
+            with (
+                patch(
+                    "macos.packaging.verify_release.subprocess.run",
+                    side_effect=missing_rpath,
+                ),
+                self.assertRaisesRegex(
+                    ValueError,
+                    "cannot resolve Sparkle",
+                ),
+            ):
+                _validate_app_runtime_links(app)
 
     def test_dmg_builder_verifies_drag_install_layout(self) -> None:
         script = DMG_BUILD_SCRIPT.read_text(encoding="utf-8")

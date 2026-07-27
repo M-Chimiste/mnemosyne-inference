@@ -8,6 +8,7 @@ import json
 import plistlib
 from pathlib import Path
 import re
+import subprocess
 import sys
 
 
@@ -28,6 +29,8 @@ WORKER_INIT = (
     / "__init__.py"
 )
 VERSION_PATTERN = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
+SPARKLE_DEPENDENCY = "@rpath/Sparkle.framework/Versions/B/Sparkle"
+APP_FRAMEWORK_RPATH = "@executable_path/../Frameworks"
 
 
 def _project_version(path: Path) -> str:
@@ -106,6 +109,49 @@ def _validate_acceptance(payload: dict, expected: str) -> None:
         raise ValueError(f"V1 acceptance is not complete: {details}")
 
 
+def _mach_o_output(*arguments: str) -> str:
+    result = subprocess.run(
+        arguments,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        diagnostic = (result.stderr or result.stdout).strip()
+        raise ValueError(
+            f"{' '.join(arguments)} failed: {diagnostic or result.returncode}"
+        )
+    return result.stdout
+
+
+def _validate_app_runtime_links(app: Path) -> None:
+    executable = app / "Contents" / "MacOS" / "UnifiedInference"
+    sparkle = (
+        app
+        / "Contents"
+        / "Frameworks"
+        / "Sparkle.framework"
+        / "Versions"
+        / "B"
+        / "Sparkle"
+    )
+    if not executable.is_file():
+        raise ValueError(f"{executable} is missing")
+    if not sparkle.is_file():
+        raise ValueError(f"{sparkle} is missing")
+
+    dependencies = _mach_o_output("/usr/bin/otool", "-L", str(executable))
+    load_commands = _mach_o_output("/usr/bin/otool", "-l", str(executable))
+    if SPARKLE_DEPENDENCY not in dependencies:
+        raise ValueError(
+            f"{executable} does not link the packaged Sparkle framework"
+        )
+    if f"path {APP_FRAMEWORK_RPATH} " not in load_commands:
+        raise ValueError(
+            f"{executable} cannot resolve Sparkle from Contents/Frameworks"
+        )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -144,6 +190,7 @@ def main() -> int:
         versions["staged app"] = _plist_version(
             args.app / "Contents" / "Info.plist"
         )
+        _validate_app_runtime_links(args.app)
     mismatches = {
         source: version
         for source, version in versions.items()

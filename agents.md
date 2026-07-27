@@ -252,6 +252,11 @@ The live `docker-compose.yml` is intentionally machine-specific and may live out
   `CODESIGN_IDENTITY` for a stable signing identity. Do not imply
   durable protected-folder grants survive arbitrary ad-hoc rebuilds; after a
   code-identity change, the user may need to reselect the folder.
+  Every non-system dynamic framework copied into `Contents/Frameworks` must
+  have a matching bundle-relative executable rpath. Release verification must
+  inspect both the dependency and `LC_RPATH`; deep code-signature validation
+  alone does not prove that the app can reach
+  `applicationDidFinishLaunching`.
 - Mac usage events normalize OpenAI, Responses, and Anthropic token shapes and atomically write local analytics plus the SQLite Postgres outbox. The central schema and retry/idempotency behavior match the CUDA deployment.
 - Image requests intentionally do not emit token-usage records. Do not add image prompt/output policy hooks; this repository is a local homelab tool.
 

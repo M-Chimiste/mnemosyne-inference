@@ -203,6 +203,38 @@ def _helper_identifier(helper: Path) -> str | None:
     return found.group(1).strip() if found else None
 
 
+def _app_runtime_links(app: Path) -> dict[str, Any]:
+    executable = app / "Contents" / "MacOS" / "UnifiedInference"
+    sparkle = (
+        app
+        / "Contents"
+        / "Frameworks"
+        / "Sparkle.framework"
+        / "Versions"
+        / "B"
+        / "Sparkle"
+    )
+    dependencies = _run(["/usr/bin/otool", "-L", str(executable)])
+    load_commands = _run(["/usr/bin/otool", "-l", str(executable)])
+    checks = {
+        "sparkle_binary_present": sparkle.is_file(),
+        "sparkle_dependency_present": bool(
+            dependencies.get("ok")
+            and "@rpath/Sparkle.framework/Versions/B/Sparkle"
+            in str(dependencies.get("diagnostic") or "")
+        ),
+        "framework_rpath_present": bool(
+            load_commands.get("ok")
+            and "path @executable_path/../Frameworks "
+            in str(load_commands.get("diagnostic") or "")
+        ),
+    }
+    return {
+        "checks": checks,
+        "accepted": all(checks.values()),
+    }
+
+
 def _packaged_engine_defaults(path: Path) -> dict[str, bool | None]:
     if not path.is_file():
         return {engine: None for engine in ENGINE_DEFAULTS}
@@ -266,6 +298,7 @@ def collect_app(
     feed = info.get("SUFeedURL")
     sparkle_key_present = bool(info.get("SUPublicEDKey"))
     helper_identifier = _helper_identifier(helper)
+    runtime_links = _app_runtime_links(app)
     developer_id = any(
         authority.startswith("Developer ID Application:")
         for authority in signing["authorities"]
@@ -309,6 +342,7 @@ def collect_app(
             "signing": signing,
             "helper_identifier": helper_identifier,
             "runtime_embedded": runtime_embedded,
+            "runtime_links": runtime_links,
             "bare_bundle_allowed": allow_bare,
             "bytecode_entries": bytecode[:20],
             "bytecode_entry_count": len(bytecode),
@@ -329,6 +363,7 @@ def collect_app(
             signature["ok"],
             helper_identifier == "com.mnemosyne.inference.service",
             runtime_embedded or allow_bare,
+            runtime_links["accepted"],
             not bytecode,
             defaults == ENGINE_DEFAULTS,
             distribution_checks is None or distribution_checks["accepted"],

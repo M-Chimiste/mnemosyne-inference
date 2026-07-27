@@ -11,8 +11,9 @@
     "bytes": 309954038,
     "signature": "ad-hoc",
     "notarized": false,
+    "launchable": false,
     "acceptance_report": "Unified-Inference-0.9.0-macos-arm64-acceptance.json",
-    "verification": "Build 47 from implementation commit 306f4ed was mounted read-only with the Applications shortcut; the embedded app passed deep strict code-signature verification after its embedded import/configuration smoke, contains zero Python bytecode entries, and its mode-0600 secret-redacted machine-readable artifact report is accepted."
+    "verification": "REJECTED after installation: build 47 crashes in dyld before applicationDidFinishLaunching because @rpath/Sparkle.framework had no Contents/Frameworks LC_RPATH. The earlier signature and artifact report did not test runtime dependency resolution. Do not use this artifact; a corrected replacement is pending."
   },
   "tiers": {
     "stable": ["core", "llama.cpp", "omlx"],
@@ -23,7 +24,7 @@
       "id": "automated-native-suites",
       "required": true,
       "status": "passed",
-      "evidence": "Local Apple Silicon run: service 280 passed (278 in the restricted suite plus both real-bookmark tests with host access); image worker 23 passed with Metal access; Swift 60 passed; packaging 31 passed; version and locked-runtime checks passed. The artifact acceptance collector passes the complete staged app and DMG."
+      "evidence": "Local Apple Silicon run: service 280 passed (278 in the restricted suite plus both real-bookmark tests with host access); image worker 23 passed with Metal access; Swift 60 passed; packaging 33 passed; version and locked-runtime checks passed. Runtime-link verification now rejects the launch-dead build-47 app that the earlier signature-only checks accepted."
     },
     {
       "id": "github-macos-ci",
@@ -95,7 +96,7 @@
       "id": "developer-id-notarized-dmg",
       "required": true,
       "status": "pending",
-      "evidence": "The 309,954,038-byte 0.9.0 build-47 arm64 ad-hoc DMG from implementation commit 306f4ed (SHA-256 a0c754a51efb8e67d16f5e1c335b5c4d21b777081ed17be988b5201a059a9b85) builds, mounts read-only, contains zero Python bytecode entries, and passes its mode-0600 paired machine-readable acceptance report, but it is not a distribution artifact. The credentialed release workflow exists; Apple signing/notarization and Sparkle private-key credentials are not available in this checkout."
+      "evidence": "Build 47 was rejected after a real installation exposed a missing Contents/Frameworks LC_RPATH for Sparkle. The builder now adds the bundle-relative rpath and release/artifact verification checks both the dependency and load command. A corrected ad-hoc DMG is pending; Apple signing/notarization and Sparkle private-key credentials remain unavailable in this checkout."
     },
     {
       "id": "signed-update-and-recovery",

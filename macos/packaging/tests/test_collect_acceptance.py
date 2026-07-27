@@ -10,6 +10,7 @@ import unittest
 from unittest.mock import patch
 
 from macos.packaging.collect_acceptance import (
+    _app_runtime_links,
     _download_lifecycle_summary,
     _exercise_launch_agent,
     _guided_setup_summary,
@@ -30,6 +31,51 @@ from macos.packaging.collect_acceptance import (
 
 
 class AcceptanceEvidenceTests(unittest.TestCase):
+    def test_app_runtime_links_require_packaged_sparkle_and_bundle_rpath(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            app = Path(directory) / "Unified Inference.app"
+            executable = app / "Contents" / "MacOS" / "UnifiedInference"
+            sparkle = (
+                app
+                / "Contents"
+                / "Frameworks"
+                / "Sparkle.framework"
+                / "Versions"
+                / "B"
+                / "Sparkle"
+            )
+            executable.parent.mkdir(parents=True)
+            sparkle.parent.mkdir(parents=True)
+            executable.touch()
+            sparkle.touch()
+            with patch(
+                "macos.packaging.collect_acceptance._run",
+                side_effect=[
+                    {
+                        "ok": True,
+                        "diagnostic": (
+                            "@rpath/Sparkle.framework/Versions/B/Sparkle"
+                        ),
+                    },
+                    {
+                        "ok": True,
+                        "diagnostic": (
+                            "path @executable_path/../Frameworks (offset 12)"
+                        ),
+                    },
+                ],
+            ):
+                self.assertTrue(_app_runtime_links(app)["accepted"])
+
+            sparkle.unlink()
+            with patch(
+                "macos.packaging.collect_acceptance._run",
+                return_value={"ok": True, "diagnostic": ""},
+            ):
+                self.assertFalse(_app_runtime_links(app)["accepted"])
+
     def test_redaction_preserves_usage_metrics_and_removes_credentials(self) -> None:
         payload = {
             "prompt_tokens": 12,

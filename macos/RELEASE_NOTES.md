@@ -31,6 +31,9 @@ read-only discovery hint.
 - The production pipeline supports signed Sparkle updates, enforces one
   version, and refuses release without Developer ID signing and notarization.
   Private ad-hoc candidates keep application updates disabled.
+  Packaged Sparkle now has an explicit `Contents/Frameworks` executable rpath,
+  and both release verification and artifact acceptance reject an app whose
+  dynamic framework dependency cannot resolve at launch.
 
 Configuration, downloaded models, engine runtimes, and token-usage history live
 below Application Support and are preserved across app updates or a manual
