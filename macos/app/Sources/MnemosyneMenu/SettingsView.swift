@@ -44,7 +44,7 @@ struct SettingsView: View {
             }
         } message: {
             Text(
-                "Keep Files removes only the profile after you save. Delete Files immediately removes the profile and its app-managed download. Finder imports and manually configured paths are never eligible for file deletion."
+                "Keep Files removes only the profile after you save. Delete Files immediately removes the profile and cleans up the matching model inside its registered storage folder. Imported models are moved to Trash so they can be recovered."
             )
         }
         .alert(

@@ -282,9 +282,12 @@ see
   durable registration state, so a failed/interrupted profile write can be
   retried without downloading the model again. The native GUI renders
   transferred/total bytes, percentage, progress, and smoothed transfer speed.
-  Hiding completed history preserves internal managed-download provenance;
-  explicit file deletion is restricted to that exact app-owned destination,
-  refuses roots/escapes/symlinks, and never applies to Finder imports.
+  Hiding completed history preserves internal managed-download provenance.
+  Managed cleanup is restricted to the exact app-owned destination. A
+  llama.cpp or oMLX import can be cleaned up only after a fresh bounded scan
+  uniquely rediscovers its payload under the registered storage, at which
+  point the exact imported paths move to the macOS Trash. Root, escape,
+  symlink, ambiguous, and shared targets remain refused.
 - Runtime version probes, installs, and activation helpers all use bounded
   process-group cleanup; timeout or cancellation cannot leave an updater child
   running.

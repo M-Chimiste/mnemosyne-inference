@@ -26,9 +26,18 @@ class FilesystemProbe:
         *,
         scope_root: str | Path,
         timeout_seconds: float = 30.0,
+        trash_helper: str | Path | None = None,
     ) -> None:
         self.scope_root = Path(scope_root).expanduser()
         self.timeout_seconds = timeout_seconds
+        configured_helper = trash_helper or os.environ.get(
+            "MNEMOSYNE_FILE_TRASH_HELPER"
+        )
+        self.trash_helper = (
+            Path(configured_helper).expanduser()
+            if configured_helper is not None
+            else None
+        )
 
     async def _run(
         self,
@@ -38,6 +47,21 @@ class FilesystemProbe:
         timeout_seconds: float | None = None,
     ) -> dict[str, Any]:
         argv = [sys.executable, "-m", "mnemosyne_macos.fs_worker", *arguments]
+        return await self._run_argv(
+            argv,
+            scope_id=scope_id,
+            scope_path=scope_path,
+            timeout_seconds=timeout_seconds,
+        )
+
+    async def _run_argv(
+        self,
+        argv: list[str],
+        *,
+        scope_id: str | None = None,
+        scope_path: str | None = None,
+        timeout_seconds: float | None = None,
+    ) -> dict[str, Any]:
         argv = wrap_scoped_argv(
             argv,
             scope_root=self.scope_root,
@@ -218,6 +242,58 @@ class FilesystemProbe:
             scope_path=root,
         )
         return bool(payload["deleted"])
+
+    async def trash_paths(
+        self,
+        *,
+        root: str,
+        paths: list[str] | tuple[str, ...],
+        expected_volume_uuid: str | None,
+        scope_id: str | None,
+    ) -> bool:
+        """Move exact, pre-discovered model paths to the macOS Trash."""
+
+        if not paths:
+            raise FilesystemProbeError("model cleanup did not identify any files")
+        helper = self.trash_helper
+        if (
+            helper is None
+            or not helper.is_file()
+            or not os.access(helper, os.X_OK)
+        ):
+            raise FilesystemProbeError(
+                "the bundled model Trash helper is unavailable; reinstall "
+                "Unified Inference before deleting imported model files"
+            )
+        status = await self.inspect(
+            root,
+            expected_volume_uuid=expected_volume_uuid,
+            scope_id=scope_id,
+            scope_path=root,
+        )
+        if not status.writable or not status.volume_matches:
+            raise FilesystemProbeError(
+                status.diagnostic or "selected model storage is not writable"
+            )
+        arguments = [str(helper), "--root", root]
+        if expected_volume_uuid is not None:
+            arguments.extend(
+                ["--expected-volume-uuid", expected_volume_uuid]
+            )
+        for path in paths:
+            arguments.extend(["--path", path])
+        payload = await self._run_argv(
+            arguments,
+            scope_id=scope_id,
+            scope_path=root,
+            timeout_seconds=max(120.0, self.timeout_seconds),
+        )
+        trashed = payload.get("trashed")
+        if not isinstance(trashed, list):
+            raise FilesystemProbeError(
+                "model Trash helper returned an invalid result"
+            )
+        return bool(trashed)
 
 
 async def _terminate(process: asyncio.subprocess.Process) -> None:

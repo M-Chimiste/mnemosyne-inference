@@ -205,11 +205,13 @@ The live `docker-compose.yml` is intentionally machine-specific and may live out
   downloaded-but-not-registered weights as a durable retryable state; retry
   profile registration without redownloading them. Report durable byte/total
   progress and smoothed transfer speed. Hiding completed history must retain
-  internal managed-download provenance. File deletion is an explicit separate
-  action limited to an exact app-managed destination under configured storage;
-  run it in a bounded helper behind the global empty-residency barrier, refuse
-  roots/escapes/symlinks, and never delete Finder imports or hand-authored
-  model paths.
+  internal managed-download provenance. File cleanup is an explicit separate
+  action behind the global empty-residency barrier. Managed downloads may
+  permanently delete only their exact ledger-owned destination. A llama.cpp
+  or oMLX profile without managed provenance may clean up only when a fresh
+  bounded scan uniquely rediscovers its exact payload inside its registered
+  storage; move those imported paths to the macOS Trash. Refuse roots,
+  escapes, symlinks, ambiguous matches, and paths shared by another profile.
 - Runtime update checks are read-only. For oMLX, select the official DMG that
   matches the host macOS major version and detect its app, CLI shim,
   conventional Homebrew locations, or running server. oMLX remains externally

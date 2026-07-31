@@ -284,12 +284,14 @@ the profile advertises only its detected generation, embeddings, or rerank
 routes.
 
 Removing a model profile keeps its files by default. The separate
-**Delete Files** confirmation is available only for a completed download owned
-by Unified Inference; Finder imports and hand-authored paths are never deleted.
-Deletion drains residency, revalidates the exact configured storage and managed
-destination, removes it in a bounded helper that refuses roots, escapes, and
-symlinks, then atomically removes the profile. oMLX deletion also refreshes its
-authoritative directory inventory inside the same all-engines-empty barrier.
+**Delete Files** confirmation can also clean up a llama.cpp or oMLX model
+previously imported from a registered folder. Cleanup drains residency and
+freshly scans that exact storage grant. A unique imported match is moved to the
+macOS Trash; a completed Unified Inference download still deletes only its
+ledger-owned destination. Bounded helpers refuse roots, escapes, symlinks,
+ambiguous matches, and files shared by another profile before the profile is
+removed. oMLX cleanup also refreshes its authoritative directory inventory
+inside the same all-engines-empty barrier.
 
 Set `HF_TOKEN` in the private environment file for gated or private Hub repos.
 The token is write-only in Settings and is inherited only by the download

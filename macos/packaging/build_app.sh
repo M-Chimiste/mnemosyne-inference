@@ -89,6 +89,7 @@ CONTENTS="$APP_DIR/Contents"
 RESOURCES="$CONTENTS/Resources"
 FRAMEWORKS="$CONTENTS/Frameworks"
 SERVICE_BOOTSTRAP="$CONTENTS/MacOS/mnemosyne-service-bootstrap"
+FILE_TRASH_HELPER="$CONTENTS/MacOS/mnemosyne-file-trash"
 MENU_EXECUTABLE="$CONTENTS/MacOS/UnifiedInference"
 
 rm -rf "$APP_DIR" "$LEGACY_APP_DIR"
@@ -115,6 +116,9 @@ install -m 755 "$BIN_DIR/MnemosyneMenu" "$MENU_EXECUTABLE"
 install -m 755 \
     "$BIN_DIR/mnemosyne-service-bootstrap" \
     "$SERVICE_BOOTSTRAP"
+install -m 755 \
+    "$BIN_DIR/mnemosyne-file-trash" \
+    "$FILE_TRASH_HELPER"
 if [[ ! -d "$BIN_DIR/Sparkle.framework" ]]; then
     echo "Sparkle.framework was not produced beside the release executable." >&2
     exit 1
@@ -197,6 +201,10 @@ codesign \
     "${CODESIGN_ARGS[@]}" \
     --identifier com.mnemosyne.inference.service \
     "$SERVICE_BOOTSTRAP"
+codesign \
+    "${CODESIGN_ARGS[@]}" \
+    --identifier com.mnemosyne.inference.file-trash \
+    "$FILE_TRASH_HELPER"
 codesign "${CODESIGN_ARGS[@]}" "$MENU_EXECUTABLE"
 codesign "${CODESIGN_ARGS[@]}" "$APP_DIR"
 

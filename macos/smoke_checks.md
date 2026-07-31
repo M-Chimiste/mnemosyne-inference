@@ -263,9 +263,12 @@ window. Exercise cancel and retry, then clear the completed history row and
 verify the model profile and files remain. Remove that profile with
 **Keep Files** and verify only configuration changes; separately use
 **Delete Files** on an app-managed test download and verify its exact directory
-and profile disappear. Confirm Finder-imported profiles cannot delete files,
-and no unrelated files are touched. Repeat with a gated repository to prove
-the write-only `HF_TOKEN` reaches only the download worker.
+and profile disappear. Import a llama.cpp GGUF and an oMLX directory from a
+registered folder, use **Delete Files**, and confirm the freshly rediscovered
+payload moves to Trash while each profile is removed. Confirm ambiguous,
+shared, root, escape, and symlink targets are refused and no unrelated files
+are touched. Repeat with a gated repository to prove the write-only `HF_TOKEN`
+reaches only the download worker.
 
 Afterward, `GET /manager/model-library/install-evidence` must show the
 candidate-observed state transitions, including hidden/deleted rows, without

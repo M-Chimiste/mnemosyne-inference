@@ -76,6 +76,8 @@ public struct ConfigurationSaveResult: Codable, Equatable, Sendable {
     public let modelCount: Int
     public let revision: String
     public let config: NativeSettings
+    public let deletedFiles: Bool?
+    public let filesDisposition: String?
 }
 
 struct DeleteManagedModelRequest: Codable, Equatable, Sendable {
