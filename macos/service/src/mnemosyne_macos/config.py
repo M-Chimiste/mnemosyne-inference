@@ -585,6 +585,16 @@ class MacConfig(BaseModel):
                         }
                     )
                 else:
+                    if isinstance(profile, dict):
+                        load = profile.get("load")
+                        if (
+                            isinstance(load, dict)
+                            and load.get("num_experts") is None
+                        ):
+                            # V1 serialized this LM Studio-only option as null
+                            # on every profile. It is not part of the V2 load
+                            # schema for retained engines.
+                            load.pop("num_experts", None)
                     retained_profiles.append(profile)
             raw["models"] = retained_profiles
 
