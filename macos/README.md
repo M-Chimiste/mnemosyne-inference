@@ -79,6 +79,17 @@ the `Mnemosyne` application-support path stay stable so existing settings and
 LaunchAgent registration survive upgrades. For diagnostic launches, the process
 environment variable `MNEMOSYNE_WORKSTATION_NAME` overrides auto-detection.
 
+Same-model requests may run concurrently while holding leases on the same
+resident epoch. The service derives a conservative per-profile limit from the
+engine contract (including llama.cpp `load.parallel` and MFLUX's serial worker),
+then applies the optional global `server.max_concurrency` ceiling. Once those
+permits are occupied, up to `server.max_queue_depth` waiters are retained in
+FIFO order; another request is rejected before upstream inference with
+`429 node_busy`, `Retry-After`, and the manager-owned
+`X-Mnemosyne-Error: node_busy` proof header. A queued model switch closes
+old-target admission, drains all active streams, and preserves the one-resident
+invariant.
+
 ## Requirements
 
 - Apple Silicon and macOS 15 or newer.
@@ -268,6 +279,12 @@ read-only facts established by the library/import workflow. Routing is exposed
 as a typed Generation, Embeddings, Rerank, or Image role, limited to the roles
 the selected engine can serve.
 
+New llama.cpp Generation profiles use the portable fleet contract:
+Chat Completions, Completions, and Responses. The native Messages route remains
+available when a hand-authored llama.cpp profile explicitly includes the
+`messages` capability. oMLX and DS4 keep their existing Generation-with-Messages
+defaults.
+
 Downloads run in killable child processes and persist queued, downloading,
 registering, downloaded-but-not-registered, partial, cancelled, failed, and
 installed states in SQLite. They can continue while the Settings window is
@@ -408,6 +425,35 @@ When `INFERENCE_API_KEY` is set, add `Authorization: Bearer ...` to `/v1/*`.
 When the variable named by `server.control_password_env` (`ADMIN_PASSWORD` by
 default) is set, authenticate to the control API as Basic user `admin`. A
 non-loopback bind is rejected unless the corresponding credential exists.
+
+For enrollment in the Nyx fleet gateway, set distinct `FLEET_API_KEY` and
+`INFERENCE_API_KEY` values in the private `.env`. The default inference bind
+is loopback-only and cannot be reached from Nyx: change `server.inference_bind`
+to this Mac's trusted LAN or Tailscale address, restrict that address with the
+host firewall or Tailscale ACLs, keep `server.control_bind` on loopback, and
+restart Mnemosyne Core. The read-only `GET /fleet/v1/snapshot` endpoint then
+exposes the versioned node identity, health, residency transition, bounded
+queue, derived/configured concurrency, strict deployments, and usage-delivery
+health. Verify locally first:
+
+```bash
+curl -s http://127.0.0.1:1240/fleet/v1/snapshot \
+  -H "Authorization: Bearer $FLEET_API_KEY" | jq
+```
+
+Then enroll `http://<trusted-mac-address>:1240` on Nyx and verify that Nyx can
+reach it. Never expose the inference listener on an untrusted LAN; bearer
+credentials protect access but do not encrypt requests or responses.
+
+The inference bearer is deliberately not accepted for this endpoint, and an
+unset fleet credential makes it unavailable. If Fleet discovery is enabled
+while `INFERENCE_API_KEY` is empty, snapshot discovery fails closed with `503`
+and `fleet_inference_auth_unconfigured`. Snapshots never expose secrets or
+local model paths. Managed Hugging Face installs with an immutable resolved
+revision and exact selected files are eligible for strict cross-node routing.
+Finder imports, hand-authored paths, symbolic revisions, and unverifiable
+legacy installs remain visible only as node-scoped `unverified` deployments
+and cannot be grouped automatically.
 
 ## Menu bar app
 

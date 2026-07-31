@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
+from jsonschema import Draft202012Validator
 import pytest
 from starlette.requests import Request
 from starlette.responses import StreamingResponse
@@ -15,7 +17,9 @@ from mnemosyne_macos.app import (
     create_inference_app,
 )
 from mnemosyne_macos.config import MacConfig, load_config, save_config
+from mnemosyne_macos.coordinator import CoordinatorError, CoordinatorState
 from mnemosyne_macos.engines.base import Deadline, EngineAdapter
+from mnemosyne_macos.install_store import InstallRecord
 from mnemosyne_macos.models import (
     Endpoint,
     EngineName,
@@ -29,6 +33,14 @@ from mnemosyne_macos.models import (
 from mnemosyne_macos.runtime import NativeRuntime
 from mnemosyne_macos.runtime import _redact_diagnostic
 from mnemosyne_macos.runtime_updates import RuntimeUpdateError
+
+
+FLEET_SNAPSHOT_SCHEMA = (
+    Path(__file__).resolve().parents[3]
+    / "fleet_protocol"
+    / "v1"
+    / "snapshot.schema.json"
+)
 
 
 class FakeAdapter(EngineAdapter):
@@ -87,6 +99,7 @@ class FakeAdapter(EngineAdapter):
 
 def test_readiness_diagnostics_redact_credentials(monkeypatch) -> None:
     monkeypatch.setenv("OMLX_ADMIN_SESSION", "secret-session-value")
+    monkeypatch.setenv("FLEET_API_KEY", "fleet-secret-value")
     monkeypatch.setenv("CUSTOM_SECRET_KEY", "custom-secret-value")
     monkeypatch.setenv("SHORT_SECRET_KEY", "xy")
 
@@ -94,7 +107,7 @@ def test_readiness_diagnostics_redact_credentials(monkeypatch) -> None:
         "Authorization: Bearer secret-session-value "
         "postgresql://writer:password123@nyx/token_sidecar "
         "https://reader:webpass@example.test/metrics "
-        "api_key=visible custom-secret-value xy",
+        "api_key=visible custom-secret-value xy fleet-secret-value",
         secret_env_keys=("CUSTOM_SECRET_KEY", "SHORT_SECRET_KEY"),
     )
 
@@ -106,7 +119,7 @@ def test_readiness_diagnostics_redact_credentials(monkeypatch) -> None:
         "Authorization: Bearer <redacted> "
         "postgresql://writer:<redacted>@nyx/token_sidecar "
         "https://reader:<redacted>@example.test/metrics "
-        "api_key=<redacted> <redacted> <redacted>"
+        "api_key=<redacted> <redacted> <redacted> <redacted>"
     )
 
 
@@ -162,6 +175,44 @@ def test_managed_install_roles_are_canonical_and_engine_scoped() -> None:
     assert _validated_install_capabilities(
         engine=EngineName.LLAMA_CPP,
         requested=None,
+        suggested_role="generation",
+        has_projector=True,
+    ) == frozenset(
+        {
+            Endpoint.CHAT_COMPLETIONS,
+            Endpoint.COMPLETIONS,
+            Endpoint.RESPONSES,
+        }
+    )
+    generation_with_messages = frozenset(
+        {
+            Endpoint.CHAT_COMPLETIONS,
+            Endpoint.COMPLETIONS,
+            Endpoint.RESPONSES,
+            Endpoint.MESSAGES,
+        }
+    )
+    assert _validated_install_capabilities(
+        engine=EngineName.LLAMA_CPP,
+        requested=set(generation_with_messages),
+        suggested_role=None,
+        has_projector=False,
+    ) == generation_with_messages
+    assert _validated_install_capabilities(
+        engine=EngineName.OMLX,
+        requested=None,
+        suggested_role="generation",
+        has_projector=False,
+    ) == generation_with_messages
+    assert _validated_install_capabilities(
+        engine=EngineName.DS4,
+        requested=None,
+        suggested_role=None,
+        has_projector=False,
+    ) == generation_with_messages
+    assert _validated_install_capabilities(
+        engine=EngineName.LLAMA_CPP,
+        requested=None,
         suggested_role="embeddings",
         has_projector=False,
     ) == frozenset({Endpoint.EMBEDDINGS})
@@ -209,6 +260,7 @@ async def test_non_streaming_proxy_rewrites_model_strips_credentials_and_records
         seen["cookie"] = request.headers.get("cookie")
         return httpx.Response(
             200,
+            headers={"X-Mnemosyne-Error": "node_busy"},
             json={
                 "id": "chatcmpl-1",
                 "choices": [{"message": {"role": "assistant", "content": "hi"}}],
@@ -247,6 +299,7 @@ async def test_non_streaming_proxy_rewrites_model_strips_credentials_and_records
             },
         )
         assert response.status_code == 200
+        assert "x-mnemosyne-error" not in response.headers
         assert seen["json"]["model"] == "publisher/upstream-model"
         assert seen["json"]["messages"][0]["content"][0]["text"] == "hi"
         assert seen["json"]["temperature"] == 0.25
@@ -350,6 +403,211 @@ async def test_image_timeout_unloads_worker_and_releases_lease(tmp_path) -> None
         assert adapters[EngineName.MFLUX].residents == []
     finally:
         await client.aclose()
+        await runtime.stop()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_buffered_image_body_fences_and_unloads_before_successor(
+    tmp_path,
+) -> None:
+    body_started = asyncio.Event()
+    body_block = asyncio.Event()
+    closed = asyncio.Event()
+
+    class BufferedUpstream:
+        status_code = 200
+        headers = httpx.Headers({"content-type": "application/json"})
+
+        async def aread(self) -> bytes:
+            body_started.set()
+            await body_block.wait()
+            return b'{"data":[]}'
+
+        async def aclose(self) -> None:
+            closed.set()
+
+    class ProxyClient:
+        def build_request(self, **kwargs) -> httpx.Request:
+            return httpx.Request(
+                kwargs["method"],
+                kwargs["url"],
+                headers=kwargs.get("headers"),
+                content=kwargs.get("content"),
+            )
+
+        async def send(self, _request: httpx.Request, *, stream: bool):
+            assert stream is True
+            return BufferedUpstream()
+
+    adapters = _adapters()
+    runtime = NativeRuntime(
+        _image_config(tmp_path),
+        adapters=adapters,
+        proxy_client=ProxyClient(),  # type: ignore[arg-type]
+    )
+    await runtime.start(raise_on_degraded=True)
+    app = create_inference_app(runtime)
+    route = next(
+        item
+        for item in app.routes
+        if getattr(item, "path", None) == "/v1/images/generations"
+    )
+    body = json.dumps({"model": "qwen-image", "prompt": "cancel"}).encode()
+    delivered = False
+
+    async def receive() -> dict:
+        nonlocal delivered
+        if not delivered:
+            delivered = True
+            return {"type": "http.request", "body": body, "more_body": False}
+        return {"type": "http.disconnect"}
+
+    request = Request(
+        {
+            "type": "http",
+            "http_version": "1.1",
+            "method": "POST",
+            "scheme": "http",
+            "path": "/v1/images/generations",
+            "raw_path": b"/v1/images/generations",
+            "query_string": b"",
+            "headers": [(b"content-type", b"application/json")],
+            "client": ("127.0.0.1", 50000),
+            "server": ("127.0.0.1", 1240),
+        },
+        receive,
+    )
+    request_task = asyncio.create_task(route.endpoint(request))
+    try:
+        await asyncio.wait_for(body_started.wait(), timeout=1)
+        successor = asyncio.create_task(
+            runtime.coordinator.acquire(runtime.profiles["qwen-image"])
+        )
+        for _ in range(50):
+            if (await runtime.coordinator.status()).queued == 1:
+                break
+            await asyncio.sleep(0)
+
+        request_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await request_task
+        with pytest.raises(CoordinatorError, match="abort in progress"):
+            await successor
+
+        status = await runtime.coordinator.status()
+        assert closed.is_set()
+        assert status.state == CoordinatorState.IDLE
+        assert status.inflight == 0
+        assert status.queued == 0
+        assert status.resident_alias is None
+        assert adapters[EngineName.MFLUX].residents == []
+    finally:
+        body_block.set()
+        if not request_task.done():
+            request_task.cancel()
+        await runtime.stop()
+
+
+@pytest.mark.asyncio
+async def test_failed_streaming_image_body_fences_and_unloads_before_successor(
+    tmp_path,
+) -> None:
+    body_failed = asyncio.Event()
+    closed = asyncio.Event()
+
+    class StreamingUpstream:
+        status_code = 200
+        headers = httpx.Headers({"content-type": "text/event-stream"})
+
+        async def aiter_bytes(self):
+            yield b'data: {"data":[{"b64_json":"cG5n"}]}\n\n'
+            await body_failed.wait()
+            raise httpx.ReadError("synthetic image stream failure")
+
+        async def aclose(self) -> None:
+            closed.set()
+
+    class ProxyClient:
+        def build_request(self, **kwargs) -> httpx.Request:
+            return httpx.Request(
+                kwargs["method"],
+                kwargs["url"],
+                headers=kwargs.get("headers"),
+                content=kwargs.get("content"),
+            )
+
+        async def send(self, _request: httpx.Request, *, stream: bool):
+            assert stream is True
+            return StreamingUpstream()
+
+    adapters = _adapters()
+    runtime = NativeRuntime(
+        _image_config(tmp_path),
+        adapters=adapters,
+        proxy_client=ProxyClient(),  # type: ignore[arg-type]
+    )
+    await runtime.start(raise_on_degraded=True)
+    app = create_inference_app(runtime)
+    route = next(
+        item
+        for item in app.routes
+        if getattr(item, "path", None) == "/v1/images/generations"
+    )
+    body = json.dumps({"model": "qwen-image", "prompt": "stream"}).encode()
+    delivered = False
+
+    async def receive() -> dict:
+        nonlocal delivered
+        if not delivered:
+            delivered = True
+            return {"type": "http.request", "body": body, "more_body": False}
+        return {"type": "http.disconnect"}
+
+    request = Request(
+        {
+            "type": "http",
+            "http_version": "1.1",
+            "method": "POST",
+            "scheme": "http",
+            "path": "/v1/images/generations",
+            "raw_path": b"/v1/images/generations",
+            "query_string": b"",
+            "headers": [(b"content-type", b"application/json")],
+            "client": ("127.0.0.1", 50000),
+            "server": ("127.0.0.1", 1240),
+        },
+        receive,
+    )
+    response = await route.endpoint(request)
+    assert isinstance(response, StreamingResponse)
+    iterator = response.body_iterator.__aiter__()
+    assert b'"b64_json":"cG5n"' in await iterator.__anext__()
+    successor = asyncio.create_task(
+        runtime.coordinator.acquire(runtime.profiles["qwen-image"])
+    )
+    try:
+        for _ in range(50):
+            if (await runtime.coordinator.status()).queued == 1:
+                break
+            await asyncio.sleep(0)
+        body_failed.set()
+
+        with pytest.raises(httpx.ReadError, match="synthetic image stream"):
+            await iterator.__anext__()
+        with pytest.raises(CoordinatorError, match="abort in progress"):
+            await successor
+
+        status = await runtime.coordinator.status()
+        assert closed.is_set()
+        assert status.state == CoordinatorState.IDLE
+        assert status.inflight == 0
+        assert status.queued == 0
+        assert status.resident_alias is None
+        assert adapters[EngineName.MFLUX].residents == []
+    finally:
+        body_failed.set()
+        if not successor.done():
+            successor.cancel()
         await runtime.stop()
 
 
@@ -630,6 +888,137 @@ async def test_cancelled_stream_with_close_failure_releases_model_lease(tmp_path
 
     assert (await runtime.coordinator.status()).inflight == 0
     await runtime.stop()
+
+
+@pytest.mark.asyncio
+async def test_stream_response_double_cancel_before_iteration_finishes_cleanup(
+    tmp_path,
+) -> None:
+    body_iterated = asyncio.Event()
+    close_started = asyncio.Event()
+    allow_close = asyncio.Event()
+    closed = asyncio.Event()
+
+    class StreamingUpstream:
+        status_code = 200
+        headers = httpx.Headers({"content-type": "text/event-stream"})
+
+        async def aiter_bytes(self):
+            body_iterated.set()
+            yield b"unreachable"
+
+        async def aclose(self) -> None:
+            close_started.set()
+            await allow_close.wait()
+            closed.set()
+
+    class ProxyClient:
+        def build_request(self, **kwargs) -> httpx.Request:
+            return httpx.Request(
+                kwargs["method"],
+                kwargs["url"],
+                headers=kwargs.get("headers"),
+                content=kwargs.get("content"),
+                params=kwargs.get("params"),
+            )
+
+        async def send(self, _request: httpx.Request, *, stream: bool):
+            assert stream is True
+            return StreamingUpstream()
+
+    runtime = NativeRuntime(
+        _config(tmp_path),
+        adapters=_adapters(),
+        proxy_client=ProxyClient(),  # type: ignore[arg-type]
+    )
+    await runtime.start(raise_on_degraded=True)
+    app = create_inference_app(runtime)
+    route = next(
+        item
+        for item in app.routes
+        if getattr(item, "path", None) == "/v1/chat/completions"
+    )
+    request_body = json.dumps(
+        {"model": "frontier", "messages": [], "stream": True}
+    ).encode()
+    delivered = False
+
+    async def request_receive() -> dict:
+        nonlocal delivered
+        if not delivered:
+            delivered = True
+            return {
+                "type": "http.request",
+                "body": request_body,
+                "more_body": False,
+            }
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/v1/chat/completions",
+        "raw_path": b"/v1/chat/completions",
+        "query_string": b"",
+        "headers": [(b"content-type", b"application/json")],
+        "client": ("127.0.0.1", 50000),
+        "server": ("127.0.0.1", 1240),
+    }
+    response = await route.endpoint(Request(scope, request_receive))
+    assert isinstance(response, StreamingResponse)
+    assert (await runtime.coordinator.status()).inflight == 1
+
+    response_started = asyncio.Event()
+
+    async def response_receive() -> dict:
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    async def send(message: dict) -> None:
+        if message["type"] == "http.response.start":
+            response_started.set()
+            await asyncio.Event().wait()
+
+    response_task = asyncio.create_task(
+        response(scope, response_receive, send)
+    )
+    try:
+        await response_started.wait()
+        assert not body_iterated.is_set()
+        response_task.cancel()
+        await close_started.wait()
+        response_task.cancel()
+        await asyncio.sleep(0)
+        assert not response_task.done()
+
+        allow_close.set()
+        with pytest.raises(asyncio.CancelledError):
+            await response_task
+
+        assert not body_iterated.is_set()
+        assert closed.is_set()
+        assert (await runtime.coordinator.status()).inflight == 0
+    finally:
+        allow_close.set()
+        if not response_task.done():
+            response_task.cancel()
+        await runtime.stop()
+
+
+@pytest.mark.asyncio
+async def test_default_native_proxy_client_ignores_ambient_proxies(
+    tmp_path,
+) -> None:
+    runtime = NativeRuntime(_config(tmp_path), adapters=_adapters())
+    try:
+        assert runtime.proxy_client._trust_env is False
+    finally:
+        await runtime.start(raise_on_degraded=True)
+        await runtime.stop()
 
 
 @pytest.mark.asyncio
@@ -1309,5 +1698,417 @@ async def test_inference_and_control_auth_are_independent(tmp_path, monkeypatch)
     finally:
         await inference.aclose()
         await control.aclose()
+        await runtime.stop()
+        await upstream_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_fleet_snapshot_uses_dedicated_auth_and_path_free_v1_shape(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("FLEET_API_KEY", raising=False)
+    monkeypatch.setenv("INFERENCE_API_KEY", "inference-secret")
+    upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _r: httpx.Response(500))
+    )
+    runtime = NativeRuntime(
+        _config(tmp_path),
+        adapters=_adapters(),
+        proxy_client=upstream_client,
+    )
+    await runtime.start(raise_on_degraded=True)
+    client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=create_inference_app(runtime)),
+        base_url="http://inference.test",
+    )
+    try:
+        assert (await client.get("/fleet/v1/snapshot")).status_code == 503
+
+        monkeypatch.setenv("FLEET_API_KEY", "fleet-secret")
+        inference_token = await client.get(
+            "/fleet/v1/snapshot",
+            headers={"Authorization": "Bearer inference-secret"},
+        )
+        assert inference_token.status_code == 401
+
+        monkeypatch.delenv("INFERENCE_API_KEY")
+        missing_inference_auth = await client.get(
+            "/fleet/v1/snapshot",
+            headers={"Authorization": "Bearer fleet-secret"},
+        )
+        assert missing_inference_auth.status_code == 503
+        assert (
+            missing_inference_auth.json()["detail"]["code"]
+            == "fleet_inference_auth_unconfigured"
+        )
+        monkeypatch.setenv("INFERENCE_API_KEY", "inference-secret")
+
+        first = await client.get(
+            "/fleet/v1/snapshot",
+            headers={"Authorization": "Bearer fleet-secret"},
+        )
+        second = await client.get(
+            "/fleet/v1/snapshot",
+            headers={"Authorization": "Bearer fleet-secret"},
+        )
+        assert first.status_code == 200
+        assert second.status_code == 200
+        snapshot = first.json()
+        schema = json.loads(FLEET_SNAPSHOT_SCHEMA.read_text(encoding="utf-8"))
+        Draft202012Validator.check_schema(schema)
+        Draft202012Validator(schema).validate(snapshot)
+        assert second.json()["snapshot_sequence"] == snapshot["snapshot_sequence"] + 1
+        assert set(snapshot) == {
+            "schema_version",
+            "snapshot_sequence",
+            "observed_at",
+            "node",
+            "health",
+            "residency",
+            "admission",
+            "capacity",
+            "deployments",
+            "usage_delivery",
+        }
+        assert snapshot["schema_version"] == 1
+        assert set(snapshot["node"]) == {
+            "node_id",
+            "instance_id",
+            "platform",
+            "version",
+        }
+        assert snapshot["node"]["platform"] == "macos"
+        assert set(snapshot["health"]) == {
+            "state",
+            "accepting",
+            "authoritative",
+            "diagnostic_code",
+        }
+        assert set(snapshot["residency"]) == {
+            "alias",
+            "deployment_id",
+            "engine",
+            "epoch",
+            "transition_target",
+        }
+        assert set(snapshot["admission"]) == {
+            "queue_depth",
+            "queue_limit",
+            "queued_by_deployment",
+        }
+        capacity_fields = {
+            "derived_limit",
+            "configured_max_concurrency",
+            "effective_limit",
+            "active",
+            "queued",
+            "available",
+            "source",
+            "confidence",
+            "saturation",
+        }
+        assert set(snapshot["capacity"]) == capacity_fields
+        assert set(snapshot["usage_delivery"]) == {
+            "enabled",
+            "writer_ready",
+            "outbox_pending",
+            "last_flush_at",
+            "last_error_code",
+        }
+        deployment = snapshot["deployments"][0]
+        assert set(deployment) == {
+            "alias",
+            "deployment_id",
+            "identity",
+            "identity_confidence",
+            "fleet_eligible",
+            "loadable",
+            "warm",
+            "capacity",
+        }
+        assert set(deployment["capacity"]) == capacity_fields
+        assert set(deployment["identity"]) == {
+            "protocol",
+            "engine",
+            "upstream_model",
+            "resolved_revision",
+            "artifact",
+            "kind",
+            "capabilities",
+            "load_config_digest",
+        }
+        assert set(deployment["identity"]["artifact"]) == {
+            "format",
+            "selected_files",
+            "quantization",
+            "content_digest",
+        }
+        assert deployment["identity_confidence"] == "unverified"
+        assert deployment["fleet_eligible"] is False
+        serialized = json.dumps(snapshot, sort_keys=True)
+        assert str(tmp_path) not in serialized
+        assert "inference-secret" not in serialized
+        assert "fleet-secret" not in serialized
+    finally:
+        await client.aclose()
+        await runtime.stop()
+        await upstream_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_fleet_snapshot_maps_internal_verifying_state_and_transition_target(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    class VerifyGateAdapter(FakeAdapter):
+        def __init__(self, engine: EngineName) -> None:
+            super().__init__(engine)
+            self.verify_started = asyncio.Event()
+            self.verify_gate = asyncio.Event()
+
+        async def inspect(self, *, deadline: Deadline) -> EngineSnapshot:
+            snapshot = await super().inspect(deadline=deadline)
+            if self.residents and not self.verify_gate.is_set():
+                self.verify_started.set()
+                await self.verify_gate.wait()
+            return snapshot
+
+    monkeypatch.setenv("FLEET_API_KEY", "fleet-secret")
+    monkeypatch.setenv("INFERENCE_API_KEY", "inference-secret")
+    adapters = _adapters()
+    gated = VerifyGateAdapter(EngineName.OMLX)
+    adapters[EngineName.OMLX] = gated
+    upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _r: httpx.Response(500))
+    )
+    runtime = NativeRuntime(
+        _config(tmp_path),
+        adapters=adapters,
+        proxy_client=upstream_client,
+    )
+    await runtime.start(raise_on_degraded=True)
+    client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=create_inference_app(runtime)),
+        base_url="http://inference.test",
+    )
+    lease_task = asyncio.create_task(
+        runtime.coordinator.acquire(runtime.profiles["frontier"])
+    )
+    try:
+        await asyncio.wait_for(gated.verify_started.wait(), timeout=1)
+        assert (await runtime.coordinator.status()).state == (
+            CoordinatorState.VERIFYING_TARGET
+        )
+        response = await client.get(
+            "/fleet/v1/snapshot",
+            headers={"Authorization": "Bearer fleet-secret"},
+        )
+        assert response.status_code == 200
+        snapshot = response.json()
+        deployment = snapshot["deployments"][0]
+        assert snapshot["health"]["state"] == "verifying"
+        assert snapshot["residency"]["transition_target"] == (
+            deployment["deployment_id"]
+        )
+    finally:
+        gated.verify_gate.set()
+        lease = await asyncio.wait_for(lease_task, timeout=1)
+        await lease.release()
+        await client.aclose()
+        await runtime.stop()
+        await upstream_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_fleet_snapshot_warm_capacity_is_zero_while_resident_drains(
+    tmp_path,
+) -> None:
+    config = MacConfig.model_validate(
+        {
+            "server": {"idle_unload_seconds": None},
+            "engines": {"omlx": {"enabled": True}},
+            "paths": {"state_database": str(tmp_path / "state.db")},
+            "models": [
+                {
+                    "alias": "warm",
+                    "engine": "llama.cpp",
+                    "model": "/models/warm.gguf",
+                    "load": {"parallel": 4},
+                },
+                {
+                    "alias": "cold",
+                    "engine": "omlx",
+                    "model": "publisher/cold",
+                },
+            ],
+        }
+    )
+    runtime = NativeRuntime(config, adapters=_adapters())
+    await runtime.start(raise_on_degraded=True)
+    warm_lease = await runtime.coordinator.acquire(runtime.profiles["warm"])
+    successor = asyncio.create_task(
+        runtime.coordinator.acquire(runtime.profiles["cold"])
+    )
+    try:
+        for _ in range(50):
+            if (await runtime.coordinator.status()).state == CoordinatorState.DRAINING:
+                break
+            await asyncio.sleep(0)
+        assert (await runtime.coordinator.status()).state == CoordinatorState.DRAINING
+
+        snapshot = await runtime.fleet_snapshot()
+        by_alias = {item["alias"]: item for item in snapshot["deployments"]}
+        assert by_alias["warm"]["warm"] is True
+        assert by_alias["warm"]["capacity"]["effective_limit"] == 4
+        assert by_alias["warm"]["capacity"]["available"] == 0
+        assert by_alias["cold"]["warm"] is False
+        assert by_alias["cold"]["capacity"]["available"] == 1
+    finally:
+        await warm_lease.release()
+        cold_lease = await asyncio.wait_for(successor, timeout=1)
+        await cold_lease.release()
+        await runtime.stop()
+
+
+@pytest.mark.asyncio
+async def test_fleet_snapshot_aggregates_synonym_queues_by_deployment_id(
+    tmp_path,
+) -> None:
+    destination = tmp_path / "managed"
+    filename = "model-Q4_K_M.gguf"
+    config = MacConfig.model_validate(
+        {
+            "server": {"idle_unload_seconds": None},
+            "paths": {"state_database": str(tmp_path / "state.db")},
+            "models": [
+                {
+                    "alias": "primary",
+                    "engine": "llama.cpp",
+                    "model": str(destination / filename),
+                    "storage": "internal",
+                },
+                {
+                    "alias": "synonym",
+                    "engine": "llama.cpp",
+                    "model": str(destination / filename),
+                    "storage": "internal",
+                },
+            ],
+        }
+    )
+    runtime = NativeRuntime(config, adapters=_adapters())
+
+    async def latest_for_alias(alias: str) -> InstallRecord:
+        return InstallRecord(
+            id=f"install-{alias}",
+            repo_id="publisher/shared-GGUF",
+            engine="llama.cpp",
+            storage="internal",
+            alias=alias,
+            destination=str(destination),
+            status="installed",
+            revision="a" * 40,
+            filename=filename,
+        )
+
+    runtime.installer.latest_for_alias = latest_for_alias  # type: ignore[method-assign]
+    await runtime.start(raise_on_degraded=True)
+    resident = await runtime.coordinator.acquire(runtime.profiles["primary"])
+    first_waiter = asyncio.create_task(
+        runtime.coordinator.acquire(runtime.profiles["primary"])
+    )
+    second_waiter = asyncio.create_task(
+        runtime.coordinator.acquire(runtime.profiles["synonym"])
+    )
+    try:
+        for _ in range(50):
+            if (await runtime.coordinator.status()).queued == 2:
+                break
+            await asyncio.sleep(0)
+        assert (await runtime.coordinator.status()).queued == 2
+
+        snapshot = await runtime.fleet_snapshot()
+        deployments = snapshot["deployments"]
+        assert len({item["deployment_id"] for item in deployments}) == 1
+        deployment_id = deployments[0]["deployment_id"]
+        assert snapshot["admission"]["queued_by_deployment"] == {
+            deployment_id: 2
+        }
+        assert {
+            item["capacity"]["queued"] for item in deployments
+        } == {2}
+    finally:
+        first_waiter.cancel()
+        second_waiter.cancel()
+        await asyncio.gather(
+            first_waiter,
+            second_waiter,
+            return_exceptions=True,
+        )
+        await resident.release()
+        await runtime.stop()
+
+
+@pytest.mark.asyncio
+async def test_full_waiter_queue_returns_stable_429_before_upstream_work(
+    tmp_path,
+) -> None:
+    config_payload = _config(tmp_path).model_dump(mode="json")
+    config_payload["server"]["max_queue_depth"] = 1
+    config = MacConfig.model_validate(config_payload)
+    upstream_calls = 0
+
+    def upstream_handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal upstream_calls
+        upstream_calls += 1
+        return httpx.Response(200, json={"choices": []})
+
+    upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(upstream_handler)
+    )
+    runtime = NativeRuntime(
+        config,
+        adapters=_adapters(),
+        proxy_client=upstream_client,
+    )
+    await runtime.start(raise_on_degraded=True)
+    client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=create_inference_app(runtime)),
+        base_url="http://inference.test",
+    )
+    resident = await runtime.coordinator.acquire(runtime.profiles["frontier"])
+    waiting_request = asyncio.create_task(
+        client.post(
+            "/v1/chat/completions",
+            json={"model": "frontier", "messages": []},
+        )
+    )
+    try:
+        for _ in range(50):
+            if (await runtime.coordinator.status()).queued == 1:
+                break
+            await asyncio.sleep(0)
+        assert (await runtime.coordinator.status()).queued == 1
+
+        rejected = await client.post(
+            "/v1/chat/completions",
+            json={"model": "frontier", "messages": []},
+        )
+        assert rejected.status_code == 429
+        assert rejected.headers["retry-after"] == "1"
+        assert rejected.headers["x-mnemosyne-error"] == "node_busy"
+        assert rejected.json()["detail"]["code"] == "node_busy"
+        assert upstream_calls == 0
+
+        await resident.release()
+        admitted = await asyncio.wait_for(waiting_request, timeout=1)
+        assert admitted.status_code == 200
+        assert upstream_calls == 1
+    finally:
+        if not waiting_request.done():
+            waiting_request.cancel()
+        await resident.release()
+        await client.aclose()
         await runtime.stop()
         await upstream_client.aclose()

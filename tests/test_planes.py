@@ -13,6 +13,14 @@ def test_inference_plane_excludes_manager_routes(inference_client):
     assert inference_client.post("/manager/load", json={"model": "a-model"}).status_code == 404
 
 
+def test_fleet_snapshot_is_inference_plane_only(client, monkeypatch):
+    monkeypatch.setenv("FLEET_API_KEY", "fleet-secret")
+    assert client.get(
+        "/fleet/v1/snapshot",
+        headers={"Authorization": "Bearer fleet-secret"},
+    ).status_code == 404
+
+
 def test_admin_plane_requires_basic_for_manager_and_docs(admin_client_no_auth):
     for path in ("/manager/status", "/docs", "/openapi.json", "/redoc"):
         r = admin_client_no_auth.get(path)
@@ -93,7 +101,8 @@ def test_inner_port_clash_guard_rejects_external_port(tmp_config, monkeypatch):
 
 def test_proxy_strips_auth_and_cookie_before_inner_vllm(rich_client, monkeypatch):
     client, _stub = rich_client
-    captured: dict[str, dict[str, str]] = {}
+    captured_headers: dict[str, str] = {}
+    captured_trust_env: list[bool] = []
 
     class FakeResponse:
         status_code = 200
@@ -106,11 +115,12 @@ def test_proxy_strips_auth_and_cookie_before_inner_vllm(rich_client, monkeypatch
             return None
 
     class FakeAsyncClient:
-        def __init__(self, timeout=None):
+        def __init__(self, timeout=None, trust_env=True):
             self.timeout = timeout
+            captured_trust_env.append(trust_env)
 
         def build_request(self, method, url, headers, content, params):
-            captured["headers"] = dict(headers)
+            captured_headers.update(headers)
             return object()
 
         async def send(self, request, stream=True):
@@ -126,6 +136,7 @@ def test_proxy_strips_auth_and_cookie_before_inner_vllm(rich_client, monkeypatch
         headers={"Cookie": "session=do-not-forward"},
     )
     assert r.status_code == 200
-    forwarded = {k.lower(): v for k, v in captured["headers"].items()}
+    forwarded = {k.lower(): v for k, v in captured_headers.items()}
     assert "authorization" not in forwarded
     assert "cookie" not in forwarded
+    assert captured_trust_env == [False]

@@ -30,7 +30,12 @@ _QUANT_RE = re.compile(
     re.IGNORECASE,
 )
 
-_GENERATION_CAPABILITIES = (
+_LLAMA_GENERATION_CAPABILITIES = (
+    "chat/completions",
+    "completions",
+    "responses",
+)
+_OMLX_GENERATION_CAPABILITIES = (
     "chat/completions",
     "completions",
     "responses",
@@ -219,13 +224,13 @@ def _read_model_card(directory: Path) -> str | None:
 
 def _gguf_capabilities(path: Path, *, has_projector: bool) -> tuple[str, ...]:
     if has_projector:
-        return _GENERATION_CAPABILITIES
+        return _LLAMA_GENERATION_CAPABILITIES
     name = path.stem.casefold()
     if re.search(r"(^|[-_.])rerank(?:er|ing)?($|[-_.])", name):
         return _RERANK_CAPABILITIES
     if re.search(r"(^|[-_.])embed(?:ding|dings)?($|[-_.])", name):
         return _EMBEDDING_CAPABILITIES
-    return _GENERATION_CAPABILITIES
+    return _LLAMA_GENERATION_CAPABILITIES
 
 
 def _sentence_transformers_embedding(directory: Path) -> bool:
@@ -381,7 +386,7 @@ def _omlx_capabilities(
         return (
             "likely",
             "Local metadata identifies an oMLX generation model; final compatibility is verified on load.",
-            _GENERATION_CAPABILITIES,
+            _OMLX_GENERATION_CAPABILITIES,
         )
 
     auto_map = config.get("auto_map")
@@ -399,7 +404,7 @@ def _omlx_capabilities(
         return (
             "likely",
             "Local metadata identifies an oMLX generation model; final compatibility is verified on load.",
-            _GENERATION_CAPABILITIES,
+            _OMLX_GENERATION_CAPABILITIES,
         )
 
     return (

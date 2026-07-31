@@ -37,15 +37,17 @@ class ModelKind(StrEnum):
     IMAGE = "image"
 
 
+LLAMA_CPP_GENERATION_CAPABILITIES = frozenset(
+    {
+        Endpoint.CHAT_COMPLETIONS,
+        Endpoint.COMPLETIONS,
+        Endpoint.RESPONSES,
+    }
+)
+
+
 DEFAULT_CAPABILITIES: dict[EngineName, frozenset[Endpoint]] = {
-    EngineName.LLAMA_CPP: frozenset(
-        {
-            Endpoint.CHAT_COMPLETIONS,
-            Endpoint.COMPLETIONS,
-            Endpoint.RESPONSES,
-            Endpoint.MESSAGES,
-        }
-    ),
+    EngineName.LLAMA_CPP: LLAMA_CPP_GENERATION_CAPABILITIES,
     EngineName.OMLX: frozenset(
         {
             Endpoint.CHAT_COMPLETIONS,
@@ -86,6 +88,21 @@ class TargetKey:
 
 
 @dataclass(frozen=True)
+class EffectiveLoadIdentity:
+    """Every setting required to safely reuse a resident for a target.
+
+    Fleet deployment identity deliberately remains stricter: it includes the
+    complete request capability contract. This local identity exists only to
+    decide whether a resident process can safely serve another lease without
+    being relaunched.
+    """
+
+    key: TargetKey
+    wire_model: str
+    process_mode: str | None
+
+
+@dataclass(frozen=True)
 class ResolvedTarget:
     alias: str
     key: TargetKey
@@ -97,6 +114,41 @@ class ResolvedTarget:
     storage_path: str | None = None
     scope_id: str | None = None
     storage_volume_uuid: str | None = None
+
+
+def llama_cpp_process_mode(capabilities: frozenset[Endpoint]) -> str:
+    """Mirror the capability-derived switches in ``build_llama_cpp_argv``."""
+
+    generation_endpoints = {
+        Endpoint.CHAT_COMPLETIONS,
+        Endpoint.COMPLETIONS,
+        Endpoint.RESPONSES,
+        Endpoint.MESSAGES,
+    }
+    if capabilities & generation_endpoints:
+        return "generation"
+    if Endpoint.RERANK in capabilities:
+        return "rerank"
+    if Endpoint.EMBEDDINGS in capabilities:
+        return "embeddings"
+    # ModelProfile validation prevents this for configured llama.cpp models.
+    # Preserve a distinct value for directly constructed test/integration
+    # targets rather than accidentally treating them as a generation process.
+    return "unsupported:" + ",".join(sorted(item.value for item in capabilities))
+
+
+def effective_load_identity(target: ResolvedTarget) -> EffectiveLoadIdentity:
+    """Return the resident-process equality key used by the coordinator."""
+
+    return EffectiveLoadIdentity(
+        key=target.key,
+        wire_model=target.wire_model,
+        process_mode=(
+            llama_cpp_process_mode(target.capabilities)
+            if target.key.engine == EngineName.LLAMA_CPP
+            else None
+        ),
+    )
 
 
 @dataclass(frozen=True)

@@ -28,6 +28,19 @@ _ALIAS_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 # against earlier drafts of this design leaking into user configs.
 _RESERVED_PREFIXES = ("__cache__:", "__cache__/")
 
+_CAPABILITY_ALIASES = {
+    "chat.completions": "chat.completions",
+    "chat/completions": "chat.completions",
+    "completions": "completions",
+    "embeddings": "embeddings",
+    "images.generations": "images.generations",
+    "images/generations": "images.generations",
+    "messages": "messages",
+    "rerank": "rerank",
+    "responses": "responses",
+}
+SUPPORTED_MODEL_CAPABILITIES = frozenset(_CAPABILITY_ALIASES.values())
+
 
 class ConfigError(Exception):
     """Any non-recoverable problem loading or validating config."""
@@ -45,6 +58,12 @@ class Server(BaseModel):
     idle_unload_seconds: int | None = 900
     startup_timeout_seconds: int = 600
     swap_queue_timeout_seconds: int = 300
+    # Optional operator ceiling over adapter-derived concurrent request
+    # capacity. The engine-derived limit remains authoritative when lower.
+    max_concurrency: int | None = Field(default=None, ge=1)
+    # Requests beyond active capacity may wait locally only within this
+    # bounded FIFO. Nyx maintains its own bounded per-model queues as well.
+    max_queue_depth: int = Field(default=128, ge=1, le=100_000)
     image_request_timeout_seconds: int = 1800
     image_max_pixels: int = 4_194_304
 
@@ -136,9 +155,23 @@ class ModelProfile(BaseModel):
     kind: Literal["language", "image"] = "language"
     image: ImageDefaults | None = None
     gguf_filename: str | None = None
+    # Optional repository-relative multimodal projector. The resolved profile
+    # turns this into a private cache path for llama-server while fleet
+    # identity records only this explicit selected file.
+    projector_filename: str | None = None
+    # Endpoint contract is configurable, but omitted values retain safe
+    # engine-specific defaults. Internally the historic dotted spellings are
+    # preserved for compatibility; the fleet protocol canonicalizes them.
+    capabilities: tuple[str, ...] | None = None
 
     @model_validator(mode="after")
     def _backend_consistency(self) -> "ModelProfile":
+        if self.capabilities is None:
+            self.capabilities = default_model_capabilities(
+                backend=self.backend,
+                kind=self.kind,
+            )
+        capabilities = set(self.capabilities)
         if self.backend == "llama.cpp" and not self.gguf_filename:
             raise ValueError(
                 f"model '{self.alias}' has backend='llama.cpp' but no gguf_filename"
@@ -146,6 +179,19 @@ class ModelProfile(BaseModel):
         if self.backend != "llama.cpp" and self.gguf_filename:
             raise ValueError(
                 f"model '{self.alias}' has gguf_filename set but backend is '{self.backend}'"
+            )
+        if self.backend != "llama.cpp" and self.projector_filename:
+            raise ValueError(
+                f"model '{self.alias}' has projector_filename set but backend "
+                f"is '{self.backend}'"
+            )
+        if (
+            self.projector_filename is not None
+            and self.projector_filename == self.gguf_filename
+        ):
+            raise ValueError(
+                f"model '{self.alias}' projector_filename must differ from "
+                "gguf_filename"
             )
         if self.kind == "image" and self.backend != "sglang-diffusion":
             raise ValueError(
@@ -161,18 +207,78 @@ class ModelProfile(BaseModel):
             raise ValueError(
                 f"model '{self.alias}' has image defaults but kind is not 'image'"
             )
+        if self.kind == "image":
+            if capabilities != {"images.generations"}:
+                raise ValueError(
+                    f"image model '{self.alias}' may only advertise "
+                    "images/generations"
+                )
+        elif "images.generations" in capabilities:
+            raise ValueError(
+                f"language model '{self.alias}' cannot advertise "
+                "images/generations"
+            )
+        if self.backend == "llama.cpp":
+            generation = capabilities & {
+                "chat.completions",
+                "completions",
+                "responses",
+                "messages",
+            }
+            specialized = capabilities & {"embeddings", "rerank"}
+            if generation and specialized:
+                raise ValueError(
+                    f"llama.cpp generation model '{self.alias}' cannot also "
+                    "advertise embeddings or rerank"
+                )
+            if "rerank" in capabilities and capabilities != {"rerank"}:
+                raise ValueError(
+                    f"llama.cpp rerank model '{self.alias}' may only "
+                    "advertise rerank"
+                )
+            if self.projector_filename and not generation:
+                raise ValueError(
+                    f"llama.cpp projector for '{self.alias}' requires a "
+                    "generation-capable profile"
+                )
         return self
 
-    @property
-    def capabilities(self) -> tuple[str, ...]:
-        if self.kind == "image":
-            return ("images.generations",)
-        return (
-            "chat.completions",
-            "completions",
-            "embeddings",
-            "responses",
-        )
+    @field_validator("capabilities", mode="before")
+    @classmethod
+    def _capabilities_shape(cls, value):
+        if value is None:
+            return None
+        if isinstance(value, (str, bytes)) or not isinstance(
+            value, (list, tuple, set, frozenset)
+        ):
+            raise ValueError("capabilities must be a non-empty list")
+        normalized: set[str] = set()
+        for raw in value:
+            item = str(raw).strip().lower().removeprefix("/v1/")
+            mapped = _CAPABILITY_ALIASES.get(item)
+            if mapped is None:
+                raise ValueError(f"unsupported model capability '{raw}'")
+            normalized.add(mapped)
+        if not normalized:
+            raise ValueError("capabilities must contain at least one endpoint")
+        return tuple(sorted(normalized))
+
+    @field_validator("projector_filename")
+    @classmethod
+    def _projector_filename_shape(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if (
+            not value
+            or not value.endswith(".gguf")
+            or value.startswith("/")
+            or "\\" in value
+            or any(part in {"", ".", ".."} for part in value.split("/"))
+        ):
+            raise ValueError(
+                "projector_filename must be a repository-relative .gguf file"
+            )
+        return value
 
     @field_validator("alias")
     @classmethod
@@ -205,6 +311,27 @@ class ModelProfile(BaseModel):
         raise ValueError(f"gpus must be 'all' or a list of non-negative ints, got {v!r}")
 
 
+def default_model_capabilities(
+    *,
+    backend: str,
+    kind: str,
+) -> tuple[str, ...]:
+    """Return the backward-compatible, engine-aware endpoint contract."""
+
+    if kind == "image" or backend == "sglang-diffusion":
+        return ("images.generations",)
+    if backend == "llama.cpp":
+        # Common portable Generation contract shared with native llama.cpp.
+        return ("chat.completions", "completions", "responses")
+    # Preserve the established CUDA vLLM behavior.
+    return (
+        "chat.completions",
+        "completions",
+        "embeddings",
+        "responses",
+    )
+
+
 class TokenSidecar(BaseModel):
     """Forward per-request token usage to a central Postgres ledger.
 
@@ -233,6 +360,21 @@ class TokenSidecar(BaseModel):
         return self
 
 
+class FleetNode(BaseModel):
+    """Stable, non-secret identity advertised to the Nyx fleet gateway."""
+
+    model_config = ConfigDict(extra="forbid")
+    node_id: str = Field(default="", max_length=128)
+
+    @field_validator("node_id")
+    @classmethod
+    def _node_id_is_bounded(cls, value: str) -> str:
+        value = value.strip()
+        if value and any(ord(char) < 0x20 for char in value):
+            raise ValueError("fleet.node_id must not contain control characters")
+        return value
+
+
 class Config(BaseModel):
     model_config = ConfigDict(extra="forbid")
     server: Server = Field(default_factory=Server)
@@ -240,6 +382,7 @@ class Config(BaseModel):
     defaults: Defaults = Field(default_factory=Defaults)
     models: list[ModelProfile] = Field(default_factory=list)
     token_sidecar: TokenSidecar = Field(default_factory=TokenSidecar)
+    fleet: FleetNode = Field(default_factory=FleetNode)
 
     @model_validator(mode="after")
     def _cross_refs(self) -> "Config":
@@ -262,6 +405,15 @@ class Config(BaseModel):
                     f"model '{m.alias}' image defaults exceed "
                     f"server.image_max_pixels={self.server.image_max_pixels}"
                 )
+        if (
+            self.token_sidecar.enabled
+            and self.fleet.node_id
+            and self.fleet.node_id != self.token_sidecar.node_id
+        ):
+            raise ValueError(
+                "fleet.node_id must match token_sidecar.node_id when token "
+                "reporting is enabled"
+            )
         return self
 
 

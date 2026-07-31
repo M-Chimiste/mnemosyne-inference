@@ -1,5 +1,5 @@
 """End-to-end token-sidecar flow:
-  /v1/* hit → in-memory deque → _flush_usage tees to SQLite outbox →
+  /v1/* hit → atomic SQLite analytics + outbox commit →
   _pg_flush_once drains outbox → fake PgWriter receives rows.
 
 These tests stub the upstream engine and the postgres writer so they run
@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -148,14 +150,13 @@ def test_non_streaming_request_round_trips_to_fake_writer(sidecar_client, monkey
     )
     assert r.status_code == 200
 
-    # Deque has the row; outbox doesn't yet.
-    assert len(vllm_manager._runtime.usage_rows) == 1
-    assert vllm_manager._catalog.count_pg_outbox() == 0
-
-    # Flush deque → SQLite analytics + outbox.
-    vllm_manager._flush_usage()
+    # The response does not complete until analytics and outbox commit in one
+    # transaction. The deque is reserved for failed-write retries.
     assert not vllm_manager._runtime.usage_rows
     assert vllm_manager._catalog.count_pg_outbox() == 1
+    assert vllm_manager._catalog._conn.execute(
+        "SELECT COUNT(*) AS c FROM request_usage"
+    ).fetchone()["c"] == 1
 
     # Drain outbox → fake postgres.
     _run(vllm_manager._pg_flush_once())
@@ -176,6 +177,265 @@ def test_non_streaming_request_round_trips_to_fake_writer(sidecar_client, monkey
     assert vllm_manager._catalog.count_pg_outbox() == 0
     assert vllm_manager._pg_last_flush_count == 1
     assert vllm_manager._pg_last_error is None
+
+
+def test_immediate_sqlite_failure_retains_event_until_retry(
+    sidecar_client,
+    monkeypatch,
+):
+    client, _stub = sidecar_client
+    _patch_upstream(monkeypatch, _FakeResponse(body=_usage_body(7, 2, 9)))
+    original = vllm_manager._catalog.record_usage_batch
+    attempts = 0
+
+    def fail_once(rows, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise sqlite3.OperationalError("synthetic write failure")
+        return original(rows, **kwargs)
+
+    monkeypatch.setattr(
+        vllm_manager._catalog,
+        "record_usage_batch",
+        fail_once,
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": "a-model", "messages": []},
+    )
+
+    assert response.status_code == 200
+    assert len(vllm_manager._runtime.usage_rows) == 1
+    assert vllm_manager._catalog.count_pg_outbox() == 0
+    assert vllm_manager._catalog._conn.execute(
+        "SELECT COUNT(*) AS c FROM request_usage"
+    ).fetchone()["c"] == 0
+
+    vllm_manager._flush_usage()
+
+    assert attempts == 2
+    assert not vllm_manager._runtime.usage_rows
+    assert vllm_manager._catalog.count_pg_outbox() == 1
+    row = vllm_manager._catalog._conn.execute(
+        "SELECT prompt_tokens, completion_tokens, total_tokens "
+        "FROM request_usage"
+    ).fetchone()
+    assert tuple(row) == (7, 2, 9)
+
+
+def test_ambiguous_committed_write_retries_idempotently(
+    sidecar_client,
+    monkeypatch,
+):
+    client, _stub = sidecar_client
+    _patch_upstream(monkeypatch, _FakeResponse(body=_usage_body(7, 2, 9)))
+    original = vllm_manager._catalog.record_usage_batch
+    first = True
+
+    def commit_then_raise(rows, **kwargs):
+        nonlocal first
+        original(rows, **kwargs)
+        if first:
+            first = False
+            raise sqlite3.OperationalError("synthetic lost commit acknowledgement")
+
+    monkeypatch.setattr(
+        vllm_manager._catalog,
+        "record_usage_batch",
+        commit_then_raise,
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": "a-model", "messages": []},
+    )
+
+    assert response.status_code == 200
+    assert len(vllm_manager._runtime.usage_rows) == 1
+    vllm_manager._flush_usage()
+    assert not vllm_manager._runtime.usage_rows
+    assert vllm_manager._catalog.count_pg_outbox() == 1
+    assert vllm_manager._catalog._conn.execute(
+        "SELECT COUNT(*) AS c FROM request_usage"
+    ).fetchone()["c"] == 1
+    aggregate = vllm_manager._catalog._conn.execute(
+        "SELECT total_prompt_tokens, total_completion_tokens "
+        "FROM models WHERE alias = 'a-model'"
+    ).fetchone()
+    assert tuple(aggregate) == (7, 2)
+
+
+@pytest.mark.parametrize(
+    "commit_succeeds",
+    [True, False],
+    ids=["commit", "failure"],
+)
+@pytest.mark.asyncio
+async def test_repeated_cancellation_waits_for_known_usage_outcome(
+    sidecar_client,
+    monkeypatch,
+    commit_succeeds,
+):
+    """A second cancellation cannot escape before commit or retry enqueue."""
+    _client, _stub = sidecar_client
+    original = vllm_manager._persist_usage_entries
+    started = threading.Event()
+    allow_outcome = threading.Event()
+
+    def block_before_outcome(entries):
+        started.set()
+        if not allow_outcome.wait(timeout=5):
+            raise TimeoutError("test did not release usage persistence")
+        if commit_succeeds:
+            original(entries)
+        else:
+            raise sqlite3.OperationalError("synthetic persistence failure")
+
+    monkeypatch.setattr(
+        vllm_manager,
+        "_persist_usage_entries",
+        block_before_outcome,
+    )
+    entry = vllm_manager._make_usage_entry(
+        requested_model="a-model",
+        alias="a-model",
+        backend="vllm",
+        usage=vllm_manager.NormalizedUsage(
+            prompt_tokens=7,
+            completion_tokens=2,
+            total_tokens=9,
+            raw={
+                "prompt_tokens": 7,
+                "completion_tokens": 2,
+                "total_tokens": 9,
+            },
+        ),
+        endpoint="/v1/chat/completions",
+        streamed=False,
+        response_ms=1.0,
+        status_code=200,
+    )
+    assert entry is not None
+
+    record_task = asyncio.create_task(
+        vllm_manager._record_usage_entry(entry)
+    )
+    try:
+        assert await asyncio.to_thread(started.wait, 2)
+        record_task.cancel()
+        await asyncio.sleep(0)
+        record_task.cancel()
+        await asyncio.sleep(0)
+
+        assert not record_task.done()
+        assert vllm_manager._catalog.count_pg_outbox() == 0
+
+        allow_outcome.set()
+        with pytest.raises(asyncio.CancelledError):
+            await record_task
+    finally:
+        allow_outcome.set()
+
+    if commit_succeeds:
+        assert not vllm_manager._runtime.usage_rows
+        analytics = vllm_manager._catalog._conn.execute(
+            "SELECT event_id, prompt_tokens, completion_tokens, total_tokens "
+            "FROM request_usage"
+        ).fetchall()
+        assert [tuple(row) for row in analytics] == [
+            (entry.event_id, 7, 2, 9)
+        ]
+        outbox = vllm_manager._catalog._conn.execute(
+            "SELECT event_id FROM pg_usage_outbox"
+        ).fetchall()
+        assert [row["event_id"] for row in outbox] == [entry.event_id]
+    else:
+        assert [
+            queued.event_id for queued in vllm_manager._runtime.usage_rows
+        ] == [entry.event_id]
+        assert vllm_manager._catalog._conn.execute(
+            "SELECT COUNT(*) AS c FROM request_usage"
+        ).fetchone()["c"] == 0
+        assert vllm_manager._catalog.count_pg_outbox() == 0
+
+
+@pytest.mark.parametrize(
+    ("path", "payload", "expected"),
+    [
+        (
+            "/v1/responses",
+            {
+                "type": "response",
+                "usage": {
+                    "input_tokens": 12,
+                    "output_tokens": 5,
+                    "total_tokens": 17,
+                },
+            },
+            (12, 5, 17),
+        ),
+        (
+            "/v1/messages",
+            {
+                "type": "message",
+                "usage": {
+                    "input_tokens": 4,
+                    "cache_creation_input_tokens": 6,
+                    "cache_read_input_tokens": 8,
+                    "output_tokens": 3,
+                },
+            },
+            (18, 3, 21),
+        ),
+        (
+            "/v1/rerank",
+            {
+                "results": [],
+                "usage": {"prompt_tokens": 9, "total_tokens": 9},
+            },
+            (9, 0, 9),
+        ),
+    ],
+)
+def test_fleet_language_routes_round_trip_to_durable_outbox(
+    sidecar_client,
+    monkeypatch,
+    path,
+    payload,
+    expected,
+):
+    client, _stub = sidecar_client
+    vllm_manager._config.models[0].capabilities = (
+        "chat.completions",
+        "completions",
+        "embeddings",
+        "messages",
+        "rerank",
+        "responses",
+    )
+    _patch_upstream(
+        monkeypatch,
+        _FakeResponse(body=json.dumps(payload).encode()),
+    )
+
+    response = client.post(path, json={"model": "a-model"})
+    assert response.status_code == 200
+
+    assert not vllm_manager._runtime.usage_rows
+    assert vllm_manager._catalog.count_pg_outbox() == 1
+    _run(vllm_manager._pg_flush_once())
+
+    writer: FakeWriter = vllm_manager._pg_writer
+    assert len(writer.batches) == 1
+    sent = writer.batches[0][0]
+    assert sent["endpoint"] == path
+    assert (
+        sent["prompt_tokens"],
+        sent["completion_tokens"],
+        sent["total_tokens"],
+    ) == expected
 
 
 def test_streaming_request_marks_streamed_true(sidecar_client, monkeypatch):
@@ -200,7 +460,7 @@ def test_streaming_request_marks_streamed_true(sidecar_client, monkeypatch):
     _ = r.content  # drain the stream
     assert r.status_code == 200
 
-    vllm_manager._flush_usage()
+    assert not vllm_manager._runtime.usage_rows
     _run(vllm_manager._pg_flush_once())
     writer: FakeWriter = vllm_manager._pg_writer
     sent = writer.batches[0][0]
@@ -216,7 +476,6 @@ def test_outage_keeps_rows_in_outbox(sidecar_client, monkeypatch):
         "/v1/chat/completions",
         json={"model": "a-model", "messages": []},
     )
-    vllm_manager._flush_usage()
     assert vllm_manager._catalog.count_pg_outbox() == 1
 
     # Simulate Postgres being unreachable.
@@ -266,7 +525,6 @@ def test_status_endpoint_reports_pending(sidecar_client, monkeypatch):
     client, _stub = sidecar_client
     _patch_upstream(monkeypatch, _FakeResponse(body=_usage_body()))
     client.post("/v1/chat/completions", json={"model": "a-model", "messages": []})
-    vllm_manager._flush_usage()
     r = client.get("/manager/status").json()
     assert r["token_sidecar"]["outbox_pending"] == 1
     assert r["token_sidecar"]["last_flush_count"] == 0  # not flushed yet
@@ -274,11 +532,10 @@ def test_status_endpoint_reports_pending(sidecar_client, monkeypatch):
 
 def test_disabled_sidecar_does_not_tee_to_outbox(rich_client, monkeypatch):
     """When token_sidecar.enabled=false (default rich_client config),
-    flushing leaves the outbox empty even though usage rows ran through."""
+    analytics commit immediately while the delivery outbox stays empty."""
     client, _stub = rich_client
     _patch_upstream(monkeypatch, _FakeResponse(body=_usage_body()))
     client.post("/v1/chat/completions", json={"model": "a-model", "messages": []})
-    vllm_manager._flush_usage()
     assert vllm_manager._catalog.count_pg_outbox() == 0
     # And the analytics table still got the row.
     n = vllm_manager._catalog._conn.execute(

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import time
 
 import pytest
@@ -567,9 +568,7 @@ def test_case_insensitive_model_lookups_preserve_canonical_rows(cat):
 
 
 def test_legacy_db_migration_adds_revision(tmp_path):
-    """A pre-Phase-4 DB without revision/resolved_sha columns gets
-    migrated by _migrate_revision_column on open."""
-    import sqlite3
+    """A legacy DB receives model and idempotent-usage columns on open."""
     db = str(tmp_path / "legacy.db")
     conn = sqlite3.connect(db)
     conn.executescript("""
@@ -588,6 +587,14 @@ def test_legacy_db_migration_adds_revision(tmp_path):
           pid INTEGER, status TEXT NOT NULL, started_at INTEGER NOT NULL,
           finished_at INTEGER, bytes_downloaded INTEGER DEFAULT 0,
           total_bytes INTEGER, error TEXT
+        );
+        CREATE TABLE request_usage (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          ts REAL NOT NULL, requested_model TEXT, alias TEXT, backend TEXT,
+          prompt_tokens INTEGER NOT NULL DEFAULT 0,
+          completion_tokens INTEGER NOT NULL DEFAULT 0,
+          total_tokens INTEGER NOT NULL DEFAULT 0,
+          usage_json TEXT
         );
         INSERT INTO models (alias, hf_model_id, source, gpus, storage_location, status)
         VALUES ('legacy', 'org/legacy', 'config', '"all"', 'tmp', 'partial');
@@ -609,6 +616,11 @@ def test_legacy_db_migration_adds_revision(tmp_path):
             )
         }
         assert "request_usage" in table_names
+        usage_cols = {
+            row["name"]
+            for row in cat._conn.execute("PRAGMA table_info('request_usage')")
+        }
+        assert "event_id" in usage_cols
         row = cat.get_model("legacy")
         assert row.revision == "main"  # default backfill
         assert row.resolved_sha is None
@@ -666,6 +678,139 @@ def test_record_usage_batch_empty_is_noop(cat):
     cat.record_usage_batch([])
     rows = cat._conn.execute("SELECT COUNT(*) AS c FROM request_usage").fetchone()
     assert rows["c"] == 0
+
+
+def test_usage_analytics_and_outbox_commit_atomically_and_idempotently(cat):
+    cat._raw_insert_model(
+        alias="a-model",
+        hf_model_id="org/a-model",
+        storage_location="tmp",
+    )
+    analytics = (
+        100.0,
+        "a-model",
+        "a-model",
+        "vllm",
+        10,
+        5,
+        15,
+        '{"prompt_tokens":10}',
+    )
+    outbox = _outbox_row("event-1", 100.0)
+
+    cat.record_usage_batch(
+        [analytics],
+        event_ids=["event-1"],
+        outbox_rows=[outbox],
+    )
+    # An ambiguous retry of the same event changes neither local analytics,
+    # delivery state, nor model aggregates.
+    cat.record_usage_batch(
+        [analytics],
+        event_ids=["event-1"],
+        outbox_rows=[outbox],
+    )
+
+    assert cat._conn.execute(
+        "SELECT COUNT(*) AS c FROM request_usage"
+    ).fetchone()["c"] == 1
+    assert cat.count_pg_outbox() == 1
+    aggregate = cat._conn.execute(
+        "SELECT total_prompt_tokens, total_completion_tokens "
+        "FROM models WHERE alias = 'a-model'"
+    ).fetchone()
+    assert tuple(aggregate) == (10, 5)
+
+
+def test_outbox_failure_rolls_back_usage_analytics(cat):
+    cat._raw_insert_model(
+        alias="a-model",
+        hf_model_id="org/a-model",
+        storage_location="tmp",
+    )
+    cat._conn.execute(
+        """
+        CREATE TRIGGER synthetic_outbox_failure
+        BEFORE INSERT ON pg_usage_outbox
+        BEGIN
+          SELECT RAISE(ABORT, 'synthetic outbox failure');
+        END
+        """
+    )
+
+    with pytest.raises(sqlite3.IntegrityError, match="synthetic outbox failure"):
+        cat.record_usage_batch(
+            [
+                (
+                    100.0,
+                    "a-model",
+                    "a-model",
+                    "vllm",
+                    10,
+                    5,
+                    15,
+                    None,
+                )
+            ],
+            event_ids=["event-1"],
+            outbox_rows=[_outbox_row("event-1", 100.0)],
+        )
+
+    assert cat._conn.execute(
+        "SELECT COUNT(*) AS c FROM request_usage"
+    ).fetchone()["c"] == 0
+    assert cat.count_pg_outbox() == 0
+    aggregate = cat._conn.execute(
+        "SELECT total_prompt_tokens, total_completion_tokens "
+        "FROM models WHERE alias = 'a-model'"
+    ).fetchone()
+    assert tuple(aggregate) == (0, 0)
+
+
+def test_usage_event_survives_reopen_and_retry(tmp_path):
+    db_path = tmp_path / "usage-restart.db"
+    first = open_catalog(str(db_path))
+    first._raw_insert_model(
+        alias="a-model",
+        hf_model_id="org/a-model",
+        storage_location="tmp",
+    )
+    analytics = (
+        100.0,
+        "a-model",
+        "a-model",
+        "vllm",
+        10,
+        5,
+        15,
+        None,
+    )
+    outbox = _outbox_row("event-restart", 100.0)
+    first.record_usage_batch(
+        [analytics],
+        event_ids=["event-restart"],
+        outbox_rows=[outbox],
+    )
+    first.close()
+
+    reopened = open_catalog(str(db_path))
+    try:
+        assert reopened._conn.execute(
+            "SELECT event_id FROM request_usage"
+        ).fetchone()["event_id"] == "event-restart"
+        assert reopened.peek_pg_outbox(1)[0]["event_id"] == "event-restart"
+
+        reopened.record_usage_batch(
+            [analytics],
+            event_ids=["event-restart"],
+            outbox_rows=[outbox],
+        )
+        assert reopened._conn.execute(
+            "SELECT COUNT(*) AS c FROM request_usage"
+        ).fetchone()["c"] == 1
+        assert reopened.count_pg_outbox() == 1
+    finally:
+        reopened.close()
 
 
 # ── token-sidecar outbox (v3) ────────────────────────────────────────

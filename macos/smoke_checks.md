@@ -133,6 +133,44 @@ available when their runtime is installed, external oMLX is not described as
 ready unless its authoritative service responds, and DS4/MFLUX are labeled
 Preview rather than Stable.
 
+### Fleet snapshot and bounded admission
+
+Set different values for `INFERENCE_API_KEY` and `FLEET_API_KEY` in the private
+`.env`, restart the service, and verify the fleet credential boundary:
+
+```bash
+curl -si http://127.0.0.1:1240/fleet/v1/snapshot
+curl -si http://127.0.0.1:1240/fleet/v1/snapshot \
+  -H "Authorization: Bearer $INFERENCE_API_KEY"
+curl -s http://127.0.0.1:1240/fleet/v1/snapshot \
+  -H "Authorization: Bearer $FLEET_API_KEY" | jq
+```
+
+The first two calls must return `401`; the third must return schema version 1
+without a credential, DSN, absolute model path, storage root, or bookmark.
+Successive snapshots must retain `node.node_id` and `node.instance_id` while
+increasing `snapshot_sequence`. Restarting the service must change only the
+instance ID. A managed install pinned to a 40–64 hex Hub revision must be
+`fleet_eligible`; a Finder/manual profile or symbolic revision must be
+`unverified` and ineligible.
+
+For the Nyx rollout, change only `server.inference_bind` from loopback to the
+Mac's trusted LAN or Tailscale address, leave `server.control_bind` on
+loopback, restart, and restrict `:1240` with the host firewall or Tailscale
+ACLs. From Nyx, repeat the authenticated snapshot request against that private
+address before enrolling it in Fleet. Do not expose this bearer-authenticated
+plain-HTTP listener on an untrusted network.
+
+Set `server.max_concurrency` below a llama.cpp profile's `load.parallel`, set
+`server.max_queue_depth: 1`, and issue enough overlapping long requests to
+occupy every permit and the one waiter. Confirm the next request receives
+`429` with `detail.code=node_busy` and `Retry-After: 1` before the inner engine
+sees it. During the run, snapshot `capacity.active`, `capacity.available`,
+`admission.queue_depth`, and `queued_by_deployment` must agree. Queue a
+different model and verify no later request to the old model bypasses it; the
+snapshot must show `draining` and the target deployment ID until every old
+stream closes.
+
 ## 2. Local-library adoption
 
 In **Settings → Models**, choose **Add Existing Models…** and select the exact
@@ -482,7 +520,7 @@ This gate applies only to a machine with an older LM Studio-backed
 configuration or model library.
 
 1. Stop LM Studio before starting Unified Inference.
-2. Open the upgraded schema-version-2 configuration and confirm there is no
+2. Open the upgraded schema-version-3 configuration and confirm there is no
    `engines.lmstudio` block. Old LM Studio profiles should appear only under
    `migration.legacy_lmstudio_profiles` and must not appear in `/v1/models`.
 3. Confirm **Detected model folders** offers the configured

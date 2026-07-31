@@ -1,7 +1,7 @@
 import Foundation
 
 public struct NativeSettings: Codable, Equatable, Sendable {
-    public static let supportedSchemaVersion = 2
+    public static let supportedSchemaVersion = 3
 
     public var schemaVersion: Int
     public var server: ServerSettings
@@ -68,12 +68,15 @@ public struct ServerSettings: Codable, Equatable, Sendable {
     public var idleUnloadSeconds: Int? = 900
     public var startupTimeoutSeconds = 900.0
     public var swapQueueTimeoutSeconds = 300.0
+    public var maxConcurrency: Int?
+    public var maxQueueDepth = 128
     public var shutdownGraceSeconds = 30.0
     public var reconcileIntervalSeconds = 30.0
     public var imageRequestTimeoutSeconds = 1_800.0
     public var imageMaxPixels = 4_194_304
     public var startupPolicy = "unload_all"
     public var inferenceApiKeyEnv = "INFERENCE_API_KEY"
+    public var fleetApiKeyEnv = "FLEET_API_KEY"
     public var controlPasswordEnv = "ADMIN_PASSWORD"
 
     public init() {}

@@ -20,7 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from . import __version__
 from .config import MacConfig, suggested_model_alias
-from .coordinator import CoordinatorError, QueueTimeout
+from .coordinator import CoordinatorError, QueueFull, QueueTimeout
 from .engines.base import AdapterError
 from .filesystem import FilesystemProbeError
 from .image_api import ImageRequestError, normalize_image_request
@@ -64,6 +64,27 @@ def _lexical_path(value: str) -> str:
     )
 
 
+async def _await_task_to_known_outcome(task: asyncio.Task):
+    """Defer repeated caller cancellation until an owned task is complete."""
+
+    cancellation: asyncio.CancelledError | None = None
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as exc:
+            if cancellation is None:
+                cancellation = exc
+        except Exception:
+            break
+
+    if task.cancelled():
+        return task.result()
+    result = task.result()
+    if cancellation is not None:
+        raise cancellation
+    return result
+
+
 class LoadRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     model: str
@@ -102,11 +123,37 @@ class InstallModelRequest(BaseModel):
     capabilities: set[Endpoint] | None = None
 
 
-_INSTALL_ROLE_CAPABILITIES: dict[str, frozenset[Endpoint]] = {
-    "generation": DEFAULT_CAPABILITIES[EngineName.LLAMA_CPP],
-    "embeddings": frozenset({Endpoint.EMBEDDINGS}),
-    "rerank": frozenset({Endpoint.RERANK}),
-    "image": frozenset({Endpoint.IMAGES_GENERATIONS}),
+_GENERATION_WITH_MESSAGES = frozenset(
+    {
+        Endpoint.CHAT_COMPLETIONS,
+        Endpoint.COMPLETIONS,
+        Endpoint.RESPONSES,
+        Endpoint.MESSAGES,
+    }
+)
+_INSTALL_ROLE_CAPABILITY_SETS: dict[
+    EngineName,
+    dict[str, tuple[frozenset[Endpoint], ...]],
+] = {
+    EngineName.LLAMA_CPP: {
+        "generation": (
+            DEFAULT_CAPABILITIES[EngineName.LLAMA_CPP],
+            _GENERATION_WITH_MESSAGES,
+        ),
+        "embeddings": (frozenset({Endpoint.EMBEDDINGS}),),
+        "rerank": (frozenset({Endpoint.RERANK}),),
+    },
+    EngineName.OMLX: {
+        "generation": (_GENERATION_WITH_MESSAGES,),
+        "embeddings": (frozenset({Endpoint.EMBEDDINGS}),),
+        "rerank": (frozenset({Endpoint.RERANK}),),
+    },
+    EngineName.DS4: {
+        "generation": (_GENERATION_WITH_MESSAGES,),
+    },
+    EngineName.MFLUX: {
+        "image": (frozenset({Endpoint.IMAGES_GENERATIONS}),),
+    },
 }
 
 
@@ -117,6 +164,7 @@ def _validated_install_capabilities(
     suggested_role: str | None,
     has_projector: bool,
 ) -> frozenset[Endpoint]:
+    role_capabilities = _INSTALL_ROLE_CAPABILITY_SETS.get(engine, {})
     if requested is None:
         role = (
             "image"
@@ -125,28 +173,23 @@ def _validated_install_capabilities(
             if engine == EngineName.DS4
             else suggested_role or "generation"
         )
-        capabilities = _INSTALL_ROLE_CAPABILITIES.get(role)
-        if capabilities is None:
+        accepted = role_capabilities.get(role)
+        if accepted is None:
             raise ValueError("model metadata suggested an unsupported role")
+        capabilities = accepted[0]
     else:
         capabilities = frozenset(requested)
 
-    allowed_roles: dict[EngineName, set[str]] = {
-        EngineName.LLAMA_CPP: {"generation", "embeddings", "rerank"},
-        EngineName.OMLX: {"generation", "embeddings", "rerank"},
-        EngineName.DS4: {"generation"},
-        EngineName.MFLUX: {"image"},
-    }
     matching_role = next(
         (
             role
-            for role, role_capabilities in _INSTALL_ROLE_CAPABILITIES.items()
-            if capabilities == role_capabilities
+            for role, accepted in role_capabilities.items()
+            if capabilities in accepted
         ),
         None,
     )
-    if matching_role is None or matching_role not in allowed_roles.get(engine, set()):
-        allowed = ", ".join(sorted(allowed_roles.get(engine, set()))) or "none"
+    if matching_role is None:
+        allowed = ", ".join(sorted(role_capabilities)) or "none"
         raise ValueError(
             f"{engine.value} installs require one supported model role: {allowed}"
         )
@@ -203,25 +246,32 @@ async def _close_proxy_resources(
     this helper preserves cancellation after both cleanup attempts run.
     """
 
-    cancellation: asyncio.CancelledError | None = None
-    try:
-        if upstream is not None:
-            try:
-                await upstream.aclose()
-            except asyncio.CancelledError as exc:
-                cancellation = exc
-            except Exception:
-                logger.warning("failed to close upstream response", exc_info=True)
-    finally:
-        if lease is not None:
-            try:
-                await lease.release()
-            except asyncio.CancelledError as exc:
-                cancellation = cancellation or exc
-            except Exception:
-                logger.exception("failed to release model lease")
-    if cancellation is not None:
-        raise cancellation
+    async def drain() -> None:
+        cancellation: asyncio.CancelledError | None = None
+        try:
+            if upstream is not None:
+                try:
+                    await upstream.aclose()
+                except asyncio.CancelledError as exc:
+                    cancellation = exc
+                except Exception:
+                    logger.warning("failed to close upstream response", exc_info=True)
+        finally:
+            if lease is not None:
+                try:
+                    await lease.release()
+                except asyncio.CancelledError as exc:
+                    cancellation = cancellation or exc
+                except Exception:
+                    logger.exception("failed to release model lease")
+        if cancellation is not None:
+            raise cancellation
+
+    cleanup = asyncio.create_task(
+        drain(),
+        name="mnemosyne-close-proxy-resources",
+    )
+    await _await_task_to_known_outcome(cleanup)
 
 
 async def _audit_after_upstream_failure(runtime: NativeRuntime) -> None:
@@ -236,12 +286,48 @@ async def _abort_image_request(
     upstream: Any | None,
     lease: Any | None,
 ) -> None:
-    """Release the lease and terminate MFLUX so cancelled work frees memory."""
-    await _close_proxy_resources(upstream, lease)
+    """Fence admission before terminating MFLUX after an interrupted request."""
+
+    cancellation: asyncio.CancelledError | None = None
+    if lease is not None:
+        try:
+            await lease.abort()
+        except asyncio.CancelledError as exc:
+            cancellation = exc
+        except Exception:
+            logger.exception("failed to abort and unload image resident")
+    if upstream is not None:
+        try:
+            await upstream.aclose()
+        except asyncio.CancelledError as exc:
+            cancellation = cancellation or exc
+        except Exception:
+            logger.warning("failed to close aborted image response", exc_info=True)
+    if cancellation is not None:
+        raise cancellation
+
+
+async def _abort_image_request_shielded(
+    runtime: NativeRuntime,
+    upstream: Any | None,
+    lease: Any | None,
+) -> None:
+    """Let the MFLUX epoch fence/unload finish if its caller is cancelled."""
+
+    cleanup = asyncio.create_task(
+        _abort_image_request(runtime, upstream, lease),
+        name="mnemosyne-abort-image-request",
+    )
     try:
-        await runtime.coordinator.unload()
-    except Exception:
-        logger.exception("failed to unload image worker after request abort")
+        await asyncio.shield(cleanup)
+    except asyncio.CancelledError as cancellation:
+        # The independently owned cleanup task keeps running. Usually the
+        # cancellation that reached this wrapper has already been delivered,
+        # so this second shield waits for the fence/unload before cancellation
+        # is re-raised. A repeated cancellation still cannot cancel cleanup.
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.shield(cleanup)
+        raise cancellation
 
 
 def _json_model(body: bytes) -> str:
@@ -258,6 +344,8 @@ def _json_model(body: bytes) -> str:
 
 
 def _error_status(exc: Exception) -> int:
+    if isinstance(exc, QueueFull):
+        return 429
     if isinstance(exc, QueueTimeout):
         return 504
     if isinstance(exc, KeyError):
@@ -321,12 +409,128 @@ async def _record_usage(
             logger.exception("failed to persist token usage event")
 
 
+class _StreamingProxyOwnership:
+    """Idempotent full-ASGI ownership of native upstream and model lease."""
+
+    def __init__(
+        self,
+        *,
+        runtime: NativeRuntime,
+        upstream: httpx.Response,
+        lease: Any,
+        target: Any,
+        endpoint: Endpoint,
+        requested_model: str,
+        started_at: float,
+        usage_parser: StreamingUsageParser,
+    ) -> None:
+        self.runtime = runtime
+        self.upstream = upstream
+        self.lease = lease
+        self.target = target
+        self.endpoint = endpoint
+        self.requested_model = requested_model
+        self.started_at = started_at
+        self.usage_parser = usage_parser
+        self.body_failed = False
+        self.upstream_failed = False
+        self._completion_task: asyncio.Task[None] | None = None
+
+    def note_failure(self, *, upstream_failed: bool) -> None:
+        self.body_failed = True
+        self.upstream_failed = self.upstream_failed or upstream_failed
+
+    async def _finish(self) -> None:
+        try:
+            usage = self.usage_parser.finish()
+            await _record_usage(
+                self.runtime,
+                usage,
+                endpoint=self.endpoint,
+                engine=str(self.target.key.engine),
+                requested_model=self.requested_model,
+                alias=self.target.alias,
+                streamed=True,
+                started_at=self.started_at,
+                status_code=self.upstream.status_code,
+            )
+        finally:
+            try:
+                if (
+                    self.target.key.engine == EngineName.MFLUX
+                    and self.body_failed
+                ):
+                    await _abort_image_request_shielded(
+                        self.runtime,
+                        self.upstream,
+                        self.lease,
+                    )
+                else:
+                    await _close_proxy_resources(self.upstream, self.lease)
+            finally:
+                if (
+                    self.upstream_failed
+                    and self.target.key.engine != EngineName.MFLUX
+                ):
+                    await _audit_after_upstream_failure(self.runtime)
+
+    async def complete(self) -> None:
+        if self._completion_task is None:
+            self._completion_task = asyncio.create_task(
+                self._finish(),
+                name="mnemosyne-streaming-proxy-finish",
+            )
+        await _await_task_to_known_outcome(self._completion_task)
+
+
+class _OwnedStreamingResponse(StreamingResponse):
+    """Ensure cleanup even if cancellation precedes body iteration."""
+
+    def __init__(
+        self,
+        content,
+        *,
+        owner: _StreamingProxyOwnership,
+        status_code: int,
+        headers: Mapping[str, str],
+    ) -> None:
+        super().__init__(
+            content,
+            status_code=status_code,
+            headers=dict(headers),
+        )
+        self._owner = owner
+
+    async def __call__(self, scope, receive, send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        except asyncio.CancelledError:
+            self._owner.note_failure(upstream_failed=False)
+            raise
+        except BaseException:
+            self._owner.note_failure(upstream_failed=False)
+            raise
+        finally:
+            await self._owner.complete()
+
+
 def _inference_authorized(runtime: NativeRuntime, request: Request) -> bool:
     expected = os.environ.get(
         runtime.config.server.inference_api_key_env, ""
     ).strip()
     if not expected:
         return True
+    prefix = "Bearer "
+    supplied = request.headers.get("authorization", "")
+    return supplied.startswith(prefix) and hmac.compare_digest(
+        supplied[len(prefix) :], expected
+    )
+
+
+def _fleet_authorized(runtime: NativeRuntime, request: Request) -> bool:
+    expected = os.environ.get(runtime.config.server.fleet_api_key_env, "").strip()
+    if not expected:
+        return False
     prefix = "Bearer "
     supplied = request.headers.get("authorization", "")
     return supplied.startswith(prefix) and hmac.compare_digest(
@@ -395,6 +599,36 @@ def create_inference_app(runtime: NativeRuntime) -> FastAPI:
     async def models() -> dict:
         return {"object": "list", "data": runtime.model_list()}
 
+    @app.get("/fleet/v1/snapshot")
+    async def fleet_snapshot(request: Request) -> dict:
+        configured = os.environ.get(
+            runtime.config.server.fleet_api_key_env,
+            "",
+        ).strip()
+        if not configured:
+            raise HTTPException(503, "fleet snapshot authentication is not configured")
+        if not _fleet_authorized(runtime, request):
+            raise HTTPException(
+                status_code=401,
+                detail="invalid or missing fleet bearer token",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        if not os.environ.get(
+            runtime.config.server.inference_api_key_env,
+            "",
+        ).strip():
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "fleet_inference_auth_unconfigured",
+                    "message": (
+                        "configure a node-specific inference API key before "
+                        "enabling fleet discovery"
+                    ),
+                },
+            )
+        return await runtime.fleet_snapshot()
+
     async def proxy(request: Request, endpoint: Endpoint) -> Response:
         body = await request.body()
         requested_model = _json_model(body)
@@ -456,21 +690,29 @@ def create_inference_app(runtime: NativeRuntime) -> FastAPI:
                 upstream = await runtime.proxy_client.send(upstream_request, stream=True)
         except asyncio.CancelledError:
             if target.key.engine == EngineName.MFLUX:
-                cleanup = asyncio.create_task(
-                    _abort_image_request(runtime, upstream, lease),
-                    name="mnemosyne-abort-image-request",
-                )
-                with contextlib.suppress(asyncio.CancelledError):
-                    await asyncio.shield(cleanup)
+                await _abort_image_request_shielded(runtime, upstream, lease)
             else:
                 await _close_proxy_resources(upstream, lease)
             raise
         except TimeoutError as exc:
             if target.key.engine == EngineName.MFLUX:
-                await _abort_image_request(runtime, upstream, lease)
+                await _abort_image_request_shielded(runtime, upstream, lease)
             else:
                 await _close_proxy_resources(upstream, lease)
             raise HTTPException(504, "image generation timed out") from exc
+        except QueueFull as exc:
+            await _close_proxy_resources(upstream, lease)
+            raise HTTPException(
+                status_code=429,
+                detail={
+                    "code": "node_busy",
+                    "message": str(exc),
+                },
+                headers={
+                    "Retry-After": "1",
+                    "X-Mnemosyne-Error": "node_busy",
+                },
+            ) from exc
         except HTTPException:
             await _close_proxy_resources(upstream, lease)
             raise
@@ -493,9 +735,18 @@ def create_inference_app(runtime: NativeRuntime) -> FastAPI:
                     and endpoint in {Endpoint.CHAT_COMPLETIONS, Endpoint.COMPLETIONS}
                 )
             )
+            owner = _StreamingProxyOwnership(
+                runtime=runtime,
+                upstream=upstream,
+                lease=lease,
+                target=target,
+                endpoint=endpoint,
+                requested_model=requested_model,
+                started_at=started_at,
+                usage_parser=usage_parser,
+            )
 
             async def stream_body():
-                upstream_failed = False
                 try:
                     async for chunk in upstream.aiter_bytes():
                         usage_parser.feed(chunk)
@@ -504,35 +755,24 @@ def create_inference_app(runtime: NativeRuntime) -> FastAPI:
                     tail = event_filter.finish()
                     if tail:
                         yield tail
-                except httpx.HTTPError:
-                    upstream_failed = True
+                except asyncio.CancelledError:
+                    owner.note_failure(upstream_failed=False)
+                    raise
+                except BaseException:
+                    owner.note_failure(upstream_failed=True)
                     raise
                 finally:
-                    try:
-                        usage = usage_parser.finish()
-                        await _record_usage(
-                            runtime,
-                            usage,
-                            endpoint=endpoint,
-                            engine=str(target.key.engine),
-                            requested_model=requested_model,
-                            alias=target.alias,
-                            streamed=True,
-                            started_at=started_at,
-                            status_code=upstream.status_code,
-                        )
-                    finally:
-                        await _close_proxy_resources(upstream, lease)
-                        if upstream_failed:
-                            await _audit_after_upstream_failure(runtime)
+                    await owner.complete()
 
-            return StreamingResponse(
+            return _OwnedStreamingResponse(
                 stream_body(),
+                owner=owner,
                 status_code=upstream.status_code,
                 headers=response_headers,
             )
 
         upstream_failed = False
+        body_failed = False
         try:
             content = await upstream.aread()
             decoded: Mapping[str, Any] | None = None
@@ -559,12 +799,22 @@ def create_inference_app(runtime: NativeRuntime) -> FastAPI:
                 status_code=upstream.status_code,
                 headers=response_headers,
             )
+        except asyncio.CancelledError:
+            body_failed = True
+            raise
         except httpx.HTTPError as exc:
+            body_failed = True
             upstream_failed = True
             raise HTTPException(502, f"upstream response failed: {exc}") from exc
+        except Exception:
+            body_failed = True
+            raise
         finally:
-            await _close_proxy_resources(upstream, lease)
-            if upstream_failed:
+            if target.key.engine == EngineName.MFLUX and body_failed:
+                await _abort_image_request_shielded(runtime, upstream, lease)
+            else:
+                await _close_proxy_resources(upstream, lease)
+            if upstream_failed and target.key.engine != EngineName.MFLUX:
                 await _audit_after_upstream_failure(runtime)
 
     @app.post("/v1/chat/completions")

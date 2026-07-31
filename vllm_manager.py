@@ -27,9 +27,9 @@ import uuid
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Awaitable, Callable, Optional, TypeVar
+from typing import Any, Awaitable, Callable, Optional, TypeVar
 
-from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.openapi.docs import get_redoc_html, get_swagger_ui_html
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
@@ -50,6 +50,27 @@ from catalog import (
 )
 from config import Config, ConfigError, GpuPlan, load_config, load_env
 from downloader import ConflictError, repo_cache_dir
+from cuda_residency import (
+    CapacitySpec,
+    CoordinatorState,
+    CudaResidencyCoordinator,
+    ModelLease,
+    NotAccepting,
+    QueueFull,
+    QueueTimeout,
+    ResidencyError,
+)
+from fleet_protocol import (
+    FLEET_SCHEMA_VERSION,
+    deployment_identity,
+    derive_cuda_capacity,
+    effective_capacity,
+    gguf_quantization,
+    identity_is_authoritative,
+    positive_int_flag,
+    semantic_extra_args,
+    sha256_id,
+)
 from image_api import ImageRequestError, normalize_image_request
 from profiles import ProfileNotReady, ResolvedProfile, resolve_profile
 from runtime import (
@@ -64,6 +85,7 @@ from runtime import (
     derive_tp_size,
     vllm_wants_eager_default,
 )
+from usage_normalization import NormalizedUsage, StreamingUsageParser, normalize_usage
 
 # ──────────────────────────────────────────────
 # Configuration
@@ -135,6 +157,10 @@ _eviction_task:  Optional[asyncio.Task]     = None
 _flush_task:     Optional[asyncio.Task]     = None
 _pg_flush_task:  Optional[asyncio.Task]     = None
 _legacy_alias_warned: set[str]              = set()
+_coordinator: Optional[CudaResidencyCoordinator] = None
+_fleet_instance_id: str = uuid.uuid4().hex
+_fleet_snapshot_sequence: int = 0
+_fleet_snapshot_sequence_lock = threading.Lock()
 
 # Optional postgres token-usage sink (token_sidecar). `_pg_writer` is None
 # when the sidecar is disabled or its DSN is missing; `_pg_last_*` feeds the
@@ -160,7 +186,7 @@ _catalog: Optional[Catalog] = None
 async def _wait_for_health(url: str, timeout: int) -> bool:
     """Poll a /health URL until the engine reports ready or the deadline
     expires. Returns False if the process died early."""
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(trust_env=False) as client:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if vllm_process and vllm_process.poll() is not None:
@@ -198,7 +224,7 @@ async def _wait_for_sglang_diffusion(timeout: int = STARTUP_TIMEOUT) -> bool:
 
 def _kill_engine():
     """Stop the resident engine subprocess (idempotent) and reset runtime
-    state. Backend-agnostic — flushes buffered usage to the catalog before
+    state. Backend-agnostic — retries any failed usage writes before
     clearing the resident alias so the just-evicted model's last activity
     makes it to disk."""
     global vllm_process
@@ -434,6 +460,371 @@ async def _start_engine(profile: ResolvedProfile) -> None:
         await _start_vllm(profile)
 
 
+def _profile_artifact(profile: ResolvedProfile) -> dict:
+    if profile.backend == "llama.cpp":
+        # Canonical v1 selection names only files explicitly chosen by the
+        # profile. llama-server discovers peer shards from the primary GGUF,
+        # but automatic peers are deliberately absent from strict identity.
+        selected = sorted(
+            {
+                filename
+                for filename in (
+                    profile.gguf_filename,
+                    profile.projector_filename,
+                )
+                if filename
+            }
+        )
+        artifact_format = "gguf"
+    elif profile.backend == "sglang-diffusion":
+        selected = []
+        artifact_format = "diffusers"
+    else:
+        selected = []
+        artifact_format = "safetensors"
+    return {
+        "format": artifact_format,
+        "selected_files": selected,
+        "quantization": (
+            profile.quantization
+            or (
+                gguf_quantization(profile.gguf_filename)
+                if profile.backend == "llama.cpp"
+                else None
+            )
+        ),
+        # The installed HF commit pins the selected tree, but it is not itself
+        # a SHA-256 digest of the weight bytes.
+        "content_digest": None,
+    }
+
+
+def _valid_int(value: str, *, minimum: int = 1) -> bool:
+    try:
+        return int(value) >= minimum
+    except (TypeError, ValueError):
+        return False
+
+
+def _valid_gpu_fraction(value: str) -> bool:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return False
+    return 0 < parsed <= 1
+
+
+def _valid_non_option(value: str) -> bool:
+    return bool(value) and not value.startswith("-")
+
+
+def _last_valid_flag(
+    args: tuple[str, ...],
+    names: set[str],
+    validator: Callable[[str], bool],
+) -> str | None:
+    result: str | None = None
+    index = 0
+    while index < len(args):
+        item = args[index]
+        name, equals, inline = item.partition("=")
+        if name not in names:
+            index += 1
+            continue
+        if equals:
+            if validator(inline):
+                result = inline
+            index += 1
+            continue
+        if index + 1 < len(args) and validator(args[index + 1]):
+            result = args[index + 1]
+            index += 2
+            continue
+        index += 1
+    return result
+
+
+def _strip_valid_flags(
+    args: tuple[str, ...],
+    value_flags: dict[str, Callable[[str], bool]],
+    boolean_flags: set[str],
+) -> tuple[str, ...]:
+    """Remove only unambiguous well-formed non-semantic options.
+
+    A malformed option remains ordered in the identity input. In particular,
+    it never consumes a following semantic option that merely looks like its
+    missing value.
+    """
+
+    output: list[str] = []
+    index = 0
+    while index < len(args):
+        item = args[index]
+        name, equals, inline = item.partition("=")
+        if name in boolean_flags and not equals:
+            index += 1
+            continue
+        validator = value_flags.get(name)
+        if validator is None:
+            output.append(item)
+            index += 1
+            continue
+        if equals:
+            if validator(inline):
+                index += 1
+            else:
+                output.append(item)
+                index += 1
+            continue
+        if index + 1 < len(args) and validator(args[index + 1]):
+            index += 2
+            continue
+        output.append(item)
+        index += 1
+    return tuple(output)
+
+
+def _semantic_load_config(profile: ResolvedProfile) -> dict:
+    """Normalize output-affecting settings and exclude placement/capacity."""
+
+    args = tuple(semantic_extra_args(profile.extra_args, backend=profile.backend))
+    positive = lambda value: _valid_int(value, minimum=1)
+    nonnegative = lambda value: _valid_int(value, minimum=0)
+    if profile.backend == "vllm":
+        value_flags: dict[str, Callable[[str], bool]] = {
+            "--gpu-memory-utilization": _valid_gpu_fraction,
+            "--tensor-parallel-size": positive,
+            "--pipeline-parallel-size": positive,
+            "--data-parallel-size": positive,
+            "--max-model-len": positive,
+        }
+        context_length = (
+            positive_int_flag(args, "--max-model-len")
+            or profile.max_model_len
+        )
+        semantic_base = {
+            "context_length": context_length,
+            "trust_remote_code": profile.trust_remote_code,
+        }
+        boolean_flags: set[str] = set()
+    elif profile.backend == "llama.cpp":
+        pooling_values = {
+            "none",
+            "mean",
+            "cls",
+            "last",
+            "rank",
+            "unspecified",
+        }
+        enum_pooling = lambda value: value.lower() in pooling_values
+        value_flags = {
+            "--threads": positive,
+            "-t": positive,
+            "--threads-batch": positive,
+            "-tb": positive,
+            "--batch-size": positive,
+            "-b": positive,
+            "--ubatch-size": positive,
+            "-ub": positive,
+            "--n-gpu-layers": lambda value: _valid_int(value, minimum=-1),
+            "--gpu-layers": lambda value: _valid_int(value, minimum=-1),
+            "-ngl": lambda value: _valid_int(value, minimum=-1),
+            "--split-mode": lambda value: value in {"none", "layer", "row"},
+            "--tensor-split": _valid_non_option,
+            "--main-gpu": nonnegative,
+            "--flash-attn": lambda value: value.lower()
+            in {"on", "off", "auto", "true", "false", "0", "1"},
+            "--ctx-size": positive,
+            "-c": positive,
+            "--pooling": enum_pooling,
+            "--pooling-type": enum_pooling,
+        }
+        boolean_flags = {
+            "--no-kv-offload",
+            "--kv-unified",
+        }
+        context_length = (
+            positive_int_flag(args, "--ctx-size", "-c")
+            or profile.max_model_len
+        )
+        semantic_base = {
+            "context_length": context_length,
+            "pooling": _last_valid_flag(
+                args,
+                {"--pooling", "--pooling-type"},
+                enum_pooling,
+            ),
+        }
+    else:
+        value_flags = {
+            "--num-gpus": positive,
+            "--gpu-memory-utilization": _valid_gpu_fraction,
+        }
+        boolean_flags = set()
+        semantic_base = {
+            "image_defaults": profile.image_defaults,
+        }
+    semantic_base["semantic_extra_args"] = list(
+        _strip_valid_flags(args, value_flags, boolean_flags)
+    )
+    return semantic_base
+
+
+def _profile_deployment(
+    profile: ResolvedProfile,
+) -> tuple[str, dict, bool]:
+    """Return strict identity, safe public identity document, and confidence."""
+
+    upstream = profile.upstream_model or profile.served_model_name
+    portable_upstream = bool(_RAW_HF_ID_RE.fullmatch(upstream))
+    if not portable_upstream:
+        # Raw/local/unusual engine targets remain callable for compatibility
+        # but are neither disclosed nor automatically groupable across nodes.
+        upstream = f"local-artifact-{sha256_id(upstream)}"
+    artifact = _profile_artifact(profile)
+    deployment_id, _load_digest, identity = deployment_identity(
+        engine=profile.backend,
+        upstream_model=upstream,
+        resolved_revision=profile.revision or None,
+        artifact=artifact,
+        kind=profile.kind,
+        capabilities=profile.capabilities,
+        load_config=_semantic_load_config(profile),
+    )
+    authoritative = identity_is_authoritative(
+        resolved_revision=profile.revision or None,
+        artifact=artifact,
+    ) and portable_upstream
+    return deployment_id, identity, authoritative
+
+
+async def _probe_engine_capacity(profile: ResolvedProfile) -> CapacitySpec:
+    """Derive safe concurrency, preferring live engine-native state."""
+
+    fallback = derive_cuda_capacity(
+        backend=profile.backend,
+        extra_args=profile.extra_args,
+        configured_max_concurrency=None,
+        active=0,
+        queued=0,
+    )
+    derived = fallback.derived_limit
+    source = fallback.source
+    confidence = fallback.confidence
+    if profile.backend != "llama.cpp":
+        # vLLM 0.22.1 logs a theoretical KV concurrency estimate at startup
+        # but does not expose it as a stable Prometheus value. A valid
+        # --max-num-seqs is therefore the configured adapter limit; otherwise
+        # admission remains conservatively single-request.
+        return CapacitySpec(derived, source, confidence)
+    try:
+        async with httpx.AsyncClient(timeout=2.0, trust_env=False) as client:
+            response = await client.get(f"{VLLM_BASE}/slots")
+            if response.status_code == 200:
+                payload = response.json()
+                slots = (
+                    payload
+                    if isinstance(payload, list)
+                    else payload.get("slots", [])
+                    if isinstance(payload, dict)
+                    else []
+                )
+                if isinstance(slots, list) and slots:
+                    derived = len(slots)
+                    source = "llama.cpp-slots"
+                    confidence = "authoritative"
+    except Exception:
+        # Metrics are an optimization over conservative adapter defaults.
+        # Engine readiness has already been established by the start path.
+        pass
+    return CapacitySpec(derived, source, confidence)
+
+
+def _set_coordinator_inflight(value: int) -> None:
+    _runtime.inflight = value
+
+
+def _set_coordinator_transition(profile: ResolvedProfile | None) -> None:
+    global _loading_target
+    _loading_target = profile.alias if profile is not None else None
+
+
+def _new_coordinator() -> CudaResidencyCoordinator:
+    if _config is None:
+        raise RuntimeError("config not loaded")
+
+    async def start(profile: ResolvedProfile) -> None:
+        await _start_engine(profile)
+
+    def stop() -> None:
+        # Resolve through the module global at call time so compatibility
+        # fixtures and operators patching the legacy hook still work.
+        _kill_vllm()
+
+    return CudaResidencyCoordinator(
+        start_engine=start,
+        stop_engine=stop,
+        derive_capacity=_probe_engine_capacity,
+        configured_max_concurrency=_config.server.max_concurrency,
+        max_queue_depth=_config.server.max_queue_depth,
+        on_inflight_changed=_set_coordinator_inflight,
+        on_transition_changed=_set_coordinator_transition,
+    )
+
+
+def _get_coordinator() -> CudaResidencyCoordinator:
+    global _coordinator
+    if _coordinator is None:
+        _coordinator = _new_coordinator()
+    return _coordinator
+
+
+def _admission_http_exception(exc: BaseException) -> HTTPException:
+    if isinstance(exc, QueueFull):
+        return HTTPException(
+            429,
+            detail={"code": "node_busy", "message": "node admission queue is full"},
+            headers={
+                "Retry-After": "1",
+                "X-Mnemosyne-Error": "node_busy",
+            },
+        )
+    if isinstance(exc, QueueTimeout):
+        return HTTPException(
+            504,
+            detail={"code": "node_queue_timeout", "message": "node admission timed out"},
+        )
+    if isinstance(exc, NotAccepting):
+        return HTTPException(
+            503,
+            detail={"code": "node_not_accepting", "message": "node is not accepting requests"},
+            headers={"Retry-After": "1"},
+        )
+    return HTTPException(503, f"engine load failed: {exc}")
+
+
+async def _acquire_profile_lease(
+    profile: ResolvedProfile,
+    deadline: float,
+) -> ModelLease:
+    deployment_id, _identity, _authoritative = _profile_deployment(profile)
+    timeout = max(0.0, deadline - time.monotonic())
+    try:
+        return await _get_coordinator().acquire(
+            profile,
+            deployment_id,
+            timeout_seconds=timeout,
+        )
+    except (QueueFull, QueueTimeout, NotAccepting) as exc:
+        raise _admission_http_exception(exc) from exc
+    except ResidencyError as exc:
+        raise HTTPException(503, f"engine load failed: {exc}") from exc
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(503, f"engine load failed: {exc}") from exc
+
+
 # ──────────────────────────────────────────────
 # Swap queue + deadline helpers (Phase 2 §5.3)
 # ──────────────────────────────────────────────
@@ -458,63 +849,68 @@ async def _run_until(
 
 
 async def ensure_loaded(profile: ResolvedProfile, deadline: float) -> None:
-    """Block until vLLM is serving `profile.alias`. Raises HTTPException(504)
-    on deadline expiry, HTTPException(503) on vLLM load failure.
+    """Compatibility load shim routed through the lease coordinator.
 
-    Concurrency model (LMStudio-style): single _swap_lock for cross-target
-    transitions; per-target asyncio.Event for piggyback so multiple requests
-    for the same loading target wait on one load. See plans/phase_2.md §5.3.
+    The transient lease prevents this explicit load from swapping beneath an
+    existing request.  Data-plane proxying acquires its own single lease and
+    does not call this helper first.
     """
-    global _loading_target, _load_event, _load_error
-    target = profile.alias
-    while True:
-        if _runtime.resident_alias == target and _loading_target is None:
-            return  # warm path
-        if _loading_target == target:  # piggyback an in-flight load
-            try:
-                await _run_until(_load_event.wait, deadline)
-            except asyncio.TimeoutError:
-                raise HTTPException(504, f"swap queue timeout waiting for '{target}'")
-            if _load_error is not None:
-                raise HTTPException(503, f"engine load failed: {_load_error}")
-            continue  # re-check resident
-        try:
-            await _run_until(_swap_lock.acquire, deadline)
-        except asyncio.TimeoutError:
-            raise HTTPException(504, f"swap queue timeout acquiring lock for '{target}'")
-        try:
-            if _runtime.resident_alias == target:  # raced
-                return
-            _loading_target = target
-            _load_event = asyncio.Event()
-            _load_error = None
-            try:
-                await _run_until(lambda: _start_engine(profile), deadline)
-            except asyncio.TimeoutError:
-                # _start_engine cleans up the half-launched subprocess in
-                # the backend-specific start function. Surface as 504.
-                raise HTTPException(504, f"engine load did not complete in time for '{target}'")
-            except asyncio.CancelledError:
-                # Caller cancelled. Don't stash _load_error — piggybackers
-                # will re-check resident, see no model loaded, and retry
-                # against their own deadline.
-                raise
-            except HTTPException:
-                raise
-            except Exception as e:
-                _load_error = e
-                raise HTTPException(503, f"engine load failed: {e}")
-            finally:
-                _loading_target = None
-                _load_event.set()
-        finally:
-            _swap_lock.release()
-        # loop falls through to warm-path check
+
+    lease = await _acquire_profile_lease(profile, deadline)
+    await lease.release()
 
 
 # ──────────────────────────────────────────────
 # Usage buffer flush (Phase 2 §5.7)
 # ──────────────────────────────────────────────
+
+def _persist_usage_entries(entries: list[UsageEntry]) -> None:
+    """Atomically persist analytics and optional delivery-outbox rows."""
+
+    if not entries:
+        return
+    if _catalog is None:
+        raise RuntimeError("catalog is not initialized")
+    analytics_rows = [
+        (
+            entry.ts,
+            entry.requested_model,
+            entry.alias,
+            entry.backend,
+            entry.prompt_tokens,
+            entry.completion_tokens,
+            entry.total_tokens,
+            entry.usage_json,
+        )
+        for entry in entries
+    ]
+    outbox_rows = (
+        [
+            (
+                entry.event_id,
+                entry.ts,
+                entry.requested_model,
+                entry.alias,
+                entry.backend,
+                entry.endpoint,
+                1 if entry.streamed else 0,
+                entry.prompt_tokens,
+                entry.completion_tokens,
+                entry.total_tokens,
+                entry.response_ms,
+                entry.status_code,
+            )
+            for entry in entries
+        ]
+        if _config is not None and _config.token_sidecar.enabled
+        else []
+    )
+    _catalog.record_usage_batch(
+        analytics_rows,
+        event_ids=[entry.event_id for entry in entries],
+        outbox_rows=outbox_rows,
+    )
+
 
 def _flush_usage() -> None:
     """Sync. Safe from any context — no-op if there's nothing to flush.
@@ -523,13 +919,11 @@ def _flush_usage() -> None:
     Drains two buffers:
       - `request_count_delta` for the currently-resident alias (legacy
         per-resident counter on `models.request_count`).
-      - `usage_rows` of per-request token-usage tuples (Phase: token
-        tracking) — keyed per-row by alias so eviction between request and
-        flush is handled cleanly.
+      - `usage_rows`, now an in-memory retry buffer populated only when an
+        immediate SQLite transaction fails.
 
-    When token_sidecar is enabled, the same rows are mirrored into the
-    SQLite outbox (`pg_usage_outbox`) so the postgres flush loop can ship
-    them upstream durably across restarts.
+    Analytics and, when token_sidecar is enabled, `pg_usage_outbox` are
+    committed atomically. Rows leave the retry deque only after that commit.
     """
     if _catalog is None:
         return
@@ -540,33 +934,13 @@ def _flush_usage() -> None:
         _runtime.request_count_delta = 0
     if not _runtime.usage_rows:
         return
-    entries: list[UsageEntry] = []
-    while _runtime.usage_rows:
-        entries.append(_runtime.usage_rows.popleft())
-    # Project to the 8-tuple shape `record_usage_batch` expects (the wire
-    # format the existing analytics path was built around — kept stable).
-    analytics_rows = [
-        (
-            e.ts, e.requested_model, e.alias, e.backend,
-            e.prompt_tokens, e.completion_tokens, e.total_tokens, e.usage_json,
-        )
-        for e in entries
-    ]
-    _catalog.record_usage_batch(analytics_rows)
-    # Mirror to the postgres outbox when the sidecar is enabled. Done in
-    # the same flush tick so a missed analytics write and a missed outbox
-    # write fail together (or not at all).
-    if _config is not None and _config.token_sidecar.enabled:
-        outbox_rows = [
-            (
-                e.event_id, e.ts, e.requested_model, e.alias, e.backend,
-                e.endpoint, 1 if e.streamed else 0,
-                e.prompt_tokens, e.completion_tokens, e.total_tokens,
-                e.response_ms, e.status_code,
-            )
-            for e in entries
-        ]
-        _catalog.enqueue_pg_outbox(outbox_rows)
+    # This deque is now a retry buffer used only after an immediate durable
+    # write fails. Peek first and remove rows only after the atomic SQLite
+    # transaction commits; event IDs make a retry idempotent.
+    entries = list(_runtime.usage_rows)
+    _persist_usage_entries(entries)
+    for _entry in entries:
+        _runtime.usage_rows.popleft()
 
 
 def _flush_usage_best_effort(context: str) -> None:
@@ -578,7 +952,7 @@ def _flush_usage_best_effort(context: str) -> None:
 
 
 async def _flush_loop() -> None:
-    """Background task: flush every 30s while the manager is up."""
+    """Retry failed immediate usage writes every 30s while the manager is up."""
     while True:
         await asyncio.sleep(30)
         try:
@@ -664,20 +1038,22 @@ async def _eviction_loop() -> None:
     logger.info("Idle eviction enabled (threshold=%ds, period=%ds)", threshold, period)
     while True:
         await asyncio.sleep(period)
-        async with _swap_lock:
-            if _runtime.resident_alias is None:
-                continue
-            if _runtime.inflight > 0:
-                continue
-            if _runtime.last_used_at is None:
-                continue
-            idle = time.time() - _runtime.last_used_at
-            if idle > threshold:
+        coordinator = _coordinator
+        if coordinator is None:
+            continue
+        try:
+            evicted = await coordinator.evict_if_idle(
+                threshold,
+                timeout_seconds=_config.server.swap_queue_timeout_seconds,
+            )
+            if evicted:
                 logger.info(
-                    "Idle eviction: '%s' idle %ds (threshold %ds)",
-                    _runtime.resident_alias, int(idle), threshold,
+                    "Idle eviction safely drained the resident model "
+                    "(threshold %ds)",
+                    threshold,
                 )
-                _kill_vllm()
+        except QueueTimeout as exc:
+            logger.warning("Idle eviction drain timed out: %s", exc)
 
 
 # ──────────────────────────────────────────────
@@ -722,6 +1098,7 @@ def _synthesize_profile(model_id: str) -> ResolvedProfile:
         storage_path=storage_path,
         extra_args=(),
         revision="main",
+        upstream_model=model_id,
     )
 
 
@@ -921,6 +1298,11 @@ async def _reload_config() -> ReloadResult:
         {l.name: l.path for l in new.storage.locations},
     )
     _config = new
+    if _coordinator is not None:
+        await _coordinator.reconfigure(
+            configured_max_concurrency=new.server.max_concurrency,
+            max_queue_depth=new.server.max_queue_depth,
+        )
     return ReloadResult(sync=sync, reconcile=rec)
 
 
@@ -950,12 +1332,15 @@ async def manager_lifespan(
     global _config, _catalog, _runtime, _eviction_task, _flush_task
     global _pg_writer, _pg_flush_task, _pg_last_flush_at
     global _pg_last_flush_count, _pg_last_error
+    global _coordinator, _fleet_instance_id, _fleet_snapshot_sequence
     if cfg is None:
         load_env()
         cfg = load_config()
     _config = cfg
     _catalog = open_catalog()
     _runtime = RuntimeState()
+    _fleet_instance_id = uuid.uuid4().hex
+    _fleet_snapshot_sequence = 0
     _legacy_alias_warned.clear()
     # Phase 5 — load vLLM-supported architectures for /manager/hf/search.
     # Primary: runtime introspection of vllm.model_executor.models.registry.
@@ -1049,6 +1434,7 @@ async def manager_lifespan(
         f"  │  No model loaded. POST /manager/load first.         │\n"
         f"  └─────────────────────────────────────────────────────┘\n"
     )
+    _coordinator = _new_coordinator()
     try:
         yield
     finally:
@@ -1072,8 +1458,22 @@ async def manager_lifespan(
             except Exception as e:
                 logger.warning("cancel_install(%s) during shutdown: %s", alias, e)
         hf_search.shutdown_search_pool()
-        # Final flush before _kill_vllm wipes _runtime — belt-and-suspenders
-        # in case _kill_vllm's internal flush ever moves.
+        coordinator_stopped = True
+        if _coordinator is not None:
+            try:
+                await _coordinator.shutdown(
+                    timeout_seconds=(
+                        _config.server.swap_queue_timeout_seconds
+                        if _config is not None
+                        else 300
+                    )
+                )
+            except Exception as exc:
+                # A drain timeout intentionally leaves the engine untouched;
+                # killing here would violate the full-stream lease invariant.
+                coordinator_stopped = False
+                logger.error("Safe coordinator shutdown incomplete: %s", exc)
+        # Final flush after all successfully drained request leases settle.
         _flush_usage_best_effort("lifespan shutdown")
         # Last chance for the outbox to ship rows that just landed in the
         # final SQLite flush above. Best-effort: never block teardown on
@@ -1083,8 +1483,14 @@ async def manager_lifespan(
             with contextlib.suppress(Exception):
                 await _pg_writer.close()
             _pg_writer = None
-        logger.info("Shutting down — stopping vLLM ...")
-        _kill_vllm()
+        if coordinator_stopped:
+            logger.info("Shutting down — engine is safely drained and stopped")
+            _kill_vllm()
+        else:
+            logger.error(
+                "Engine stop skipped because active request drain was not proven"
+            )
+        _coordinator = None
         if _catalog is not None:
             _catalog.close()
             _catalog = None
@@ -1102,6 +1508,7 @@ async def manager_lifespan(
 # registered after include_router() run are silently ignored.
 health_router = APIRouter()
 inference_router = APIRouter()
+fleet_router = APIRouter()
 admin_router = APIRouter()
 docs_router = APIRouter()
 ui_router = APIRouter()
@@ -1138,6 +1545,9 @@ async def status():
     `engine_pid` (vllm_pid is kept as a deprecated alias for one release).
     """
     profile = _runtime.resident_profile
+    coordinator_view = (
+        await _coordinator.status() if _coordinator is not None else None
+    )
     loaded_model = profile.served_model_name if profile else None
     load_time = _runtime.model_load_time
     engine_pid = (
@@ -1179,6 +1589,29 @@ async def status():
         ),
         "inflight_requests": _runtime.inflight,
         "swap_target":       _loading_target,
+        "residency": (
+            {
+                "state": coordinator_view.state.value,
+                "epoch": coordinator_view.epoch,
+                "queued": coordinator_view.queued,
+                "queue_limit": coordinator_view.queue_limit,
+                "transition_target": coordinator_view.transition_target,
+                "accepting": coordinator_view.accepting,
+                "authoritative": coordinator_view.authoritative,
+            }
+            if coordinator_view is not None
+            else None
+        ),
+        "max_concurrency": (
+            coordinator_view.configured_max_concurrency
+            if coordinator_view is not None
+            else None
+        ),
+        "effective_concurrency": (
+            coordinator_view.effective_limit
+            if coordinator_view is not None
+            else 1
+        ),
         # Backend dispatch surface
         "backend":           profile.backend if profile else None,
         "model_kind":        profile.kind if profile else None,
@@ -1459,22 +1892,34 @@ async def load_model(request: Request):
 
 @admin_router.post("/manager/unload", tags=["manager"])
 async def unload_model():
-    """Unload the current model and free all GPU memory."""
-    deadline = time.monotonic() + (
-        _config.server.swap_queue_timeout_seconds if _config else 300
+    """Drain active response leases, then unload and free GPU memory."""
+    coordinator = _get_coordinator()
+    before = await coordinator.status()
+    if (
+        before.resident_profile is None
+        and before.state == CoordinatorState.IDLE
+        and before.queued == 0
+    ):
+        return {"status": "nothing to unload"}
+    was_alias = (
+        before.resident_profile.alias
+        if before.resident_profile is not None
+        else _loading_target
     )
     try:
-        await _run_until(_swap_lock.acquire, deadline)
-    except asyncio.TimeoutError:
-        raise HTTPException(504, "timeout waiting for active model load to finish")
-    try:
-        if _runtime.resident_alias is None:
-            return {"status": "nothing to unload"}
-        was = _runtime.resident_alias
-        _kill_vllm()
-        return {"status": "unloaded", "was": was}
-    finally:
-        _swap_lock.release()
+        await coordinator.unload(
+            timeout_seconds=(
+                _config.server.swap_queue_timeout_seconds if _config else 300
+            )
+        )
+    except QueueTimeout as exc:
+        raise HTTPException(504, "timeout draining active model requests") from exc
+    except ResidencyError as exc:
+        raise HTTPException(503, "safe engine unload failed") from exc
+    return {
+        "status": "unloaded",
+        "was": was_alias,
+    }
 
 
 @admin_router.get("/manager/models", tags=["manager"])
@@ -1789,10 +2234,11 @@ async def _install_internal(
         backend=backend,
         gguf_filename=gguf_filename,
         model_kind=model_kind,
-        capabilities=(
-            ["images.generations"]
-            if model_kind == "image"
-            else ["chat.completions", "completions", "embeddings", "responses"]
+        capabilities=list(
+            config_mod.default_model_capabilities(
+                backend=backend,
+                kind=model_kind,
+            )
         ),
         image_config=image_config,
     )
@@ -2295,18 +2741,321 @@ async def health():
     }
 
 
+async def require_fleet_bearer(request: Request) -> None:
+    """Authenticate Nyx independently from ordinary inference clients."""
+
+    expected = os.environ.get("FLEET_API_KEY", "")
+    if not expected:
+        # Do not advertise the fleet inventory surface until it is explicitly
+        # enrolled with a credential.
+        raise HTTPException(404)
+    auth = request.headers.get("authorization", "")
+    if not auth.startswith("Bearer "):
+        raise HTTPException(401, headers={"WWW-Authenticate": "Bearer"})
+    if not secrets.compare_digest(auth[len("Bearer ") :], expected):
+        raise HTTPException(401, headers={"WWW-Authenticate": "Bearer"})
+
+
+def _fleet_node_id() -> str:
+    if _config is None:
+        return ""
+    return (
+        _config.fleet.node_id.strip()
+        or _config.token_sidecar.node_id.strip()
+    )
+
+
+def _next_fleet_snapshot_sequence() -> int:
+    global _fleet_snapshot_sequence
+    with _fleet_snapshot_sequence_lock:
+        value = _fleet_snapshot_sequence
+        _fleet_snapshot_sequence += 1
+    return value
+
+
+def _fleet_profiles() -> list[ResolvedProfile]:
+    """Resolve only declarative/installed profiles; never raw request paths."""
+
+    if _config is None:
+        return []
+    aliases = [model.alias for model in _config.models]
+    if _catalog is not None:
+        aliases.extend(
+            row.alias
+            for row in _catalog.list_models()
+            if row.source == "ui_install"
+            and row.status == "installed"
+            and not is_cache_only_alias(row.alias)
+        )
+    profiles: list[ResolvedProfile] = []
+    for alias in dict.fromkeys(aliases):
+        if not alias or len(alias) > 128:
+            continue
+        try:
+            profile = resolve_profile(alias, _config, _catalog)
+            _deployment_id, identity, _authoritative = _profile_deployment(profile)
+        except (KeyError, ProfileNotReady, ValueError, TypeError):
+            continue
+        artifact = identity["artifact"]
+        selected = artifact["selected_files"]
+        if (
+            len(identity["upstream_model"]) > 512
+            or (
+                identity["resolved_revision"] is not None
+                and len(identity["resolved_revision"]) > 256
+            )
+            or (
+                artifact["quantization"] is not None
+                and len(artifact["quantization"]) > 128
+            )
+            or any(
+                not item
+                or len(item) > 512
+                or os.path.isabs(item)
+                or "\\" in item
+                or ".." in Path(item.replace("\\", "/")).parts
+                for item in selected
+            )
+        ):
+            continue
+        profiles.append(profile)
+    return profiles
+
+
+def _capacity_dict(
+    spec: CapacitySpec,
+    *,
+    configured_max_concurrency: int | None,
+    active: int,
+    queued: int,
+    admission_open: bool,
+) -> dict:
+    return effective_capacity(
+        derived_limit=spec.derived_limit,
+        configured_max_concurrency=configured_max_concurrency,
+        active=active,
+        queued=queued,
+        source=spec.source,
+        confidence=spec.confidence,
+        admission_open=admission_open,
+    ).to_dict()
+
+
+def _static_profile_capacity(
+    profile: ResolvedProfile,
+    *,
+    active: int,
+    queued: int,
+    admission_open: bool,
+) -> dict:
+    return derive_cuda_capacity(
+        backend=profile.backend,
+        extra_args=profile.extra_args,
+        configured_max_concurrency=(
+            _config.server.max_concurrency if _config is not None else None
+        ),
+        active=active,
+        queued=queued,
+        admission_open=admission_open,
+    ).to_dict()
+
+
+@fleet_router.get("/fleet/v1/snapshot", tags=["fleet"])
+async def fleet_snapshot(
+    response: Response,
+    _auth: None = Depends(require_fleet_bearer),
+):
+    """Return one schema-v1, secret-free authoritative node snapshot."""
+
+    response.headers["Cache-Control"] = "no-store"
+    if not os.environ.get("INFERENCE_API_KEY", ""):
+        # A discoverable node must not claim routable capacity when the
+        # enrolled per-node inference credential would be ignored.
+        raise HTTPException(
+            503,
+            detail={
+                "code": "fleet_inference_auth_unconfigured",
+                "message": (
+                    "configure a node-specific INFERENCE_API_KEY before "
+                    "enabling fleet discovery"
+                ),
+            },
+        )
+    node_id = _fleet_node_id()
+    if not node_id:
+        raise HTTPException(
+            503,
+            detail={
+                "code": "fleet_node_id_unconfigured",
+                "message": (
+                    "configure fleet.node_id or token_sidecar.node_id "
+                    "before enrollment"
+                ),
+            },
+        )
+    if len(node_id) > 128 or any(ord(char) < 0x20 for char in node_id):
+        raise HTTPException(
+            503,
+            detail={
+                "code": "fleet_node_id_invalid",
+                "message": "configured fleet node identity is not protocol-safe",
+            },
+        )
+    coordinator = _get_coordinator()
+    status_view = await coordinator.status()
+
+    engine_alive = bool(
+        vllm_process is not None and vllm_process.poll() is None
+    )
+    process_mismatch = (
+        (
+            status_view.state == CoordinatorState.READY
+            and status_view.resident_profile is not None
+            and not engine_alive
+        )
+        or (
+            status_view.state == CoordinatorState.IDLE
+            and status_view.resident_profile is None
+            and engine_alive
+        )
+    )
+    authoritative = status_view.authoritative and not process_mismatch
+    diagnostic_code = status_view.diagnostic_code
+    if process_mismatch:
+        diagnostic_code = (
+            "engine_process_missing"
+            if status_view.resident_profile is not None
+            else "unexpected_engine_process"
+        )
+    accepting = status_view.accepting and authoritative
+    root_admission_open = accepting and status_view.state in {
+        CoordinatorState.IDLE,
+        CoordinatorState.READY,
+    }
+    root_capacity = _capacity_dict(
+        status_view.capacity,
+        configured_max_concurrency=status_view.configured_max_concurrency,
+        active=status_view.active,
+        queued=status_view.queued,
+        admission_open=root_admission_open,
+    )
+
+    deployments: list[dict] = []
+    for profile in _fleet_profiles():
+        deployment_id, identity, identity_authoritative = _profile_deployment(profile)
+        warm = deployment_id == status_view.resident_deployment_id
+        queued = status_view.queued_by_deployment.get(deployment_id, 0)
+        if warm:
+            deployment_capacity = _capacity_dict(
+                status_view.capacity,
+                configured_max_concurrency=status_view.configured_max_concurrency,
+                active=status_view.active,
+                queued=queued,
+                admission_open=root_admission_open,
+            )
+        else:
+            # Cold estimates remain visible while the node is accepting so
+            # Nyx can safely choose a bounded drain/switch tier.
+            deployment_capacity = _static_profile_capacity(
+                profile,
+                active=0,
+                queued=queued,
+                admission_open=accepting,
+            )
+        deployments.append(
+            {
+                "alias": profile.alias,
+                "deployment_id": deployment_id,
+                "identity": identity,
+                "identity_confidence": (
+                    "authoritative" if identity_authoritative else "unverified"
+                ),
+                "fleet_eligible": identity_authoritative,
+                "loadable": True,
+                "warm": warm,
+                "capacity": deployment_capacity,
+            }
+        )
+    deployments.sort(key=lambda item: item["alias"])
+
+    if status_view.state == CoordinatorState.DEGRADED:
+        health_state = "degraded"
+    else:
+        health_state = status_view.state.value
+    if process_mismatch:
+        health_state = "degraded"
+    usage_enabled = bool(_config and _config.token_sidecar.enabled)
+    return {
+        "schema_version": FLEET_SCHEMA_VERSION,
+        "snapshot_sequence": _next_fleet_snapshot_sequence(),
+        "observed_at": time.time(),
+        "node": {
+            "node_id": node_id,
+            "instance_id": _fleet_instance_id,
+            "platform": "cuda",
+            "version": "1.0.0",
+        },
+        "health": {
+            "state": health_state,
+            "accepting": accepting,
+            "authoritative": authoritative,
+            "diagnostic_code": diagnostic_code,
+        },
+        "residency": {
+            "alias": (
+                status_view.resident_profile.alias
+                if status_view.resident_profile is not None
+                else None
+            ),
+            "deployment_id": status_view.resident_deployment_id,
+            "engine": (
+                status_view.resident_profile.backend
+                if status_view.resident_profile is not None
+                else None
+            ),
+            "epoch": status_view.epoch,
+            "transition_target": status_view.transition_target,
+        },
+        "admission": {
+            "queue_depth": status_view.queued,
+            "queue_limit": status_view.queue_limit,
+            "queued_by_deployment": status_view.queued_by_deployment,
+        },
+        "capacity": root_capacity,
+        "deployments": deployments,
+        "usage_delivery": {
+            "enabled": usage_enabled,
+            "writer_ready": _pg_writer is not None,
+            "outbox_pending": _catalog.count_pg_outbox() if _catalog else 0,
+            "last_flush_at": _pg_last_flush_at,
+            "last_error_code": (
+                "delivery_failed" if _pg_last_error is not None else None
+            ),
+        },
+    }
+
+
 # ──────────────────────────────────────────────
 # OpenAI-compatible proxy → inner vLLM
 # ──────────────────────────────────────────────
 
 VLLM_BASE = f"http://{VLLM_INNER_HOST}:{VLLM_INNER_PORT}"
 
-# Endpoints whose 200 responses carry an OpenAI-style `usage` block. Used by
-# the token-usage tracker to avoid parsing irrelevant payloads (e.g. /v1/models).
+# Language endpoints whose successful responses can carry recognized token
+# usage. Images intentionally do not emit token events.
 _USAGE_ENDPOINTS = frozenset({
     "v1/chat/completions",
     "v1/completions",
     "v1/embeddings",
+    "v1/messages",
+    "v1/rerank",
+    "v1/responses",
+})
+
+# Only these OpenAI request shapes accept `stream_options.include_usage`.
+_FORCED_STREAM_USAGE_ENDPOINTS = frozenset({
+    "v1/chat/completions",
+    "v1/completions",
 })
 
 # Legacy in-memory aliases (deprecated; tier 3 in _resolve_request_model).
@@ -2348,14 +3097,20 @@ def _canonicalize_model_field(body: bytes, profile: Optional[ResolvedProfile]) -
     return json.dumps(payload, separators=(",", ":")).encode("utf-8")
 
 
-def _ensure_stream_usage(body: bytes) -> tuple[bytes, bool]:
+def _ensure_stream_usage(
+    body: bytes,
+    path: str = "v1/chat/completions",
+) -> tuple[bytes, bool]:
     """Inject `stream_options.include_usage: true` into streaming requests.
 
-    vLLM only emits the trailing `usage` SSE event when the client opts in
-    via stream_options. We force the opt-in so the proxy can record token
-    counts, and return a flag indicating whether the *client* had already
-    asked for it — the streaming wrapper uses that flag to decide whether
-    to forward the synthetic usage event to the client or strip it.
+    Chat Completions and legacy Completions emit the trailing `usage` SSE
+    event when the client opts in via stream_options. Force that opt-in so the
+    proxy can account for tokens, and return whether the client had already
+    requested it so the synthetic event can be hidden when necessary.
+
+    Responses and Anthropic Messages have their own streaming usage events
+    and do not accept this Chat-specific field. Their request bytes remain
+    unchanged.
 
     Returns (possibly-rewritten body, client_asked_for_usage).
     """
@@ -2368,7 +3123,12 @@ def _ensure_stream_usage(body: bytes) -> tuple[bytes, bool]:
     if not isinstance(payload, dict) or not payload.get("stream"):
         return body, False
     opts = payload.get("stream_options")
-    if isinstance(opts, dict) and opts.get("include_usage") is True:
+    client_asked_for_usage = (
+        isinstance(opts, dict) and opts.get("include_usage") is True
+    )
+    if path not in _FORCED_STREAM_USAGE_ENDPOINTS:
+        return body, client_asked_for_usage
+    if client_asked_for_usage:
         return body, True
     new_opts = dict(opts) if isinstance(opts, dict) else {}
     new_opts["include_usage"] = True
@@ -2413,61 +3173,240 @@ def _process_sse_event(
     return True, usage
 
 
-def _append_usage_row(
+def _sse_event_completes_usage(event_bytes: bytes, path: str) -> bool:
+    """Return whether an SSE event carries the route's final usage totals."""
+
+    text = event_bytes.decode("utf-8", errors="replace").rstrip("\r\n")
+    data_lines = [
+        line[5:].lstrip()
+        for raw in text.split("\n")
+        if (line := raw.rstrip("\r")).startswith("data:")
+    ]
+    if not data_lines:
+        return False
+    try:
+        payload = json.loads("\n".join(data_lines))
+    except Exception:
+        return False
+    if not isinstance(payload, dict):
+        return False
+    if normalize_usage(payload, endpoint=f"/{path}") is None:
+        return False
+
+    event_type = str(payload.get("type") or "")
+    if path == "v1/responses":
+        return event_type == "response.completed"
+    if path == "v1/messages":
+        return event_type == "message_delta"
+    # Chat/Completions usage events and the unlikely streaming
+    # Embeddings/Rerank usage block are complete when emitted.
+    return True
+
+
+def _make_usage_entry(
     *,
     requested_model: Optional[str],
     alias: Optional[str],
     backend: Optional[str],
-    usage: dict,
+    usage: NormalizedUsage,
     endpoint: str,
     streamed: bool,
     response_ms: float,
     status_code: int,
-) -> None:
-    """Queue a per-request usage row for the next `_flush_loop` tick.
+) -> UsageEntry | None:
+    """Build one idempotent usage event for the durable SQLite path.
 
     No-op when `alias` is unknown (raw HF id passthrough with no resident
-    profile). Defensive about non-integer token counts since vLLM and
-    llama-server have shipped occasional `null` values in error-but-200 paths.
-
-    `event_id` is generated here (UUID4 hex) so the same identity rides both
-    the in-memory deque and the durable SQLite outbox — the postgres-side
-    `ON CONFLICT (event_id) DO NOTHING` then makes DELETE-after-success
-    safe to retry.
+    profile). `event_id` is generated before persistence so retries use the
+    same identity in local analytics, the durable outbox, and Postgres.
     """
     if not alias:
-        return
+        return None
     try:
-        prompt = int(usage.get("prompt_tokens") or 0)
-    except (TypeError, ValueError):
-        prompt = 0
-    try:
-        completion = int(usage.get("completion_tokens") or 0)
-    except (TypeError, ValueError):
-        completion = 0
-    try:
-        total = int(usage.get("total_tokens") or (prompt + completion))
-    except (TypeError, ValueError):
-        total = prompt + completion
-    try:
-        usage_json = json.dumps(usage, separators=(",", ":"))
+        usage_json = json.dumps(dict(usage.raw), separators=(",", ":"))
     except Exception:
         usage_json = None
-    _runtime.usage_rows.append(UsageEntry(
+    return UsageEntry(
         ts=time.time(),
         requested_model=requested_model,
         alias=alias,
         backend=backend or "vllm",
-        prompt_tokens=prompt,
-        completion_tokens=completion,
-        total_tokens=total,
+        prompt_tokens=usage.prompt_tokens,
+        completion_tokens=usage.completion_tokens,
+        total_tokens=usage.total_tokens,
         usage_json=usage_json,
         event_id=uuid.uuid4().hex,
         endpoint=endpoint,
         streamed=streamed,
         response_ms=response_ms,
         status_code=status_code,
-    ))
+    )
+
+
+async def _record_usage_entry(entry: UsageEntry) -> None:
+    """Persist before response completion, retaining a retry on failure.
+
+    SQLite work runs off the event loop. Even repeated cancellation is delayed
+    until the transaction reaches a known outcome. A failed transaction leaves
+    the event in the in-memory retry deque, and `_flush_loop` removes it only
+    after a later atomic commit.
+    """
+
+    persist_task = asyncio.create_task(
+        asyncio.to_thread(_persist_usage_entries, [entry]),
+        name="cuda-usage-persist",
+    )
+    cancellation: asyncio.CancelledError | None = None
+    persist_error: BaseException | None = None
+
+    # A client disconnect can call cancel more than once. Keep putting a
+    # shield between this wrapper and the persistence task until SQLite has
+    # definitely committed or failed; awaiting the task unshielded after the
+    # first cancellation would let a second cancellation cancel the wrapper
+    # before it can retain the event for retry.
+    while not persist_task.done():
+        try:
+            await asyncio.shield(persist_task)
+        except asyncio.CancelledError as exc:
+            if cancellation is None:
+                cancellation = exc
+        except Exception:
+            # The task is complete when its exception reaches the shield.
+            # Inspect it below so success/failure has one authoritative path.
+            break
+
+    if persist_task.cancelled():
+        persist_error = RuntimeError(
+            "usage persistence task was cancelled before a known outcome"
+        )
+    else:
+        try:
+            persist_task.result()
+        except Exception as exc:
+            persist_error = exc
+
+    if persist_error is not None:
+        if not any(
+            queued.event_id == entry.event_id
+            for queued in _runtime.usage_rows
+        ):
+            _runtime.usage_rows.append(entry)
+        logger.warning(
+            "Immediate usage persistence failed; retained for retry (%s)",
+            type(persist_error).__name__,
+        )
+    if cancellation is not None:
+        raise cancellation
+
+
+async def _record_usage_row(
+    *,
+    requested_model: Optional[str],
+    alias: Optional[str],
+    backend: Optional[str],
+    usage: NormalizedUsage,
+    endpoint: str,
+    streamed: bool,
+    response_ms: float,
+    status_code: int,
+) -> None:
+    entry = _make_usage_entry(
+        requested_model=requested_model,
+        alias=alias,
+        backend=backend,
+        usage=usage,
+        endpoint=endpoint,
+        streamed=streamed,
+        response_ms=response_ms,
+        status_code=status_code,
+    )
+    if entry is not None:
+        await _record_usage_entry(entry)
+
+
+async def _cleanup_proxy_resources(
+    *,
+    response: Any | None = None,
+    client: Any | None = None,
+    lease: ModelLease | None = None,
+) -> None:
+    """Attempt every proxy cleanup operation without losing cancellation.
+
+    Response/client close implementations are outside the coordinator's
+    trust boundary and may raise (including ``CancelledError``). Each cleanup
+    therefore runs independently, while the complete drain is shielded from
+    cancellation of the request task. If the caller was cancelled, that
+    cancellation is re-raised only after the model lease release completed.
+    """
+
+    operations: list[tuple[str, Callable[[], Awaitable[None]], bool]] = []
+    if response is not None:
+        operations.append(("upstream_response_close", response.aclose, False))
+    if client is not None:
+        operations.append(("upstream_client_close", client.aclose, False))
+    if lease is not None:
+        operations.append(("model_lease_release", lease.release, True))
+    if not operations:
+        return
+
+    async def run_operation(
+        label: str,
+        operation: Callable[[], Awaitable[None]],
+        release_operation: bool,
+    ) -> None:
+        try:
+            if release_operation:
+                release_task = asyncio.create_task(
+                    operation(),
+                    name="cuda-proxy-model-lease-release",
+                )
+                await _await_task_to_known_outcome(release_task)
+            else:
+                await operation()
+        except asyncio.CancelledError:
+            logger.error("%s was cancelled during proxy cleanup", label)
+        except Exception as exc:
+            logger.error(
+                "%s failed during proxy cleanup (%s)",
+                label,
+                type(exc).__name__,
+            )
+
+    async def drain() -> None:
+        tasks = [
+            asyncio.create_task(
+                run_operation(label, operation, release_operation),
+                name=f"cuda-proxy-cleanup-{label}",
+            )
+            for label, operation, release_operation in operations
+        ]
+        await asyncio.gather(*tasks)
+
+    cleanup_task = asyncio.create_task(drain(), name="cuda-proxy-cleanup")
+    await _await_task_to_known_outcome(cleanup_task)
+
+
+async def _await_task_to_known_outcome(task: asyncio.Task):
+    """Defer repeated caller cancellation until an owned task is complete."""
+
+    cancellation: asyncio.CancelledError | None = None
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as exc:
+            if cancellation is None:
+                cancellation = exc
+        except Exception:
+            # The task is complete (or about to publish its exception). Inspect
+            # its authoritative result below.
+            break
+
+    if task.cancelled():
+        return task.result()
+    result = task.result()
+    if cancellation is not None:
+        raise cancellation
+    return result
 
 
 async def _open_upstream(
@@ -2482,7 +3421,7 @@ async def _open_upstream(
         k: v for k, v in request.headers.items()
         if k.lower() not in ("host", "content-length", "authorization", "cookie")
     }
-    client = httpx.AsyncClient(timeout=timeout)
+    client = httpx.AsyncClient(timeout=timeout, trust_env=False)
     try:
         req = client.build_request(
             method=request.method,
@@ -2494,21 +3433,156 @@ async def _open_upstream(
         response = await client.send(req, stream=True)
         return client, response
     except BaseException:
-        await client.aclose()
+        await _cleanup_proxy_resources(client=client)
         raise
 
 
+def _downstream_proxy_headers(incoming) -> dict[str, str]:
+    """Strip manager-reserved proof headers from engine responses."""
+
+    return {
+        key: value
+        for key, value in incoming.items()
+        if key.lower() != "x-mnemosyne-error"
+    }
+
+
+class _StreamingProxyOwnership:
+    """Exactly-once ownership of a streamed upstream response and lease."""
+
+    def __init__(
+        self,
+        *,
+        client: httpx.AsyncClient,
+        response: httpx.Response,
+        lease: ModelLease,
+        requested_model: str | None,
+        alias: str | None,
+        backend: str | None,
+        path: str,
+        request_start_monotonic: float | None,
+    ) -> None:
+        self.client = client
+        self.response = response
+        self.lease = lease
+        self.requested_model = requested_model
+        self.alias = alias
+        self.backend = backend
+        self.path = path
+        self.request_start_monotonic = request_start_monotonic
+        self.last_usage: NormalizedUsage | None = None
+        self.usage_parser = StreamingUsageParser(endpoint=f"/{path}")
+        self._usage_recorded = False
+        self._completion_task: asyncio.Task[None] | None = None
+
+    @property
+    def track_usage(self) -> bool:
+        return (
+            200 <= self.response.status_code < 300
+            and self.path in _USAGE_ENDPOINTS
+        )
+
+    async def record_usage(self) -> None:
+        if (
+            self._usage_recorded
+            or not self.track_usage
+            or self.last_usage is None
+        ):
+            return
+        self._usage_recorded = True
+        try:
+            response_ms = (
+                (
+                    time.monotonic() - self.request_start_monotonic
+                )
+                * 1000.0
+                if self.request_start_monotonic is not None
+                else 0.0
+            )
+            await _record_usage_row(
+                requested_model=self.requested_model,
+                alias=self.alias,
+                backend=self.backend,
+                usage=self.last_usage,
+                endpoint=(
+                    f"/{self.path}"
+                    if not self.path.startswith("/")
+                    else self.path
+                ),
+                streamed=True,
+                response_ms=response_ms,
+                status_code=self.response.status_code,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self._usage_recorded = False
+            raise
+
+    async def _finish(self) -> None:
+        _runtime.last_used_at = time.time()
+        _runtime.request_count_delta += 1
+        if self.track_usage and self.last_usage is not None:
+            try:
+                await self.record_usage()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "Failed to finalize streaming usage row (%s)",
+                    type(exc).__name__,
+                )
+        await _cleanup_proxy_resources(
+            response=self.response,
+            client=self.client,
+            lease=self.lease,
+        )
+
+    async def complete(self) -> None:
+        if self._completion_task is None:
+            self._completion_task = asyncio.create_task(
+                self._finish(),
+                name="cuda-streaming-proxy-finish",
+            )
+        await _await_task_to_known_outcome(self._completion_task)
+
+
+class _OwnedStreamingResponse(StreamingResponse):
+    """Streaming response whose outer ASGI lifetime owns cleanup.
+
+    The response lifetime starts before Starlette asks the body iterator for
+    its first item, closing the ownership gap where an unstarted async
+    generator's ``finally`` block would never run.
+    """
+
+    def __init__(
+        self,
+        content,
+        *,
+        owner: _StreamingProxyOwnership,
+        status_code: int,
+        headers: dict[str, str],
+        media_type: str | None,
+    ) -> None:
+        super().__init__(
+            content,
+            status_code=status_code,
+            headers=headers,
+            media_type=media_type,
+        )
+        self._owner = owner
+
+    async def __call__(self, scope, receive, send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            await self._owner.complete()
+
+
 async def _wrap_stream(
-    client: httpx.AsyncClient,
-    response: httpx.Response,
+    owner: _StreamingProxyOwnership,
     *,
-    requested_model: Optional[str] = None,
-    alias: Optional[str] = None,
-    backend: Optional[str] = None,
-    status_code: int = 200,
     client_asked_for_usage: bool = False,
-    path: str = "",
-    request_start_monotonic: Optional[float] = None,
 ):
     """Stream upstream chunks and own the inflight + usage accounting for
     this request. Reaching here means upstream returned headers, so usage
@@ -2520,66 +3594,45 @@ async def _wrap_stream(
     `usage` block, and (when the client did not opt in to that event) strips
     it from the bytes forwarded to the client.
     """
-    track_usage = (
-        200 <= status_code < 300
-        and path in _USAGE_ENDPOINTS
-    )
-    last_usage: Optional[dict] = None
     buffer = bytearray()
-    try:
-        async for chunk in response.aiter_bytes():
-            if not track_usage:
-                yield chunk
-                continue
-            buffer.extend(chunk)
-            while True:
-                idx = buffer.find(b"\n\n")
-                idx_crlf = buffer.find(b"\r\n\r\n")
-                if idx == -1 and idx_crlf == -1:
-                    break
-                if idx == -1 or (idx_crlf != -1 and idx_crlf < idx):
-                    boundary, sep_len = idx_crlf, 4
-                else:
-                    boundary, sep_len = idx, 2
-                event_bytes = bytes(buffer[:boundary + sep_len])
-                del buffer[:boundary + sep_len]
-                forward, usage = _process_sse_event(
-                    event_bytes, client_asked_for_usage,
-                )
-                if usage is not None:
-                    last_usage = usage
-                if forward:
-                    yield event_bytes
-        if track_usage and buffer:
-            # Stream ended without a trailing event terminator — forward
-            # the tail verbatim so the client doesn't see truncation.
+    async for chunk in owner.response.aiter_bytes():
+        if not owner.track_usage:
+            yield chunk
+            continue
+        owner.usage_parser.feed(chunk)
+        buffer.extend(chunk)
+        while True:
+            idx = buffer.find(b"\n\n")
+            idx_crlf = buffer.find(b"\r\n\r\n")
+            if idx == -1 and idx_crlf == -1:
+                break
+            if idx == -1 or (idx_crlf != -1 and idx_crlf < idx):
+                boundary, sep_len = idx_crlf, 4
+            else:
+                boundary, sep_len = idx, 2
+            event_bytes = bytes(buffer[:boundary + sep_len])
+            del buffer[:boundary + sep_len]
+            forward, _usage = _process_sse_event(
+                event_bytes,
+                (
+                    client_asked_for_usage
+                    or owner.path not in _FORCED_STREAM_USAGE_ENDPOINTS
+                ),
+            )
+            if _sse_event_completes_usage(event_bytes, owner.path):
+                owner.last_usage = owner.usage_parser.usage
+                await owner.record_usage()
+            if forward:
+                yield event_bytes
+    if owner.track_usage:
+        owner.last_usage = owner.usage_parser.finish()
+        # Commit before the response iterator terminates (and, for an
+        # unterminated tail, before forwarding that final SSE bytestring).
+        await owner.record_usage()
+        if buffer:
+            # Stream ended without a trailing event terminator — forward the
+            # tail verbatim so the client doesn't see truncation.
             yield bytes(buffer)
-    finally:
-        _runtime.inflight -= 1
-        _runtime.last_used_at = time.time()
-        _runtime.request_count_delta += 1
-        if track_usage and last_usage is not None:
-            try:
-                if request_start_monotonic is not None:
-                    response_ms = (time.monotonic() - request_start_monotonic) * 1000.0
-                else:
-                    response_ms = 0.0
-                _append_usage_row(
-                    requested_model=requested_model,
-                    alias=alias,
-                    backend=backend,
-                    usage=last_usage,
-                    endpoint=f"/{path}" if not path.startswith("/") else path,
-                    streamed=True,
-                    response_ms=response_ms,
-                    status_code=status_code,
-                )
-            except Exception as e:
-                logger.warning("Failed to queue streaming usage row: %s", e)
-        with contextlib.suppress(Exception):
-            await response.aclose()
-        with contextlib.suppress(Exception):
-            await client.aclose()
 
 
 async def _proxy(request: Request, path: str, body: bytes):
@@ -2591,10 +3644,8 @@ async def _proxy(request: Request, path: str, body: bytes):
         lookup (config → ui_install → MODEL_ALIASES → installed HF id → raw).
         Unknown values raise 404. Org/repo and absolute paths fall through
         to tier 4.
-      - Swap queueing via ensure_loaded — multiple requests for the same
-        loading target piggyback on one load.
-      - Inflight counter incremented under _swap_lock with a resident-alias
-        re-check, closing the eviction TOCTOU window.
+      - One strict-deployment FIFO lease covers admission, model loading, the
+        upstream request, and the complete response body/stream.
       - Usage (last_used_at, request_count_delta) bumps only on a SUCCESSFUL
         proxied request — pre-stream upstream errors don't count.
       - Single deadline computed at arrival, gates lock-wait, event-wait,
@@ -2621,43 +3672,25 @@ async def _proxy(request: Request, path: str, body: bytes):
             raise HTTPException(status_code=404, detail=f"Unknown alias '{requested}'")
 
     is_image_request = path == "v1/images/generations"
+    required_capability = (
+        "images.generations"
+        if is_image_request
+        else path.removeprefix("v1/").replace("/", ".")
+    )
     if profile is not None:
-        required_capability = (
-            "images.generations"
-            if is_image_request
-            else path.removeprefix("v1/").replace("/", ".")
-        )
-        if is_image_request and required_capability not in profile.capabilities:
+        if (
+            required_capability in config_mod.SUPPORTED_MODEL_CAPABILITIES
+            and required_capability not in profile.capabilities
+        ):
             raise HTTPException(
                 400,
-                f"model '{profile.alias}' does not support /v1/images/generations",
+                f"model '{profile.alias}' does not support /{path}",
             )
         if not is_image_request and profile.kind == "image":
             raise HTTPException(
                 400,
                 f"image model '{profile.alias}' only supports /v1/images/generations",
             )
-
-    normalized_image_body: Optional[bytes] = None
-    if is_image_request:
-        active_profile = profile or _runtime.resident_profile
-        if (
-            active_profile is None
-            or active_profile.kind != "image"
-            or "images.generations" not in active_profile.capabilities
-        ):
-            raise HTTPException(400, "the selected model does not support image generation")
-        try:
-            normalized_image_body = normalize_image_request(
-                body,
-                wire_model=active_profile.served_model_name,
-                defaults=active_profile.image_defaults or {},
-                max_pixels=(
-                    _config.server.image_max_pixels if _config is not None else 4_194_304
-                ),
-            )
-        except ImageRequestError as exc:
-            raise HTTPException(400, str(exc)) from exc
 
     if _config is None:
         swap_budget = 300
@@ -2670,48 +3703,62 @@ async def _proxy(request: Request, path: str, body: bytes):
         swap_budget = _config.server.swap_queue_timeout_seconds
     deadline = time.monotonic() + swap_budget
 
-    # Loop with one deadline, one lock-release path. continue triggers
-    # a retry of ensure_loaded if eviction or another swap raced us.
-    while True:
-        if profile is not None:
-            await ensure_loaded(profile, deadline)
-
+    if profile is not None:
+        lease = await _acquire_profile_lease(profile, deadline)
+    else:
         try:
-            await _run_until(_swap_lock.acquire, deadline)
-        except asyncio.TimeoutError:
-            raise HTTPException(504, "swap queue timeout acquiring inflight lock")
-        try:
-            if profile is not None and _runtime.resident_alias != profile.alias:
-                continue  # finally releases; loop reruns
-            if profile is None and _runtime.resident_alias is None:
-                raise HTTPException(503, "Model evicted before request started")
-            _runtime.inflight += 1
-            break
-        finally:
-            _swap_lock.release()
+            lease = await _get_coordinator().acquire_current()
+        except (QueueFull, QueueTimeout, NotAccepting) as exc:
+            raise _admission_http_exception(exc) from exc
+    wire_profile = lease.resident_profile
 
-    # Snapshot the model context used to tag any usage row we record. After
-    # the inflight increment, eviction cannot fire (it bails when inflight>0),
-    # so reading `_runtime.resident_profile` is safe for the request lifetime.
     if profile is not None:
         usage_alias: Optional[str] = profile.alias
         usage_backend: Optional[str] = profile.backend
     else:
-        resident = _runtime.resident_profile
-        usage_alias = resident.alias if resident else None
-        usage_backend = resident.backend if resident else None
+        usage_alias = wire_profile.alias
+        usage_backend = wire_profile.backend
+
+    if (
+        required_capability in config_mod.SUPPORTED_MODEL_CAPABILITIES
+        and required_capability not in wire_profile.capabilities
+    ):
+        await _cleanup_proxy_resources(lease=lease)
+        raise HTTPException(
+            400,
+            f"model '{wire_profile.alias}' does not support /{path}",
+        )
 
     is_streaming = False
     upstream_ok = False
     client: Optional[httpx.AsyncClient] = None
     response: Optional[httpx.Response] = None
     if is_image_request:
-        assert normalized_image_body is not None
-        upstream_body = normalized_image_body
+        if (
+            wire_profile.kind != "image"
+            or "images.generations" not in wire_profile.capabilities
+        ):
+            await _cleanup_proxy_resources(lease=lease)
+            raise HTTPException(400, "the selected model does not support image generation")
+        try:
+            upstream_body = normalize_image_request(
+                body,
+                wire_model=wire_profile.served_model_name,
+                defaults=wire_profile.image_defaults or {},
+                max_pixels=(
+                    _config.server.image_max_pixels if _config is not None else 4_194_304
+                ),
+            )
+        except ImageRequestError as exc:
+            await _cleanup_proxy_resources(lease=lease)
+            raise HTTPException(400, str(exc)) from exc
         client_asked_for_usage = False
     else:
-        upstream_body = _canonicalize_model_field(body, profile)
-        upstream_body, client_asked_for_usage = _ensure_stream_usage(upstream_body)
+        upstream_body = _canonicalize_model_field(body, wire_profile)
+        upstream_body, client_asked_for_usage = _ensure_stream_usage(
+            upstream_body,
+            path,
+        )
     try:
         upstream_timeout = (
             float(_config.server.image_request_timeout_seconds)
@@ -2726,27 +3773,31 @@ async def _proxy(request: Request, path: str, body: bytes):
             )
         upstream_ok = True
         if "text/event-stream" in response.headers.get("content-type", ""):
-            is_streaming = True
-            # Ownership transfers to _wrap_stream — its finally handles
-            # inflight + usage accounting.
-            wrapped_client, wrapped_response = client, response
-            client, response = None, None  # don't close in this finally
-            return StreamingResponse(
+            owner = _StreamingProxyOwnership(
+                client=client,
+                response=response,
+                lease=lease,
+                requested_model=requested,
+                alias=usage_alias,
+                backend=usage_backend,
+                path=path,
+                request_start_monotonic=request_start_monotonic,
+            )
+            owned_response = _OwnedStreamingResponse(
                 _wrap_stream(
-                    wrapped_client,
-                    wrapped_response,
-                    requested_model=requested,
-                    alias=usage_alias,
-                    backend=usage_backend,
-                    status_code=wrapped_response.status_code,
+                    owner,
                     client_asked_for_usage=client_asked_for_usage,
-                    path=path,
-                    request_start_monotonic=request_start_monotonic,
                 ),
-                status_code=wrapped_response.status_code,
-                headers=dict(wrapped_response.headers),
+                owner=owner,
+                status_code=response.status_code,
+                headers=_downstream_proxy_headers(response.headers),
                 media_type="text/event-stream",
             )
+            # Ownership transfers only after the outer response object exists.
+            # Its ASGI finally runs even when the body iterator never starts.
+            client, response = None, None
+            is_streaming = True
+            return owned_response
         content = await response.aread()
         try:
             body_json = json.loads(content)
@@ -2757,11 +3808,11 @@ async def _proxy(request: Request, path: str, body: bytes):
             and path in _USAGE_ENDPOINTS
             and isinstance(body_json, dict)
         ):
-            usage = body_json.get("usage")
-            if isinstance(usage, dict):
+            usage = normalize_usage(body_json, endpoint=f"/{path}")
+            if usage is not None:
                 try:
                     response_ms = (time.monotonic() - request_start_monotonic) * 1000.0
-                    _append_usage_row(
+                    await _record_usage_row(
                         requested_model=requested,
                         alias=usage_alias,
                         backend=usage_backend,
@@ -2780,16 +3831,14 @@ async def _proxy(request: Request, path: str, body: bytes):
         raise
     finally:
         if not is_streaming:
-            _runtime.inflight -= 1
             if upstream_ok:
                 _runtime.last_used_at = time.time()
                 _runtime.request_count_delta += 1
-            if response is not None:
-                with contextlib.suppress(Exception):
-                    await response.aclose()
-            if client is not None:
-                with contextlib.suppress(Exception):
-                    await client.aclose()
+            await _cleanup_proxy_resources(
+                response=response,
+                client=client,
+                lease=lease,
+            )
 
 
 def _models_list_payload() -> dict:
@@ -2963,6 +4012,7 @@ inference_app = FastAPI(
     docs_url=None, redoc_url=None, openapi_url=None,
 )
 inference_app.include_router(health_router)
+inference_app.include_router(fleet_router)
 inference_app.include_router(
     inference_router,
     dependencies=[Depends(require_inference_bearer)],

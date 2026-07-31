@@ -45,6 +45,7 @@ _RESPONSE_STRIP = frozenset(
         "trailer",
         "transfer-encoding",
         "upgrade",
+        "x-mnemosyne-error",
     }
 )
 

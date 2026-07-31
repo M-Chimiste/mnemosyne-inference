@@ -16,6 +16,30 @@ func credentialStatusIsSecretSafe() throws {
     #expect(status.configured == [.adminPassword])
 }
 
+@Test("The fleet gateway credential is managed independently")
+func fleetCredentialManagedIndependently() throws {
+    let temporary = FileManager.default.temporaryDirectory
+        .appending(path: UUID().uuidString, directoryHint: .isDirectory)
+    defer { try? FileManager.default.removeItem(at: temporary) }
+    try FileManager.default.createDirectory(
+        at: temporary,
+        withIntermediateDirectories: true
+    )
+    let url = temporary.appending(path: ".env")
+    let store = CredentialStore(environmentURL: url)
+
+    try store.apply(
+        replacements: [.fleetAPIKey: "fleet-secret"],
+        clearing: []
+    )
+
+    #expect(try store.status().configured == [.fleetAPIKey])
+    #expect(
+        try String(contentsOf: url, encoding: .utf8)
+            .contains("FLEET_API_KEY=fleet-secret")
+    )
+}
+
 @Test("Credential updates preserve unmanaged lines and use private permissions")
 func credentialUpdatesPreserveUnmanagedContent() throws {
     let temporary = FileManager.default.temporaryDirectory

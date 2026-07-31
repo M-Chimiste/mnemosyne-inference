@@ -1,19 +1,31 @@
 # Agents Guide
 
-This repository contains **Mnemosyne Inference**, with two isolated
-single-workstation deployments. The CUDA deployment runs vLLM, llama.cpp, or
-SGLang Diffusion in a
-container; the native Apple Silicon deployment owns an official llama.cpp
-server for GGUF, coordinates oMLX and DS4, and uses a process-isolated MFLUX
-worker without Docker. LM Studio is not an inference engine; its configured
-and conventional model folders remain read-only migration hints. Both
-deployments remain thin managers around
-upstream engines and must not fork or embed their serving implementations.
+This repository contains **Mnemosyne Inference**, with two isolated inference
+workstation deployments and an optional Nyx-hosted Fleet gateway. The CUDA
+deployment runs vLLM, llama.cpp, or SGLang Diffusion in a container; the native
+Apple Silicon deployment owns an official llama.cpp server for GGUF,
+coordinates oMLX and DS4, and uses a process-isolated MFLUX worker without
+Docker. LM Studio is not an inference engine; its configured and conventional
+model folders remain read-only migration hints. Both inference deployments
+remain thin managers around upstream engines and must not fork or embed their
+serving implementations. Fleet routes to those managers; it never owns an
+engine process.
 
 ## Repository Shape
 
 - `vllm_manager.py` is the FastAPI service entrypoint. It starts two uvicorn servers, owns manager state, launches the active inference engine, proxies `/v1/*`, serves the admin UI, and wires all HTTP routes.
 - `config.py`, `catalog.py`, `profiles.py`, `runtime.py`, and `image_api.py` hold the core substrate: YAML/.env loading, SQLite catalog state, profile resolution, pure engine argv/env builders, and bounded Images API normalization.
+- `cuda_residency.py` owns CUDA FIFO admission, strict-deployment transitions,
+  epoch leases, full-stream draining, and maintenance barriers.
+- `fleet_protocol.py` and `fleet_protocol/v1/` define shared, secret-free
+  deployment identity, capacity helpers, the node snapshot schema, and golden
+  cross-platform vectors.
+- `fleet/` is the independently locked Nyx service. It owns explicit node
+  enrollment, authenticated snapshot polling, strict model mappings,
+  capacity-aware routing, bounded fleet queues, metadata-only route history,
+  the realtime dashboard, and read-only token-ledger aggregates. It must run
+  as one process unless reservations are moved to a shared transactional
+  scheduler.
 - `downloader.py` and `download_worker.py` implement install/download orchestration. Installs run as killable subprocesses and persist state in SQLite.
 - `hf_search.py`, `repo_probe.py`, `vllm_supported_architectures.json`, and `scripts/refresh_arch_list.py` support HuggingFace discovery, vLLM architecture filtering, and GGUF probing.
 - `ui/` contains the React/Vite/TypeScript/Tailwind admin UI that is built into `/app/static` by the Dockerfile and served from the admin plane.
@@ -21,7 +33,14 @@ upstream engines and must not fork or embed their serving implementations.
 - `Dockerfile` defines the CUDA/Python runtime, builds the UI, builds a pinned `llama-server`, installs PyTorch cu129, and installs pinned vLLM plus manager dependencies. Runtime dependencies live here, not in a runtime `requirements.txt` or `pyproject.toml`.
 - `requirements-dev.txt`, `pytest.ini`, `tests/`, and `ui/package.json` define the host-side Python and UI test/build workflows.
 - `pg_writer.py` and `scripts/probe_token_sidecar_schema.py` implement and inspect the optional Postgres token-usage sink; SQLite remains the local system of record and durable outbox.
-- `project_docs/project_status.md` records current release status and feature history; `project_docs/smoke_checks.md` is the manual GPU-host checklist for behavior pytest cannot exercise.
+- `project_docs/project_status.md` records current release status and feature
+  history; `project_docs/smoke_checks.md` is the manual GPU-host checklist for
+  behavior pytest cannot exercise. `project_docs/fleet_architecture.md`,
+  `fleet_security.md`, and `fleet_acceptance.md` define the cross-node
+  protocol, threat boundary, and target-host rollout evidence.
+- `scripts/fleet_acceptance.py` runs a bounded, content-redacted multi-node
+  probe through Nyx and checks metadata fan-out plus exactly one normal token
+  event per completed language request.
 - `macos/service/` is an independent Python package for the native inference/control planes, engine adapters, lease-based global residency coordinator, and durable usage outbox. Its dependencies and lock file stay below that directory.
 - `macos/service/storage.py`, `model_library.py`, `install_store.py`, `installer.py`, and `download_worker.py` implement exact nested-folder/volume validation, engine-aware Hugging Face discovery, and process-isolated durable native downloads. The install store retains a compact transition journal so target-Mac cancel/retry/registration/dismiss/delete acceptance remains provable after UI history is hidden. Managed downloads must remain residency-neutral.
 - `macos/service/local_models.py` scans Finder-selected GGUF/MLX libraries without loading or copying weights. `macos/service/engines/llamacpp.py` translates typed profiles into a manager-owned upstream `llama-server` process while reusing the hardened managed-process ownership proof.
@@ -107,12 +126,18 @@ The live `docker-compose.yml` is intentionally machine-specific and may live out
 ### CUDA deployment
 
 - The container runs **two HTTP planes** in one Python process:
-  - Inference plane on `:8000`: `/v1/*` and `/health`.
+  - Inference plane on `:8000`: `/v1/*`, `/health`, and the separately
+    authenticated read-only `/fleet/v1/snapshot`.
   - Admin plane on `:8001`: `/manager/*`, `/ui/`, `/docs`, `/openapi.json`, `/redoc`, and admin-authenticated `/v1/*`.
 - The active engine runs behind the manager on loopback, default `127.0.0.1:8002` via `VLLM_INNER_PORT`. Do not collide this with the external inference or admin ports.
 - Admin uses HTTP Basic as `admin:$ADMIN_PASSWORD`. If `ADMIN_PASSWORD` is unset, admin bind is forced to `127.0.0.1` inside the container, which makes the published Docker admin port unreachable from the host.
-- Inference bearer auth is optional. If `INFERENCE_API_KEY` is set, `/v1/*` on the inference plane requires `Authorization: Bearer <key>`.
-- Only one model is resident at a time. `_swap_lock` serializes load/unload transitions; same-target callers can piggyback on a single lazy load; different targets queue until `swap_queue_timeout_seconds`.
+- Inference bearer auth is optional for ordinary standalone use. If `INFERENCE_API_KEY` is set, `/v1/*` on the inference plane requires `Authorization: Bearer <key>`. The independent `FLEET_API_KEY` enables bearer-authenticated, read-only `GET /fleet/v1/snapshot`; if unset that route returns 404 and it is never mounted on the admin plane. Fleet discovery fails closed with `fleet_inference_auth_unconfigured` unless `INFERENCE_API_KEY` is also non-empty.
+- Only one model is resident at a time. `CudaResidencyCoordinator` compares
+  strict deployment IDs rather than aliases, bounds FIFO waiters with
+  `server.max_queue_depth`, enforces engine-derived capacity under the optional
+  `server.max_concurrency` ceiling, and holds epoch permits through complete
+  response streams. A different-target head drains the old epoch before
+  unload/load; manual unload, eviction, and shutdown use the same barrier.
 - Proxied `/v1/*` requests peek at the JSON `model` field, resolve it through config aliases, UI-installed catalog aliases, legacy aliases, installed HF IDs, raw HF IDs, or absolute paths, then rewrite the model field to the engine-served name. Streaming requests may also receive `stream_options.include_usage=true` for accounting; synthetic usage events are hidden unless the client requested them. All other request fields, including multimodal content and backend-specific extensions, stay opaque.
 - `GET /v1/models` is the deliberate proxy exception: the manager serves it locally from the catalog so it lists every installed alias across all backends even while idle. A raw/resident model without an installed catalog row is included as a fallback.
 - Supported backends are `vllm`, `llama.cpp`, and `sglang-diffusion`.
@@ -127,13 +152,51 @@ The live `docker-compose.yml` is intentionally machine-specific and may live out
 - Installs use a subprocess worker (`python -m download_worker`) rather than in-process HuggingFace downloads. Interrupted installs are recovered as `partial` on startup and can be retried.
 - Legacy `/manager/download*` endpoints are preserved as v0 shims using synthetic cache-only aliases and the same persistent install pipeline.
 - HuggingFace search and `/manager/hf/files` run on the admin plane, include compatibility signals, and detect GGUF candidates for llama.cpp installs.
-- Token usage tracking: every successful `/v1/{chat/completions,completions,embeddings}` call queues a row in `_runtime.usage_rows`; `_flush_loop` writes it to the SQLite `request_usage` analytics table every 30s and on orderly teardown. When `token_sidecar.enabled` is set in YAML and `TOKEN_SIDECAR_POSTGRES_DSN` is in `.env`, the same flush also writes to SQLite `pg_usage_outbox`, and `_pg_flush_loop` (via `pg_writer.PgWriter`) drains it to the central Postgres ledger (`public.token_usage`). Once flushed from memory, the outbox is the durable retry queue; `event_id` UUIDs plus `ON CONFLICT DO NOTHING` make DELETE-after-success retry-safe. Respect `max_outbox_rows`, which intentionally drops the oldest rows at the cap. `/manager/status.token_sidecar` exposes outbox depth and last-flush metadata.
+- Token usage tracking: every successful `/v1/{chat/completions,completions,responses,messages,embeddings,rerank}` response with a recognized usage block produces one normalized event; OpenAI Responses input/output fields, Anthropic Messages cache counters, nested envelopes, and completed streams normalize into the common prompt/completion/total shape. Before a non-streaming response completes or a terminal stream event is forwarded, the manager atomically commits idempotent local analytics and, when `token_sidecar.enabled`, the SQLite `pg_usage_outbox`. `_runtime.usage_rows` is only an in-memory retry queue for a failed immediate SQLite transaction, and `_flush_loop` removes rows only after a later commit. `_pg_flush_loop` (via `pg_writer.PgWriter`) drains the durable outbox to `public.token_usage`; the shared event UUID plus `ON CONFLICT DO NOTHING` makes ambiguous local commits and DELETE-after-success delivery retries safe. Respect `max_outbox_rows`, which intentionally drops the oldest rows at the cap. `/manager/status.token_sidecar` exposes outbox depth and last-flush metadata.
+
+### Nyx Fleet gateway
+
+- Fleet exposes one authenticated OpenAI-compatible `/v1/*` endpoint and a
+  `/fleet/` dashboard. It supports only its explicit route allowlist and
+  rewrites only the model alias and authorization header.
+- Node enrollment is explicit. Each node has distinct snapshot and inference
+  credentials, and neither credential is an admin credential. Fleet's public
+  client key, dashboard-admin key, all node credentials, and read-only ledger
+  DSN must remain distinct environment-backed secrets.
+- Snapshot liveness is based on Nyx monotonic receipt time, instance identity,
+  and increasing sequence. Persisted snapshots never regain routing authority
+  after restart without a fresh poll.
+- A public model maps to one exact deployment ID and exact capability set.
+  Only authoritative immutable provenance is eligible; aliases, node IDs,
+  storage paths, capacity, and live residency are excluded from deployment
+  identity. The schema, packaged copy, producers, validators, and golden
+  vectors must change together.
+- Scheduling is warm-first, weighted least-outstanding within a tier, and
+  bounded FIFO per public model. In-memory reservations cover the stale-poll
+  window, while the selected node remains final admission authority.
+- A reservation lasts through the complete response body or stream.
+  Cancellation-safe cleanup must return it exactly once. Retry is permitted
+  only for proven connection establishment failure or a pre-work `429` with
+  the manager-owned `X-Mnemosyne-Error: node_busy` proof header; body-only
+  errors are terminal, and ambiguous timeouts are never retried.
+- Fleet SQLite stores fixed route metadata only. It never stores request or
+  response bodies, secrets, or token rows. Nodes remain the sole token-event
+  writers; Nyx reads bounded aggregates from `public.token_usage` through a
+  read-only role.
+- Default node HTTP clients must ignore ambient proxy variables, must not
+  follow redirects, and must never expose node URLs or credentials to the
+  dashboard.
 
 ### Native macOS deployment
 
 - Inference is on `127.0.0.1:1240` so Unified Inference is a drop-in replacement for the previous token sidecar; control is on `127.0.0.1:17321`, oMLX uses `:17322`, the manager-owned DS4 child uses `:17323`, the manager-owned MFLUX worker uses `:17324`, and manager-owned llama.cpp uses `:17325`. Reserve `17320` and `17326-17329` for later native services. The legacy sidecar must be booted out and persistently disabled or removed before Unified Inference binds `:1240`; merely unloading it lets it return at the next login.
+- The inference plane also exposes read-only `GET /fleet/v1/snapshot` only
+  when its independent `FLEET_API_KEY` is configured. Discovery fails closed
+  with `fleet_inference_auth_unconfigured` unless the inference key is also
+  configured. Never reuse the inference key, control password, or another
+  node's credential.
 - A per-user LaunchAgent owns Mnemosyne Core. The controller uses an explicit AppKit `NSStatusItem` with a SwiftUI popover; quitting it must not terminate inference. `SMAppService.agent` registers the embedded plist and the bootstrap must `execve` the bundled Python without daemonizing.
-- `ResidencyCoordinator` owns the cross-engine invariant. A request holds an epoch-tagged model lease through its complete stream. FIFO queuing stops old-target admission once a switch is pending, drains active leases, proves all enabled adapters empty, loads one target, and proves exactly one ready manager-owned resident.
+- `ResidencyCoordinator` owns the cross-engine invariant. A request holds an epoch-tagged model lease through its complete stream. FIFO queuing stops old-target admission once a switch is pending, drains active leases, proves all enabled adapters empty, loads one target, and proves exactly one ready manager-owned resident. Engine-derived capacity is capped by optional `server.max_concurrency`; `server.max_queue_depth` and `server.queue_timeout_seconds` bound admission.
 - oMLX is an external loopback service controlled through its native lifecycle APIs. llama.cpp and DS4 are model-specific process groups started by Mnemosyne. Never kill an unknown PID or listener; persisted managed-process identity must match executable, argv, start identity, and process group before recovery or signaling.
 - Persisted llama.cpp survivor metadata must also retain the exact storage
   root, scope ID, and volume UUID so restart recovery can reconstruct and
@@ -282,6 +345,8 @@ Important environment variables:
 - `VLLM_INNER_PORT`: defaults to `8002`.
 - `ADMIN_PASSWORD`: required for host/LAN access to the admin plane.
 - `INFERENCE_API_KEY`: optional bearer key for inference-plane `/v1/*`.
+- `FLEET_API_KEY`: optional node-specific bearer key enabling the read-only
+  fleet snapshot on the inference plane.
 - `HUGGING_FACE_HUB_TOKEN`: optional token for gated HuggingFace repos, read by install workers after restart.
 - `TOKEN_SIDECAR_POSTGRES_DSN`: optional secret-bearing DSN used only when `token_sidecar.enabled` is true.
 - `MNEMOSYNE_LOG_FORMAT`: `json` by default; set `text` for locally readable logs.
@@ -312,6 +377,10 @@ Model profiles support aliases, HF model IDs, revision, quantization, GPU plan, 
 - In Mac code, engine mutation belongs to adapters and cross-engine ordering
   belongs to `ResidencyCoordinator`. The HTTP layer must acquire a lease before
   opening upstream and release it only after the complete body/stream closes.
+- On CUDA, all inference, explicit load, unload, eviction, and shutdown paths
+  must go through `CudaResidencyCoordinator`; never call the process teardown
+  hook beneath an active epoch lease. Queue keys and transition targets are
+  strict deployment IDs, not aliases.
 - Keep inner Mac engines on loopback. A non-loopback Mnemosyne inference bind
   requires `INFERENCE_API_KEY`; a non-loopback control bind requires
   `ADMIN_PASSWORD`.
@@ -390,13 +459,26 @@ uv run --project macos/service mnemosyne-macos --check-config \
 cd macos/app && swift build && swift test
 ```
 
+Nyx Fleet development and representative acceptance:
+
+```bash
+uv sync --directory fleet --frozen --extra dev
+uv run --directory fleet --frozen --extra dev python -m pytest -q
+uv run --directory fleet --frozen python -m compileall -q \
+  src/mnemosyne_fleet
+uv run --directory fleet --frozen \
+  python ../scripts/fleet_acceptance.py --url http://nyx:17400 \
+  --model <public-model> --require-node <mac-node> \
+  --require-node <cuda-node>
+```
+
 ## Verification Expectations
 
 For docs-only changes, a readback, relative-link audit, and `git diff --check` are enough. When deleting or renaming documentation, remove references from the README, examples, and this guide in the same change.
 
 For Python or CLI changes, prefer at least:
 
-- `python -m py_compile vllm_manager.py config.py catalog.py profiles.py runtime.py downloader.py download_worker.py hf_search.py repo_probe.py pg_writer.py logsetup.py`
+- `python -m py_compile vllm_manager.py cuda_residency.py fleet_protocol.py usage_normalization.py config.py catalog.py profiles.py runtime.py downloader.py download_worker.py hf_search.py repo_probe.py pg_writer.py logsetup.py`
 - `bash -n vllm-ctl`
 - `python -m pytest -q`
 
@@ -414,6 +496,11 @@ For menu/bootstrap changes, run `swift build` and `swift test` from `macos/app`.
 LaunchAgent registration, Metal memory release, and real engine swapping still
 require the target Mac and `macos/smoke_checks.md`; full Xcode is required for
 the packaged `SMAppService` smoke.
+
+For Fleet changes, run its independent locked suite, build a wheel, verify the
+canonical and packaged snapshot schemas are semantically identical, and run
+the target-host procedure in `project_docs/fleet_acceptance.md` before calling
+the multi-node rollout complete.
 
 When behavior touches process launch, ports, engine argv construction, Docker mounts, or GPU behavior, add or run targeted tests and call out any manual Docker smoke checks that still need a CUDA host.
 

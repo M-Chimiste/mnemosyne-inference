@@ -447,6 +447,11 @@ def test_install_llamacpp_persists_backend_and_filename(client, stub_downloader,
     row = client.get("/manager/install/qw-q4").json()
     assert row["backend"] == "llama.cpp"
     assert row["gguf_filename"] == "model-Q4_K_M.gguf"
+    assert row["capabilities"] == [
+        "chat.completions",
+        "completions",
+        "responses",
+    ]
     # Worker call should propagate the chosen filename.
     assert stub_downloader.calls
     # The stub captures kwargs we passed; gguf_primary_filename is one of them.

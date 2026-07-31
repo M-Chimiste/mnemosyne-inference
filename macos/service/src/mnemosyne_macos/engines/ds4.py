@@ -44,6 +44,7 @@ from ..models import (
     ResolvedTarget,
     ServiceState,
     TargetKey,
+    effective_load_identity,
 )
 
 
@@ -455,7 +456,7 @@ class DS4Adapter(EngineAdapter):
     ) -> None:
         self.config = config
         self.base_url = f"http://{config.host}:{config.port}"
-        self._client = client or httpx.AsyncClient()
+        self._client = client or httpx.AsyncClient(trust_env=False)
         self._owns_client = client is None
         self._spawn_process = spawn_process or self._default_spawn
         self._identity_probe = identity_probe or self._default_identity_probe
@@ -886,7 +887,8 @@ class DS4Adapter(EngineAdapter):
                 and before.residents[0].managed
                 and before.residents[0].ready
                 and self._target is not None
-                and self._target.key == target.key
+                and effective_load_identity(self._target)
+                == effective_load_identity(target)
             ):
                 return self._handle(target, before.residents[0])
             raise AdapterError(

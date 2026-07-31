@@ -61,6 +61,9 @@ def test_minimal_config_parses(cfg_path):
     assert len(cfg.storage.locations) == 1
     assert cfg.models == []
     assert cfg.server.inference_port == 8000
+    assert cfg.server.max_concurrency is None
+    assert cfg.server.max_queue_depth == 128
+    assert cfg.fleet.node_id == ""
     assert cfg.defaults.gpu_memory_utilization == 0.90
 
 
@@ -105,6 +108,77 @@ def test_full_config_parses(tmp_path):
     assert cfg.models[2].extra_args == ["--limit-mm-per-prompt", "image=4"]
 
 
+def test_model_capability_defaults_are_engine_aware():
+    vllm = ModelProfile(alias="vllm-model", model="org/model")
+    llama = ModelProfile(
+        alias="llama-model",
+        model="org/model-gguf",
+        backend="llama.cpp",
+        gguf_filename="model-Q4_K_M.gguf",
+    )
+    image = ModelProfile(
+        alias="image-model",
+        model="org/image",
+        backend="sglang-diffusion",
+        kind="image",
+    )
+
+    assert vllm.capabilities == (
+        "chat.completions",
+        "completions",
+        "embeddings",
+        "responses",
+    )
+    assert llama.capabilities == (
+        "chat.completions",
+        "completions",
+        "responses",
+    )
+    assert image.capabilities == ("images.generations",)
+
+
+def test_llamacpp_generation_contract_and_projector_are_configurable():
+    profile = ModelProfile(
+        alias="vision-model",
+        model="org/model-gguf",
+        backend="llama.cpp",
+        gguf_filename="model-Q4_K_M.gguf",
+        projector_filename="vision/mmproj-F16.gguf",
+        capabilities=[
+            "/v1/responses",
+            "completions",
+            "chat/completions",
+        ],
+    )
+
+    assert profile.capabilities == (
+        "chat.completions",
+        "completions",
+        "responses",
+    )
+    assert profile.projector_filename == "vision/mmproj-F16.gguf"
+
+
+def test_llamacpp_projector_rejects_specialized_or_unsafe_profile():
+    with pytest.raises(ValueError, match="generation-capable"):
+        ModelProfile(
+            alias="embed-model",
+            model="org/model-gguf",
+            backend="llama.cpp",
+            gguf_filename="model-Q4_K_M.gguf",
+            projector_filename="mmproj-F16.gguf",
+            capabilities=["embeddings"],
+        )
+    with pytest.raises(ValueError, match="repository-relative"):
+        ModelProfile(
+            alias="unsafe-projector",
+            model="org/model-gguf",
+            backend="llama.cpp",
+            gguf_filename="model-Q4_K_M.gguf",
+            projector_filename="../mmproj-F16.gguf",
+        )
+
+
 def test_idle_unload_null_parses_to_none(cfg_path):
     cfg_path.write_text(cfg_path.read_text() + "\nserver:\n  idle_unload_seconds: null\n")
     cfg = load_config(str(cfg_path))
@@ -114,6 +188,37 @@ def test_idle_unload_null_parses_to_none(cfg_path):
 def test_empty_models_allowed(cfg_path):
     cfg = load_config(str(cfg_path))
     assert cfg.models == []
+
+
+def test_concurrency_queue_must_have_at_least_one_slot(tmp_path):
+    p = _write(tmp_path / "config.yaml", f"""\
+        server:
+          max_queue_depth: 0
+        storage:
+          default: tmp
+          locations:
+            - name: tmp
+              path: {tmp_path}
+    """)
+    with pytest.raises(ConfigError, match="max_queue_depth"):
+        load_config(p)
+
+
+def test_fleet_and_usage_node_ids_must_match_when_reporting_enabled(tmp_path):
+    p = _write(tmp_path / "config.yaml", f"""\
+        storage:
+          default: tmp
+          locations:
+            - name: tmp
+              path: {tmp_path}
+        fleet:
+          node_id: cuda-a
+        token_sidecar:
+          enabled: true
+          node_id: cuda-b
+    """)
+    with pytest.raises(ConfigError, match="must match token_sidecar.node_id"):
+        load_config(p)
 
 
 # ── validation failures ─────────────────────────────────────────────
@@ -419,6 +524,29 @@ def test_resolve_profile_config_wins_over_ui_install(tmp_path):
         cat.close()
 
 
+def test_resolve_config_profile_uses_matching_installed_sha(tmp_path):
+    from catalog import open_catalog
+
+    cfg = _make_config(tmp_path)
+    cat = open_catalog(":memory:")
+    try:
+        cat._raw_insert_model(
+            alias="qw7b",
+            hf_model_id="Qwen/Qwen2.5-7B",
+            source="config",
+            gpus='"all"',
+            storage_location="tmp",
+            status="installed",
+            resolved_sha="a" * 40,
+            backend="vllm",
+        )
+        rp = resolve_profile("qw7b", cfg, catalog=cat)
+        assert rp.revision == "a" * 40
+        assert rp.upstream_model == "Qwen/Qwen2.5-7B"
+    finally:
+        cat.close()
+
+
 def test_resolve_profile_config_llamacpp_uses_reconciled_cache_path(tmp_path):
     from catalog import open_catalog
     cfg = Config.model_validate({
@@ -457,6 +585,102 @@ def test_resolve_profile_config_llamacpp_uses_reconciled_cache_path(tmp_path):
         assert "snapshots/main" not in rp.engine_model_path
     finally:
         cat.close()
+
+
+def test_resolve_profile_config_llamacpp_resolves_explicit_projector(tmp_path):
+    from catalog import open_catalog
+
+    cfg = Config.model_validate({
+        "storage": {
+            "default": "tmp",
+            "locations": [{"name": "tmp", "path": str(tmp_path)}],
+        },
+        "models": [{
+            "alias": "gguf",
+            "model": "org/gguf-repo",
+            "backend": "llama.cpp",
+            "gguf_filename": "model-Q4_K_M.gguf",
+            "projector_filename": "vision/mmproj-F16.gguf",
+        }],
+    })
+    snap = tmp_path / "hub" / "models--org--gguf-repo" / "snapshots" / ("a" * 40)
+    (snap / "vision").mkdir(parents=True)
+    gguf = snap / "model-Q4_K_M.gguf"
+    projector = snap / "vision" / "mmproj-F16.gguf"
+    gguf.write_text("fake")
+    projector.write_text("fake-projector")
+    cat = open_catalog(":memory:")
+    try:
+        cat._raw_insert_model(
+            alias="gguf",
+            hf_model_id="org/gguf-repo",
+            source="config",
+            gpus='"all"',
+            storage_location="tmp",
+            status="installed",
+            cache_path=str(snap),
+            resolved_sha="a" * 40,
+            backend="llama.cpp",
+            gguf_filename="model-Q4_K_M.gguf",
+        )
+        rp = resolve_profile("gguf", cfg, catalog=cat)
+        assert rp.engine_model_path == str(gguf)
+        assert rp.projector_filename == "vision/mmproj-F16.gguf"
+        assert rp.projector_model_path == str(projector)
+    finally:
+        cat.close()
+
+
+def test_resolve_legacy_mixed_llamacpp_capabilities_matches_launch_mode(
+    tmp_path,
+):
+    from catalog import open_catalog
+    from runtime import build_llama_argv
+    import vllm_manager
+
+    cfg = Config.model_validate({
+        "storage": {
+            "default": "tmp",
+            "locations": [{"name": "tmp", "path": str(tmp_path)}],
+        },
+    })
+    cat = open_catalog(":memory:")
+    try:
+        cat._raw_insert_model(
+            alias="legacy-gguf",
+            hf_model_id="org/legacy-gguf",
+            source="ui_install",
+            gpus='"all"',
+            storage_location="tmp",
+            status="installed",
+            cache_path=str(tmp_path / "snapshot"),
+            resolved_sha="a" * 40,
+            backend="llama.cpp",
+            gguf_filename="model-Q4_K_M.gguf",
+            capabilities=(
+                '["chat.completions","completions","embeddings","responses"]'
+            ),
+        )
+        profile = resolve_profile("legacy-gguf", cfg, catalog=cat)
+    finally:
+        cat.close()
+
+    assert profile.capabilities == (
+        "chat.completions",
+        "completions",
+        "responses",
+    )
+    argv = build_llama_argv(profile, host="127.0.0.1", port=8002)
+    assert "--embedding" not in argv
+    _deployment_id, identity, authoritative = (
+        vllm_manager._profile_deployment(profile)
+    )
+    assert identity["capabilities"] == [
+        "chat/completions",
+        "completions",
+        "responses",
+    ]
+    assert authoritative is True
 
 
 def test_resolve_profile_config_llamacpp_requires_installed_cache_row(tmp_path):

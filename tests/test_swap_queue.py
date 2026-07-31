@@ -40,6 +40,7 @@ def boot(rich_config, stub_vllm):
         {l.name: l.path for l in vllm_manager._config.storage.locations},
     )
     vllm_manager._runtime = RuntimeState()
+    vllm_manager._coordinator = None
     vllm_manager._loading_target = None
     vllm_manager._load_event = None
     vllm_manager._load_error = None
@@ -273,19 +274,17 @@ async def test_cancelled_loader_does_not_set_load_error(boot):
 
 
 @pytest.mark.asyncio
-async def test_unload_waits_for_in_progress_load_then_unloads(boot):
-    boot.delay = 0.05
-
-    load_task = asyncio.create_task(
-        vllm_manager.ensure_loaded(_profile("a-model"), _deadline())
+async def test_unload_waits_for_active_lease_then_unloads(boot):
+    await vllm_manager.ensure_loaded(_profile("a-model"), _deadline())
+    lease = await vllm_manager._acquire_profile_lease(
+        _profile("a-model"), _deadline()
     )
-    await asyncio.sleep(0.005)  # let the load acquire _swap_lock
 
     unload_task = asyncio.create_task(vllm_manager.unload_model())
     await asyncio.sleep(0.005)
-    assert not unload_task.done(), "unload should wait for active load to finish"
+    assert not unload_task.done(), "unload should wait for active request lease"
 
-    await load_task
+    await lease.release()
     result = await asyncio.wait_for(unload_task, timeout=2.0)
 
     assert result == {"status": "unloaded", "was": "a-model"}

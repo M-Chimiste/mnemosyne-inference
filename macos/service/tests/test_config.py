@@ -27,12 +27,17 @@ def test_shipped_example_config_is_valid() -> None:
     assert config.engines.omlx.enabled is False
     assert config.models == []
     assert config.profiles() == {}
-from mnemosyne_macos.models import Endpoint, EngineName, ModelKind
+from mnemosyne_macos.models import (
+    Endpoint,
+    EngineName,
+    ModelKind,
+    effective_load_identity,
+)
 
 
 def test_defaults_replace_the_legacy_sidecar_port() -> None:
     config = MacConfig()
-    assert config.schema_version == 2
+    assert config.schema_version == 3
     assert config.server.inference_port == 1240
     assert config.server.control_port == 17321
     assert config.engines.llama_cpp.port == 17325
@@ -46,6 +51,9 @@ def test_defaults_replace_the_legacy_sidecar_port() -> None:
     assert config.engines.ds4.process_state_path.endswith("/state/ds4-process.json")
     assert config.token_sidecar.enabled is True
     assert config.token_sidecar.node_id == ""
+    assert config.server.max_concurrency is None
+    assert config.server.max_queue_depth == 128
+    assert config.server.fleet_api_key_env == "FLEET_API_KEY"
 
 
 def test_packaged_example_has_the_intentional_v1_runtime_topology() -> None:
@@ -85,12 +93,33 @@ def test_parse_config_migrates_v1_lmstudio_profiles_to_inert_import_records() ->
         source="in-memory configuration",
     )
 
-    assert config.schema_version == 2
+    assert config.schema_version == 3
     assert config.models == []
     assert [
         model.alias for model in config.migration.legacy_lmstudio_profiles
     ] == ["local-model"]
     assert not hasattr(config.engines, "lmstudio")
+
+
+def test_v2_configuration_migrates_to_v3_concurrency_defaults() -> None:
+    config = MacConfig.model_validate({"schema_version": 2})
+
+    assert config.schema_version == 3
+    assert config.server.max_concurrency is None
+    assert config.server.max_queue_depth == 128
+    assert config.server.fleet_api_key_env == "FLEET_API_KEY"
+
+
+@pytest.mark.parametrize(
+    ("server", "field"),
+    [
+        ({"max_concurrency": 0}, "max_concurrency"),
+        ({"max_queue_depth": 0}, "max_queue_depth"),
+    ],
+)
+def test_concurrency_limits_must_be_positive(server, field: str) -> None:
+    with pytest.raises(ValueError, match=field):
+        MacConfig.model_validate({"server": server})
 
 
 def test_parse_config_reports_source_for_invalid_yaml() -> None:
@@ -161,6 +190,68 @@ def test_profiles_allow_safe_dotted_legacy_aliases() -> None:
     profiles = config.profiles()
 
     assert profiles["lfm2.5-8b-a1b"].wire_model == "lfm2.5-8b-a1b"
+
+
+def test_llama_generation_contract_defaults_without_messages_but_allows_opt_in() -> None:
+    config = MacConfig.model_validate(
+        {
+            "models": [
+                {
+                    "alias": "portable",
+                    "engine": "llama.cpp",
+                    "model": "/models/portable.gguf",
+                },
+                {
+                    "alias": "anthropic",
+                    "engine": "llama.cpp",
+                    "model": "/models/anthropic.gguf",
+                    "capabilities": [
+                        "chat/completions",
+                        "completions",
+                        "responses",
+                        "messages",
+                    ],
+                },
+            ]
+        }
+    )
+    profiles = config.profiles()
+
+    assert profiles["portable"].capabilities == frozenset(
+        {
+            Endpoint.CHAT_COMPLETIONS,
+            Endpoint.COMPLETIONS,
+            Endpoint.RESPONSES,
+        }
+    )
+    assert Endpoint.MESSAGES in profiles["anthropic"].capabilities
+
+
+def test_request_only_image_defaults_do_not_change_resident_load_identity() -> None:
+    def target(width: int):
+        return MacConfig.model_validate(
+            {
+                "engines": {"mflux": {"enabled": True}},
+                "models": [
+                    {
+                        "alias": "image",
+                        "engine": "mflux",
+                        "model": "publisher/image",
+                        "kind": "image",
+                        "served_model_name": "image-wire",
+                        "image": {
+                            "family": "image-family",
+                            "quantize": 8,
+                            "width": width,
+                        },
+                    }
+                ],
+            }
+        ).profiles()["image"]
+
+    assert effective_load_identity(target(1024)) == effective_load_identity(
+        target(768)
+    )
 
 
 @pytest.mark.parametrize(

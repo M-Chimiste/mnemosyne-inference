@@ -15,7 +15,14 @@ from .base import AdapterError, Deadline
 from .ds4 import DS4Adapter
 from ..config import LlamaCppConfig
 from ..filesystem import FilesystemProbe, FilesystemProbeError
-from ..models import Endpoint, EngineName, LoadedHandle, ProxyRoute, ResolvedTarget
+from ..models import (
+    Endpoint,
+    EngineName,
+    LoadedHandle,
+    ProxyRoute,
+    ResolvedTarget,
+    llama_cpp_process_mode,
+)
 from ..runtime_updates import resolve_active_runtime
 
 
@@ -153,16 +160,10 @@ def build_llama_cpp_argv(
             )
         argv.extend(["--mmproj", str(projector)])
 
-    generation_endpoints = {
-        Endpoint.CHAT_COMPLETIONS,
-        Endpoint.COMPLETIONS,
-        Endpoint.RESPONSES,
-        Endpoint.MESSAGES,
-    }
-    generation_enabled = bool(target.capabilities & generation_endpoints)
-    if not generation_enabled and Endpoint.RERANK in target.capabilities:
+    process_mode = llama_cpp_process_mode(target.capabilities)
+    if process_mode == "rerank":
         argv.extend(["--embedding", "--reranking", "--pooling", "rank"])
-    elif not generation_enabled and Endpoint.EMBEDDINGS in target.capabilities:
+    elif process_mode == "embeddings":
         argv.append("--embedding")
         if options.get("pooling") is not None:
             argv.extend(["--pooling", str(options["pooling"])])

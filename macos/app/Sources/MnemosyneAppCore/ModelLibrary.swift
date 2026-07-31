@@ -226,6 +226,6 @@ public struct StartModelInstallRequest: Codable, Equatable, Sendable {
         filename = model.filename
         self.projectorFilename = projectorFilename
         self.includeProjector = includeProjector
-        capabilities = role.capabilities
+        capabilities = role.capabilities(for: model.engine)
     }
 }

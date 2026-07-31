@@ -11,14 +11,16 @@ import time
 from typing import AsyncIterator, Awaitable, Callable, Mapping
 
 from .engines.base import Deadline, EngineAdapter
+from .fleet_protocol import Capacity, derive_macos_capacity
 from .models import (
+    EffectiveLoadIdentity,
     Endpoint,
     EngineName,
     EngineSnapshot,
     LoadedHandle,
     ProxyRoute,
     ResolvedTarget,
-    TargetKey,
+    effective_load_identity,
 )
 
 
@@ -28,6 +30,10 @@ class CoordinatorError(RuntimeError):
 
 class QueueTimeout(CoordinatorError):
     pass
+
+
+class QueueFull(CoordinatorError):
+    """Admission was rejected before any engine inference work began."""
 
 
 class CoordinatorState(StrEnum):
@@ -64,6 +70,11 @@ class CoordinatorStatus:
     inflight: int
     queued: int
     diagnostic: str | None
+    initialized: bool
+    accepting: bool
+    transition_target: str | None
+    queued_by_deployment: Mapping[str, int]
+    capacity: Capacity | None
 
 
 @dataclass
@@ -112,6 +123,25 @@ class ModelLease:
             raise
         self._released = True
 
+    async def abort(self) -> None:
+        """Atomically close admission, release this lease, and unload its epoch."""
+
+        if self._released:
+            return
+        if self._release_task is None:
+            self._release_task = asyncio.create_task(
+                self._coordinator._abort_epoch(self.epoch),
+                name=f"mnemosyne-model-lease-abort-{self.epoch}",
+            )
+        try:
+            await asyncio.shield(self._release_task)
+        except asyncio.CancelledError:
+            raise
+        except BaseException:
+            self._release_task = None
+            raise
+        self._released = True
+
     async def __aenter__(self) -> "ModelLease":
         return self
 
@@ -135,6 +165,8 @@ class ResidencyCoordinator:
         transition_timeout_seconds: float = 900,
         cleanup_timeout_seconds: float = 60,
         shutdown_grace_seconds: float = 30,
+        configured_max_concurrency: int | None = None,
+        max_queue_depth: int = 128,
     ) -> None:
         self.adapters = dict(adapters)
         for engine, adapter in self.adapters.items():
@@ -146,6 +178,12 @@ class ResidencyCoordinator:
         self.transition_timeout_seconds = transition_timeout_seconds
         self.cleanup_timeout_seconds = cleanup_timeout_seconds
         self.shutdown_grace_seconds = shutdown_grace_seconds
+        if configured_max_concurrency is not None and configured_max_concurrency < 1:
+            raise ValueError("configured_max_concurrency must be positive or null")
+        if max_queue_depth < 1:
+            raise ValueError("max_queue_depth must be positive")
+        self.configured_max_concurrency = configured_max_concurrency
+        self.max_queue_depth = max_queue_depth
         self._condition = asyncio.Condition()
         self._operation_lock = asyncio.Lock()
         self._queue: deque[_Waiter] = deque()
@@ -155,6 +193,7 @@ class ResidencyCoordinator:
         self._state = CoordinatorState.IDLE
         self._diagnostic: str | None = None
         self._drive_task: asyncio.Task[None] | None = None
+        self._transition_target: ResolvedTarget | None = None
         self._stopping = False
         self._initialized = False
         self._accepting = False
@@ -190,6 +229,7 @@ class ResidencyCoordinator:
             raise
         async with self._condition:
             self._resident = None
+            self._transition_target = None
             self._initialized = True
             self._accepting = True
             self._state = CoordinatorState.IDLE
@@ -213,6 +253,33 @@ class ResidencyCoordinator:
                 raise CoordinatorError("coordinator is not initialized")
             if not self._accepting:
                 raise CoordinatorError("coordinator is temporarily not accepting requests")
+            self._purge_cancelled_locked()
+            if (
+                not self._queue
+                and self._resident is not None
+                and effective_load_identity(self._resident.target)
+                == effective_load_identity(target)
+                and self._state == CoordinatorState.READY
+                and self._transition_target is None
+            ):
+                capacity = derive_macos_capacity(
+                    self._resident.target,
+                    configured_max_concurrency=self.configured_max_concurrency,
+                    active=self._inflight,
+                    queued=0,
+                )
+                if capacity.available > 0:
+                    lease_handle = replace(
+                        self._resident,
+                        target=target,
+                        wire_model=target.wire_model,
+                    )
+                    self._inflight += 1
+                    return ModelLease(self, lease_handle, self._epoch)
+            if len(self._queue) >= self.max_queue_depth:
+                raise QueueFull(
+                    f"node admission queue is full ({self.max_queue_depth} waiters)"
+                )
             self._queue.append(waiter)
             self._ensure_driver_locked()
             self._condition.notify_all()
@@ -290,6 +357,7 @@ class ResidencyCoordinator:
                         )
                         return
                     if not self._queue:
+                        self._transition_target = None
                         if self._resident is None:
                             if self._state != CoordinatorState.DEGRADED:
                                 self._state = CoordinatorState.IDLE
@@ -300,11 +368,20 @@ class ResidencyCoordinator:
                     head = self._queue[0]
                     if (
                         self._resident is not None
-                        and self._resident.target.key == head.target.key
+                        and effective_load_identity(self._resident.target)
+                        == effective_load_identity(head.target)
                     ):
-                        self._grant_head_group_locked(head.target.key)
+                        self._transition_target = None
+                        granted = self._grant_head_group_locked(
+                            effective_load_identity(head.target)
+                        )
+                        if granted == 0:
+                            if self._state != CoordinatorState.DEGRADED:
+                                self._state = CoordinatorState.READY
+                            await self._condition.wait()
                         continue
 
+                    self._transition_target = head.target
                     if self._resident is not None and self._inflight > 0:
                         self._state = CoordinatorState.DRAINING
                         await self._condition.wait()
@@ -328,13 +405,18 @@ class ResidencyCoordinator:
                         if not clean:
                             self._initialized = False
                             self._accepting = False
-                        self._fail_head_group_locked(transition_target.key, exc)
+                        self._transition_target = None
+                        self._fail_head_group_locked(
+                            effective_load_identity(transition_target),
+                            exc,
+                        )
                         self._condition.notify_all()
                     continue
 
                 async with self._condition:
                     self._resident = handle
                     self._epoch += 1
+                    self._transition_target = None
                     # A control-plane barrier or audit can fail closed in the
                     # narrow gap between verified load and publication. Keep
                     # the observed handle for reconciliation, but never reopen
@@ -354,9 +436,21 @@ class ResidencyCoordinator:
                     if self._queue and not self._stopping:
                         self._ensure_driver_locked()
 
-    def _grant_head_group_locked(self, key: TargetKey) -> None:
+    def _grant_head_group_locked(self, identity: EffectiveLoadIdentity) -> int:
         assert self._resident is not None
-        while self._queue and self._queue[0].target.key == key:
+        capacity = derive_macos_capacity(
+            self._resident.target,
+            configured_max_concurrency=self.configured_max_concurrency,
+            active=self._inflight,
+            queued=len(self._queue),
+        )
+        available = capacity.available
+        granted = 0
+        while (
+            available > 0
+            and self._queue
+            and effective_load_identity(self._queue[0].target) == identity
+        ):
             waiter = self._queue.popleft()
             if waiter.cancelled or waiter.future.cancelled():
                 continue
@@ -366,11 +460,21 @@ class ResidencyCoordinator:
                 wire_model=waiter.target.wire_model,
             )
             self._inflight += 1
+            granted += 1
+            available -= 1
             waiter.future.set_result((lease_handle, self._epoch))
         self._condition.notify_all()
+        return granted
 
-    def _fail_head_group_locked(self, key: TargetKey, exc: BaseException) -> None:
-        while self._queue and self._queue[0].target.key == key:
+    def _fail_head_group_locked(
+        self,
+        identity: EffectiveLoadIdentity,
+        exc: BaseException,
+    ) -> None:
+        while (
+            self._queue
+            and effective_load_identity(self._queue[0].target) == identity
+        ):
             waiter = self._queue.popleft()
             if not waiter.future.done():
                 waiter.future.set_exception(exc)
@@ -516,9 +620,106 @@ class ResidencyCoordinator:
         if self._inflight == 0:
             self._last_used_monotonic = time.monotonic()
 
+    async def _abort_epoch(self, epoch: int) -> None:
+        """Release one epoch lease while atomically fencing later admission."""
+
+        deadline = Deadline.after(self.transition_timeout_seconds)
+        async with self._condition:
+            if epoch != self._epoch:
+                return
+            self._accepting = False
+            self._fail_all_locked(CoordinatorError("resident request abort in progress"))
+            self._release_locked(epoch)
+            self._condition.notify_all()
+            while self._inflight > 0:
+                budget = deadline.remaining()
+                if budget <= 0:
+                    error = QueueTimeout(
+                        "timed out draining active model leases after request abort"
+                    )
+                    self._initialized = False
+                    self._state = CoordinatorState.DEGRADED
+                    self._diagnostic = str(error)
+                    raise error
+                self._state = CoordinatorState.DRAINING
+                try:
+                    async with asyncio.timeout(budget):
+                        await self._condition.wait()
+                except TimeoutError as exc:
+                    error = QueueTimeout(
+                        "timed out draining active model leases after request abort"
+                    )
+                    self._initialized = False
+                    self._state = CoordinatorState.DEGRADED
+                    self._diagnostic = str(error)
+                    raise error from exc
+            drive_task = self._drive_task
+        try:
+            await self._await_driver_until(
+                drive_task,
+                deadline,
+                operation="request abort",
+            )
+            budget = deadline.remaining()
+            if budget <= 0:
+                raise QueueTimeout("request abort transition deadline expired")
+            async with asyncio.timeout(budget):
+                async with self._operation_lock:
+                    await self._publish_state(CoordinatorState.UNLOADING)
+                    await self._unload_globally(deadline)
+        except Exception as exc:
+            async with self._condition:
+                self._initialized = False
+                self._accepting = False
+                self._state = CoordinatorState.DEGRADED
+                self._diagnostic = str(exc)
+                self._condition.notify_all()
+            raise
+        async with self._condition:
+            self._resident = None
+            self._transition_target = None
+            self._initialized = True
+            self._accepting = True
+            self._state = CoordinatorState.IDLE
+            self._diagnostic = None
+            self._last_used_monotonic = time.monotonic()
+            self._condition.notify_all()
+
     async def status(self) -> CoordinatorStatus:
         async with self._condition:
             resident = self._resident
+            queued_by_alias: dict[str, int] = {}
+            queued = 0
+            for waiter in self._queue:
+                if waiter.cancelled or waiter.future.cancelled():
+                    continue
+                queued += 1
+                queued_by_alias[waiter.target.alias] = (
+                    queued_by_alias.get(waiter.target.alias, 0) + 1
+                )
+            resident_accepting = bool(
+                resident is not None
+                and self._initialized
+                and self._accepting
+                and not self._stopping
+                and self._state == CoordinatorState.READY
+                and (
+                    not self._queue
+                    or effective_load_identity(self._queue[0].target)
+                    == effective_load_identity(resident.target)
+                )
+            )
+            capacity = (
+                derive_macos_capacity(
+                    resident.target,
+                    configured_max_concurrency=self.configured_max_concurrency,
+                    active=self._inflight,
+                    queued=queued,
+                    accepting=resident_accepting,
+                )
+                if resident is not None
+                else None
+            )
             return CoordinatorStatus(
                 state=self._state,
                 resident_alias=resident.target.alias if resident else None,
@@ -528,8 +729,19 @@ class ResidencyCoordinator:
                 ),
                 epoch=self._epoch,
                 inflight=self._inflight,
-                queued=sum(1 for waiter in self._queue if not waiter.cancelled),
+                queued=queued,
                 diagnostic=self._diagnostic,
+                initialized=self._initialized,
+                accepting=bool(
+                    self._initialized and self._accepting and not self._stopping
+                ),
+                transition_target=(
+                    self._transition_target.alias
+                    if self._transition_target is not None
+                    else None
+                ),
+                queued_by_deployment=queued_by_alias,
+                capacity=capacity,
             )
 
     async def _await_driver_until(
@@ -629,6 +841,7 @@ class ResidencyCoordinator:
             raise
         async with self._condition:
             self._resident = None
+            self._transition_target = None
             self._initialized = True
             self._accepting = True
             self._state = CoordinatorState.IDLE
@@ -687,6 +900,7 @@ class ResidencyCoordinator:
             raise
         async with self._condition:
             self._resident = None
+            self._transition_target = None
             self._initialized = True
             self._accepting = True
             self._state = CoordinatorState.IDLE
@@ -786,6 +1000,7 @@ class ResidencyCoordinator:
                 self._condition.notify_all()
             raise
         async with self._condition:
+            self._transition_target = None
             if not matches:
                 self._resident = None
                 self._state = CoordinatorState.IDLE
@@ -994,6 +1209,7 @@ class ResidencyCoordinator:
 
         async with self._condition:
             self._resident = None
+            self._transition_target = None
             self._initialized = False
             self._state = CoordinatorState.STOPPING
             if diagnostics:

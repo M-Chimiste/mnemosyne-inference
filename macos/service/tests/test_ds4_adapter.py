@@ -22,6 +22,17 @@ from mnemosyne_macos.engines.ds4 import (
 )
 
 
+@pytest.mark.asyncio
+async def test_default_ds4_client_ignores_ambient_proxies(tmp_path: Path) -> None:
+    adapter = DS4Adapter(
+        DS4Config(process_state_path=str(tmp_path / "ds4.json")),
+    )
+    try:
+        assert adapter._client._trust_env is False
+    finally:
+        await adapter.aclose()
+
+
 def _target():
     return MacConfig.model_validate(
         {

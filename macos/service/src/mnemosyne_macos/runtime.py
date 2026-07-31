@@ -12,6 +12,7 @@ from pathlib import Path
 import re
 import time
 from typing import Mapping
+from uuid import uuid4
 
 import httpx
 
@@ -26,13 +27,22 @@ from .config import (
     save_config,
     suggested_model_alias,
 )
-from .coordinator import CoordinatorStatus, ResidencyCoordinator
+from .coordinator import CoordinatorState, CoordinatorStatus, ResidencyCoordinator
 from .engines.base import Deadline, EngineAdapter
 from .engines.ds4 import DS4Adapter
 from .engines.llamacpp import LlamaCppAdapter
 from .engines.mflux import MFluxAdapter
 from .engines.omlx import OMLXAdapter
 from .filesystem import FilesystemProbe, FilesystemProbeError
+from .fleet_protocol import (
+    FLEET_SCHEMA_VERSION,
+    deployment_identity,
+    derive_macos_capacity,
+    effective_capacity,
+    gguf_quantization,
+    immutable_revision,
+    portable_load_config,
+)
 from .models import (
     ENGINE_RELEASE_TIER,
     Endpoint,
@@ -85,6 +95,7 @@ def _redact_diagnostic(
     redacted = value
     for key in (
         "INFERENCE_API_KEY",
+        "FLEET_API_KEY",
         "ADMIN_PASSWORD",
         "OMLX_API_KEY",
         "OMLX_ADMIN_SESSION",
@@ -171,30 +182,165 @@ def _lexical_path(value: str | Path) -> str:
     )
 
 
-def _path_is_within(root: str | Path, candidate: str | Path) -> bool:
-    root_value = _lexical_path(root)
-    candidate_value = _lexical_path(candidate)
-    try:
-        return os.path.commonpath([root_value, candidate_value]) == root_value
-    except ValueError:
-        return False
-
-
 def _profile_uses_install_destination(
     profile: ModelProfile,
     install: InstallRecord,
 ) -> bool:
     destination = _lexical_path(install.destination)
     if profile.engine in {EngineName.LLAMA_CPP, EngineName.DS4}:
-        if not _path_is_within(destination, profile.model):
+        selected = [
+            value
+            for value in (install.filename, install.projector_filename)
+            if value is not None
+        ]
+        safe_selected = _safe_repository_files(selected)
+        if (
+            install.filename is None
+            or safe_selected is None
+            or safe_selected != sorted(selected)
+        ):
+            return False
+        expected_model = _lexical_path(
+            os.path.join(destination, install.filename)
+        )
+        if _lexical_path(profile.model) != expected_model:
             return False
         projector = profile.load.projector_path
-        return projector is None or _path_is_within(destination, projector)
+        if install.projector_filename is None:
+            return projector is None
+        if projector is None:
+            return False
+        expected_projector = _lexical_path(
+            os.path.join(destination, install.projector_filename)
+        )
+        return _lexical_path(projector) == expected_projector
     if profile.engine == EngineName.MFLUX:
         return _lexical_path(profile.model) == destination
     if profile.engine == EngineName.OMLX:
         return profile.model == Path(destination).name
     return False
+
+
+def _fleet_artifact_format(engine: EngineName) -> str:
+    return {
+        EngineName.LLAMA_CPP: "gguf",
+        EngineName.DS4: "gguf",
+        EngineName.OMLX: "mlx-snapshot",
+        EngineName.MFLUX: "mflux-snapshot",
+    }[engine]
+
+
+def _safe_repository_files(values: list[str]) -> list[str] | None:
+    if len(values) > 128:
+        return None
+    safe: list[str] = []
+    for value in values:
+        if (
+            not value
+            or len(value) > 512
+            or value.startswith(("/", "\\"))
+            or re.match(r"^[A-Za-z]:[\\/]", value)
+        ):
+            return None
+        normalized = value.replace("\\", "/")
+        if any(part in {"", ".", ".."} for part in normalized.split("/")):
+            return None
+        safe.append(normalized)
+    return sorted(set(safe))
+
+
+def _safe_huggingface_repo_id(value: str) -> bool:
+    return bool(
+        len(value) <= 512
+        and re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9._-]*"
+            r"(?:/[A-Za-z0-9][A-Za-z0-9._-]*)?",
+            value,
+        )
+    )
+
+
+def _fleet_deployment_identity(
+    *,
+    node_id: str,
+    profile: ModelProfile,
+    target: ResolvedTarget,
+    install: InstallRecord | None,
+) -> tuple[str, dict, bool]:
+    """Return deployment ID, canonical identity, and strict eligibility."""
+
+    managed = bool(
+        install is not None
+        and install.status == "installed"
+        and profile.engine.value == install.engine
+        and profile.storage == install.storage
+        and _profile_uses_install_destination(profile, install)
+    )
+    authoritative = bool(
+        managed and install is not None and immutable_revision(install.revision)
+    )
+    if managed and install is not None:
+        if target.key.engine in {EngineName.LLAMA_CPP, EngineName.DS4}:
+            # Auto-discovered shard companions are download provenance, not
+            # independently selected artifacts. Strict identity contains the
+            # exact primary file plus only an explicitly selected projector.
+            files = [
+                value
+                for value in (install.filename, install.projector_filename)
+                if value is not None
+            ]
+        else:
+            install_payload = install.to_dict()
+            files = [
+                str(value)
+                for value in install_payload.get("download_files", [])
+                if isinstance(value, str) and value
+            ]
+        selected_files = _safe_repository_files(files)
+        if selected_files is None:
+            selected_files = []
+            authoritative = False
+        artifact: dict[str, object] = {
+            "format": _fleet_artifact_format(target.key.engine),
+            "selected_files": selected_files,
+            "quantization": gguf_quantization(install.filename),
+            "content_digest": None,
+        }
+        if _safe_huggingface_repo_id(install.repo_id):
+            upstream_model = install.repo_id
+            revision = (
+                install.revision
+                if install.revision is None or len(install.revision) <= 256
+                else None
+            )
+            if immutable_revision(revision):
+                revision = revision.lower()
+        else:
+            upstream_model = f"node-local:{node_id}:{target.alias}"
+            revision = None
+            authoritative = False
+    else:
+        # Node-scoping prevents two path-only profiles from being mistaken for
+        # strict replicas while keeping local filesystem details private.
+        artifact = {
+            "format": _fleet_artifact_format(target.key.engine),
+            "selected_files": [],
+            "quantization": None,
+            "content_digest": None,
+        }
+        upstream_model = f"node-local:{node_id}:{target.alias}"
+        revision = None
+
+    deployment_id, _load_digest, identity = deployment_identity(
+        engine=target.key.engine.value,
+        upstream_model=upstream_model,
+        resolved_revision=revision,
+        artifact=artifact,
+        kind=target.kind.value,
+        capabilities=(endpoint.value for endpoint in target.capabilities),
+        load_config=portable_load_config(target),
+    )
+    return deployment_id, identity, authoritative
 
 
 def _storage_scope_for_path(
@@ -314,8 +460,13 @@ class NativeRuntime:
             transition_timeout_seconds=config.server.startup_timeout_seconds,
             cleanup_timeout_seconds=max(30, config.server.shutdown_grace_seconds),
             shutdown_grace_seconds=config.server.shutdown_grace_seconds,
+            configured_max_concurrency=config.server.max_concurrency,
+            max_queue_depth=config.server.max_queue_depth,
         )
-        self.proxy_client = proxy_client or httpx.AsyncClient(timeout=None)
+        self.proxy_client = proxy_client or httpx.AsyncClient(
+            timeout=None,
+            trust_env=False,
+        )
         self._owns_proxy_client = proxy_client is None
         self.self_test_client = self_test_client or httpx.AsyncClient(
             timeout=None,
@@ -343,6 +494,9 @@ class NativeRuntime:
         self._maintenance_task: asyncio.Task[None] | None = None
         self._reload_lock = asyncio.Lock()
         self._runtime_update_lock = asyncio.Lock()
+        self._fleet_snapshot_lock = asyncio.Lock()
+        self._fleet_instance_id = uuid4().hex
+        self._fleet_snapshot_sequence = 0
         self._omlx_directory_sync_pending = False
         self.startup_error: str | None = None
 
@@ -1141,7 +1295,7 @@ class NativeRuntime:
         if needs_omlx and not restart_required:
             await self._sync_omlx_model_directories()
         return {
-            "schema_version": 2,
+            "schema_version": new_config.schema_version,
             "imported": imported,
             "restart_required": restart_required,
             "revision": configuration_revision(new_config),
@@ -1153,6 +1307,7 @@ class NativeRuntime:
         payload = asdict(value)
         secret_env_keys = (
             self.config.server.inference_api_key_env,
+            self.config.server.fleet_api_key_env,
             self.config.server.control_password_env,
             self.config.engines.omlx.api_key_env,
             self.config.engines.omlx.admin_session_env,
@@ -1180,6 +1335,189 @@ class NativeRuntime:
         payload["token_sidecar"] = usage_status
         return payload
 
+    async def fleet_snapshot(self) -> dict:
+        """Return one versioned, path-free snapshot for the enrolled gateway."""
+
+        async with self._fleet_snapshot_lock:
+            async with self._reload_lock:
+                targets = list(self.profiles.values())
+                profiles = {
+                    profile.alias: profile.model_copy(deep=True)
+                    for profile in self.config.models
+                    if profile.alias in self.profiles
+                }
+                configured_max = self.config.server.max_concurrency
+                queue_limit = self.config.server.max_queue_depth
+
+            installs = await asyncio.gather(
+                *(self.installer.latest_for_alias(target.alias) for target in targets),
+                return_exceptions=True,
+            )
+            usage = await self.usage.status()
+            coordinator = await self.coordinator.status()
+            node_id = self.usage.identity.node_id
+
+            identity_by_alias: dict[str, tuple[str, dict, bool]] = {}
+            for target, install_result in zip(targets, installs, strict=True):
+                profile = profiles[target.alias]
+                install = (
+                    install_result
+                    if isinstance(install_result, InstallRecord)
+                    else None
+                )
+                identity_by_alias[target.alias] = _fleet_deployment_identity(
+                    node_id=node_id,
+                    profile=profile,
+                    target=target,
+                    install=install,
+                )
+
+            deployment_id_by_alias = {
+                alias: identity[0]
+                for alias, identity in identity_by_alias.items()
+            }
+            queued_by_deployment: dict[str, int] = {}
+            for alias, count in coordinator.queued_by_deployment.items():
+                deployment_id = deployment_id_by_alias.get(alias)
+                if deployment_id is not None:
+                    queued_by_deployment[deployment_id] = (
+                        queued_by_deployment.get(deployment_id, 0) + count
+                    )
+
+            authoritative = bool(
+                coordinator.initialized
+                and coordinator.diagnostic is None
+                and coordinator.state
+                not in {CoordinatorState.DEGRADED, CoordinatorState.STOPPING}
+            )
+            accepting = bool(authoritative and coordinator.accepting)
+            deployments: list[dict] = []
+            for target in targets:
+                deployment_id, identity, eligible = (
+                    identity_by_alias[target.alias]
+                )
+                warm = coordinator.resident_alias == target.alias
+                queued = queued_by_deployment.get(deployment_id, 0)
+                warm_accepting = bool(
+                    warm
+                    and coordinator.state == CoordinatorState.READY
+                    and coordinator.capacity is not None
+                    and coordinator.capacity.available > 0
+                )
+                capacity = derive_macos_capacity(
+                    target,
+                    configured_max_concurrency=configured_max,
+                    active=coordinator.inflight if warm else 0,
+                    queued=queued,
+                    # Deployment capacity is a cold scheduling estimate. It
+                    # remains discoverable while another model is resident;
+                    # a warm resident, however, cannot advertise admission
+                    # while it is draining, verifying, or fenced.
+                    accepting=(warm_accepting if warm else accepting),
+                )
+                deployments.append(
+                    {
+                        "alias": target.alias,
+                        "deployment_id": deployment_id,
+                        "identity": identity,
+                        "identity_confidence": (
+                            "authoritative" if eligible else "unverified"
+                        ),
+                        "fleet_eligible": eligible,
+                        "loadable": authoritative,
+                        "warm": warm,
+                        "capacity": capacity.to_dict(),
+                    }
+                )
+
+            resident_deployment = (
+                deployment_id_by_alias.get(coordinator.resident_alias)
+                if coordinator.resident_alias is not None
+                else None
+            )
+            transition_deployment = (
+                deployment_id_by_alias.get(coordinator.transition_target)
+                if coordinator.transition_target is not None
+                else None
+            )
+            root_capacity = (
+                coordinator.capacity.to_dict()
+                if coordinator.capacity is not None
+                else effective_capacity(
+                    derived_limit=1,
+                    configured_max_concurrency=configured_max,
+                    active=coordinator.inflight,
+                    queued=coordinator.queued,
+                    source="no-resident",
+                    confidence="conservative",
+                    accepting=False,
+                ).to_dict()
+            )
+
+            if self.startup_error is not None:
+                diagnostic_code = "startup_error"
+            elif coordinator.state == CoordinatorState.DEGRADED:
+                diagnostic_code = "coordinator_degraded"
+            elif not coordinator.initialized:
+                diagnostic_code = "not_initialized"
+            else:
+                diagnostic_code = None
+            health_state = (
+                "verifying"
+                if coordinator.state
+                in {
+                    CoordinatorState.VERIFYING_EMPTY,
+                    CoordinatorState.VERIFYING_TARGET,
+                }
+                else coordinator.state.value
+            )
+
+            self._fleet_snapshot_sequence += 1
+            return {
+                "schema_version": FLEET_SCHEMA_VERSION,
+                "snapshot_sequence": self._fleet_snapshot_sequence,
+                "observed_at": time.time(),
+                "node": {
+                    "node_id": node_id,
+                    "instance_id": self._fleet_instance_id,
+                    "platform": "macos",
+                    "version": __version__,
+                },
+                "health": {
+                    "state": health_state,
+                    "accepting": accepting,
+                    "authoritative": authoritative,
+                    "diagnostic_code": diagnostic_code,
+                },
+                "residency": {
+                    "alias": coordinator.resident_alias,
+                    "deployment_id": resident_deployment,
+                    "engine": (
+                        coordinator.resident_engine.value
+                        if coordinator.resident_engine is not None
+                        else None
+                    ),
+                    "epoch": coordinator.epoch,
+                    "transition_target": transition_deployment,
+                },
+                "admission": {
+                    "queue_depth": coordinator.queued,
+                    "queue_limit": queue_limit,
+                    "queued_by_deployment": queued_by_deployment,
+                },
+                "capacity": root_capacity,
+                "deployments": deployments,
+                "usage_delivery": {
+                    "enabled": bool(usage.get("enabled")),
+                    "writer_ready": bool(usage.get("writer_ready")),
+                    "outbox_pending": int(usage.get("outbox_depth") or 0),
+                    "last_flush_at": usage.get("last_flush_at"),
+                    "last_error_code": (
+                        "delivery_error" if usage.get("last_error") else None
+                    ),
+                },
+            }
+
     async def readiness(self) -> dict:
         """Return bounded, actionable setup and health state without upstream checks."""
 
@@ -1187,6 +1525,7 @@ class NativeRuntime:
         runtime_status = await self.runtime_updates.installed_status()
         secret_env_keys = (
             self.config.server.inference_api_key_env,
+            self.config.server.fleet_api_key_env,
             self.config.server.control_password_env,
             self.config.engines.omlx.api_key_env,
             self.config.engines.omlx.admin_session_env,

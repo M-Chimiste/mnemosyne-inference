@@ -12,7 +12,10 @@ func defaultControlPort() {
     #expect(!NativeSettings().engines.omlx.enabled)
     #expect(!NativeSettings().engines.ds4.enabled)
     #expect(!NativeSettings().engines.mflux.enabled)
-    #expect(NativeSettings().schemaVersion == 2)
+    #expect(NativeSettings().schemaVersion == 3)
+    #expect(NativeSettings().server.maxConcurrency == nil)
+    #expect(NativeSettings().server.maxQueueDepth == 128)
+    #expect(NativeSettings().server.fleetApiKeyEnv == "FLEET_API_KEY")
     #expect(NativeSettings().tokenSidecar.enabled)
 }
 
@@ -73,6 +76,7 @@ func configurationSaveRequestEncoding() throws {
     )
     var settings = NativeSettings()
     settings.server.inferencePort = 17_330
+    settings.server.maxConcurrency = 3
     settings.storage = ModelStorageSettings(
         default: "athena-models",
         locations: [
@@ -117,7 +121,10 @@ func configurationSaveRequestEncoding() throws {
     let locations = try #require(storage["locations"] as? [[String: Any]])
     let load = try #require(models.first?["load"] as? [String: Any])
     #expect(server["inference_port"] as? Int == 17_330)
-    #expect(config["schema_version"] as? Int == 2)
+    #expect(config["schema_version"] as? Int == 3)
+    #expect(server["max_concurrency"] as? Int == 3)
+    #expect(server["max_queue_depth"] as? Int == 128)
+    #expect(server["fleet_api_key_env"] as? String == "FLEET_API_KEY")
     #expect(load["context_length"] as? Int == 32_768)
     #expect(load["projector_path"] as? String == "/Volumes/Athena/models/mmproj.gguf")
     #expect(load["gpu_layers"] as? Int == 99)
@@ -201,9 +208,9 @@ func futureConfigurationSchemaSaveRefused() throws {
     let client = ControlAPIClient(
         baseURL: URL(string: "http://localhost:17321")!
     )
-    let settings = NativeSettings(schemaVersion: 3)
+    let settings = NativeSettings(schemaVersion: 4)
 
-    #expect(throws: ControlAPIError.unsupportedConfigurationSchema(3)) {
+    #expect(throws: ControlAPIError.unsupportedConfigurationSchema(4)) {
         _ = try client.configurationSaveRequest(
             settings: settings,
             revision: String(repeating: "f", count: 64)
@@ -215,8 +222,8 @@ func futureConfigurationSchemaSaveRefused() throws {
 func configurationDecoding() throws {
     let payload = #"""
     {
-      "schema_version": 2,
-      "server": {"inference_bind":"127.0.0.1","inference_port":1240,"control_bind":"127.0.0.1","control_port":17321,"idle_unload_seconds":900,"startup_timeout_seconds":900,"swap_queue_timeout_seconds":300,"shutdown_grace_seconds":30,"reconcile_interval_seconds":30,"image_request_timeout_seconds":1800,"image_max_pixels":4194304,"startup_policy":"unload_all","inference_api_key_env":"INFERENCE_API_KEY","control_password_env":"ADMIN_PASSWORD"},
+      "schema_version": 3,
+      "server": {"inference_bind":"127.0.0.1","inference_port":1240,"control_bind":"127.0.0.1","control_port":17321,"idle_unload_seconds":900,"startup_timeout_seconds":900,"swap_queue_timeout_seconds":300,"max_concurrency":null,"max_queue_depth":128,"shutdown_grace_seconds":30,"reconcile_interval_seconds":30,"image_request_timeout_seconds":1800,"image_max_pixels":4194304,"startup_policy":"unload_all","inference_api_key_env":"INFERENCE_API_KEY","fleet_api_key_env":"FLEET_API_KEY","control_password_env":"ADMIN_PASSWORD"},
       "engines": {
         "llama_cpp":{"enabled":true,"host":"127.0.0.1","port":17325,"binary":"/runtime/llama-server","working_directory":"/runtime","process_state_path":"/state/llama.json","request_timeout_seconds":30,"shutdown_grace_seconds":30},
         "omlx":{"enabled":true,"base_url":"http://127.0.0.1:17322","api_key_env":"OMLX_API_KEY","admin_session_env":"OMLX_ADMIN_SESSION","request_timeout_seconds":30,"model_directories":["/Volumes/Athena/models"]},
@@ -240,6 +247,9 @@ func configurationDecoding() throws {
     #expect(settings.models.first?.image?.family == .qwenImage)
     #expect(settings.models.first?.image?.numInferenceSteps == 30)
     #expect(settings.tokenSidecar.maxOutboxRows == 100_000)
+    #expect(settings.server.maxConcurrency == nil)
+    #expect(settings.server.maxQueueDepth == 128)
+    #expect(settings.server.fleetApiKeyEnv == "FLEET_API_KEY")
 }
 
 @Test("Local model scans preserve explicit projector and migration metadata")
@@ -423,7 +433,10 @@ func llamaCppFileSelectionDecoding() throws {
     #expect(install.projectorFilename == "mmproj-F16.gguf")
     #expect(install.includeProjector)
     #expect(install.revision == "abc123")
-    #expect(install.capabilities == ModelRole.generation.capabilities)
+    #expect(
+        install.capabilities
+            == ModelRole.generation.capabilities(for: .llamaCpp)
+    )
 }
 
 @Test("GGUF file discovery preserves the llama.cpp engine value in the query")

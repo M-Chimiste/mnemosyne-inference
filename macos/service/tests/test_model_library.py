@@ -25,6 +25,32 @@ def test_ds4_and_mflux_only_offer_curated_artifacts() -> None:
     assert all(item.filename and item.compatibility == "verified" for item in ds4)
 
 
+def test_verified_install_candidate_pins_resolved_hub_revision(monkeypatch) -> None:
+    seen: dict = {}
+
+    class FakeAPI:
+        def __init__(self, token=None):
+            seen["token"] = token
+
+        def model_info(self, repo_id, **kwargs):
+            seen["repo_id"] = repo_id
+            seen.update(kwargs)
+            return SimpleNamespace(sha="a" * 40)
+
+    monkeypatch.setattr("mnemosyne_macos.model_library.HfApi", FakeAPI)
+    candidate = validate_install_candidate(
+        engine=EngineName.MFLUX,
+        repo_id="black-forest-labs/FLUX.1-schnell",
+        filename=None,
+        revision="main",
+    )
+
+    assert candidate.resolved_revision == "a" * 40
+    assert seen["repo_id"] == "black-forest-labs/FLUX.1-schnell"
+    assert seen["revision"] == "main"
+    assert seen["files_metadata"] is True
+
+
 def test_active_mflux_pack_can_extend_curated_catalog(monkeypatch, tmp_path) -> None:
     root = tmp_path / "runtimes"
     runtime = root / "mflux" / "0.20.0"
@@ -166,6 +192,29 @@ def test_omlx_search_filters_adapters_and_reports_compatibility(monkeypatch) -> 
         "limit": 20,
         "full": True,
     }
+
+
+def test_omlx_install_candidate_retains_resolved_hub_revision(monkeypatch) -> None:
+    class FakeAPI:
+        def __init__(self, token=None):
+            self.token = token
+
+        def model_info(self, *_args, **_kwargs):
+            return SimpleNamespace(
+                sha="b" * 40,
+                tags=["mlx", "text-generation"],
+                pipeline_tag="text-generation",
+            )
+
+    monkeypatch.setattr("mnemosyne_macos.model_library.HfApi", FakeAPI)
+    candidate = validate_install_candidate(
+        engine=EngineName.OMLX,
+        repo_id="mlx-community/Model-4bit",
+        filename=None,
+        revision="main",
+    )
+
+    assert candidate.resolved_revision == "b" * 40
 
 
 def test_download_size_uses_exact_file_or_complete_snapshot(monkeypatch) -> None:

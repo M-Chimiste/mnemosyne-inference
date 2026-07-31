@@ -22,7 +22,7 @@ from repo_probe import expand_shard_filenames
 logger = logging.getLogger("vllm-manager.catalog")
 
 DEFAULT_DB_PATH = "/state/mnemosyne.db"
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 _RESERVED_PREFIX_COLON = "__cache__:"
 _RESERVED_PREFIX_SLASH = "__cache__/"
@@ -371,6 +371,7 @@ class Catalog:
                 );
                 CREATE TABLE IF NOT EXISTS request_usage (
                   id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+                  event_id           TEXT,
                   ts                 REAL NOT NULL,
                   requested_model    TEXT,
                   alias              TEXT,
@@ -407,7 +408,7 @@ class Catalog:
                     "INSERT INTO schema_version(version) VALUES (?)", (SCHEMA_VERSION,)
                 )
             elif int(existing["version"]) < SCHEMA_VERSION:
-                # All additions through v4 are additive (CREATE TABLE IF NOT
+                # All additions through v5 are additive (CREATE TABLE IF NOT
                 # EXISTS / additive ALTERs above), so the only step here is
                 # bumping the stored version once the bootstrap script has
                 # ensured every needed table exists.
@@ -462,6 +463,18 @@ class Catalog:
                     "ALTER TABLE models ADD COLUMN total_completion_tokens "
                     "INTEGER NOT NULL DEFAULT 0"
                 )
+            usage_cols = {
+                row["name"]
+                for row in self._conn.execute("PRAGMA table_info('request_usage')")
+            }
+            if "event_id" not in usage_cols:
+                self._conn.execute(
+                    "ALTER TABLE request_usage ADD COLUMN event_id TEXT"
+                )
+            self._conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_request_usage_event "
+                "ON request_usage(event_id)"
+            )
 
     # ── sync ──────────────────────────────────────────────────────────
 
@@ -840,33 +853,75 @@ class Catalog:
                 (int(last_used_at), delta, alias),
             )
 
-    def record_usage_batch(self, rows: Iterable[tuple]) -> None:
+    def record_usage_batch(
+        self,
+        rows: Iterable[tuple],
+        *,
+        event_ids: Iterable[str | None] | None = None,
+        outbox_rows: Iterable[tuple] | None = None,
+    ) -> None:
         """Drain pending token-usage rows from the proxy hot path.
 
         Each tuple: (ts, requested_model, alias, backend,
                      prompt_tokens, completion_tokens, total_tokens, usage_json).
-        Inserts one row per request into request_usage and bumps per-alias
-        aggregate columns on models in a single transaction. Aliases with
-        no matching models row (raw HF id passthrough) are still logged in
-        request_usage; the UPDATE silently matches zero rows.
+        Optional event IDs make retries idempotent. Optional Postgres-outbox
+        tuples are inserted in the same SQLite transaction, so analytics and
+        delivery state cannot diverge. Aliases with no matching models row
+        (raw HF id passthrough) are still logged in request_usage; the UPDATE
+        silently matches zero rows.
         """
         rows = list(rows)
         if not rows:
             return
+        ids = (
+            [None] * len(rows)
+            if event_ids is None
+            else list(event_ids)
+        )
+        if len(ids) != len(rows):
+            raise ValueError("event_ids must match usage row count")
+        durable_outbox_rows = (
+            [] if outbox_rows is None else list(outbox_rows)
+        )
         agg: dict[str, tuple[int, int, float]] = {}
-        for ts, _req, alias, _backend, prompt, completion, _total, _uj in rows:
-            if not alias:
-                continue
-            p_sum, c_sum, last_ts = agg.get(alias, (0, 0, 0.0))
-            agg[alias] = (p_sum + prompt, c_sum + completion, max(last_ts, ts))
         with self._lock, self._conn:
-            self._conn.executemany(
-                "INSERT INTO request_usage "
-                "(ts, requested_model, alias, backend, prompt_tokens, "
-                " completion_tokens, total_tokens, usage_json) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                rows,
-            )
+            for event_id, row in zip(ids, rows):
+                (
+                    ts,
+                    requested_model,
+                    alias,
+                    backend,
+                    prompt,
+                    completion,
+                    total,
+                    usage_json,
+                ) = row
+                inserted = self._conn.execute(
+                    "INSERT INTO request_usage "
+                    "(event_id, ts, requested_model, alias, backend, "
+                    " prompt_tokens, completion_tokens, total_tokens, usage_json) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(event_id) DO NOTHING",
+                    (
+                        event_id,
+                        ts,
+                        requested_model,
+                        alias,
+                        backend,
+                        prompt,
+                        completion,
+                        total,
+                        usage_json,
+                    ),
+                )
+                if inserted.rowcount <= 0 or not alias:
+                    continue
+                p_sum, c_sum, last_ts = agg.get(alias, (0, 0, 0.0))
+                agg[alias] = (
+                    p_sum + prompt,
+                    c_sum + completion,
+                    max(last_ts, ts),
+                )
             for alias, (p_sum, c_sum, last_ts) in agg.items():
                 self._conn.execute(
                     "UPDATE models SET "
@@ -875,6 +930,16 @@ class Catalog:
                     "last_used_at = MAX(COALESCE(last_used_at, 0), ?) "
                     "WHERE alias = ?",
                     (p_sum, c_sum, int(last_ts), alias),
+                )
+            if durable_outbox_rows:
+                self._conn.executemany(
+                    "INSERT INTO pg_usage_outbox "
+                    "(event_id, ts, requested_model, alias, backend, endpoint, "
+                    " streamed, prompt_tokens, completion_tokens, total_tokens, "
+                    " response_ms, status_code) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(event_id) DO NOTHING",
+                    durable_outbox_rows,
                 )
 
     def schema_version(self) -> int:

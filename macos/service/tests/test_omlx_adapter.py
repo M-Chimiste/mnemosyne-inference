@@ -650,3 +650,12 @@ async def test_omlx_unload_404_is_safe_only_after_confirmed_absence() -> None:
     await adapter.unload(instance, deadline=Deadline.after(1))
     assert loaded is False
     await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_default_omlx_client_ignores_ambient_proxies() -> None:
+    adapter = OMLXAdapter(OMLXConfig())
+    try:
+        assert adapter._client._trust_env is False
+    finally:
+        await adapter.aclose()

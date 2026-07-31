@@ -32,7 +32,7 @@ public enum ModelRole: String, Codable, CaseIterable, Identifiable, Sendable {
     public var explanation: String {
         switch self {
         case .generation:
-            "Chat, text completions, Responses, and Anthropic Messages"
+            "Chat, text completions, Responses, and Messages where configured"
         case .embeddings:
             "Vector embeddings only"
         case .rerank:
@@ -53,6 +53,13 @@ public enum ModelRole: String, Codable, CaseIterable, Identifiable, Sendable {
         case .image:
             ["images/generations"]
         }
+    }
+
+    public func capabilities(for engine: InferenceEngine) -> [String] {
+        if self == .generation, engine == .llamaCpp {
+            return ["chat/completions", "completions", "responses"]
+        }
+        return capabilities
     }
 }
 
@@ -76,8 +83,11 @@ public extension ModelProfileSettings {
         }
 
         let configured = Set(capabilities)
-        let generation = Set(ModelRole.generation.capabilities)
-        if configured == generation {
+        let generation = Set(ModelRole.generation.capabilities(for: engine))
+        let generationWithMessages = Set(ModelRole.generation.capabilities)
+        if configured == generation
+            || (engine == .llamaCpp && configured == generationWithMessages)
+        {
             return .generation
         }
         if configured == Set(ModelRole.embeddings.capabilities) {
@@ -115,7 +125,14 @@ public extension ModelProfileSettings {
 
     mutating func applyRole(_ role: ModelRole) {
         guard availableRoles.contains(role) else { return }
-        capabilities = role.capabilities
+        let explicitLlamaMessages = (
+            engine == .llamaCpp
+                && role == .generation
+                && Set(capabilities ?? []) == Set(ModelRole.generation.capabilities)
+        )
+        if !explicitLlamaMessages {
+            capabilities = role.capabilities(for: engine)
+        }
 
         if role == .image {
             kind = .image

@@ -42,6 +42,14 @@ def _profile(
     served_model_name: str | None = None,
     engine_model_path: str | None = None,
     gguf_filename: str | None = None,
+    projector_filename: str | None = None,
+    projector_model_path: str | None = None,
+    capabilities: tuple[str, ...] = (
+        "chat.completions",
+        "completions",
+        "embeddings",
+        "responses",
+    ),
     revision: str = "main",
 ) -> ResolvedProfile:
     served = served_model_name if served_model_name is not None else model
@@ -61,6 +69,9 @@ def _profile(
         revision=revision,
         backend=backend,
         gguf_filename=gguf_filename,
+        projector_filename=projector_filename,
+        projector_model_path=projector_model_path,
+        capabilities=capabilities,
     )
 
 
@@ -340,6 +351,57 @@ def test_llama_argv_max_model_len_emits_c_flag():
 def test_llama_argv_max_model_len_omitted_when_none():
     argv = build_llama_argv(_llama_profile(), host="h", port=1)
     assert "-c" not in argv
+
+
+def test_llama_argv_emits_explicit_projector_before_escape_hatch():
+    argv = build_llama_argv(
+        _llama_profile(
+            projector_filename="mmproj-F16.gguf",
+            projector_model_path="/hf-cache/snapshot/mmproj-F16.gguf",
+            extra_args=("--temp", "0.2"),
+        ),
+        host="h",
+        port=1,
+    )
+    assert argv[argv.index("--mmproj") + 1] == (
+        "/hf-cache/snapshot/mmproj-F16.gguf"
+    )
+    assert argv[-2:] == ["--temp", "0.2"]
+
+
+def test_llama_argv_generation_mode_does_not_enable_pooling():
+    argv = build_llama_argv(
+        _llama_profile(
+            capabilities=(
+                "chat.completions",
+                "completions",
+                "responses",
+            ),
+        ),
+        host="h",
+        port=1,
+    )
+    assert "--embedding" not in argv
+    assert "--reranking" not in argv
+
+
+def test_llama_argv_embedding_and_rerank_modes_are_real():
+    embedding = build_llama_argv(
+        _llama_profile(capabilities=("embeddings",)),
+        host="h",
+        port=1,
+    )
+    rerank = build_llama_argv(
+        _llama_profile(capabilities=("rerank",)),
+        host="h",
+        port=1,
+    )
+
+    assert "--embedding" in embedding
+    assert "--reranking" not in embedding
+    assert "--embedding" in rerank
+    assert "--reranking" in rerank
+    assert rerank[rerank.index("--pooling") + 1] == "rank"
 
 
 def test_llama_argv_extra_args_appended_last():

@@ -93,7 +93,7 @@ class HttpEngineAdapter(EngineAdapter):
         if poll_interval_seconds < 0:
             raise ValueError("poll_interval_seconds must be non-negative")
         self.poll_interval_seconds = poll_interval_seconds
-        self._client = client or httpx.AsyncClient()
+        self._client = client or httpx.AsyncClient(trust_env=False)
         self._owns_client = client is None
 
         host = urlsplit(self.base_url).hostname or ""

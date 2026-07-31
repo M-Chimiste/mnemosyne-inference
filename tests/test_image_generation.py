@@ -180,6 +180,9 @@ def test_cuda_images_route_uses_profile_defaults_without_token_usage(
             assert seen["body"]["true_cfg_scale"] == 2.5
             assert seen["timeout"] == 1800.0
             assert not vllm_manager._runtime.usage_rows
+            assert vllm_manager._catalog._conn.execute(
+                "SELECT COUNT(*) AS c FROM request_usage"
+            ).fetchone()["c"] == 0
 
 
 def test_sglang_install_persists_image_capability(client, stub_downloader) -> None:

@@ -68,12 +68,15 @@ class ServerConfig(BaseModel):
     idle_unload_seconds: int | None = Field(default=900, ge=1)
     startup_timeout_seconds: float = Field(default=900, gt=0)
     swap_queue_timeout_seconds: float = Field(default=300, gt=0)
+    max_concurrency: int | None = Field(default=None, ge=1)
+    max_queue_depth: int = Field(default=128, ge=1, le=100_000)
     shutdown_grace_seconds: float = Field(default=30, gt=0)
     reconcile_interval_seconds: float = Field(default=30, ge=5)
     image_request_timeout_seconds: float = Field(default=1800, gt=0)
     image_max_pixels: int = Field(default=4_194_304, ge=4096)
     startup_policy: str = "unload_all"
     inference_api_key_env: str = "INFERENCE_API_KEY"
+    fleet_api_key_env: str = "FLEET_API_KEY"
     control_password_env: str = "ADMIN_PASSWORD"
 
     @model_validator(mode="after")
@@ -264,7 +267,7 @@ class ImageProfileConfig(BaseModel):
 class ModelProfile(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    alias: str
+    alias: str = Field(max_length=128)
     engine: EngineName
     model: str
     storage: str | None = None
@@ -540,7 +543,7 @@ class StorageConfig(BaseModel):
 class MacConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    schema_version: Literal[2] = 2
+    schema_version: Literal[3] = 3
     server: ServerConfig = Field(default_factory=ServerConfig)
     engines: EnginesConfig = Field(default_factory=EnginesConfig)
     paths: PathsConfig = Field(default_factory=PathsConfig)
@@ -556,6 +559,11 @@ class MacConfig(BaseModel):
             return value
         raw = copy.deepcopy(value)
         version = raw.get("schema_version", 1)
+        if version == 2:
+            raw["schema_version"] = 3
+            return raw
+        if version == 3:
+            return raw
         if version != 1:
             return raw
 
@@ -596,7 +604,7 @@ class MacConfig(BaseModel):
             migrated_profiles = [*previous, *migrated_profiles]
         migration["legacy_lmstudio_profiles"] = migrated_profiles
         raw["migration"] = migration
-        raw["schema_version"] = 2
+        raw["schema_version"] = 3
         return raw
 
     @model_validator(mode="after")

@@ -79,6 +79,7 @@ def _plane_auth_env(monkeypatch):
     """Exercise admin Basic by default and keep inference auth opt-in."""
     monkeypatch.setenv("ADMIN_PASSWORD", "test-pw")
     monkeypatch.delenv("INFERENCE_API_KEY", raising=False)
+    monkeypatch.delenv("FLEET_API_KEY", raising=False)
 
 
 @pytest.fixture
@@ -109,6 +110,7 @@ def _reset_globals():
     vllm_manager._catalog = None
     # Phase 2 globals
     vllm_manager._runtime = RuntimeState()
+    vllm_manager._coordinator = None
     vllm_manager._loading_target = None
     vllm_manager._load_event = None
     vllm_manager._load_error = None

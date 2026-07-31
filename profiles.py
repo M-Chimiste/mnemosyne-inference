@@ -33,6 +33,48 @@ class ProfileNotReady(Exception):
     """A managed profile exists but its expected local weights are not ready."""
 
 
+_LLAMA_GENERATION_CAPABILITIES = (
+    "chat.completions",
+    "completions",
+    "messages",
+    "responses",
+)
+
+
+def _effective_backend_capabilities(
+    backend: str,
+    capabilities,
+) -> tuple[str, ...]:
+    """Project legacy capability rows onto the mode the engine will launch."""
+
+    values = tuple(str(value) for value in capabilities)
+    if backend != "llama.cpp":
+        return values
+    normalized = {
+        {
+            "chat/completions": "chat.completions",
+            "/v1/chat/completions": "chat.completions",
+        }.get(value, value)
+        for value in values
+    }
+    if normalized == {"embeddings"}:
+        return ("embeddings",)
+    if normalized == {"rerank"}:
+        return ("rerank",)
+    generation = tuple(
+        capability
+        for capability in _LLAMA_GENERATION_CAPABILITIES
+        if capability in normalized
+    )
+    if generation:
+        # Historical CUDA rows advertised generation plus embeddings even
+        # though llama-server was launched in generation mode. Drop the
+        # impossible specialized claim so proxying and Fleet stay truthful.
+        return generation
+    # An invalid specialized mixture has no honest endpoint contract.
+    return ()
+
+
 @dataclass(frozen=True)
 class ResolvedProfile:
     alias: str
@@ -49,11 +91,17 @@ class ResolvedProfile:
     revision: str = "main"
     backend: str = "vllm"   # "vllm" | "llama.cpp" | "sglang-diffusion"
     gguf_filename: Optional[str] = None
+    projector_filename: Optional[str] = None
+    projector_model_path: Optional[str] = None
     kind: str = "language"
     capabilities: tuple[str, ...] = (
         "chat.completions", "completions", "embeddings", "responses",
     )
     image_defaults: Optional[dict] = None
+    # Canonical repository/model identity used for strict fleet deployment
+    # matching. Unlike engine_model_path this never needs to contain a local
+    # storage path.
+    upstream_model: Optional[str] = None
 
     @property
     def model(self) -> str:
@@ -112,13 +160,25 @@ def resolve_profile(
         )
         storage_path = storage_locations[storage_name]
         backend = config_profile.backend
+        row = catalog.get_model(alias) if catalog is not None else None
+        resolved_revision = config_profile.revision
+        if (
+            row is not None
+            and row.status == "installed"
+            and row.hf_model_id == config_profile.model
+            and (row.backend or "vllm") == backend
+            and row.resolved_sha
+        ):
+            # Config remains authoritative for behavior, while the catalog's
+            # completed install records the immutable commit actually present
+            # on disk. Never borrow a SHA from a stale/mismatched row.
+            resolved_revision = row.resolved_sha
         if backend == "llama.cpp":
             if not config_profile.gguf_filename:
                 # Pydantic validator catches this, but guard defensively.
                 raise ValueError(
                     f"alias '{alias}' has backend=llama.cpp but no gguf_filename"
                 )
-            row = catalog.get_model(alias) if catalog is not None else None
             if row is None or row.cache_path is None or row.status != "installed":
                 raise ProfileNotReady(
                     f"alias '{alias}' is not ready; install/reconcile the selected GGUF first"
@@ -129,9 +189,21 @@ def resolve_profile(
                 raise ProfileNotReady(
                     f"alias '{alias}' is not ready; missing GGUF file '{config_profile.gguf_filename}'"
                 )
+            projector_path = None
+            if config_profile.projector_filename:
+                projector_path = os.path.join(
+                    row.cache_path,
+                    config_profile.projector_filename,
+                )
+                if not os.path.isfile(projector_path):
+                    raise ProfileNotReady(
+                        f"alias '{alias}' is not ready; missing projector file "
+                        f"'{config_profile.projector_filename}'"
+                    )
         else:
             served = config_profile.model
             engine_path = config_profile.model
+            projector_path = None
         return ResolvedProfile(
             alias=config_profile.alias,
             served_model_name=served,
@@ -148,16 +220,22 @@ def resolve_profile(
             storage_name=storage_name,
             storage_path=storage_path,
             extra_args=tuple(config_profile.extra_args),
-            revision=config_profile.revision,
+            revision=resolved_revision,
             backend=backend,
             gguf_filename=config_profile.gguf_filename,
+            projector_filename=config_profile.projector_filename,
+            projector_model_path=projector_path,
             kind=config_profile.kind,
-            capabilities=config_profile.capabilities,
+            capabilities=_effective_backend_capabilities(
+                backend,
+                config_profile.capabilities or (),
+            ),
             image_defaults=(
                 config_profile.image.model_dump()
                 if config_profile.image is not None
                 else None
             ),
+            upstream_model=config_profile.model,
         )
 
     if catalog is not None:
@@ -216,10 +294,14 @@ def resolve_profile(
                 backend=backend,
                 gguf_filename=row.gguf_filename,
                 kind=row.model_kind,
-                capabilities=tuple(json.loads(row.capabilities)),
+                capabilities=_effective_backend_capabilities(
+                    backend,
+                    json.loads(row.capabilities),
+                ),
                 image_defaults=(
                     json.loads(row.image_config) if row.image_config else None
                 ),
+                upstream_model=row.hf_model_id,
             )
 
     raise KeyError(alias)

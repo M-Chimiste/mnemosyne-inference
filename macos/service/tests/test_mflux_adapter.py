@@ -15,6 +15,15 @@ from mnemosyne_macos.models import EngineName, ServiceState
 
 
 @pytest.mark.asyncio
+async def test_default_mflux_client_ignores_ambient_proxies() -> None:
+    adapter = MFluxAdapter(MFluxConfig(enabled=True))
+    try:
+        assert adapter._client._trust_env is False
+    finally:
+        await adapter.aclose()
+
+
+@pytest.mark.asyncio
 async def test_managed_runtime_overrides_bundled_mflux_fallback(
     tmp_path: Path, monkeypatch
 ) -> None:

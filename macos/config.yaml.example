@@ -1,7 +1,7 @@
 # Mnemosyne native macOS configuration.
 # Copy to ~/Library/Application Support/Mnemosyne/config.yaml.
 
-schema_version: 2
+schema_version: 3
 
 server:
   inference_bind: 127.0.0.1
@@ -11,12 +11,19 @@ server:
   idle_unload_seconds: 900
   startup_timeout_seconds: 900
   swap_queue_timeout_seconds: 300
+  # null derives a conservative limit from each engine/profile. Set a positive
+  # integer to cap that derived limit for every resident model.
+  max_concurrency: null
+  # Waiting requests only; warm requests with a free concurrency permit bypass
+  # the queue without violating FIFO model-switch ordering.
+  max_queue_depth: 128
   shutdown_grace_seconds: 30
   reconcile_interval_seconds: 30
   image_request_timeout_seconds: 1800
   image_max_pixels: 4194304
   startup_policy: unload_all
   inference_api_key_env: INFERENCE_API_KEY
+  fleet_api_key_env: FLEET_API_KEY
   control_password_env: ADMIN_PASSWORD
 
 engines:

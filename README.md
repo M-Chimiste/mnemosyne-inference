@@ -2,9 +2,11 @@
 
 ## What this is
 
-Mnemosyne Inference gives a single workstation local-model-manager experience
-on top of upstream inference engines. The repository now contains two sibling
-deployments with independent dependencies and packaging:
+Mnemosyne Inference gives each workstation a local-model-manager experience
+on top of upstream inference engines, with an optional Nyx-hosted gateway that
+turns enrolled workstations into one discoverable endpoint. The repository
+contains two inference-node deployments with independent dependencies and
+packaging:
 
 - The established CUDA deployment runs vLLM, llama.cpp, or SGLang Diffusion
   in Docker, including local text-to-image generation.
@@ -14,6 +16,10 @@ deployments with independent dependencies and packaging:
   not use Docker, so MLX and Metal remain available to the host processes.
   Start with the [Mac installation guide](macos/INSTALL.md), then use
   [macos/README.md](macos/README.md) as the operator and developer reference.
+- The standalone [Mnemosyne Fleet service](fleet/README.md) runs on Nyx,
+  polls authenticated read-only node snapshots, routes only to strict
+  deployment matches with capacity, and presents realtime node and token
+  status without becoming an inference-engine manager.
 
 The remainder of this README describes the CUDA deployment unless a section is
 explicitly labeled macOS.
@@ -24,8 +30,9 @@ explicitly labeled macOS.
 | --- | --- | --- |
 | CUDA/Linux | Docker, vLLM, llama.cpp, SGLang Diffusion | Feature-complete implementation and automated coverage; current engine pins and cross-backend swaps still need a CUDA-workstation release smoke. |
 | Apple Silicon | Managed llama.cpp, external oMLX, Preview DS4, Preview MFLUX worker | The 0.9 release candidate has complete automated native coverage and a verified private DMG. llama.cpp and oMLX are the Stable V1 engines; DS4 and MFLUX remain Preview. LM Studio engine support has been removed, while its model directory remains a Finder-confirmed migration hint. The signed/notarized release and target-Mac acceptance ledger are still open, so this is not yet V1. |
+| Nyx Fleet | FastAPI gateway, strict scheduler, realtime dashboard, read-only token-ledger view | Implementation and isolated fault-injection coverage are present; LAN/Tailscale rollout and representative Mac/CUDA target-host evidence remain pending. |
 
-Both deployments expose one stable API, keep at most one model resident, and
+Both inference deployments expose one stable API, keep at most one model resident, and
 use the same `/v1/images/generations` contract. Language-model usage can be
 written to SQLite and optionally forwarded through the durable Postgres
 outbox. Image requests are deliberately excluded from token accounting.
@@ -276,6 +283,9 @@ Top-level blocks:
     or another model is loaded.
   - `swap_queue_timeout_seconds: 300` is the longest a `/v1/*` caller will
     wait while another model is loading before getting a `504`.
+  - `max_concurrency` is an optional ceiling over engine-derived request
+    capacity. `max_queue_depth` bounds FIFO node waiters; arrivals beyond it
+    receive a pre-inference `429 node_busy`.
 - **`storage`** — named locations for HF caches. `default:` is the location
   used when an install does not pick one explicitly. Each entry's `path` is a
   container path that must be backed by a host bind-mount (see [Adding a
@@ -288,6 +298,56 @@ Top-level blocks:
   `quantization`, `max_model_len`, `storage`, `backend`, `gguf_filename`, and
   `extra_args` for raw engine flags appended verbatim. Image profiles use
   `backend: sglang-diffusion`, `kind: image`, and an `image:` defaults block.
+- **`fleet`** — the stable, non-secret node ID advertised to an explicitly
+  enrolled Nyx gateway. Use the same ID as `token_sidecar.node_id` when
+  central token reporting is enabled.
+
+## Nyx fleet gateway and enrollment
+
+Install the standalone gateway by following [fleet/README.md](fleet/README.md).
+Run one gateway process on Nyx so its in-memory reservations form one
+authoritative scheduling view. It exposes the public `/v1/*` endpoint,
+authenticated Fleet APIs, and `/fleet/` realtime dashboard while querying the
+existing token ledger with a read-only role.
+
+The CUDA manager can participate over a trusted LAN or Tailscale address. Set
+a unique `fleet.node_id` in
+`config.yaml`, plus distinct node-specific `FLEET_API_KEY` and
+`INFERENCE_API_KEY` values in `.env`, restart the container, then enroll the
+node's private inference URL and both credentials in Nyx.
+
+No external Compose port, volume, container-name, or mount change is required:
+the maintained template already loads `.env` and Fleet uses the existing
+inference port. Rebuild/re-create the container so it contains the new
+snapshot and lease-coordinator code.
+
+Nyx polls the inference-plane-only, read-only snapshot:
+
+```bash
+curl -s http://cuda-host:8000/fleet/v1/snapshot \
+  -H "Authorization: Bearer $FLEET_API_KEY" | jq
+```
+
+If `FLEET_API_KEY` is unset the route returns `404`; it is never available on
+the admin plane. If Fleet discovery is enabled while `INFERENCE_API_KEY`
+remains empty, the snapshot fails closed with `503` and
+`fleet_inference_auth_unconfigured` so Nyx cannot route through an
+unauthenticated data plane. The schema-v1 response contains strict deployment identities,
+residency epoch, bounded admission state, derived/effective capacity, and
+redacted token-outbox health. It never contains engine arguments, storage
+paths, inner URLs, credentials, prompts, or outputs.
+
+Every CUDA request holds an epoch lease from admission until its entire
+response body or stream closes. A different-model FIFO head stops new
+old-model admissions, drains the active epoch, then swaps. Manual unload, idle
+eviction, and shutdown use the same barrier. Capacity starts conservatively:
+vLLM uses a valid `--max-num-seqs` or 1, llama.cpp uses live `/slots` with
+`--parallel`/1 as fallback, and SGLang Diffusion uses 1. `max_concurrency` may
+lower these values but cannot raise them. See
+[the fleet architecture](project_docs/fleet_architecture.md) for Nyx
+scheduling, strict matching, and failure semantics. Native enrollment is
+documented in [macos/README.md](macos/README.md); the bounded multi-node
+rollout is in [fleet acceptance](project_docs/fleet_acceptance.md).
 
 ## Image generation
 
@@ -553,13 +613,18 @@ unless you say otherwise. Follow these rules:
 
 ## Token usage telemetry
 
-Every successful `/v1/{chat/completions,completions,embeddings}` call is
-accounted for locally in the SQLite `request_usage` table — open
-`/manager/status` or query `~/vllm-manager/state/mnemosyne.db` directly.
+Every successful `/v1/{chat/completions,completions,responses,messages,embeddings,rerank}`
+response with a recognized usage block is accounted for locally in the SQLite
+`request_usage` table. OpenAI input/output fields, Anthropic Messages cache
+counters, and their streaming envelopes are normalized into the common
+prompt/completion/total shape. Open `/manager/status` or query
+`~/vllm-manager/state/mnemosyne.db` directly.
 
 For multi-node fleets, the manager can additionally forward every row to a
 central Postgres ledger (a "token sidecar"). The local SQLite is the
-durable cache: a Postgres outage or container restart never drops data.
+durable cache: local analytics and the delivery outbox commit atomically
+before a completed response (or terminal stream event) is forwarded. A
+Postgres outage or container restart therefore does not drop committed usage.
 
 1. **Apply the schema once** on the central host. The writer role is
    intentionally privilege-limited and cannot DDL — apply this as a
@@ -593,7 +658,7 @@ durable cache: a Postgres outage or container restart never drops data.
    ```yaml
    token_sidecar:
      enabled: true
-     node_id: Mnemosyne          # unique per host
+     node_id: Mnemosyne          # unique per host; match fleet.node_id
      flush_interval_seconds: 30
      batch_size: 500
      max_outbox_rows: 100000
@@ -612,9 +677,10 @@ durable cache: a Postgres outage or container restart never drops data.
 
 The DSN is secret-bearing and stays in `.env` (gitignored); everything else
 is declarative config that `vllm-ctl reload` will pick up. Both the SQLite
-outbox and the postgres `event_id` PK use UUIDs so a DELETE-after-success
-retry is naturally idempotent — `outbox_pending` should sit at zero in
-steady state, but is allowed to grow up to `max_outbox_rows` during
+analytics table, SQLite outbox, and Postgres ledger use the same UUID event
+identity, so ambiguous local commits and DELETE-after-success delivery retries
+are idempotent. `outbox_pending` should sit at zero in steady state, but is
+allowed to grow up to `max_outbox_rows` during
 outages, with oldest rows dropped past the cap (logged as a warning).
 
 ## Common operations
@@ -672,6 +738,11 @@ curl -u admin:"$ADMIN_PASSWORD" -X POST \
 - **`504` from `/v1/*` during a swap.** The caller waited longer than
   `server.swap_queue_timeout_seconds` for another model to finish loading.
   Either bump the timeout, retry, or queue your traffic differently.
+- **`429 node_busy` from `/v1/*`.** All effective concurrency permits are in
+  use and the bounded node queue is full. Nyx may safely try another strict
+  replica because this response is emitted before engine work starts and
+  carries the manager-owned `X-Mnemosyne-Error: node_busy` proof header. A
+  body-only `node_busy` error is never retried.
 - **`503` from `/v1/*` mid-load.** The active engine child died (OOM, kernel
   mismatch, bad model file, etc.). The next request retriggers a fresh load —
   there is no auto-restart loop by design. Check `vllm-ctl logs`

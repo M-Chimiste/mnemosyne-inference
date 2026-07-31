@@ -59,7 +59,7 @@ class MFluxAdapter(EngineAdapter):
     ) -> None:
         self.config = config
         self.base_url = f"http://{config.host}:{config.port}"
-        self._client = client or httpx.AsyncClient()
+        self._client = client or httpx.AsyncClient(trust_env=False)
         self._owns_client = client is None
         self._spawn_process = spawn_process
         self._poll_interval_seconds = poll_interval_seconds

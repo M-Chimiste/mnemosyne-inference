@@ -716,7 +716,17 @@ def validate_install_candidate(
 ) -> LibraryModel:
     verified = verified_model(engine=engine, repo_id=repo_id, filename=filename)
     if verified is not None:
-        return verified
+        info = HfApi(token=token or _hf_token()).model_info(
+            repo_id,
+            revision=revision,
+            files_metadata=True,
+        )
+        resolved_revision = getattr(info, "sha", None) or revision
+        if not resolved_revision:
+            raise ValueError(
+                "the selected model did not resolve to an immutable Hub revision"
+            )
+        return replace(verified, resolved_revision=str(resolved_revision))
     unavailable = next(
         (
             model
@@ -776,7 +786,7 @@ def validate_install_candidate(
         raise ValueError(f"{engine.value} downloads are limited to verified models")
 
     api = HfApi(token=token or _hf_token())
-    info = api.model_info(repo_id, files_metadata=False)
+    info = api.model_info(repo_id, revision=revision, files_metadata=False)
     tags = {str(tag).casefold() for tag in (getattr(info, "tags", None) or [])}
     if "mlx" not in tags and "mlx" not in repo_id.casefold():
         raise ValueError("the selected repository is not published as an MLX model")
@@ -790,6 +800,11 @@ def validate_install_candidate(
         compatibility="likely",
         compatibility_reason="Published as an MLX model; oMLX performs final validation on load.",
         quantization=_quantization(repo_id, tags),
+        resolved_revision=(
+            str(getattr(info, "sha"))
+            if getattr(info, "sha", None) is not None
+            else revision
+        ),
         suggested_role=_suggested_role(
             repo_id,
             tags,
