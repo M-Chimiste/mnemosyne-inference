@@ -127,6 +127,18 @@ final class SettingsViewModel: ObservableObject {
         settings.schemaVersion <= NativeSettings.supportedSchemaVersion
     }
 
+    var inferenceAPIKeyWillBeConfigured: Bool {
+        if credentialsToClear.contains(.inferenceAPIKey) {
+            return false
+        }
+        if let draft = credentialDrafts[.inferenceAPIKey],
+           !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        {
+            return true
+        }
+        return configuredCredentials.contains(.inferenceAPIKey)
+    }
+
     var statusColor: Color {
         switch statusTone {
         case .normal: .secondary

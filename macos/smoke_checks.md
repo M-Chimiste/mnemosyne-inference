@@ -112,7 +112,10 @@ lsof -nP \
 ```
 
 Confirm Unified Inference owns `1240`/`17321` and every inner listener is
-loopback-only. oMLX owns `17322` when that optional engine is enabled.
+loopback-only. In the default **This Mac only** mode, `1240` is loopback-only;
+with **Allow connections from the local network** enabled, only `1240` may
+listen on `0.0.0.0`. The control listener on `17321` stays loopback-only. oMLX
+owns `17322` when that optional engine is enabled.
 Manager-owned DS4, MFLUX, and llama.cpp should be absent from `17323`,
 `17324`, and `17325` while unloaded. LM Studio is not part of the inference
 topology. The previous token sidecar is not required in the inference path.
@@ -125,6 +128,18 @@ curl -s http://127.0.0.1:17321/manager/status | jq
 curl -s http://127.0.0.1:17321/manager/readiness | jq
 curl -s http://127.0.0.1:1240/v1/models | jq
 ```
+
+Exercise both local-network inference modes from a second device:
+
+1. Enable **Settings → General → Allow connections from the local network**,
+   leave the Inference API key unset, save, and restart. Confirm an
+   unauthenticated request to `http://<Mac-LAN-address>:1240/v1/models`
+   succeeds.
+2. Set **Settings → Credentials → Inference API key**, save, and restart.
+   Confirm the same unauthenticated request returns `401` and a request with
+   `Authorization: Bearer <key>` succeeds.
+3. Confirm `17321` and every inner-engine port remain unreachable from the
+   second device.
 
 Open **Settings → Setup & Health** and compare it with the readiness payload.
 Confirm the product version matches `macos/VERSION`, diagnostics contain no

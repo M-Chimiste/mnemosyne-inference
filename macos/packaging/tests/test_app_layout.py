@@ -95,6 +95,14 @@ class AppLayoutTests(unittest.TestCase):
             script,
         )
 
+    def test_bundle_explains_optional_local_network_inference(self) -> None:
+        with INFO_PLIST.open("rb") as stream:
+            info = plistlib.load(stream)
+
+        description = info["NSLocalNetworkUsageDescription"]
+        self.assertIn("inference requests", description)
+        self.assertIn("local network", description)
+
     def test_build_injects_and_verifies_the_single_native_version(self) -> None:
         script = BUILD_SCRIPT.read_text(encoding="utf-8")
         version = VERSION_FILE.read_text(encoding="utf-8").strip()

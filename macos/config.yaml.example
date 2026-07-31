@@ -4,6 +4,8 @@
 schema_version: 2
 
 server:
+  # Settings > General switches this between 127.0.0.1 (This Mac only) and
+  # 0.0.0.0 (all reachable interfaces, including the local network).
   inference_bind: 127.0.0.1
   inference_port: 1240
   control_bind: 127.0.0.1
@@ -16,6 +18,8 @@ server:
   image_request_timeout_seconds: 1800
   image_max_pixels: 4194304
   startup_policy: unload_all
+  # Authentication is optional on either bind. When this variable is set,
+  # every /v1/* request must send Authorization: Bearer <key>.
   inference_api_key_env: INFERENCE_API_KEY
   control_password_env: ADMIN_PASSWORD
 

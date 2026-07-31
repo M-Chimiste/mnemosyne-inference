@@ -151,12 +151,10 @@ def _is_loopback(value: str) -> bool:
 
 
 def validate_exposure(config: MacConfig) -> None:
-    if not _is_loopback(config.server.inference_bind):
-        key = os.environ.get(config.server.inference_api_key_env, "").strip()
-        if not key:
-            raise RuntimeConfigurationError(
-                "a non-loopback inference bind requires an inference API key"
-            )
+    # Inference bearer authentication is intentionally optional on every bind.
+    # The inference-plane middleware requires it whenever the configured
+    # environment variable is non-empty and otherwise accepts unauthenticated
+    # requests, including on an explicitly selected LAN bind.
     if not _is_loopback(config.server.control_bind):
         password = os.environ.get(config.server.control_password_env, "").strip()
         if not password:

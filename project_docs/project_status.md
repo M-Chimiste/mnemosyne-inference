@@ -1,6 +1,6 @@
 # Mnemosyne Inference — Project Status
 
-**Last updated:** 2026-07-26
+**Last updated:** 2026-07-31
 
 ## Current state
 
@@ -49,6 +49,9 @@ the CUDA image or its `8000-8002` topology. The first implementation includes:
   LM Studio settings/default-folder hints that never contact its engine,
   model-card and GGUF/config metadata, exact quant selection, automatic vision
   projector selection with opt-out, and alias-preserving migration;
+- optional local-network exposure for the public native inference listener,
+  with a guarded Settings toggle, optional bearer authentication, an explicit
+  unauthenticated warning, and loopback-only control/inner-engine listeners;
 - receiver-owned durable Finder bookmarks stored privately across LaunchAgent
   restarts and scoped child `exec`, with bounded killable receipt/reactivation,
   configuration-save preflight, startup revalidation/pruning, only SHA-256

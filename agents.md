@@ -131,7 +131,7 @@ The live `docker-compose.yml` is intentionally machine-specific and may live out
 
 ### Native macOS deployment
 
-- Inference is on `127.0.0.1:1240` so Unified Inference is a drop-in replacement for the previous token sidecar; control is on `127.0.0.1:17321`, oMLX uses `:17322`, the manager-owned DS4 child uses `:17323`, the manager-owned MFLUX worker uses `:17324`, and manager-owned llama.cpp uses `:17325`. Reserve `17320` and `17326-17329` for later native services. The legacy sidecar must be booted out and persistently disabled or removed before Unified Inference binds `:1240`; merely unloading it lets it return at the next login.
+- Inference defaults to `127.0.0.1:1240` so Unified Inference is a drop-in replacement for the previous token sidecar; the native Settings UI may deliberately switch only that public inference listener to `0.0.0.0:1240` for LAN/VPN clients. Control stays on `127.0.0.1:17321`, oMLX uses `:17322`, the manager-owned DS4 child uses `:17323`, the manager-owned MFLUX worker uses `:17324`, and manager-owned llama.cpp uses `:17325`. Reserve `17320` and `17326-17329` for later native services. The legacy sidecar must be booted out and persistently disabled or removed before Unified Inference binds `:1240`; merely unloading it lets it return at the next login.
 - A per-user LaunchAgent owns Mnemosyne Core. The controller uses an explicit AppKit `NSStatusItem` with a SwiftUI popover; quitting it must not terminate inference. `SMAppService.agent` registers the embedded plist and the bootstrap must `execve` the bundled Python without daemonizing.
 - `ResidencyCoordinator` owns the cross-engine invariant. A request holds an epoch-tagged model lease through its complete stream. FIFO queuing stops old-target admission once a switch is pending, drains active leases, proves all enabled adapters empty, loads one target, and proves exactly one ready manager-owned resident.
 - oMLX is an external loopback service controlled through its native lifecycle APIs. llama.cpp and DS4 are model-specific process groups started by Mnemosyne. Never kill an unknown PID or listener; persisted managed-process identity must match executable, argv, start identity, and process group before recovery or signaling.
@@ -312,8 +312,10 @@ Model profiles support aliases, HF model IDs, revision, quantization, GPU plan, 
 - In Mac code, engine mutation belongs to adapters and cross-engine ordering
   belongs to `ResidencyCoordinator`. The HTTP layer must acquire a lease before
   opening upstream and release it only after the complete body/stream closes.
-- Keep inner Mac engines on loopback. A non-loopback Mnemosyne inference bind
-  requires `INFERENCE_API_KEY`; a non-loopback control bind requires
+- Keep inner Mac engines on loopback. The public Mnemosyne inference listener
+  may bind non-loopback with optional authentication: when `INFERENCE_API_KEY`
+  is set, `/v1/*` requires its bearer token; when it is absent, inference is
+  deliberately unauthenticated. A non-loopback control bind still requires
   `ADMIN_PASSWORD`.
 
 ## Common Commands

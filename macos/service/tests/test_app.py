@@ -26,8 +26,12 @@ from mnemosyne_macos.models import (
     ResolvedTarget,
     ServiceState,
 )
-from mnemosyne_macos.runtime import NativeRuntime
-from mnemosyne_macos.runtime import _redact_diagnostic
+from mnemosyne_macos.runtime import (
+    NativeRuntime,
+    RuntimeConfigurationError,
+    _redact_diagnostic,
+    validate_exposure,
+)
 from mnemosyne_macos.runtime_updates import RuntimeUpdateError
 
 
@@ -126,6 +130,26 @@ def _config(tmp_path, *, endpoint: Endpoint | None = None) -> MacConfig:
             "models": [model],
         }
     )
+
+
+def test_lan_inference_allows_optional_authentication(tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv("INFERENCE_API_KEY", raising=False)
+    config = _config(tmp_path)
+    config.server.inference_bind = "0.0.0.0"
+
+    validate_exposure(config)
+
+
+def test_lan_control_still_requires_authentication(tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv("ADMIN_PASSWORD", raising=False)
+    config = _config(tmp_path)
+    config.server.control_bind = "0.0.0.0"
+
+    with pytest.raises(
+        RuntimeConfigurationError,
+        match="non-loopback control bind requires an admin password",
+    ):
+        validate_exposure(config)
 
 
 def _adapters() -> dict[EngineName, FakeAdapter]:
@@ -1277,12 +1301,47 @@ async def test_structured_configuration_rejects_unusable_folder_grant_before_wri
 
 
 @pytest.mark.asyncio
+async def test_lan_inference_without_key_accepts_unauthenticated_requests(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("INFERENCE_API_KEY", raising=False)
+    config = _config(tmp_path)
+    config.server.inference_bind = "0.0.0.0"
+    upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _r: httpx.Response(500))
+    )
+    runtime = NativeRuntime(
+        config,
+        adapters=_adapters(),
+        proxy_client=upstream_client,
+    )
+    await runtime.start(raise_on_degraded=True)
+    inference = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=create_inference_app(runtime)),
+        base_url="http://inference.test",
+    )
+    try:
+        response = await inference.get("/v1/models")
+        assert response.status_code == 200
+    finally:
+        await inference.aclose()
+        await runtime.stop()
+        await upstream_client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_inference_and_control_auth_are_independent(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("INFERENCE_API_KEY", "inference-secret")
     monkeypatch.setenv("ADMIN_PASSWORD", "admin-secret")
-    upstream_client = httpx.AsyncClient(transport=httpx.MockTransport(lambda _r: httpx.Response(500)))
+    config = _config(tmp_path)
+    config.server.inference_bind = "0.0.0.0"
+    config.server.control_bind = "0.0.0.0"
+    upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _r: httpx.Response(500))
+    )
     runtime = NativeRuntime(
-        _config(tmp_path),
+        config,
         adapters=_adapters(),
         proxy_client=upstream_client,
     )

@@ -77,6 +77,11 @@ public struct ServerSettings: Codable, Equatable, Sendable {
     public var controlPasswordEnv = "ADMIN_PASSWORD"
 
     public init() {}
+
+    public var allowsLocalNetworkInference: Bool {
+        get { inferenceBind == "0.0.0.0" }
+        set { inferenceBind = newValue ? "0.0.0.0" : "127.0.0.1" }
+    }
 }
 
 public struct EngineSettings: Codable, Equatable, Sendable {

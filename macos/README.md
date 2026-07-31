@@ -404,10 +404,20 @@ curl -sX POST http://127.0.0.1:1240/v1/images/generations \
   | jq -r '.data[0].b64_json' | base64 --decode > image.png
 ```
 
-When `INFERENCE_API_KEY` is set, add `Authorization: Bearer ...` to `/v1/*`.
-When the variable named by `server.control_password_env` (`ADMIN_PASSWORD` by
-default) is set, authenticate to the control API as Basic user `admin`. A
-non-loopback bind is rejected unless the corresponding credential exists.
+The inference listener defaults to **This Mac only** (`127.0.0.1`). In
+**Settings → General**, enable **Allow connections from the local network** to
+persist `server.inference_bind: 0.0.0.0`; restart the background service to
+apply the listener change. `0.0.0.0` means every reachable interface,
+including LAN and VPN interfaces, so review the warning shown in Settings.
+
+Inference authentication is optional on either bind. When
+`INFERENCE_API_KEY` is set through **Settings → Credentials**, add
+`Authorization: Bearer ...` to every `/v1/*` request. When it is absent,
+`/v1/*` accepts unauthenticated requests, including from the local network.
+The control listener remains on `127.0.0.1`; if it is deliberately configured
+on a non-loopback address, the variable named by
+`server.control_password_env` (`ADMIN_PASSWORD` by default) is still required
+and clients authenticate as Basic user `admin`.
 
 ## Menu bar app
 
