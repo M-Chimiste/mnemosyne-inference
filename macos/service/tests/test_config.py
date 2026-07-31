@@ -93,6 +93,40 @@ def test_parse_config_migrates_v1_lmstudio_profiles_to_inert_import_records() ->
     assert not hasattr(config.engines, "lmstudio")
 
 
+def test_parse_config_removes_obsolete_v1_num_experts_from_retained_profiles(
+) -> None:
+    config = parse_config(
+        """
+        schema_version: 1
+        engines:
+          lmstudio:
+            enabled: false
+          omlx:
+            enabled: true
+        models:
+          - alias: omlx-model
+            engine: omlx
+            model: publisher/omlx-model
+            load:
+              num_experts: null
+          - alias: llama-model
+            engine: llama.cpp
+            model: /models/llama-model.gguf
+            load:
+              num_experts: null
+              threads: 8
+        """,
+        source="v1 configuration",
+    )
+
+    assert config.schema_version == 2
+    assert [profile.alias for profile in config.models] == [
+        "omlx-model",
+        "llama-model",
+    ]
+    assert config.models[1].load.threads == 8
+
+
 def test_parse_config_reports_source_for_invalid_yaml() -> None:
     with pytest.raises(ConfigError, match="in-memory configuration"):
         parse_config("models: [", source="in-memory configuration")
