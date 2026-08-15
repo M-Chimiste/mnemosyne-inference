@@ -65,7 +65,7 @@ public struct ServerSettings: Codable, Equatable, Sendable {
     public var inferencePort = 1_240
     public var controlBind = "127.0.0.1"
     public var controlPort = 17_321
-    public var idleUnloadSeconds: Int? = 900
+    public var idleUnloadSeconds: Int?
     public var startupTimeoutSeconds = 900.0
     public var swapQueueTimeoutSeconds = 300.0
     public var maxConcurrency: Int?

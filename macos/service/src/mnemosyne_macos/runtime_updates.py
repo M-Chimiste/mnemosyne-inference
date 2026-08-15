@@ -179,6 +179,37 @@ def _omlx_cli_candidates() -> tuple[Path, ...]:
     return tuple(unique)
 
 
+def _omlx_installation_kind(path: str | None) -> str:
+    """Classify ownership without trusting PATH aliases or arbitrary commands."""
+
+    if not path:
+        return "not_installed"
+    if path.startswith(("http://", "https://")):
+        return "running_external"
+    candidate = Path(path).expanduser()
+    if candidate.suffix.casefold() == ".app":
+        return "official_app"
+    try:
+        resolved = candidate.resolve(strict=False)
+    except OSError:
+        resolved = candidate
+    normalized = str(resolved).casefold()
+    if "/cellar/omlx/head-" in normalized:
+        return "homebrew_head"
+    if "/cellar/omlx/" in normalized or "/homebrew/opt/omlx/" in normalized:
+        return "homebrew_stable"
+    if "/.omlx/bin/omlx" in normalized:
+        return "official_app_cli"
+    return "external_cli"
+
+
+def _homebrew_executable() -> Path | None:
+    for candidate in (Path("/opt/homebrew/bin/brew"), Path("/usr/local/bin/brew")):
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
 @dataclass(frozen=True)
 class RuntimeRelease:
     engine: str
@@ -1017,16 +1048,18 @@ class RuntimeUpdateManager:
         self._last_checked_at = time.time()
 
     async def _installed_omlx(self) -> tuple[str | None, str | None, str | None]:
-        candidates = (
+        app_candidates = (
             Path("/Applications/oMLX.app/Contents/Info.plist"),
             Path.home() / "Applications" / "oMLX.app" / "Contents" / "Info.plist",
         )
-        for candidate in candidates:
+        app_install: tuple[str, None, str] | None = None
+        for candidate in app_candidates:
             try:
                 with candidate.open("rb") as stream:
                     value = plistlib.load(stream).get("CFBundleShortVersionString")
                 if isinstance(value, str) and value:
-                    return value, None, str(candidate.parents[2])
+                    app_install = (value, None, str(candidate.parents[1]))
+                    break
             except (OSError, ValueError, plistlib.InvalidFileException):
                 continue
         headers: dict[str, str] = {}
@@ -1037,6 +1070,7 @@ class RuntimeUpdateManager:
         # while the official pip/wheel server reports it from /api/status.
         # Both are read-only vendor endpoints and keep runtime discovery
         # external to Unified Inference's own release cadence.
+        running_version: str | None = None
         for endpoint in ("/health", "/api/status"):
             try:
                 response = await self._client.get(
@@ -1051,16 +1085,35 @@ class RuntimeUpdateManager:
                     for key in ("version", "app_version", "server_version"):
                         value = payload.get(key)
                         if isinstance(value, str) and value:
-                            return value.removeprefix("v"), None, self.omlx.base_url
+                            running_version = value.removeprefix("v")
+                            break
+                    if running_version is not None:
+                        break
             except (httpx.HTTPError, ValueError):
                 continue
+        cli_install: tuple[str, None, str] | None = None
         for executable in _omlx_cli_candidates():
             if not executable.is_file() or not os.access(executable, os.X_OK):
                 continue
             output = await _run_version_command(str(executable), "--version")
             match = re.search(r"\d+(?:\.\d+)+(?:[-+._A-Za-z0-9]*)?", output or "")
             if match:
-                return match.group(0), None, str(executable)
+                cli_install = (match.group(0), None, str(executable))
+                break
+        if running_version is not None:
+            if app_install is not None and _version_key(app_install[0]) == _version_key(
+                running_version
+            ):
+                return app_install
+            if cli_install is not None and _version_key(cli_install[0]) == _version_key(
+                running_version
+            ):
+                return running_version, None, cli_install[2]
+            return running_version, None, self.omlx.base_url
+        if app_install is not None:
+            return app_install
+        if cli_install is not None:
+            return cli_install
         return None, None, None
 
     async def _installed_llama_cpp(
@@ -1179,6 +1232,11 @@ class RuntimeUpdateManager:
                 "version": version,
                 "revision": revision,
                 "path": path,
+                "installation_kind": (
+                    _omlx_installation_kind(path)
+                    if engine == "omlx"
+                    else "managed_or_configured"
+                ),
             }
             for engine, (version, revision, path) in zip(
                 _ENGINES,
@@ -1248,7 +1306,15 @@ class RuntimeUpdateManager:
                         "available_revision": release.source_revision if release else None,
                         "release_notes_url": upstream_url,
                         "update_available": update_available,
-                        "can_install": engine in {"llama.cpp", "mflux", "ds4"}
+                        "can_install": (
+                            engine in {"llama.cpp", "mflux", "ds4"}
+                            or (
+                                engine == "omlx"
+                                and local_status[engine].get("installation_kind")
+                                == "homebrew_stable"
+                                and self.omlx.enabled
+                            )
+                        )
                         and update_available,
                         "can_rollback": self._rollback_version(engine) is not None,
                         "management_note": (
@@ -1264,7 +1330,35 @@ class RuntimeUpdateManager:
                                 )
                             )
                         ),
-                        "diagnostic": self._diagnostics.get(engine),
+                        "diagnostic": (
+                            "Enable oMLX before a supervised Homebrew update so Unified Inference can drain and validate its control plane."
+                            if engine == "omlx"
+                            and update_available
+                            and local_status[engine].get("installation_kind")
+                            == "homebrew_stable"
+                            and not self.omlx.enabled
+                            else self._diagnostics.get(engine)
+                        ),
+                        "upgrade_strategy": (
+                            {
+                                "official_app": "vendor_app_updater",
+                                "official_app_cli": "vendor_app_updater",
+                                "homebrew_stable": "supervised_homebrew",
+                                "homebrew_head": "migrate_to_stable",
+                                "running_external": "external_manual",
+                                "external_cli": "external_manual",
+                                "not_installed": "official_installer",
+                            }.get(
+                                str(
+                                    local_status[engine].get(
+                                        "installation_kind", "not_installed"
+                                    )
+                                ),
+                                "managed",
+                            )
+                            if engine == "omlx"
+                            else "managed"
+                        ),
                     }
                 )
             return {
@@ -1275,6 +1369,87 @@ class RuntimeUpdateManager:
                 "core_protocol": CORE_RUNTIME_PROTOCOL,
                 "engines": statuses,
             }
+
+    async def upgrade_omlx_homebrew(
+        self,
+        version: str | None = None,
+    ) -> tuple[str | None, str | None]:
+        """Delegate one explicit stable update to the exact Homebrew owner."""
+
+        async with self._install_lock:
+            if self._last_checked_at is None:
+                await self._refresh_releases()
+            latest = self._upstream_omlx[0]
+            requested = version or latest
+            if not requested or not latest or requested != latest:
+                raise RuntimeUpdateError(
+                    "oMLX update must target the current official stable release"
+                )
+            installed = await self.installed_status()
+            state = installed["omlx"]
+            kind = state.get("installation_kind")
+            if kind == "homebrew_head":
+                raise RuntimeUpdateError(
+                    "Homebrew HEAD cannot be upgraded reproducibly; migrate to the official oMLX app or stable formula"
+                )
+            if kind != "homebrew_stable":
+                raise RuntimeUpdateError(
+                    "supervised oMLX upgrades require a stable Homebrew installation"
+                )
+            brew = _homebrew_executable()
+            if brew is None:
+                raise RuntimeUpdateError("the owning Homebrew executable is unavailable")
+            cli_path = state.get("path")
+            if not isinstance(cli_path, str):
+                raise RuntimeUpdateError("the installed oMLX CLI path is unavailable")
+            cli = Path(cli_path).expanduser()
+            if not cli.is_file() or not os.access(cli, os.X_OK):
+                raise RuntimeUpdateError("the installed oMLX CLI is not executable")
+
+            stop_attempted = False
+            failure: BaseException | None = None
+            try:
+                # A failed/timeout response has an ambiguous process outcome,
+                # so always attempt the bounded owner restart after invoking
+                # stop rather than assuming the service stayed up.
+                stop_attempted = True
+                await _run_checked(str(cli), "stop", timeout=120)
+                await _run_checked(str(brew), "update", timeout=900)
+                await _run_checked(str(brew), "upgrade", "omlx", timeout=1800)
+            except BaseException as exc:
+                failure = exc
+            finally:
+                if stop_attempted:
+                    refreshed_cli = next(
+                        (
+                            candidate
+                            for candidate in _omlx_cli_candidates()
+                            if candidate.is_file() and os.access(candidate, os.X_OK)
+                        ),
+                        cli,
+                    )
+                    try:
+                        await _run_checked(str(refreshed_cli), "start", timeout=120)
+                    except BaseException as restart_error:
+                        if failure is None:
+                            failure = restart_error
+            if failure is not None:
+                raise failure
+
+            deadline = time.monotonic() + 90
+            observed_version: str | None = None
+            observed_path: str | None = None
+            while time.monotonic() < deadline:
+                observed_version, _revision, observed_path = await self._installed_omlx()
+                if (
+                    observed_version is not None
+                    and _version_key(observed_version) >= _version_key(requested)
+                ):
+                    return observed_version, observed_path
+                await asyncio.sleep(1)
+            raise RuntimeUpdateError(
+                "updated oMLX did not return with the requested stable version"
+            )
 
     async def _download_source(self, url: str, destination: Path) -> None:
         downloaded = 0

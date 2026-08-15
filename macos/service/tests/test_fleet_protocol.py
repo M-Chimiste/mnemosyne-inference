@@ -8,6 +8,7 @@ import pytest
 from mnemosyne_macos.fleet_protocol import (
     canonical_json,
     deployment_identity,
+    derive_macos_capacity,
     normalize_capabilities,
     portable_load_config,
     semantic_extra_args,
@@ -18,6 +19,33 @@ from mnemosyne_macos.runtime import _fleet_deployment_identity
 
 
 PROTOCOL_ROOT = Path(__file__).resolve().parents[3] / "fleet_protocol" / "v1"
+
+
+def test_ds4_parallel_slots_drive_capacity_but_not_deployment_identity() -> None:
+    target = MacConfig.model_validate(
+        {
+            "engines": {"ds4": {"enabled": True}},
+            "models": [
+                {
+                    "alias": "glm",
+                    "engine": "ds4",
+                    "model": "/models/GLM-5.2.gguf",
+                    "load": {"parallel": 4},
+                }
+            ],
+        }
+    ).profiles()["glm"]
+
+    capacity = derive_macos_capacity(
+        target,
+        configured_max_concurrency=None,
+    )
+
+    assert capacity.derived_limit == 4
+    assert capacity.effective_limit == 4
+    assert capacity.source == "ds4-batched-sessions"
+    assert capacity.confidence == "configured"
+    assert "parallel" not in portable_load_config(target)
 
 
 def test_native_identity_matches_cross_platform_golden_vectors() -> None:

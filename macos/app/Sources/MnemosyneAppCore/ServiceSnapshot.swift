@@ -38,6 +38,50 @@ public struct TokenSidecarSnapshot: Codable, Equatable, Sendable {
     }
 }
 
+public struct ModelPerformanceSnapshot: Codable, Equatable, Sendable {
+    public let alias: String
+    public let engine: String
+    public let requests: Int
+    public let errors: Int
+    public let coldStarts: Int
+    public let averageAdmissionMs: Double?
+    public let averageFirstByteMs: Double?
+    public let averageTotalMs: Double?
+    public let averageOutputTokensPerSecond: Double?
+    public let p50TotalMs: Double?
+    public let p95TotalMs: Double?
+
+    enum CodingKeys: String, CodingKey {
+        case alias
+        case engine
+        case requests
+        case errors
+        case coldStarts = "cold_starts"
+        case averageAdmissionMs = "average_admission_ms"
+        case averageFirstByteMs = "average_first_byte_ms"
+        case averageTotalMs = "average_total_ms"
+        case averageOutputTokensPerSecond = "average_output_tokens_per_second"
+        case p50TotalMs = "p50_total_ms"
+        case p95TotalMs = "p95_total_ms"
+    }
+}
+
+public struct PerformanceSnapshot: Codable, Equatable, Sendable {
+    public let windowLimit: Int
+    public let sampleCount: Int
+    public let oldestObservedAt: Double?
+    public let newestObservedAt: Double?
+    public let byModel: [ModelPerformanceSnapshot]
+
+    enum CodingKeys: String, CodingKey {
+        case windowLimit = "window_limit"
+        case sampleCount = "sample_count"
+        case oldestObservedAt = "oldest_observed_at"
+        case newestObservedAt = "newest_observed_at"
+        case byModel = "by_model"
+    }
+}
+
 /// Deliberately small view of `/manager/status`.
 ///
 /// Every field is optional so the menu app remains compatible while the native
@@ -49,6 +93,7 @@ public struct ServiceSnapshot: Codable, Equatable, Sendable {
     public let residentEngine: String?
     public let inFlightRequests: Int?
     public let tokenSidecar: TokenSidecarSnapshot?
+    public let performance: PerformanceSnapshot?
     public let diagnostic: String?
     public let startupError: String?
 
@@ -59,6 +104,7 @@ public struct ServiceSnapshot: Codable, Equatable, Sendable {
         residentEngine: String?,
         inFlightRequests: Int?,
         tokenSidecar: TokenSidecarSnapshot?,
+        performance: PerformanceSnapshot? = nil,
         diagnostic: String? = nil,
         startupError: String? = nil
     ) {
@@ -68,6 +114,7 @@ public struct ServiceSnapshot: Codable, Equatable, Sendable {
         self.residentEngine = residentEngine
         self.inFlightRequests = inFlightRequests
         self.tokenSidecar = tokenSidecar
+        self.performance = performance
         self.diagnostic = diagnostic
         self.startupError = startupError
     }
@@ -79,6 +126,7 @@ public struct ServiceSnapshot: Codable, Equatable, Sendable {
         case residentEngine = "resident_engine"
         case inFlightRequests = "in_flight_requests"
         case tokenSidecar = "token_sidecar"
+        case performance
         case diagnostic
         case startupError = "startup_error"
     }

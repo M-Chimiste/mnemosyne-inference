@@ -269,10 +269,14 @@ fail-closed ownership/port error and never signals that process.
 
 ## 4. Managed Hugging Face downloads
 
-In **Settings → Model Library**, choose llama.cpp and search for a GGUF
-repository. Confirm Download remains disabled until an exact quant/shard set is
-selected. Confirm the model-card preview and detected architecture, context
-length, parameter count, and license match the repository metadata. When the
+In **Settings → Model Library**, search once and confirm llama.cpp, oMLX, DS4,
+and MFLUX candidates share one result list with explicit engine-support badges;
+there must be no engine tabs or picker. Choose a llama.cpp GGUF repository and
+confirm Download remains disabled until an exact quant/shard set is selected.
+Confirm Hugging Face YAML front matter is absent, Markdown headings/lists/links
+are rendered, the card and full detail pane scroll without truncating install
+controls, and detected architecture, context length, parameter count, and
+license match the repository metadata. When the
 repository publishes a vision projector beside the selected GGUF, confirm the
 highest-fidelity option is selected automatically; then exercise both a manual
 choice and **Text only (opt out)**. Choose a GUI-configured storage folder and
@@ -290,6 +294,21 @@ and profile disappear. Confirm Finder-imported profiles cannot delete files,
 and no unrelated files are touched. Repeat with a gated repository to prove
 the write-only `HF_TOKEN` reaches only the download worker.
 
+Use an empty unified search and identify results with the DS4 support badge.
+Confirm nine current single-node choices appear: five DeepSeek V4 and four GLM
+5.2. DSpark support weights and
+distributed-only Pro halves must not appear as standalone models. Select the
+Unsloth GLM Q4 choice and confirm its displayed size covers eleven shards; its
+durable install record must retain all eleven exact paths and one immutable
+revision.
+
+For a DeepSeek Flash profile with enough memory headroom, set **Resident request
+sessions** to `2`, restart/reload the profile, and issue two overlapping
+requests. Confirm the DS4 argv contains exactly `--batched-session 2`, status
+reports capacity two, neither request is rejected by manager admission, and
+both leases drain before unload. Repeat with the setting unset and confirm
+authoritative capacity returns to one.
+
 Afterward, `GET /manager/model-library/install-evidence` must show the
 candidate-observed state transitions, including hidden/deleted rows, without
 credentials or arbitrary worker output. The ordinary installs endpoint remains
@@ -302,6 +321,23 @@ oMLX reports exactly one loaded pool model, and a second request reuses it.
 Exercise non-streaming and streaming chat, Responses, embeddings, or rerank as
 allowed by that profile. Explicit unload must converge without an admin-auth
 error.
+
+Set oMLX `scheduler.max_concurrent_requests` above one, leave Unified
+Inference's concurrency ceiling blank, and issue that many overlapping warm
+requests. `GET /manager/status` and the fleet snapshot must report the oMLX
+admin setting as the authoritative capacity while all leases remain on the
+same resident epoch. Then set a lower global ceiling and verify it caps, but
+never raises, the engine limit.
+
+After several requests, inspect `GET /manager/performance` and the menu-bar
+popover. Confirm p50/p95, cold-start count, and streamed tokens/second are
+present and that no prompt or response content appears. Compare the same alias
+against a direct compatible endpoint with `macos/scripts/benchmark_native.py`.
+
+Inspect the oMLX Runtime Updates card's SSD-cache metrics. Exercise **Reset SSD
+Cache…** only with disposable cache state: admission must close, active work
+must drain, all engines must unload, the official oMLX cache-clear API must
+complete, and model weights must remain untouched.
 
 If oMLX rejects unload, do not weaken strict residency. Keep it loopback-only
 and correct its admin authentication/session configuration.
@@ -404,8 +440,8 @@ section.
   private bookmark;
   unmount the drive and confirm the location becomes unavailable, then mount a
   different volume at the same path and confirm the UUID mismatch fails closed;
-- **Model Library** exposes engine and model choices through pickers/lists,
-  never a raw repository or storage-path field; start a small compatible test
+- **Model Library** exposes one cross-engine list with engine-support badges,
+  never engine tabs or a raw repository/storage-path field; start a small compatible test
   download, confirm bytes/total, percentage, progress, and speed update live,
   then close/reopen Settings and confirm progress persists and cancel/retry
   work without making any model resident;
@@ -463,6 +499,14 @@ In **Settings → Runtime Updates**, confirm llama.cpp reports the official
 MFLUX matches the official PyPI version, and DS4 shows the current official
 `antirez/ds4` commit. No dependency metadata should be requested from the
 Unified Inference GitHub repository.
+
+For a stable Homebrew-owned oMLX installation with an update available,
+confirm the UI displays the exact stop/update/upgrade/start sequence. Begin a
+long request and approve the update: it must wait for the lease, invoke only
+those fixed owner commands, restart oMLX, validate an authoritative empty
+inventory, and then reopen admission. A Homebrew HEAD build must refuse this
+path and present stable migration guidance; an official app must continue to
+delegate updates to its own updater.
 
 Start a long request, then install an available official update. The download
 and validation phase must not disturb the resident model. For llama.cpp,

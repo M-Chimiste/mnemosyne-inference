@@ -20,7 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from . import __version__
 from .config import MacConfig, suggested_model_alias
-from .coordinator import CoordinatorError, QueueFull, QueueTimeout
+from .coordinator import CoordinatorError, CoordinatorState, QueueFull, QueueTimeout
 from .engines.base import AdapterError
 from .filesystem import FilesystemProbeError
 from .image_api import ImageRequestError, normalize_image_request
@@ -36,6 +36,7 @@ from .model_library import (
     validate_install_candidate,
 )
 from .models import DEFAULT_CAPABILITIES, Endpoint, EngineName
+from .performance import RequestPerformanceTimer
 from .proxy import (
     InvalidProxyRequest,
     StreamingEventFilter,
@@ -376,9 +377,9 @@ async def _record_usage(
     streamed: bool,
     started_at: float,
     status_code: int,
-) -> None:
+) -> Any:
     if usage is None or not (200 <= status_code < 300):
-        return
+        return None
     event: UsageEvent | None
     if isinstance(usage, Mapping):
         event = usage_event_from_payload(
@@ -407,6 +408,8 @@ async def _record_usage(
             await runtime.record_usage(event)
         except Exception:
             logger.exception("failed to persist token usage event")
+        return event.usage
+    return None
 
 
 class _StreamingProxyOwnership:
@@ -423,6 +426,7 @@ class _StreamingProxyOwnership:
         requested_model: str,
         started_at: float,
         usage_parser: StreamingUsageParser,
+        performance_timer: RequestPerformanceTimer,
     ) -> None:
         self.runtime = runtime
         self.upstream = upstream
@@ -432,6 +436,7 @@ class _StreamingProxyOwnership:
         self.requested_model = requested_model
         self.started_at = started_at
         self.usage_parser = usage_parser
+        self.performance_timer = performance_timer
         self.body_failed = False
         self.upstream_failed = False
         self._completion_task: asyncio.Task[None] | None = None
@@ -441,6 +446,7 @@ class _StreamingProxyOwnership:
         self.upstream_failed = self.upstream_failed or upstream_failed
 
     async def _finish(self) -> None:
+        usage = None
         try:
             usage = self.usage_parser.finish()
             await _record_usage(
@@ -473,6 +479,21 @@ class _StreamingProxyOwnership:
                     and self.target.key.engine != EngineName.MFLUX
                 ):
                     await _audit_after_upstream_failure(self.runtime)
+                self.performance_timer.finish(
+                    status_code=self.upstream.status_code,
+                    error_code=(
+                        "upstream_stream_failure"
+                        if self.upstream_failed
+                        else "stream_interrupted"
+                        if self.body_failed
+                        else "upstream_status"
+                        if self.upstream.status_code >= 400
+                        else None
+                    ),
+                    completion_tokens=(
+                        usage.completion_tokens if usage is not None else None
+                    ),
+                )
 
     async def complete(self) -> None:
         if self._completion_task is None:
@@ -653,6 +674,17 @@ def create_inference_app(runtime: NativeRuntime) -> FastAPI:
                 raise HTTPException(400, str(exc)) from exc
 
         started_at = time.monotonic()
+        performance_timer = runtime.performance.start(
+            alias=target.alias,
+            engine=target.key.engine.value,
+            endpoint=f"/v1/{endpoint.value}",
+            streamed=False,
+        )
+        before_admission = await runtime.coordinator.status()
+        cold_start = not (
+            before_admission.resident_alias == target.alias
+            and before_admission.state == CoordinatorState.READY
+        )
         lease = None
         upstream: httpx.Response | None = None
         try:
@@ -668,12 +700,14 @@ def create_inference_app(runtime: NativeRuntime) -> FastAPI:
                 target,
                 timeout_seconds=lease_timeout,
             )
+            performance_timer.mark_admitted(cold_start=cold_start)
             route = lease.route(endpoint)
             prepared, requested_model, streamed, client_asked_usage = prepare_request_body(
                 body,
                 route=route,
                 endpoint=endpoint,
             )
+            performance_timer.streamed = streamed
             upstream_request = runtime.proxy_client.build_request(
                 method=request.method,
                 url=f"{route.base_url}{route.path}",
@@ -688,19 +722,23 @@ def create_inference_app(runtime: NativeRuntime) -> FastAPI:
                     upstream = await runtime.proxy_client.send(upstream_request, stream=True)
             else:
                 upstream = await runtime.proxy_client.send(upstream_request, stream=True)
+            performance_timer.mark_upstream_headers()
         except asyncio.CancelledError:
+            performance_timer.finish(status_code=499, error_code="cancelled")
             if target.key.engine == EngineName.MFLUX:
                 await _abort_image_request_shielded(runtime, upstream, lease)
             else:
                 await _close_proxy_resources(upstream, lease)
             raise
         except TimeoutError as exc:
+            performance_timer.finish(status_code=504, error_code="request_timeout")
             if target.key.engine == EngineName.MFLUX:
                 await _abort_image_request_shielded(runtime, upstream, lease)
             else:
                 await _close_proxy_resources(upstream, lease)
             raise HTTPException(504, "image generation timed out") from exc
         except QueueFull as exc:
+            performance_timer.finish(status_code=429, error_code="queue_full")
             await _close_proxy_resources(upstream, lease)
             raise HTTPException(
                 status_code=429,
@@ -713,10 +751,23 @@ def create_inference_app(runtime: NativeRuntime) -> FastAPI:
                     "X-Mnemosyne-Error": "node_busy",
                 },
             ) from exc
-        except HTTPException:
+        except HTTPException as exc:
+            performance_timer.finish(
+                status_code=exc.status_code,
+                error_code="request_rejected",
+            )
             await _close_proxy_resources(upstream, lease)
             raise
         except Exception as exc:
+            status_code = _error_status(exc)
+            performance_timer.finish(
+                status_code=status_code,
+                error_code=(
+                    "upstream_transport"
+                    if isinstance(exc, httpx.HTTPError)
+                    else "inference_failure"
+                ),
+            )
             await _close_proxy_resources(upstream, lease)
             if isinstance(exc, httpx.HTTPError):
                 await _audit_after_upstream_failure(runtime)
@@ -727,6 +778,7 @@ def create_inference_app(runtime: NativeRuntime) -> FastAPI:
         is_event_stream = "text/event-stream" in upstream.headers.get(
             "content-type", ""
         )
+        performance_timer.streamed = streamed or is_event_stream
         if streamed or is_event_stream:
             usage_parser = StreamingUsageParser(endpoint=f"/v1/{endpoint.value}")
             event_filter = StreamingEventFilter(
@@ -744,11 +796,13 @@ def create_inference_app(runtime: NativeRuntime) -> FastAPI:
                 requested_model=requested_model,
                 started_at=started_at,
                 usage_parser=usage_parser,
+                performance_timer=performance_timer,
             )
 
             async def stream_body():
                 try:
                     async for chunk in upstream.aiter_bytes():
+                        performance_timer.mark_first_byte()
                         usage_parser.feed(chunk)
                         for forwarded in event_filter.feed(chunk):
                             yield forwarded
@@ -775,6 +829,7 @@ def create_inference_app(runtime: NativeRuntime) -> FastAPI:
         body_failed = False
         try:
             content = await upstream.aread()
+            performance_timer.mark_first_byte()
             decoded: Mapping[str, Any] | None = None
             try:
                 candidate = json.loads(content)
@@ -783,7 +838,7 @@ def create_inference_app(runtime: NativeRuntime) -> FastAPI:
             except (TypeError, ValueError):
                 pass
             if endpoint != Endpoint.IMAGES_GENERATIONS:
-                await _record_usage(
+                normalized_usage = await _record_usage(
                     runtime,
                     decoded,
                     endpoint=endpoint,
@@ -794,6 +849,19 @@ def create_inference_app(runtime: NativeRuntime) -> FastAPI:
                     started_at=started_at,
                     status_code=upstream.status_code,
                 )
+            else:
+                normalized_usage = None
+            performance_timer.finish(
+                status_code=upstream.status_code,
+                error_code=(
+                    "upstream_status" if upstream.status_code >= 400 else None
+                ),
+                completion_tokens=(
+                    normalized_usage.completion_tokens
+                    if normalized_usage is not None
+                    else None
+                ),
+            )
             return Response(
                 content=content,
                 status_code=upstream.status_code,
@@ -801,13 +869,19 @@ def create_inference_app(runtime: NativeRuntime) -> FastAPI:
             )
         except asyncio.CancelledError:
             body_failed = True
+            performance_timer.finish(status_code=499, error_code="cancelled")
             raise
         except httpx.HTTPError as exc:
             body_failed = True
             upstream_failed = True
+            performance_timer.finish(
+                status_code=502,
+                error_code="upstream_response",
+            )
             raise HTTPException(502, f"upstream response failed: {exc}") from exc
         except Exception:
             body_failed = True
+            performance_timer.finish(status_code=500, error_code="response_failure")
             raise
         finally:
             if target.key.engine == EngineName.MFLUX and body_failed:
@@ -864,6 +938,10 @@ def create_control_app(runtime: NativeRuntime) -> FastAPI:
     @app.get("/manager/status")
     async def status() -> dict:
         return await runtime.status()
+
+    @app.get("/manager/performance")
+    async def performance() -> dict:
+        return runtime.performance.snapshot()
 
     @app.get("/manager/readiness")
     async def readiness() -> dict:
@@ -1051,17 +1129,38 @@ def create_control_app(runtime: NativeRuntime) -> FastAPI:
 
     @app.get("/manager/model-library/search")
     async def library_search(
-        engine: EngineName,
+        engine: EngineName | None = None,
         q: str = Query(default="", max_length=200),
         limit: int = Query(default=20, ge=1, le=50),
     ) -> dict:
         try:
-            models = await asyncio.to_thread(
-                search_models,
-                q,
-                engine=engine,
-                limit=limit,
-            )
+            if engine is not None:
+                models = await asyncio.to_thread(
+                    search_models,
+                    q,
+                    engine=engine,
+                    limit=limit,
+                )
+            else:
+                searches = [
+                    asyncio.to_thread(
+                        search_models,
+                        q,
+                        engine=candidate,
+                        limit=limit,
+                    )
+                    for candidate in EngineName
+                ]
+                grouped = await asyncio.gather(*searches)
+                models = [model for group in grouped for model in group]
+                models.sort(
+                    key=lambda model: (
+                        -(model.downloads or 0),
+                        model.display_name.casefold(),
+                        model.engine,
+                        model.filename or "",
+                    )
+                )
             return {"models": [model.to_dict() for model in models]}
         except Exception as exc:
             raise HTTPException(502, f"Hugging Face search failed: {exc}") from exc
@@ -1207,7 +1306,7 @@ def create_control_app(runtime: NativeRuntime) -> FastAPI:
                     kind="image",
                     image=image_profile_defaults(candidate),
                 )
-            elif payload.engine == EngineName.LLAMA_CPP:
+            elif payload.engine in {EngineName.DS4, EngineName.LLAMA_CPP}:
                 if not candidate.filename:
                     raise ValueError("select an exact GGUF file")
                 load: dict[str, Any] = {}
@@ -1222,7 +1321,11 @@ def create_control_app(runtime: NativeRuntime) -> FastAPI:
                     engine=payload.engine,
                     model=str(destination / candidate.filename),
                     storage=payload.storage or runtime.config.storage.default,
-                    served_model_name=alias,
+                    served_model_name=(
+                        candidate.family
+                        if payload.engine == EngineName.DS4
+                        else alias
+                    ),
                     capabilities=set(capabilities),
                     load=load,
                 )
@@ -1364,6 +1467,20 @@ def create_control_app(runtime: NativeRuntime) -> FastAPI:
     async def runtime_update_evidence() -> dict:
         try:
             return await runtime.runtime_update_evidence()
+        except Exception as exc:
+            raise HTTPException(_error_status(exc), str(exc)) from exc
+
+    @app.get("/manager/engines/omlx/cache")
+    async def omlx_cache_health() -> dict:
+        try:
+            return await runtime.omlx_cache_health()
+        except Exception as exc:
+            raise HTTPException(_error_status(exc), str(exc)) from exc
+
+    @app.post("/manager/engines/omlx/cache/reset")
+    async def reset_omlx_cache() -> dict:
+        try:
+            return await runtime.reset_omlx_cache()
         except Exception as exc:
             raise HTTPException(_error_status(exc), str(exc)) from exc
 

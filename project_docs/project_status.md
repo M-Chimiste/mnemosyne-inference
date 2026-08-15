@@ -1,6 +1,6 @@
 # Mnemosyne Inference — Project Status
 
-**Last updated:** 2026-07-31
+**Last updated:** 2026-08-14
 
 ## Current state
 
@@ -77,6 +77,10 @@ the CUDA image or its `8000-8002` topology. The first implementation includes:
   history, a compact persistent transition journal for target-Mac lifecycle
   evidence, residency-neutral profile creation, and exact manager-owned
   directory deletion behind the global empty-residency barrier;
+- current DS4 discovery for its five DeepSeek V4 and four GLM 5.2 single-node
+  targets, with exact Hub-file/revision validation and atomic eleven-shard GLM
+  installation rather than broad unsupported GGUF claims, plus typed
+  resident-session capacity for upstream scheduling/batching;
 - a bounded private managed-runtime lifecycle journal that distinguishes
   service instances and proves activation, post-restart inference, rollback,
   post-rollback inference, and fixed-code corrupt-runtime rejection without
@@ -257,6 +261,18 @@ see
   builds from an exact official GitHub commit. Managed updates stage
   independently, activate through the global-empty maintenance barrier, and
   retain the previous version for rollback without a repository-owned feed.
+- The native coordinator now reads oMLX's authoritative concurrent-request
+  limit from its admin settings, applies only an optional global ceiling, and
+  keeps a bounded metadata-only performance window with cold-start, admission,
+  first-byte, total-latency, and streamed token-rate aggregates. Fresh configs
+  retain one verified warm model and new GGUF profiles use bounded interactive
+  context defaults.
+- oMLX runtime ownership is classified as official app, stable Homebrew,
+  Homebrew HEAD, or other external service. Stable Homebrew updates use an
+  explicit globally drained fixed-command workflow; HEAD builds migrate rather
+  than rebuild. Vendor cache metrics and a confirmed, drain-safe official SSD
+  cache reset are available without exposing paths or credentials. A
+  content-redacted benchmark supports direct compatible-endpoint comparisons.
 - Unified Inference is now the native token sidecar: central reporting defaults
   on for every language engine. Existing machines can migrate the previous
   sidecar's canonical `node.id` and ledger DSN from its LaunchAgent; Settings
@@ -315,7 +331,11 @@ see
   facts are read-only, and API routing is selected through typed,
   engine-constrained Generation, Embeddings, Rerank, or Image roles rather
   than raw paths and arbitrary endpoint checkboxes.
-- Hugging Face discovery now shows bounded model-card prose and architecture,
+- Hugging Face discovery now uses one cross-engine catalog with explicit
+  engine-support badges while retaining exact per-engine install validation.
+  Model cards strip Hub YAML front matter and render safe Markdown blocks in a
+  scrollable detail pane rather than compressing or truncating the install UI.
+  Discovery also shows bounded model-card prose and architecture,
   context length, parameter count, and license when Hub/config/GGUF metadata
   provides them. GGUF search requires an exact quant/shard selection and
   automatically selects the highest-fidelity same-directory vision projector,

@@ -57,3 +57,54 @@ func mixedModelCardMarkupNormalization() {
     #expect(String(rendered.characters).contains("Overview"))
     #expect(!String(rendered.characters).contains("<br>"))
 }
+
+@Test("Hugging Face front matter is removed before model-card rendering")
+func huggingFaceFrontMatterRemoval() {
+    let source = """
+    ---
+    tags:
+    - unsloth
+    - qwen3
+    base_model: Qwen/Qwen3-Coder-30B-A3B-Instruct
+    license: apache-2.0
+    ---
+    # Qwen3 Coder
+
+    A **local coding model** with [documentation](https://example.test/docs).
+    """
+
+    let markdown = ModelTextMarkup.markdown(from: source)
+    let rendered = String(ModelTextMarkup.attributedString(from: source).characters)
+
+    #expect(markdown.hasPrefix("# Qwen3 Coder"))
+    #expect(!markdown.contains("base_model:"))
+    #expect(!rendered.contains("license:"))
+    #expect(rendered.contains("local coding model"))
+}
+
+@Test("Model cards are split into readable Markdown blocks")
+func modelCardBlockParsing() {
+    let source = """
+    ## Overview
+
+    Use **vision** and text.
+
+    - 128k context
+    2. Exact GGUF selection
+
+    > Verify the runtime first.
+
+    ```shell
+    llama-server --model model.gguf
+    ```
+    """
+
+    let blocks = ModelTextMarkup.blocks(from: source)
+
+    #expect(blocks[0] == .heading(level: 2, text: "Overview"))
+    #expect(blocks[1] == .paragraph("Use **vision** and text."))
+    #expect(blocks[2] == .unorderedItem("128k context"))
+    #expect(blocks[3] == .orderedItem(number: 2, text: "Exact GGUF selection"))
+    #expect(blocks[4] == .quote("Verify the runtime first."))
+    #expect(blocks[5] == .code("llama-server --model model.gguf"))
+}

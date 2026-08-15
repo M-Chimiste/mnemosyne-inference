@@ -15,6 +15,7 @@ func defaultControlPort() {
     #expect(NativeSettings().schemaVersion == 3)
     #expect(NativeSettings().server.maxConcurrency == nil)
     #expect(NativeSettings().server.maxQueueDepth == 128)
+    #expect(NativeSettings().server.idleUnloadSeconds == nil)
     #expect(NativeSettings().server.fleetApiKeyEnv == "FLEET_API_KEY")
     #expect(NativeSettings().tokenSidecar.enabled)
 }
@@ -24,6 +25,34 @@ func endpointResolution() {
     let client = ControlAPIClient(baseURL: URL(string: "http://localhost:17321")!)
     #expect(client.endpointURL("/manager/status").absoluteString == "http://localhost:17321/manager/status")
     #expect(client.endpointURL("/manager/models").absoluteString == "http://localhost:17321/manager/models")
+}
+
+@Test("oMLX cache health remains metadata-only and decodes large byte counts")
+func omlxCacheHealthDecoding() throws {
+    let payload = #"""
+    {
+      "available":true,
+      "total_requests":42,
+      "total_cached_tokens":12000,
+      "cache_efficiency":0.42,
+      "ssd_file_count":80,
+      "ssd_size_bytes":153545080832,
+      "ssd_limit_bytes":274877906944,
+      "hot_size_bytes":1073741824,
+      "hot_limit_bytes":8589934592,
+      "reset_recommended":false,
+      "diagnostic":null
+    }
+    """#.data(using: .utf8)!
+
+    let health = try JSONDecoder.nativeSettingsDecoder().decode(
+        OMLXCacheHealth.self,
+        from: payload
+    )
+    #expect(health.totalRequests == 42)
+    #expect(health.ssdSizeBytes == 153_545_080_832)
+    #expect(health.cacheEfficiency == 0.42)
+    #expect(!health.resetRecommended)
 }
 
 @Test("Load requests use the control endpoint and exact JSON body")
@@ -252,6 +281,27 @@ func configurationDecoding() throws {
     #expect(settings.server.fleetApiKeyEnv == "FLEET_API_KEY")
 }
 
+@Test("DS4 resident session capacity reuses the typed parallel setting")
+func ds4ParallelSessionsRoundTrip() throws {
+    let load = ModelLoadSettings(
+        contextLength: 32_768,
+        parallel: 3,
+        kvDiskSpaceMb: 8_192
+    )
+    let encoded = try JSONEncoder.nativeSettingsEncoder().encode(load)
+    let object = try #require(
+        JSONSerialization.jsonObject(with: encoded) as? [String: Any]
+    )
+
+    #expect(object["parallel"] as? Int == 3)
+    let decoded = try JSONDecoder.nativeSettingsDecoder().decode(
+        ModelLoadSettings.self,
+        from: encoded
+    )
+    #expect(decoded.parallel == 3)
+    #expect(decoded.kvDiskSpaceMb == 8_192)
+}
+
 @Test("Local model scans preserve explicit projector and migration metadata")
 func localModelScanDecoding() throws {
     let payload = #"""
@@ -460,6 +510,28 @@ func llamaCppFileSelectionRequest() throws {
     #expect(query["engine"] == "llama.cpp")
     #expect(query["repo_id"] == "org/model-GGUF")
     #expect(query["revision"] == "abc123")
+}
+
+@Test("Model library search requests one unified catalog without an engine filter")
+func unifiedModelLibrarySearchRequest() throws {
+    let client = ControlAPIClient(
+        baseURL: URL(string: "http://localhost:17321")!,
+        adminPassword: "secret"
+    )
+    let request = client.librarySearchRequest(query: "qwen vision")
+    let url = try #require(request.url)
+    let components = try #require(
+        URLComponents(url: url, resolvingAgainstBaseURL: false)
+    )
+    let query = Dictionary(
+        uniqueKeysWithValues: (components.queryItems ?? []).map { ($0.name, $0.value) }
+    )
+
+    #expect(url.path == "/manager/model-library/search")
+    #expect(query["q"] == "qwen vision")
+    #expect(query["engine"] == nil)
+    #expect(request.httpMethod == "GET")
+    #expect(request.value(forHTTPHeaderField: "Authorization") == "Basic YWRtaW46c2VjcmV0")
 }
 
 @Test("Model library records preserve engine compatibility and nested destinations")
@@ -748,6 +820,27 @@ func statusDecodeIsForwardCompatible() throws {
         "last_error": "Postgres is unavailable",
         "future_field": "ignored"
       },
+      "performance": {
+        "window_limit": 512,
+        "sample_count": 3,
+        "oldest_observed_at": 1,
+        "newest_observed_at": 2,
+        "by_model": [{
+          "alias": "glm-5-2",
+          "engine": "omlx",
+          "requests": 3,
+          "errors": 0,
+          "cold_starts": 1,
+          "average_admission_ms": 12.5,
+          "average_upstream_headers_ms": 15.0,
+          "average_first_byte_ms": 42.0,
+          "average_total_ms": 950.0,
+          "average_output_tokens_per_second": 25.5,
+          "p50_total_ms": 900.0,
+          "p95_total_ms": 1200.0
+        }],
+        "recent": []
+      },
       "another_future_field": true
     }
     """#.data(using: .utf8)!
@@ -764,6 +857,10 @@ func statusDecodeIsForwardCompatible() throws {
     #expect(snapshot.tokenSidecar?.lastFlushAt == 1_784_462_400.5)
     #expect(snapshot.tokenSidecar?.writerReady == false)
     #expect(snapshot.tokenSidecar?.lastError == "Postgres is unavailable")
+    #expect(snapshot.performance?.sampleCount == 3)
+    #expect(snapshot.performance?.byModel.first?.p50TotalMs == 900)
+    #expect(snapshot.performance?.byModel.first?.coldStarts == 1)
+    #expect(snapshot.performance?.byModel.first?.averageOutputTokensPerSecond == 25.5)
     #expect(snapshot.diagnostic == "engine state needs attention")
     #expect(snapshot.startupError == "oMLX authentication failed")
 }

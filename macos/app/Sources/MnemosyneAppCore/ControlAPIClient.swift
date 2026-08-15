@@ -14,7 +14,7 @@ public protocol ControlAPI: Sendable {
     func unload() async throws
     func storageLocations() async throws -> StorageSnapshot
     func inspectStorage(path: String, bookmarkData: Data?) async throws -> StorageStatus
-    func searchLibrary(query: String, engine: InferenceEngine) async throws -> [LibraryModel]
+    func searchLibrary(query: String) async throws -> [LibraryModel]
     func libraryFiles(
         repoId: String, engine: InferenceEngine, revision: String?
     ) async throws -> [LibraryModel]
@@ -43,6 +43,8 @@ public protocol ControlAPI: Sendable {
         engine: InferenceEngine, version: String?
     ) async throws -> RuntimeUpdateSnapshot
     func rollbackRuntimeUpdate(engine: InferenceEngine) async throws -> RuntimeUpdateSnapshot
+    func omlxCacheHealth() async throws -> OMLXCacheHealth
+    func resetOMLXCache() async throws -> OMLXCacheResetResult
     func configuration() async throws -> ConfigurationSnapshot
     func saveConfiguration(
         _ settings: NativeSettings, revision: String
@@ -269,21 +271,9 @@ public struct ControlAPIClient: ControlAPI, Sendable {
     }
 
     public func searchLibrary(
-        query: String,
-        engine: InferenceEngine
+        query: String
     ) async throws -> [LibraryModel] {
-        var components = URLComponents(
-            url: endpointURL("/manager/model-library/search"),
-            resolvingAgainstBaseURL: false
-        )!
-        components.queryItems = [
-            URLQueryItem(name: "engine", value: engine.rawValue),
-            URLQueryItem(name: "q", value: query),
-        ]
-        var request = URLRequest(url: components.url!)
-        request.httpMethod = "GET"
-        request.setValue("application/json", forHTTPHeaderField: "Accept")
-        addAuthorization(to: &request)
+        let request = librarySearchRequest(query: query)
         let (data, response) = try await session.data(for: request)
         try validate(response, data: data)
         return try JSONDecoder.nativeSettingsDecoder()
@@ -456,6 +446,30 @@ public struct ControlAPIClient: ControlAPI, Sendable {
         return try await sendRuntimeUpdateRequest(request)
     }
 
+    public func omlxCacheHealth() async throws -> OMLXCacheHealth {
+        let request = makeRequest(path: "/manager/engines/omlx/cache")
+        let (data, response) = try await session.data(for: request)
+        try validate(response, data: data)
+        return try JSONDecoder.nativeSettingsDecoder().decode(
+            OMLXCacheHealth.self,
+            from: data
+        )
+    }
+
+    public func resetOMLXCache() async throws -> OMLXCacheResetResult {
+        var request = makeRequest(
+            path: "/manager/engines/omlx/cache/reset",
+            method: "POST"
+        )
+        request.timeoutInterval = 15 * 60
+        let (data, response) = try await session.data(for: request)
+        try validate(response, data: data)
+        return try JSONDecoder.nativeSettingsDecoder().decode(
+            OMLXCacheResetResult.self,
+            from: data
+        )
+    }
+
     public func configuration() async throws -> ConfigurationSnapshot {
         let request = makeRequest(path: "/manager/config")
         let (data, response) = try await session.data(for: request)
@@ -505,6 +519,19 @@ public struct ControlAPIClient: ControlAPI, Sendable {
 
     func localModelSourcesRequest() -> URLRequest {
         makeRequest(path: "/manager/model-library/local-sources")
+    }
+
+    func librarySearchRequest(query: String) -> URLRequest {
+        var components = URLComponents(
+            url: endpointURL("/manager/model-library/search"),
+            resolvingAgainstBaseURL: false
+        )!
+        components.queryItems = [URLQueryItem(name: "q", value: query)]
+        var request = URLRequest(url: components.url!)
+        request.httpMethod = "GET"
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        addAuthorization(to: &request)
+        return request
     }
 
     func libraryFilesRequest(

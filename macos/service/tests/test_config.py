@@ -9,6 +9,7 @@ from mnemosyne_macos.config import (
     ConfigError,
     ImageProfileConfig,
     MacConfig,
+    ModelProfile,
     load_config,
     parse_config,
     save_config,
@@ -33,6 +34,7 @@ from mnemosyne_macos.models import (
     ModelKind,
     effective_load_identity,
 )
+from mnemosyne_macos.runtime import recommended_interactive_context_length
 
 
 def test_defaults_replace_the_legacy_sidecar_port() -> None:
@@ -53,7 +55,15 @@ def test_defaults_replace_the_legacy_sidecar_port() -> None:
     assert config.token_sidecar.node_id == ""
     assert config.server.max_concurrency is None
     assert config.server.max_queue_depth == 128
+    assert config.server.idle_unload_seconds is None
     assert config.server.fleet_api_key_env == "FLEET_API_KEY"
+
+
+def test_interactive_context_defaults_bound_extreme_model_metadata() -> None:
+    assert recommended_interactive_context_length(None) == 32_768
+    assert recommended_interactive_context_length(8_192) == 8_192
+    assert recommended_interactive_context_length(131_072) == 65_536
+    assert recommended_interactive_context_length(1_048_576) == 65_536
 
 
 def test_packaged_example_has_the_intentional_v1_runtime_topology() -> None:
@@ -159,6 +169,29 @@ def test_ds4_process_state_path_is_configurable(tmp_path) -> None:
     assert config.engines.ds4.process_state_path == str(state_path)
 
 
+@pytest.mark.parametrize(
+    ("filename", "wire_model"),
+    [
+        ("DeepSeek-V4-Flash-IQ2XXS-0731.gguf", "deepseek-v4-flash"),
+        ("DeepSeek-V4-Pro-IQ2XXS-imatrix.gguf", "deepseek-v4-pro"),
+        ("GLM-5.2-UD-Q2_K_RoutedQ2K.gguf", "glm-5.2"),
+    ],
+)
+def test_ds4_uses_upstream_canonical_wire_model(
+    filename: str, wire_model: str
+) -> None:
+    profile = ModelProfile(
+        alias="local-ds4",
+        engine=EngineName.DS4,
+        model=f"/models/{filename}",
+        # Older app-generated profiles persisted the public alias here. DS4
+        # accepts only its family aliases, so resolution must repair it.
+        served_model_name="local-ds4",
+    )
+
+    assert profile.resolve().wire_model == wire_model
+
+
 def test_profiles_resolve_engine_specific_wire_names() -> None:
     config = MacConfig.model_validate(
         {
@@ -169,7 +202,7 @@ def test_profiles_resolve_engine_specific_wire_names() -> None:
         }
     )
     profiles = config.profiles()
-    assert profiles["deepseek-v4"].wire_model == "deepseek-v4"
+    assert profiles["deepseek-v4"].wire_model == "deepseek-v4-flash"
     assert profiles["deepseek-v4"].key.engine == EngineName.DS4
     assert Endpoint.RESPONSES in profiles["deepseek-v4"].capabilities
 
@@ -348,6 +381,22 @@ def test_ds4_rejects_llama_cpp_only_load_options() -> None:
                 ]
             }
         )
+
+
+def test_ds4_parallel_slots_are_typed() -> None:
+    config = MacConfig.model_validate(
+        {
+            "models": [
+                {
+                    "alias": "deepseek",
+                    "engine": "ds4",
+                    "model": "/models/ds4.gguf",
+                    "load": {"parallel": 4},
+                }
+            ]
+        }
+    )
+    assert config.models[0].resolve().load_options["parallel"] == 4
 
 
 def test_mflux_image_profile_resolves_load_identity_and_defaults() -> None:

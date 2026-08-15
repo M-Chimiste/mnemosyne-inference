@@ -29,6 +29,24 @@ class Deadline:
         return max(0.0, self.monotonic_at - time.monotonic())
 
 
+@dataclass(frozen=True)
+class CapacityHint:
+    """Adapter-observed admission capacity for one resident model.
+
+    The coordinator still applies its optional global ceiling. Keeping the
+    engine's own limit separate makes status explain whether admission came
+    from an authoritative runtime setting or a conservative fallback.
+    """
+
+    limit: int
+    source: str
+    confidence: str
+
+    def __post_init__(self) -> None:
+        if self.limit < 1:
+            raise ValueError("capacity hint limit must be positive")
+
+
 class AdapterError(RuntimeError):
     def __init__(
         self,
@@ -48,6 +66,16 @@ class AdapterError(RuntimeError):
 class EngineAdapter(ABC):
     engine: EngineName
     ownership: str
+
+    def capacity_hint(self, target: ResolvedTarget) -> CapacityHint | None:
+        """Return a cached runtime capacity hint without performing I/O.
+
+        Adapters that cannot authoritatively observe a scheduler limit leave
+        this unset and the platform capacity derivation stays conservative.
+        """
+
+        del target
+        return None
 
     @abstractmethod
     async def validate_control(self, *, deadline: Deadline) -> EngineSnapshot:
@@ -96,4 +124,3 @@ class EngineAdapter(ABC):
     @abstractmethod
     async def aclose(self) -> None:
         raise NotImplementedError
-

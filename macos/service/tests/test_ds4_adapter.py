@@ -44,6 +44,7 @@ def _target():
                     "model": "/models/ds4.gguf",
                     "load": {
                         "context_length": 100000,
+                        "parallel": 3,
                         "kv_disk_directory": "/cache/ds4",
                         "kv_disk_space_mb": 8192,
                         "extra_args": ["--power", "70"],
@@ -108,7 +109,33 @@ def test_build_ds4_argv_pins_managed_options() -> None:
         "--port",
         "17323",
     ]
+    assert argv[argv.index("--batched-session") + 1] == "3"
     assert argv[-2:] == ["--power", "70"]
+
+
+@pytest.mark.asyncio
+async def test_ds4_capacity_matches_the_managed_session_count(tmp_path: Path) -> None:
+    adapter = DS4Adapter(
+        DS4Config(process_state_path=str(tmp_path / "ds4.json")),
+    )
+    try:
+        capacity = adapter.capacity_hint(_target())
+
+        assert capacity.limit == 3
+        assert capacity.source == "ds4-batched-sessions"
+        assert capacity.confidence == "configured"
+    finally:
+        await adapter.aclose()
+
+
+def test_ds4_rejects_batched_session_override_in_extra_args() -> None:
+    target = replace(
+        _target(),
+        load_options={"extra_args": ["--batched-session", "8"]},
+    )
+
+    with pytest.raises(AdapterError, match="--batched-session"):
+        build_ds4_argv(DS4Config(), target)
 
 
 def test_kern_procargs_parser_preserves_argument_boundaries_and_spaces() -> None:

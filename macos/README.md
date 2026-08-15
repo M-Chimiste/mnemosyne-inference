@@ -80,15 +80,42 @@ LaunchAgent registration survive upgrades. For diagnostic launches, the process
 environment variable `MNEMOSYNE_WORKSTATION_NAME` overrides auto-detection.
 
 Same-model requests may run concurrently while holding leases on the same
-resident epoch. The service derives a conservative per-profile limit from the
-engine contract (including llama.cpp `load.parallel` and MFLUX's serial worker),
-then applies the optional global `server.max_concurrency` ceiling. Once those
+resident epoch. The service derives a per-profile limit from the engine
+contract (including oMLX's authoritative
+`scheduler.max_concurrent_requests`, llama.cpp `load.parallel`, and MFLUX's
+serial worker), then applies the optional global `server.max_concurrency`
+ceiling. If an external scheduler does not expose a valid limit, admission
+falls back to one request instead of guessing. Once those
 permits are occupied, up to `server.max_queue_depth` waiters are retained in
 FIFO order; another request is rejected before upstream inference with
 `429 node_busy`, `Retry-After`, and the manager-owned
 `X-Mnemosyne-Error: node_busy` proof header. A queued model switch closes
 old-target admission, drains all active streams, and preserves the one-resident
 invariant.
+
+Fresh configurations keep the verified resident model warm. Settings provides
+Performance, Balanced, and Memory Saver residency presets; custom values may
+cap concurrency or unload after a chosen idle interval. Newly discovered GGUF
+profiles start with an interactive context no larger than 64K (32K when no
+metadata is available) rather than blindly allocating a model-card maximum of
+128K–1M. An explicitly saved context remains authoritative.
+
+The service keeps a bounded, in-memory, content-free performance window. The
+menu shows rolling p50/p95 latency and streamed output tokens/second for the
+resident alias; `GET /manager/performance` exposes admission, upstream-header,
+first-byte, total-latency, cold-start, and error aggregates. No prompt,
+response, API key, or arbitrary diagnostic text is retained in this window.
+
+For a repeatable comparison against another OpenAI-compatible Mac endpoint:
+
+```bash
+uv run --project macos/service python macos/scripts/benchmark_native.py \
+  --model your-alias --requests 8 --concurrency 4 \
+  --compare-base-url http://127.0.0.1:1234 --compare-label lm-studio
+```
+
+The benchmark uses one fixed prompt and records only status, latency, usage,
+and throughput. Omit `--compare-base-url` to measure Unified Inference alone.
 
 ## Requirements
 
@@ -108,6 +135,28 @@ stable install commands; the fragile `--HEAD --with-custom-kernel` source
 build is advanced-only. See
 [Install the official oMLX app](INSTALL.md#5-install-the-official-omlx-app)
 for the guided setup and headless alternative.
+
+## Engine strategy
+
+Unified Inference intentionally remains an adapter layer, not a fifth model
+runtime. The current upstream split is:
+
+| Model artifact | Default engine | Reason |
+| --- | --- | --- |
+| MLX directories | oMLX | Continuous batching, tiered persistent KV cache, multi-model admin lifecycle, native app, and a stable Homebrew service |
+| GGUF | llama.cpp | Official Metal-enabled server, broad quant/model support, continuous batching, and explicit parallel slots |
+| Curated image checkpoints | MFLUX | Native Apple Silicon image pipeline isolated from language dependencies |
+| Exact DeepSeek V4 and GLM 5.2 GGUF layouts | DS4 Preview | Purpose-built upstream path retained only for models tested by DS4 |
+
+The official
+[`mlx_lm.server`](https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/server.py)
+now includes batched generation and prompt-cache
+support, but adopting it directly would make Unified Inference own another
+Python runtime, server lifecycle, and upgrade surface while giving up oMLX's
+admin contract and vendor app. The current evidence does not justify that
+trade. The deliberate choice is therefore to keep oMLX replaceable behind its
+adapter, fix admission and ownership friction, and use the included benchmark
+before changing engines on measured hardware.
 
 ## Engine preparation
 
@@ -170,13 +219,21 @@ cannot grant filesystem access to an already-running external oMLX process.
 When an MLX library is in a macOS-protected folder, authorize that folder for
 the oMLX installation as well.
 
-DS4 is purpose-built for its published DeepSeek V4 Flash/PRO GGUFs; it is not a
-general GGUF runner. Runtime Updates can fetch an exact official `antirez/ds4`
-commit and build `ds4-server` locally with Apple's toolchain. An explicitly
-configured external checkout/binary remains available as a development or
-recovery fallback. Mnemosyne starts DS4 with an explicit model, context, host,
-and port and terminates only a process whose recorded identity it can prove it
-owns.
+DS4 is purpose-built for the exact DeepSeek V4 and GLM 5.2 GGUF layouts listed
+by its official downloader; it is not a general GGUF runner. The current
+library exposes four DeepSeek V4 Flash variants, one DeepSeek V4 Pro variant,
+and four GLM 5.2 variants. The Unsloth GLM Q4 choice is one atomic eleven-shard
+install. Search verifies every expected file and pins the Hugging Face revision
+before a download can start, and a managed runtime must declare the selected
+target. Runtime Updates can fetch an exact official `antirez/ds4` commit and
+build `ds4-server` locally with Apple's toolchain. An
+explicitly configured external checkout/binary remains available as a
+development or recovery fallback. Mnemosyne starts DS4 with an explicit model,
+context, host, and port and terminates only a process whose recorded identity
+it can prove it owns. DS4 profiles can set **Resident request sessions** to
+translate into the upstream `--batched-session` setting. Admission uses that
+exact slot count; leaving it unset preserves the safest one-session memory
+profile because every extra session allocates another KV state.
 
 An existing LM Studio installation is not required. Version-1 configurations
 are upgraded without starting or contacting LM Studio: legacy LM Studio
@@ -240,18 +297,27 @@ The selected root is then organized by engine:
   mflux/<owner>/<repository>/
 ```
 
-Use **Settings → Model Library** to choose llama.cpp, oMLX, DS4, or MFLUX,
-search or pick a curated recommendation, choose one of the configured folders,
-and download. Search results and details show bounded model-card prose plus
+Use **Settings → Model Library** to search one unified catalog across llama.cpp,
+oMLX, DS4, and MFLUX, choose one of the configured folders, and download. Every
+result carries an engine-support badge; selecting it retains the exact
+engine-specific validation and install path. Search results and details show
+bounded model-card prose plus
 detected architecture, context length, parameter count, and license when the
-Hub repository, config, or GGUF provides them. llama.cpp search first returns
+Hub repository, config, or GGUF provides them. Model cards remove Hugging Face
+YAML front matter and render safe Markdown headings, lists, quotes, code, links,
+and paragraphs in a dedicated scrollable surface. llama.cpp results first return
 GGUF repositories; a second GUI step requires an exact quant/shard set. When a
 same-directory vision projector exists, the highest-fidelity option is selected
 automatically; the user can choose another or opt out for text-only use. The
 resolved Hub revision and exact file list are persisted so retries cannot
 silently change weights.
-DS4 results are restricted to the GGUF files published for DS4. MFLUX offers
-the text-to-image configurations present in the pinned runtime: FLUX.1,
+DS4 results are restricted to the exact current DeepSeek V4 and GLM 5.2 GGUF
+files published and tested for DS4. They are hydrated from Hugging Face file
+metadata so missing files, incomplete shard groups, or an unresolvable revision
+are unavailable rather than installable. Auxiliary DSpark weights and
+distributed-only DeepSeek Pro halves are intentionally not presented as
+standalone models. MFLUX offers the text-to-image configurations present in
+the pinned runtime: FLUX.1,
 FLUX.2 Klein, Qwen Image, Krea 2 Turbo, FIBO, Z-Image, ERNIE Image, and
 Ideogram 4. Krea 2 Raw is shown for completeness but cannot be installed: the
 pinned upstream MFLUX loader currently accepts only Turbo's weight layout.
@@ -320,7 +386,17 @@ Inference selects the official DMG matching this Mac, detects the installed
 app, CLI shim, conventional Homebrew paths, or running server, and links to
 the official stable release without overwriting it. For a missing runtime, an
 explicitly confirmed action may delegate the initial stable installation to
-Homebrew; updates and replacements remain externally owned.
+Homebrew. A detected stable Homebrew installation also gets a supervised
+update action: Unified Inference drains inference and then delegates the fixed
+`omlx stop`, `brew update`, `brew upgrade omlx`, and `omlx start` sequence to
+the owner before validating an authoritative empty control plane. Official-app
+updates stay in the app, and Homebrew HEAD builds are offered a one-time stable
+migration instead of an unreproducible rebuild.
+
+The same card reports oMLX's vendor-provided SSD prompt-cache size and reuse
+metrics. A reset is never automatic. The explicitly confirmed reset drains all
+engines and calls oMLX's official cache-clear API; model weights and settings
+are untouched.
 
 llama.cpp, MFLUX, and DS4 are resolved directly from their official upstreams;
 there is no Unified Inference release manifest to maintain. MFLUX versions come from the
@@ -542,9 +618,9 @@ alias.
 The Storage page displays the exact selected directory, containing mount,
 free space, and availability. Add/change actions always use `NSOpenPanel`, so
 external libraries such as `/Volumes/Athena/models` are selected visually.
-The Model Library page similarly presents compatible model results and storage
-locations as GUI selections; raw repository or filesystem fields are not
-required for managed installs.
+The Model Library page similarly presents a unified cross-engine result list
+with explicit engine-support badges and storage locations as GUI selections;
+raw repository or filesystem fields are not required for managed installs.
 
 Credential fields are write-only. The window shows only whether each supported
 secret is configured, leaves its secure field blank, and allows explicit

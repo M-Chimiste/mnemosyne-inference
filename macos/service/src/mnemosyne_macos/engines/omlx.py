@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import math
 import os
 from urllib.parse import quote
 
 import httpx
 
-from .base import AdapterError, Deadline
+from .base import AdapterError, CapacityHint, Deadline
 from .http import HttpAdapterError, HttpEngineAdapter, JsonObjectResponse
 from ..config import OMLXConfig
 from ..models import (
@@ -39,6 +40,112 @@ class OMLXAdapter(HttpEngineAdapter):
             poll_interval_seconds=poll_interval_seconds,
         )
         self.admin_session_env = config.admin_session_env
+        self._capacity_hint: CapacityHint | None = None
+        self._capacity_diagnostic: str | None = None
+
+    def capacity_hint(self, target: ResolvedTarget) -> CapacityHint | None:
+        del target
+        return self._capacity_hint
+
+    @property
+    def capacity_diagnostic(self) -> str | None:
+        return self._capacity_diagnostic
+
+    async def cache_health(self, *, deadline: Deadline) -> dict[str, object]:
+        """Return a bounded, content-free view of oMLX's own cache metrics."""
+
+        payload = await self._request_json(
+            "GET",
+            "/admin/api/stats?scope=alltime",
+            operation="inspect cache health",
+            deadline=deadline,
+            headers=self._admin_headers(),
+        )
+        runtime_cache = payload.get("runtime_cache")
+        if not isinstance(runtime_cache, dict):
+            raise AdapterError(
+                self.engine,
+                "inspect cache health",
+                "oMLX stats omitted runtime_cache observability",
+            )
+
+        def nonnegative_int(value: object) -> int:
+            return (
+                value
+                if isinstance(value, int)
+                and not isinstance(value, bool)
+                and value >= 0
+                else 0
+            )
+
+        total_requests = nonnegative_int(payload.get("total_requests"))
+        cached_tokens = nonnegative_int(payload.get("total_cached_tokens"))
+        total_size_bytes = nonnegative_int(runtime_cache.get("total_size_bytes"))
+        total_num_files = nonnegative_int(runtime_cache.get("total_num_files"))
+        disk_max_bytes = nonnegative_int(runtime_cache.get("disk_max_bytes"))
+        hot_cache_size_bytes = nonnegative_int(
+            runtime_cache.get("hot_cache_size_bytes")
+        )
+        hot_cache_max_bytes = nonnegative_int(
+            runtime_cache.get("hot_cache_max_bytes")
+        )
+        cache_efficiency = payload.get("cache_efficiency")
+        if not isinstance(cache_efficiency, (int, float)) or isinstance(
+            cache_efficiency, bool
+        ) or not math.isfinite(cache_efficiency):
+            cache_efficiency = None
+
+        # A large persistent cache with a meaningful request history and no
+        # observed reuse is worth surfacing. It is only a recommendation:
+        # different prompts can legitimately produce no prefix hits.
+        reset_recommended = (
+            total_size_bytes >= 8 * 1024**3
+            and total_requests >= 10
+            and cached_tokens == 0
+        )
+        return {
+            "available": True,
+            "total_requests": total_requests,
+            "total_cached_tokens": cached_tokens,
+            "cache_efficiency": float(cache_efficiency)
+            if cache_efficiency is not None
+            else None,
+            "ssd_file_count": total_num_files,
+            "ssd_size_bytes": total_size_bytes,
+            "ssd_limit_bytes": disk_max_bytes,
+            "hot_size_bytes": hot_cache_size_bytes,
+            "hot_limit_bytes": hot_cache_max_bytes,
+            "reset_recommended": reset_recommended,
+            "diagnostic": (
+                "The persistent oMLX cache is large but has recorded no prefix-cache reuse; reset it if warm requests remain slow."
+                if reset_recommended
+                else None
+            ),
+        }
+
+    async def clear_ssd_cache(self, *, deadline: Deadline) -> int:
+        """Clear oMLX's SSD KV cache through its official admin API."""
+
+        payload = await self._request_json(
+            "POST",
+            "/admin/api/ssd-cache/clear",
+            operation="reset SSD cache",
+            deadline=deadline,
+            headers=self._admin_headers(),
+        )
+        deleted = payload.get("total_deleted")
+        if (
+            payload.get("status") != "ok"
+            or not isinstance(deleted, int)
+            or isinstance(deleted, bool)
+            or deleted < 0
+        ):
+            raise AdapterError(
+                self.engine,
+                "reset SSD cache",
+                "oMLX returned an invalid cache-reset result",
+            )
+        return deleted
 
     def _admin_headers(self) -> dict[str, str]:
         headers = self._bearer_headers()
@@ -172,7 +279,45 @@ class OMLXAdapter(HttpEngineAdapter):
         )
 
     async def validate_control(self, *, deadline: Deadline) -> EngineSnapshot:
-        return await self.inspect(deadline=deadline)
+        snapshot = await self.inspect(deadline=deadline)
+        if not snapshot.authoritative or snapshot.service_state != ServiceState.READY:
+            self._capacity_hint = None
+            return snapshot
+        try:
+            payload = await self._request_json(
+                "GET",
+                "/admin/api/global-settings",
+                operation="inspect scheduler capacity",
+                deadline=deadline,
+                headers=self._admin_headers(),
+            )
+            scheduler = payload.get("scheduler")
+            value = (
+                scheduler.get("max_concurrent_requests")
+                if isinstance(scheduler, dict)
+                else None
+            )
+            if (
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or not 1 <= value <= 1024
+            ):
+                raise ValueError(
+                    "oMLX global settings omitted a valid scheduler.max_concurrent_requests"
+                )
+            self._capacity_hint = CapacityHint(
+                limit=value,
+                source="omlx-admin-settings",
+                confidence="authoritative",
+            )
+            self._capacity_diagnostic = None
+        except (AdapterError, ValueError) as exc:
+            # Scheduler discovery is an optimization contract. Inventory and
+            # unload authority remain valid, so keep the engine callable at a
+            # conservative single request and expose the reason in diagnostics.
+            self._capacity_hint = None
+            self._capacity_diagnostic = str(exc)
+        return snapshot
 
     async def register_model_directories(
         self,

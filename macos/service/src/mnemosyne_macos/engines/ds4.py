@@ -30,7 +30,7 @@ from typing import Any, Awaitable, Callable, Mapping, Protocol
 
 import httpx
 
-from .base import AdapterError, Deadline, EngineAdapter
+from .base import AdapterError, CapacityHint, Deadline, EngineAdapter
 from ..config import DS4Config
 from ..runtime_updates import resolve_active_runtime
 from ..scoped_process import wrap_scoped_argv
@@ -296,6 +296,7 @@ _RESERVED_EXTRA_ARGS = {
     "--ctx",
     "--kv-disk-dir",
     "--kv-disk-space-mb",
+    "--batched-session",
 }
 
 
@@ -331,6 +332,8 @@ def build_ds4_argv(config: DS4Config, target: ResolvedTarget) -> list[str]:
         )
     if options.get("kv_disk_space_mb") is not None:
         argv.extend(["--kv-disk-space-mb", str(options["kv_disk_space_mb"])])
+    if options.get("parallel") is not None:
+        argv.extend(["--batched-session", str(options["parallel"])])
     argv.extend(str(arg) for arg in extra_args)
     return argv
 
@@ -473,6 +476,24 @@ class DS4Adapter(EngineAdapter):
         self._target: ResolvedTarget | None = None
         self._log_task: asyncio.Task[None] | None = None
         self._log_tail: deque[str] = deque(maxlen=80)
+
+    def capacity_hint(self, target: ResolvedTarget) -> CapacityHint:
+        configured = target.load_options.get("parallel")
+        if (
+            isinstance(configured, int)
+            and not isinstance(configured, bool)
+            and configured > 0
+        ):
+            return CapacityHint(
+                limit=configured,
+                source="ds4-batched-sessions",
+                confidence="configured",
+            )
+        return CapacityHint(
+            limit=1,
+            source="ds4-single-session",
+            confidence="authoritative",
+        )
 
     def _effective_config(self) -> DS4Config:
         managed = resolve_active_runtime("ds4", root=self._runtime_root)

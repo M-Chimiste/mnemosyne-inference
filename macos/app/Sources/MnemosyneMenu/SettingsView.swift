@@ -2,6 +2,15 @@ import Foundation
 import MnemosyneAppCore
 import SwiftUI
 
+private enum ResidencyPreset: String, CaseIterable, Identifiable {
+    case performance = "Performance"
+    case balanced = "Balanced"
+    case memorySaver = "Memory Saver"
+    case custom = "Custom"
+
+    var id: String { rawValue }
+}
+
 struct SettingsView: View {
     @ObservedObject var viewModel: SettingsViewModel
     @ObservedObject var registration: LaunchAgentRegistration
@@ -58,6 +67,36 @@ struct SettingsView: View {
         } message: {
             Text(
                 "Unified Inference will run these exact commands after approval:\n\nbrew tap jundot/omlx https://github.com/jundot/omlx\nbrew install omlx\n\nHomebrew will own the installation. This never uses --HEAD or replaces an existing oMLX installation. The stable formula omits optional custom kernels; use the recommended official app when you need them."
+            )
+        }
+        .alert(
+            "Update oMLX with Homebrew?",
+            isPresented: $viewModel.confirmHomebrewOMLXUpgrade
+        ) {
+            Button("Cancel", role: .cancel) {
+                viewModel.pendingOMLXUpgrade = nil
+            }
+            Button("Drain and Update") {
+                guard let update = viewModel.pendingOMLXUpgrade else { return }
+                viewModel.pendingOMLXUpgrade = nil
+                Task { await viewModel.installRuntimeUpdate(update) }
+            }
+        } message: {
+            Text(
+                "Unified Inference will stop new oMLX requests, drain active work, unload the resident model, and delegate these fixed operations to Homebrew:\n\nomlx stop\nbrew update\nbrew upgrade omlx\nomlx start\n\nAdmission reopens only after the updated oMLX control plane is healthy and empty."
+            )
+        }
+        .alert(
+            "Reset oMLX SSD cache?",
+            isPresented: $viewModel.confirmOMLXCacheReset
+        ) {
+            Button("Cancel", role: .cancel) {}
+            Button("Drain and Reset", role: .destructive) {
+                Task { await viewModel.resetOMLXCache() }
+            }
+        } message: {
+            Text(
+                "Unified Inference will drain active requests and unload the resident model, then ask oMLX to delete its reusable SSD KV-cache blocks. Model weights and configuration are not changed. The next matching prompt will need a fresh prefill."
             )
         }
         .sheet(isPresented: $viewModel.showLocalModelImporter) {
@@ -662,6 +701,12 @@ struct SettingsView: View {
             }
 
             Section("Model residency") {
+                Picker("Preset", selection: residencyPreset) {
+                    ForEach(ResidencyPreset.allCases) { preset in
+                        Text(preset.rawValue).tag(preset)
+                    }
+                }
+                .pickerStyle(.segmented)
                 Toggle("Unload the current model when it has been idle", isOn: idleUnloadEnabled)
                 if viewModel.settings.server.idleUnloadSeconds != nil {
                     LabeledContent("Idle time") {
@@ -674,9 +719,29 @@ struct SettingsView: View {
                 LabeledContent("Queued request timeout") {
                     secondsField($viewModel.settings.server.swapQueueTimeoutSeconds)
                 }
+                optionalIntegerField(
+                    "Concurrency ceiling",
+                    value: $viewModel.settings.server.maxConcurrency
+                )
+                LabeledContent("Maximum queued requests") {
+                    integerField(
+                        $viewModel.settings.server.maxQueueDepth,
+                        unit: "requests"
+                    )
+                }
                 LabeledContent("Shutdown grace period") {
                     secondsField($viewModel.settings.server.shutdownGraceSeconds)
                 }
+                Text(
+                    viewModel.settings.server.idleUnloadSeconds == nil
+                        ? "Performance mode keeps one verified model warm, avoiding repeated weight loads and cache scans."
+                        : "Memory-saver mode releases the resident model after the configured idle interval."
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                Text("Leave the concurrency ceiling blank to use the engine's authoritative scheduler limit. A ceiling can reduce memory pressure; it cannot exceed what the engine reports.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
 
             Section("Image generation") {
@@ -768,7 +833,7 @@ struct SettingsView: View {
                     secondsField($viewModel.settings.engines.ds4.requestTimeoutSeconds)
                 }
             } header: {
-                engineHeader("DS4", detail: "DeepSeek GGUF models")
+                engineHeader("DS4", detail: "DeepSeek V4 and GLM 5.2 GGUF models")
             }
 
             Section {
@@ -940,6 +1005,12 @@ struct SettingsView: View {
                             .textSelection(.enabled)
                     }
                 }
+                if let kind = update.installationKindLabel {
+                    GridRow {
+                        Text("Installation").foregroundStyle(.secondary)
+                        Text(kind)
+                    }
+                }
             }
 
             Text(update.managementNote)
@@ -950,6 +1021,31 @@ struct SettingsView: View {
                 Text("Download the official app, drag it to Applications, and start its server on 127.0.0.1:17322. Then choose Check Again. The official app avoids the fragile Homebrew HEAD custom-kernel build.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+            }
+            if update.engine == .omlx,
+               update.upgradeStrategy == "migrate_to_stable" {
+                Text("This is an unreproducible Homebrew HEAD build. Migrate once to the official stable app for precompiled kernels and one-click updates; Unified Inference will not rebuild an arbitrary moving commit.")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            }
+            if update.engine == .omlx,
+               let cache = viewModel.omlxCacheHealth {
+                VStack(alignment: .leading, spacing: 5) {
+                    HStack {
+                        Label("SSD prompt cache", systemImage: "externaldrive")
+                        Spacer()
+                        Text(ByteCountFormatter.string(fromByteCount: Int64(cache.ssdSizeBytes), countStyle: .file))
+                            .font(.system(.caption, design: .monospaced))
+                    }
+                    Text("\(cache.ssdFileCount) files · \(cache.totalCachedTokens.formatted()) cached tokens across \(cache.totalRequests.formatted()) requests")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    if let diagnostic = cache.diagnostic {
+                        Label(diagnostic, systemImage: "gauge.with.dots.needle.67percent")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                    }
+                }
             }
 
             if let diagnostic = update.diagnostic {
@@ -978,8 +1074,17 @@ struct SettingsView: View {
                             || viewModel.isCheckingRuntimeUpdates
                     )
                 } else if update.canInstall {
-                    Button("Install \(update.availableVersion ?? "Update")") {
-                        Task { await viewModel.installRuntimeUpdate(update) }
+                    Button(
+                        update.engine == .omlx
+                            ? "Update to \(update.availableLabel ?? "Stable")"
+                            : "Install \(update.availableVersion ?? "Update")"
+                    ) {
+                        if update.engine == .omlx {
+                            viewModel.pendingOMLXUpgrade = update
+                            viewModel.confirmHomebrewOMLXUpgrade = true
+                        } else {
+                            Task { await viewModel.installRuntimeUpdate(update) }
+                        }
                     }
                     .buttonStyle(.borderedProminent)
                     .disabled(viewModel.updatingRuntimeEngine != nil)
@@ -1001,6 +1106,13 @@ struct SettingsView: View {
                         viewModel.openOMLXApplication(update)
                     }
                 }
+                if update.engine == .omlx,
+                   update.upgradeStrategy == "migrate_to_stable",
+                   let target = update.officialInstallerUrl,
+                   let url = URL(string: target) {
+                    Link("Download Stable oMLX", destination: url)
+                        .buttonStyle(.borderedProminent)
+                }
                 if update.engine == .omlx {
                     Button("Check Again") {
                         Task { await viewModel.refreshRuntimeUpdates(force: true) }
@@ -1009,6 +1121,15 @@ struct SettingsView: View {
                         viewModel.isCheckingRuntimeUpdates
                             || viewModel.updatingRuntimeEngine != nil
                     )
+                    if viewModel.omlxCacheHealth != nil {
+                        Button("Reset SSD Cache…") {
+                            viewModel.confirmOMLXCacheReset = true
+                        }
+                        .disabled(
+                            viewModel.isResettingOMLXCache
+                                || viewModel.updatingRuntimeEngine != nil
+                        )
+                    }
                 }
                 Spacer()
                 if let target = update.releaseNotesUrl ?? update.latestUpstreamUrl,
@@ -1132,26 +1253,22 @@ struct SettingsView: View {
 
     private var libraryPage: some View {
         VStack(spacing: 0) {
-            HStack(spacing: 10) {
-                Picker("Engine", selection: Binding(
-                    get: { viewModel.libraryEngine },
-                    set: { viewModel.selectLibraryEngine($0) }
-                )) {
-                    Text("llama.cpp").tag(InferenceEngine.llamaCpp)
-                    Text("oMLX").tag(InferenceEngine.omlx)
-                    Text("DS4").tag(InferenceEngine.ds4)
-                    Text("MFLUX").tag(InferenceEngine.mflux)
+            VStack(alignment: .leading, spacing: 7) {
+                HStack(spacing: 10) {
+                    Image(systemName: "magnifyingglass")
+                        .foregroundStyle(.secondary)
+                    TextField("Search Hugging Face", text: $viewModel.libraryQuery)
+                        .textFieldStyle(.roundedBorder)
+                        .onSubmit { Task { await viewModel.refreshModelLibrary() } }
+                    Button("Search") { Task { await viewModel.refreshModelLibrary() } }
+                        .disabled(viewModel.isSearchingLibrary)
+                    if viewModel.isSearchingLibrary {
+                        ProgressView().controlSize(.small)
+                    }
                 }
-                .frame(width: 170)
-
-                TextField("Search Hugging Face", text: $viewModel.libraryQuery)
-                    .textFieldStyle(.roundedBorder)
-                    .onSubmit { Task { await viewModel.refreshModelLibrary() } }
-                Button("Search") { Task { await viewModel.refreshModelLibrary() } }
-                    .disabled(viewModel.isSearchingLibrary)
-                if viewModel.isSearchingLibrary {
-                    ProgressView().controlSize(.small)
-                }
+                Text("One catalog searches every supported model format. Engine badges show where each result can run; Preview engines remain limited to their verified upstream catalogs.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
             .padding(14)
             Divider()
@@ -1166,13 +1283,14 @@ struct SettingsView: View {
                             HStack {
                                 Text(model.displayName).fontWeight(.medium)
                                 Spacer()
-                                compatibilityBadge(model.compatibility)
+                                engineBadge(model.engine)
                             }
                             Text(model.repoId)
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                                 .lineLimit(1)
                             HStack(spacing: 9) {
+                                compatibilityBadge(model.compatibility)
                                 if let quantization = model.quantization {
                                     Text(quantization)
                                 }
@@ -1192,17 +1310,34 @@ struct SettingsView: View {
                 }
                 .frame(minWidth: 330)
 
-                VStack(alignment: .leading, spacing: 14) {
-                    if let searchResult = viewModel.selectedLibrarySearchResult {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 14) {
+                        if let searchResult = viewModel.selectedLibrarySearchResult {
                         VStack(alignment: .leading, spacing: 6) {
-                            Text(searchResult.displayName)
-                                .font(.title3.weight(.semibold))
+                            HStack(alignment: .firstTextBaseline) {
+                                Text(searchResult.displayName)
+                                    .font(.title3.weight(.semibold))
+                                    .fixedSize(horizontal: false, vertical: true)
+                                Spacer(minLength: 10)
+                                engineBadge(searchResult.engine)
+                                compatibilityBadge(searchResult.compatibility)
+                            }
                             Text(searchResult.repoId)
                                 .font(.system(.caption, design: .monospaced))
                                 .foregroundStyle(.secondary)
                                 .textSelection(.enabled)
                             Text(searchResult.compatibilityReason)
                                 .font(.callout)
+                                .fixedSize(horizontal: false, vertical: true)
+                            if searchResult.engine == .ds4 {
+                                Label(
+                                    "DS4 support is limited to exact GGUF layouts declared by the installed upstream runtime.",
+                                    systemImage: "checkmark.shield"
+                                )
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                            }
                             if viewModel.isLoadingLibraryDetails {
                                 HStack(spacing: 7) {
                                     ProgressView().controlSize(.small)
@@ -1216,43 +1351,68 @@ struct SettingsView: View {
                                         .font(.callout)
                                         .foregroundStyle(.secondary)
                                         .textSelection(.enabled)
+                                        .fixedSize(horizontal: false, vertical: true)
                                 }
-                                HStack(spacing: 8) {
+                                LazyVGrid(
+                                    columns: [
+                                        GridItem(
+                                            .adaptive(minimum: 145),
+                                            spacing: 8,
+                                            alignment: .leading
+                                        )
+                                    ],
+                                    alignment: .leading,
+                                    spacing: 7
+                                ) {
                                     if let context = details.contextLength {
                                         modelBadge(
                                             "\(context.formatted()) token context",
                                             color: .blue
                                         )
+                                        .frame(maxWidth: .infinity, alignment: .leading)
                                     }
                                     if let architecture = details.architecture {
                                         modelBadge(architecture, color: .purple)
+                                            .frame(maxWidth: .infinity, alignment: .leading)
                                     }
                                     if let parameters = details.parameterCount {
                                         modelBadge(
                                             parameterCount(parameters),
                                             color: .secondary
                                         )
+                                        .frame(maxWidth: .infinity, alignment: .leading)
                                     }
                                     if let license = details.license {
                                         modelBadge(license, color: .secondary)
+                                            .frame(maxWidth: .infinity, alignment: .leading)
                                     }
                                 }
                                 if let markdown = details.modelCardMarkdown {
-                                    DisclosureGroup("Model card") {
-                                        ScrollView {
-                                            Text(
-                                                ModelTextMarkup.attributedString(
-                                                    from: markdown
-                                                )
+                                    DisclosureGroup {
+                                        if let url = URL(
+                                            string: "https://huggingface.co/\(details.repoId)"
+                                        ) {
+                                            Link(
+                                                "Open full card on Hugging Face",
+                                                destination: url
                                             )
-                                                .frame(
-                                                    maxWidth: .infinity,
-                                                    alignment: .leading
-                                                )
-                                                .textSelection(.enabled)
-                                                .padding(.vertical, 8)
+                                            .font(.caption)
                                         }
-                                        .frame(maxHeight: 260)
+                                        ScrollView {
+                                            ModelCardView(markdown: markdown)
+                                                .padding(12)
+                                        }
+                                        .frame(height: 340)
+                                        .background(
+                                            Color(nsColor: .textBackgroundColor).opacity(0.7),
+                                            in: RoundedRectangle(cornerRadius: 8)
+                                        )
+                                        .overlay {
+                                            RoundedRectangle(cornerRadius: 8)
+                                                .stroke(.separator.opacity(0.45), lineWidth: 1)
+                                        }
+                                    } label: {
+                                        Label("Model card", systemImage: "doc.richtext")
                                     }
                                 }
                             }
@@ -1390,16 +1550,17 @@ struct SettingsView: View {
                         Text("Downloading never loads the model. The normal residency coordinator will load it only when an API request selects its new alias.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
-                    } else {
-                        ContentUnavailableView(
-                            "Choose a Model",
-                            systemImage: "shippingbox",
-                            description: Text("Search results are filtered for the selected inference engine.")
-                        )
+                        } else {
+                            ContentUnavailableView(
+                                "Choose a Model",
+                                systemImage: "shippingbox",
+                                description: Text("Search Hugging Face, then choose a result with the engine support you want.")
+                            )
+                        }
                     }
-                    Spacer()
+                    .padding(18)
+                    .frame(maxWidth: .infinity, alignment: .topLeading)
                 }
-                .padding(18)
                 .frame(minWidth: 350, maxWidth: .infinity, alignment: .topLeading)
             }
 
@@ -1680,6 +1841,13 @@ struct SettingsView: View {
                     }
                 }
                 if engine == .ds4 {
+                    optionalIntegerField(
+                        "Resident request sessions",
+                        value: $viewModel.settings.models[index].load.parallel
+                    )
+                    Text("Two or more sessions enable DS4 request concurrency and Flash decode batching, but allocate a complete KV state per session. Leave unset for the safest single-session memory use; GLM currently gains fairness rather than native batch speed.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                     TextField(
                         "KV cache folder (optional)",
                         text: optionalStringBinding(
@@ -2026,6 +2194,34 @@ struct SettingsView: View {
         )
     }
 
+    private var residencyPreset: Binding<ResidencyPreset> {
+        Binding(
+            get: {
+                switch viewModel.settings.server.idleUnloadSeconds {
+                case nil: .performance
+                case 900: .balanced
+                case 300: .memorySaver
+                default: .custom
+                }
+            },
+            set: { preset in
+                switch preset {
+                case .performance:
+                    viewModel.settings.server.idleUnloadSeconds = nil
+                    viewModel.settings.server.maxConcurrency = nil
+                case .balanced:
+                    viewModel.settings.server.idleUnloadSeconds = 900
+                    viewModel.settings.server.maxConcurrency = nil
+                case .memorySaver:
+                    viewModel.settings.server.idleUnloadSeconds = 300
+                    viewModel.settings.server.maxConcurrency = 1
+                case .custom:
+                    break
+                }
+            }
+        )
+    }
+
     private var idleUnloadSeconds: Binding<Int> {
         Binding(
             get: { viewModel.settings.server.idleUnloadSeconds ?? 900 },
@@ -2160,6 +2356,22 @@ struct SettingsView: View {
             .background(color.opacity(0.12), in: Capsule())
     }
 
+    private func engineBadge(_ engine: InferenceEngine) -> some View {
+        let color: Color = switch engine {
+        case .llamaCpp: .blue
+        case .omlx: .purple
+        case .ds4: .orange
+        case .mflux: .pink
+        }
+        return Label(engine.displayName, systemImage: "checkmark.circle.fill")
+            .font(.caption2.weight(.semibold))
+            .foregroundStyle(color)
+            .padding(.horizontal, 7)
+            .padding(.vertical, 3)
+            .background(color.opacity(0.12), in: Capsule())
+            .fixedSize()
+    }
+
     private func storageDisplayName(_ name: String) -> String {
         name.split(separator: "-").map { $0.capitalized }.joined(separator: " ")
     }
@@ -2271,6 +2483,87 @@ struct SettingsView: View {
         }
     }
 
+}
+
+private struct ModelCardView: View {
+    private let blocks: [ModelTextBlock]
+
+    init(markdown: String) {
+        blocks = ModelTextMarkup.blocks(from: markdown)
+    }
+
+    var body: some View {
+        LazyVStack(alignment: .leading, spacing: 10) {
+            ForEach(Array(blocks.enumerated()), id: \.offset) { _, block in
+                blockView(block)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .textSelection(.enabled)
+    }
+
+    @ViewBuilder
+    private func blockView(_ block: ModelTextBlock) -> some View {
+        switch block {
+        case let .heading(level, text):
+            Text(ModelTextMarkup.attributedString(from: text))
+                .font(headingFont(level))
+                .fontWeight(level <= 2 ? .bold : .semibold)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(.top, level <= 2 ? 5 : 2)
+        case let .paragraph(text):
+            Text(ModelTextMarkup.attributedString(from: text))
+                .lineSpacing(3)
+                .fixedSize(horizontal: false, vertical: true)
+        case let .unorderedItem(text):
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text("•")
+                    .fontWeight(.semibold)
+                Text(ModelTextMarkup.attributedString(from: text))
+                    .lineSpacing(2)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        case let .orderedItem(number, text):
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text("\(number).")
+                    .fontWeight(.semibold)
+                    .monospacedDigit()
+                Text(ModelTextMarkup.attributedString(from: text))
+                    .lineSpacing(2)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        case let .quote(text):
+            HStack(alignment: .top, spacing: 9) {
+                RoundedRectangle(cornerRadius: 2)
+                    .fill(Color.accentColor.opacity(0.55))
+                    .frame(width: 3)
+                Text(ModelTextMarkup.attributedString(from: text))
+                    .italic()
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        case let .code(text):
+            ScrollView(.horizontal) {
+                Text(text)
+                    .font(.system(.caption, design: .monospaced))
+                    .fixedSize(horizontal: true, vertical: true)
+                    .padding(10)
+            }
+            .background(.quaternary.opacity(0.55), in: RoundedRectangle(cornerRadius: 6))
+        case .rule:
+            Divider()
+                .padding(.vertical, 3)
+        }
+    }
+
+    private func headingFont(_ level: Int) -> Font {
+        switch level {
+        case 1: .title2
+        case 2: .title3
+        case 3: .headline
+        default: .subheadline
+        }
+    }
 }
 
 private struct ExistingModelImporterView: View {

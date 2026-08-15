@@ -8,7 +8,9 @@ server:
   inference_port: 1240
   control_bind: 127.0.0.1
   control_port: 17321
-  idle_unload_seconds: 900
+  # Keep the verified resident warm for responsive interactive use. Set a
+  # positive number (for example 900) on a memory-constrained shared Mac.
+  idle_unload_seconds: null
   startup_timeout_seconds: 900
   swap_queue_timeout_seconds: 300
   # null derives a conservative limit from each engine/profile. Set a positive

@@ -20,6 +20,7 @@ from mnemosyne_macos.config import MacConfig, load_config, save_config
 from mnemosyne_macos.coordinator import CoordinatorError, CoordinatorState
 from mnemosyne_macos.engines.base import Deadline, EngineAdapter
 from mnemosyne_macos.install_store import InstallRecord
+from mnemosyne_macos.model_library import LibraryModel
 from mnemosyne_macos.models import (
     Endpoint,
     EngineName,
@@ -247,6 +248,66 @@ def test_managed_install_roles_are_canonical_and_engine_scoped() -> None:
 
 
 @pytest.mark.asyncio
+async def test_model_library_search_unifies_all_engine_catalogs(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    seen: list[EngineName] = []
+    downloads = {
+        EngineName.LLAMA_CPP: 10,
+        EngineName.OMLX: 40,
+        EngineName.DS4: 30,
+        EngineName.MFLUX: 20,
+    }
+
+    def fake_search(query, *, engine, limit):
+        assert query == "qwen"
+        assert limit == 7
+        seen.append(engine)
+        return [
+            LibraryModel(
+                repo_id=f"owner/{engine.value}",
+                engine=engine.value,
+                display_name=engine.value,
+                model_kind="image" if engine == EngineName.MFLUX else "language",
+                compatibility="verified",
+                compatibility_reason="Supported by the selected engine.",
+                downloads=downloads[engine],
+            )
+        ]
+
+    monkeypatch.setattr("mnemosyne_macos.app.search_models", fake_search)
+    runtime = SimpleNamespace(config=_config(tmp_path))
+    client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=create_control_app(runtime)),
+        base_url="http://mnemosyne-control.test",
+    )
+    try:
+        unified = await client.get(
+            "/manager/model-library/search",
+            params={"q": "qwen", "limit": 7},
+        )
+        assert unified.status_code == 200
+        assert set(seen) == set(EngineName)
+        assert [item["engine"] for item in unified.json()["models"]] == [
+            "omlx",
+            "ds4",
+            "mflux",
+            "llama.cpp",
+        ]
+
+        seen.clear()
+        filtered = await client.get(
+            "/manager/model-library/search",
+            params={"q": "qwen", "limit": 7, "engine": "llama.cpp"},
+        )
+        assert filtered.status_code == 200
+        assert seen == [EngineName.LLAMA_CPP]
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_non_streaming_proxy_rewrites_model_strips_credentials_and_records_usage(
     tmp_path,
 ) -> None:
@@ -314,6 +375,12 @@ async def test_non_streaming_proxy_rewrites_model_strips_credentials_and_records
         assert rows[0]["alias"] == "frontier"
         assert rows[0]["backend"] == "omlx"
         assert rows[0]["total_tokens"] == 6
+        performance = runtime.performance.snapshot()
+        assert performance["sample_count"] == 1
+        assert performance["by_model"][0]["alias"] == "frontier"
+        assert performance["by_model"][0]["cold_starts"] == 1
+        assert performance["recent"][0]["status_code"] == 200
+        assert performance["recent"][0]["admission_ms"] is not None
     finally:
         await client.aclose()
         await runtime.stop()
@@ -744,6 +811,90 @@ async def test_runtime_update_control_routes_use_coordinator_barrier(tmp_path) -
         status = await runtime.coordinator.status()
         assert status.state.value == "idle"
         assert status.resident_alias is None
+    finally:
+        await client.aclose()
+        await runtime.stop()
+
+
+@pytest.mark.asyncio
+async def test_supervised_omlx_update_drains_and_validates_before_reopening(
+    tmp_path: Path,
+) -> None:
+    class FakeOMLXUpdateManager:
+        def __init__(self) -> None:
+            self.events: list[str] = []
+            self.current = "0.5.6"
+
+        async def installed_status(self) -> dict:
+            return {
+                "omlx": {
+                    "installed": True,
+                    "version": self.current,
+                    "revision": None,
+                    "path": "/opt/homebrew/bin/omlx",
+                }
+            }
+
+        async def upgrade_omlx_homebrew(
+            self, version: str | None
+        ) -> tuple[str, str]:
+            self.events.append(f"upgrade:{version}")
+            self.current = "0.5.7"
+            return self.current, "/opt/homebrew/bin/omlx"
+
+        async def check(self, *, refresh: bool = True) -> dict:
+            self.events.append(f"check:{refresh}")
+            return {
+                "channel": "official",
+                "manifest_url": None,
+                "checked_at": 1,
+                "core_protocol": 1,
+                "engines": [],
+            }
+
+        def record_lifecycle(self, **values) -> dict:
+            self.events.append(
+                f"lifecycle:{values['action']}:{values['outcome']}"
+            )
+            return dict(values)
+
+        async def aclose(self) -> None:
+            return None
+
+    updates = FakeOMLXUpdateManager()
+    adapters = _adapters()
+    runtime = NativeRuntime(
+        _config(tmp_path),
+        adapters=adapters,
+        update_manager=updates,  # type: ignore[arg-type]
+    )
+    await runtime.start(raise_on_degraded=True)
+    client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=create_control_app(runtime)),
+        base_url="http://mnemosyne.test",
+    )
+    try:
+        response = await client.post(
+            "/manager/runtime-updates/omlx/install",
+            json={"version": "0.5.7"},
+        )
+        assert response.status_code == 200
+        assert response.json()["activated"] == {
+            "engine": "omlx",
+            "version": "0.5.7",
+            "source_revision": None,
+            "path": "/opt/homebrew/bin/omlx",
+            "external_owner": "homebrew",
+        }
+        assert updates.events == [
+            "lifecycle:external_update_requested:started",
+            "upgrade:0.5.7",
+            "lifecycle:external_updated:succeeded",
+            "check:False",
+        ]
+        status = await runtime.coordinator.status()
+        assert status.state == CoordinatorState.IDLE
+        assert status.accepting is True
     finally:
         await client.aclose()
         await runtime.stop()

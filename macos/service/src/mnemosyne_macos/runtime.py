@@ -7,6 +7,7 @@ from dataclasses import asdict
 import hashlib
 import ipaddress
 import json
+import logging
 import os
 from pathlib import Path
 import re
@@ -37,7 +38,6 @@ from .filesystem import FilesystemProbe, FilesystemProbeError
 from .fleet_protocol import (
     FLEET_SCHEMA_VERSION,
     deployment_identity,
-    derive_macos_capacity,
     effective_capacity,
     gguf_quantization,
     immutable_revision,
@@ -50,6 +50,7 @@ from .models import (
     ResolvedTarget,
     ServiceState,
 )
+from .performance import PerformanceTracker
 from .install_store import InstallRecord
 from .installer import NativeInstaller
 from .local_models import (
@@ -62,6 +63,26 @@ from .usage_delivery import UsageService
 from .runtime_updates import RuntimeUpdateManager
 from .scope_process import SecurityScopeProcess
 from .security_scopes import SecurityScopeRegistry
+
+
+logger = logging.getLogger("mnemosyne-macos.runtime")
+
+DEFAULT_INTERACTIVE_CONTEXT_LENGTH = 32_768
+MAX_INTERACTIVE_CONTEXT_LENGTH = 65_536
+
+
+def recommended_interactive_context_length(detected: int | None) -> int:
+    """Choose a responsive default without discarding model capability metadata.
+
+    Model cards increasingly advertise 128K-to-1M token maxima. Passing those
+    maxima straight to llama-server eagerly allocates a correspondingly large
+    KV cache. New profiles therefore start at a bounded interactive size; an
+    operator can still opt into the full advertised context in Settings.
+    """
+
+    if detected is None:
+        return DEFAULT_INTERACTIVE_CONTEXT_LENGTH
+    return max(1, min(detected, MAX_INTERACTIVE_CONTEXT_LENGTH))
 
 
 class RuntimeConfigurationError(RuntimeError):
@@ -477,6 +498,7 @@ class NativeRuntime:
             config.paths.state_database,
             config.token_sidecar,
         )
+        self.performance = PerformanceTracker()
         self.installer = NativeInstaller(
             config.paths.state_database,
             on_installed=self._register_installed_model,
@@ -821,21 +843,27 @@ class NativeRuntime:
                 if idle_seconds is not None:
                     await self.coordinator.evict_if_idle(float(idle_seconds))
             except Exception:
-                # Status exposes coordinator diagnostics. A future logging
-                # integration records the traceback without killing upkeep.
+                logger.exception("native maintenance iteration failed")
                 continue
 
     async def _reconcile_maintenance(self) -> None:
         """Audit residency and retry a failed oMLX directory registration."""
 
-        if self._omlx_directory_sync_pending:
+        status = await self.coordinator.status()
+        if not status.initialized or self.startup_error is not None:
+            # Startup can race an externally launched oMLX service. Reconcile
+            # is the recovery path that both proves every adapter and restores
+            # admission; a read-only audit cannot initialize a failed start.
+            await self.coordinator.reconcile()
+        elif self._omlx_directory_sync_pending:
             # A failed maintenance barrier deliberately leaves the coordinator
             # degraded. Reconcile first so every adapter again proves its
             # observed state before retrying the residency-neutral rescan.
             await self.coordinator.reconcile()
-            await self._sync_omlx_model_directories()
         else:
             await self.coordinator.audit()
+        if self._omlx_directory_sync_pending:
+            await self._sync_omlx_model_directories()
         self.startup_error = None
 
     def resolve(self, alias: str) -> ResolvedTarget:
@@ -1150,9 +1178,12 @@ class NativeRuntime:
                     )
                     if (
                         compatible_load.get("context_length") is None
-                        and candidate.context_length is not None
                     ):
-                        compatible_load["context_length"] = candidate.context_length
+                        compatible_load["context_length"] = (
+                            recommended_interactive_context_length(
+                                candidate.context_length
+                            )
+                        )
                     load = ModelLoadConfig.model_validate(compatible_load)
                     preserved_capabilities = (
                         prior.capabilities
@@ -1333,6 +1364,7 @@ class NativeRuntime:
         usage_status = await self.usage.status()
         usage_status["last_error"] = redact(usage_status.get("last_error"))
         payload["token_sidecar"] = usage_status
+        payload["performance"] = self.performance.snapshot()
         return payload
 
     async def fleet_snapshot(self) -> dict:
@@ -1404,9 +1436,8 @@ class NativeRuntime:
                     and coordinator.capacity is not None
                     and coordinator.capacity.available > 0
                 )
-                capacity = derive_macos_capacity(
+                capacity = self.coordinator.capacity_for(
                     target,
-                    configured_max_concurrency=configured_max,
                     active=coordinator.inflight if warm else 0,
                     queued=queued,
                     # Deployment capacity is a cold scheduling estimate. It
@@ -1915,6 +1946,13 @@ class NativeRuntime:
         await self.usage.record(event)
 
     async def _runtime_active_version(self, engine: str) -> str | None:
+        if engine.casefold() == "omlx":
+            try:
+                status = await self.runtime_updates.installed_status()
+            except Exception:
+                return None
+            value = status.get("omlx", {}).get("version")
+            return value if isinstance(value, str) else None
         active_version = getattr(self.runtime_updates, "active_version", None)
         if not callable(active_version):
             return None
@@ -1939,6 +1977,42 @@ class NativeRuntime:
 
     async def check_runtime_updates(self, *, refresh: bool = True) -> dict:
         return await self.runtime_updates.check(refresh=refresh)
+
+    async def omlx_cache_health(self) -> dict:
+        adapter = self.adapters.get(EngineName.OMLX)
+        if not isinstance(adapter, OMLXAdapter):
+            raise RuntimeConfigurationError("oMLX is not enabled")
+        deadline = Deadline.after(self.config.server.transition_timeout_seconds)
+        return await adapter.cache_health(deadline=deadline)
+
+    async def reset_omlx_cache(self) -> dict:
+        """Reset only oMLX's SSD KV cache after globally draining inference."""
+
+        adapter = self.adapters.get(EngineName.OMLX)
+        if not isinstance(adapter, OMLXAdapter):
+            raise RuntimeConfigurationError("oMLX is not enabled")
+        deleted = 0
+
+        async def reset(deadline: Deadline) -> None:
+            nonlocal deleted
+            deleted = await adapter.clear_ssd_cache(deadline=deadline)
+
+        await self.coordinator.run_empty_maintenance(
+            reset,
+            name="oMLX SSD cache reset",
+        )
+        try:
+            cache = await self.omlx_cache_health()
+        except Exception:
+            logger.exception(
+                "oMLX cache reset succeeded but refreshed cache metrics were unavailable"
+            )
+            cache = None
+        return {
+            "status": "ok",
+            "deleted_files": deleted,
+            "cache": cache,
+        }
 
     async def runtime_update_evidence(self) -> dict:
         evidence_reader = getattr(
@@ -1975,6 +2049,9 @@ class NativeRuntime:
         self, engine: str, *, version: str | None = None
     ) -> dict:
         """Stage without touching residency, then activate behind the barrier."""
+
+        if engine.casefold() == "omlx":
+            return await self._upgrade_external_omlx(version=version)
 
         async with self._runtime_update_lock:
             active_before = await self._runtime_active_version(engine)
@@ -2065,6 +2142,89 @@ class NativeRuntime:
             result["lifecycle_evidence_recorded"] = all(evidence_recorded)
             return result
 
+    async def _upgrade_external_omlx(self, *, version: str | None) -> dict:
+        """Supervise a stable Homebrew update behind the global empty barrier."""
+
+        async with self._runtime_update_lock:
+            adapter = self.adapters.get(EngineName.OMLX)
+            if adapter is None:
+                raise RuntimeUpdateError(
+                    "enable oMLX before updating so its control plane can be drained and validated"
+                )
+            active_before = await self._runtime_active_version("omlx")
+            evidence_recorded = [
+                await self._record_runtime_lifecycle(
+                    engine="omlx",
+                    action="external_update_requested",
+                    outcome="started",
+                    requested_version=version,
+                    active_version_before=active_before,
+                    active_version_after=active_before,
+                )
+            ]
+            upgrader = getattr(self.runtime_updates, "upgrade_omlx_homebrew", None)
+            if not callable(upgrader):
+                raise RuntimeUpdateError(
+                    "this service build cannot supervise oMLX Homebrew updates"
+                )
+            updated_version: str | None = None
+            updated_path: str | None = None
+
+            async def upgrade(deadline: Deadline) -> None:
+                nonlocal updated_version, updated_path
+                updated_version, updated_path = await upgrader(version)
+                snapshot = await adapter.validate_control(deadline=deadline)
+                if (
+                    not snapshot.authoritative
+                    or snapshot.service_state != ServiceState.READY
+                    or snapshot.residents
+                ):
+                    raise RuntimeUpdateError(
+                        "updated oMLX did not return with an authoritative empty control plane: "
+                        f"{snapshot.diagnostic or snapshot.service_state}"
+                    )
+
+            try:
+                await self.coordinator.run_empty_maintenance(
+                    upgrade,
+                    name="oMLX supervised Homebrew update",
+                )
+            except Exception as exc:
+                evidence_recorded.append(
+                    await self._record_runtime_lifecycle(
+                        engine="omlx",
+                        action="external_update_rejected",
+                        outcome="failed",
+                        requested_version=version,
+                        active_version_before=active_before,
+                        active_version_after=await self._runtime_active_version("omlx"),
+                        error=exc,
+                    )
+                )
+                raise
+
+            evidence_recorded.append(
+                await self._record_runtime_lifecycle(
+                    engine="omlx",
+                    action="external_updated",
+                    outcome="succeeded",
+                    requested_version=version,
+                    prepared_version=updated_version,
+                    active_version_before=active_before,
+                    active_version_after=updated_version,
+                )
+            )
+            result = await self.runtime_updates.check(refresh=False)
+            result["activated"] = {
+                "engine": "omlx",
+                "version": updated_version,
+                "source_revision": None,
+                "path": updated_path,
+                "external_owner": "homebrew",
+            }
+            result["lifecycle_evidence_recorded"] = all(evidence_recorded)
+            return result
+
     async def rollback_runtime_update(self, engine: str) -> dict:
         async with self._runtime_update_lock:
             active_before = await self._runtime_active_version(engine)
@@ -2146,8 +2306,9 @@ class NativeRuntime:
                 )
             model = str(Path(install.destination) / install.filename)
             load = {}
-            if install.context_length is not None:
-                load["context_length"] = install.context_length
+            load["context_length"] = recommended_interactive_context_length(
+                install.context_length
+            )
             if install.projector_filename:
                 load["projector_path"] = str(
                     Path(install.destination) / install.projector_filename
@@ -2157,7 +2318,9 @@ class NativeRuntime:
                 engine=engine,
                 model=model,
                 storage=install.storage,
-                served_model_name=install.alias,
+                served_model_name=(
+                    install.family if engine == EngineName.DS4 else install.alias
+                ),
                 capabilities=requested_capabilities,
                 load=load,
             )

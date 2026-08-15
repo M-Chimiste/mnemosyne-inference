@@ -197,6 +197,14 @@ The live `docker-compose.yml` is intentionally machine-specific and may live out
   node's credential.
 - A per-user LaunchAgent owns Mnemosyne Core. The controller uses an explicit AppKit `NSStatusItem` with a SwiftUI popover; quitting it must not terminate inference. `SMAppService.agent` registers the embedded plist and the bootstrap must `execve` the bundled Python without daemonizing.
 - `ResidencyCoordinator` owns the cross-engine invariant. A request holds an epoch-tagged model lease through its complete stream. FIFO queuing stops old-target admission once a switch is pending, drains active leases, proves all enabled adapters empty, loads one target, and proves exactly one ready manager-owned resident. Engine-derived capacity is capped by optional `server.max_concurrency`; `server.max_queue_depth` and `server.queue_timeout_seconds` bound admission.
+- oMLX capacity comes from its authoritative admin
+  `scheduler.max_concurrent_requests`; a missing or incompatible scheduler
+  contract falls back to one request. llama.cpp capacity comes from the exact
+  managed `parallel` setting. Fresh configs keep the verified resident warm,
+  while the Settings presets may opt into bounded idle unloading and a lower
+  global ceiling. Performance telemetry must remain bounded, in-memory, and
+  metadata-only: never retain prompts, responses, credentials, or arbitrary
+  upstream diagnostics.
 - oMLX is an external loopback service controlled through its native lifecycle APIs. llama.cpp and DS4 are model-specific process groups started by Mnemosyne. Never kill an unknown PID or listener; persisted managed-process identity must match executable, argv, start identity, and process group before recovery or signaling.
 - Persisted llama.cpp survivor metadata must also retain the exact storage
   root, scope ID, and volume UUID so restart recovery can reconstruct and
@@ -251,7 +259,12 @@ The live `docker-compose.yml` is intentionally machine-specific and may live out
   cancellation, and service shutdown must terminate the complete helper
   process group and fail closed with an actionable permission/volume diagnostic
   while both HTTP planes remain responsive.
-- Native Hugging Face installs are engine-aware and durable. llama.cpp search
+- Native Hugging Face installs are engine-aware and durable. The Model Library
+  presents one cross-engine result list; each candidate retains and displays
+  its authoritative engine compatibility, and selecting it drives the exact
+  engine-specific validation/install flow. Model-card rendering must remove
+  Hub YAML front matter, preserve safe Markdown structure, and remain readable
+  and scrollable without compressing the rest of the install controls. llama.cpp search
   requires explicit GGUF quant/shard selection, automatically selects the
   highest-fidelity same-directory vision projector when present, and retains
   explicit text-only opt-out/manual projector selection. Discovery shows a
@@ -259,8 +272,12 @@ The live `docker-compose.yml` is intentionally machine-specific and may live out
   count, and license when Hub/config/GGUF metadata provides them. Detected GGUF
   context length and selected projector persist into the created profile.
   Exact revisions and file sets remain pinned. DS4 and MFLUX use verified
-  curated candidates; oMLX search exposes
-  metadata-derived compatibility honestly and downloaded snapshots must be
+  curated candidates; DS4 discovery must mirror the exact single-node main
+  model targets in the official `antirez/ds4` downloader, verify every Hub
+  file at the resolved revision, retain complete shard groups as one install,
+  and exclude auxiliary DSpark weights and distributed-only Pro halves. oMLX
+  search exposes metadata-derived compatibility honestly and downloaded
+  snapshots must be
   classified before profile registration so they advertise only detected
   generation, embeddings, or rerank routes. Downloads run out of process,
   never load a model, and oMLX directory changes run only through the
@@ -273,6 +290,11 @@ The live `docker-compose.yml` is intentionally machine-specific and may live out
   run it in a bounded helper behind the global empty-residency barrier, refuse
   roots/escapes/symlinks, and never delete Finder imports or hand-authored
   model paths.
+- DS4's typed `load.parallel` maps to upstream `--batched-session` and owns
+  coordinator/Fleet admission capacity; for llama.cpp the same typed setting
+  maps to its parallel slots. Never permit `extra_args` to override either
+  manager-owned slot count. The unset DS4 default is one authoritative session
+  because every additional slot allocates another full KV state.
 - Runtime update checks are read-only. For oMLX, select the official DMG that
   matches the host macOS major version and detect its app, CLI shim,
   conventional Homebrew locations, or running server. oMLX remains externally
@@ -280,7 +302,15 @@ The live `docker-compose.yml` is intentionally machine-specific and may live out
   an initial missing-runtime installation to an existing Homebrew only after
   explicit user confirmation displays fixed official tap and stable install
   commands. Do not accept arbitrary formulas/arguments, use `--HEAD`, update,
-  or reinstall through that action. llama.cpp must come from the official
+  or reinstall through that initial-install action. A separately confirmed
+  update action may operate only on a detected stable Homebrew-owned oMLX,
+  behind the global empty-residency barrier, using the fixed `omlx stop`,
+  `brew update`, `brew upgrade omlx`, and `omlx start` sequence. It must reject
+  Homebrew HEAD, official-app, and unknown external ownership and validate an
+  authoritative empty control plane before admission reopens. Cache metrics
+  must come from oMLX's official admin API; an explicit cache reset must drain
+  globally and call the official cache-clear API, never infer or delete an
+  arbitrary filesystem path. llama.cpp must come from the official
   `ggml-org/llama.cpp` macOS arm64 release asset and pass published size,
   SHA-256, safe-extraction, executable, and CLI-contract checks. MFLUX must
   come from its official PyPI project and DS4 from an exact commit in

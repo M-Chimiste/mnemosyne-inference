@@ -48,11 +48,13 @@ final class SettingsViewModel: ObservableObject {
     @Published var confirmDiscard = false
     @Published var confirmRemoveModel = false
     @Published var confirmHomebrewOMLXInstall = false
+    @Published var confirmHomebrewOMLXUpgrade = false
+    @Published var confirmOMLXCacheReset = false
+    @Published var pendingOMLXUpgrade: EngineRuntimeUpdate?
     @Published var showLocalModelImporter = false
     @Published var selectedLocalModelIDs: Set<String> = []
     @Published var localModelAliases: [String: String] = [:]
     @Published var localModelProjectors: [String: String] = [:]
-    @Published var libraryEngine: InferenceEngine = .omlx
     @Published var libraryQuery = ""
     @Published var selectedLibraryModelID: String?
     @Published var selectedLibraryFileID: String?
@@ -65,6 +67,7 @@ final class SettingsViewModel: ObservableObject {
     @Published private(set) var libraryDetails: LibraryModelDetails?
     @Published private(set) var modelInstalls: [ModelInstall] = []
     @Published private(set) var runtimeUpdateSnapshot: RuntimeUpdateSnapshot?
+    @Published private(set) var omlxCacheHealth: OMLXCacheHealth?
     @Published private(set) var readinessSnapshot: ReadinessSnapshot?
     @Published private(set) var lastSelfTest: ModelSelfTestResult?
     @Published private(set) var isRefreshingReadiness = false
@@ -75,6 +78,7 @@ final class SettingsViewModel: ObservableObject {
     @Published private(set) var isCheckingRuntimeUpdates = false
     @Published private(set) var updatingRuntimeEngine: InferenceEngine?
     @Published private(set) var isInstallingOMLXWithHomebrew = false
+    @Published private(set) var isResettingOMLXCache = false
     @Published private(set) var isSearchingLibrary = false
     @Published private(set) var isLoadingLibraryFiles = false
     @Published private(set) var isLoadingLibraryDetails = false
@@ -495,7 +499,7 @@ final class SettingsViewModel: ObservableObject {
         isSearchingLibrary = true
         defer { isSearchingLibrary = false }
         do {
-            async let found = client.searchLibrary(query: libraryQuery, engine: libraryEngine)
+            async let found = client.searchLibrary(query: libraryQuery)
             async let installs = client.modelInstalls()
             libraryModels = try await found
             modelInstalls = try await installs
@@ -511,18 +515,6 @@ final class SettingsViewModel: ObservableObject {
         } catch {
             setStatus("Could not browse models: \(error.localizedDescription)", tone: .error)
         }
-    }
-
-    func selectLibraryEngine(_ engine: InferenceEngine) {
-        libraryEngine = engine
-        libraryModels = []
-        libraryFileOptions = []
-        libraryDetails = nil
-        selectedLibraryModelID = nil
-        selectedLibraryFileID = nil
-        selectedLibraryProjector = ""
-        selectedLibraryRole = defaultLibraryRole(for: engine)
-        Task { await refreshModelLibrary() }
     }
 
     func selectLibraryModel(id: String?) {
@@ -657,7 +649,8 @@ final class SettingsViewModel: ObservableObject {
         guard
             !isCheckingRuntimeUpdates,
             updatingRuntimeEngine == nil,
-            !isInstallingOMLXWithHomebrew
+            !isInstallingOMLXWithHomebrew,
+            !isResettingOMLXCache
         else { return }
         isCheckingRuntimeUpdates = true
         defer { isCheckingRuntimeUpdates = false }
@@ -665,6 +658,11 @@ final class SettingsViewModel: ObservableObject {
             runtimeUpdateSnapshot = force
                 ? try await client.checkRuntimeUpdates()
                 : try await client.runtimeUpdates(refresh: false)
+            if settings.engines.omlx.enabled {
+                omlxCacheHealth = try? await client.omlxCacheHealth()
+            } else {
+                omlxCacheHealth = nil
+            }
             if force {
                 setStatus("Runtime update check completed.", tone: .success)
             }
@@ -673,10 +671,37 @@ final class SettingsViewModel: ObservableObject {
         }
     }
 
+    func resetOMLXCache() async {
+        guard
+            !isResettingOMLXCache,
+            updatingRuntimeEngine == nil,
+            !isInstallingOMLXWithHomebrew
+        else { return }
+        isResettingOMLXCache = true
+        setStatus("Draining inference and resetting the oMLX SSD cache…", tone: .normal)
+        defer { isResettingOMLXCache = false }
+        do {
+            let result = try await client.resetOMLXCache()
+            if let cache = result.cache {
+                omlxCacheHealth = cache
+            }
+            setStatus(
+                "Reset the oMLX SSD cache (\(result.deletedFiles) files). Model weights were not changed.",
+                tone: .success
+            )
+        } catch {
+            setStatus(
+                "Could not reset the oMLX cache: \(error.localizedDescription)",
+                tone: .error
+            )
+        }
+    }
+
     func installOMLXWithHomebrew() async {
         guard
             !isInstallingOMLXWithHomebrew,
-            updatingRuntimeEngine == nil
+            updatingRuntimeEngine == nil,
+            !isResettingOMLXCache
         else { return }
         guard let executable = HomebrewOMLXInstaller.executableURL() else {
             setStatus(
@@ -735,23 +760,29 @@ final class SettingsViewModel: ObservableObject {
     }
 
     func installRuntimeUpdate(_ update: EngineRuntimeUpdate) async {
-        guard update.canInstall, updatingRuntimeEngine == nil else { return }
+        guard
+            update.canInstall,
+            updatingRuntimeEngine == nil,
+            !isResettingOMLXCache
+        else { return }
         updatingRuntimeEngine = update.engine
         setStatus(
-            "Preparing the official \(update.displayName) runtime…",
+            update.engine == .omlx
+                ? "Draining inference before the Homebrew-owned oMLX update…"
+                : "Preparing the official \(update.displayName) runtime…",
             tone: .normal
         )
         defer { updatingRuntimeEngine = nil }
         do {
             runtimeUpdateSnapshot = try await client.installRuntimeUpdate(
                 engine: update.engine,
-                version: update.availableVersion
+                version: update.availableVersion ?? update.latestUpstreamVersion
             )
-            if update.engine == libraryEngine {
-                await refreshModelLibrary()
-            }
+            await refreshModelLibrary()
             setStatus(
-                "\(update.displayName) was updated. The previous runtime remains available for rollback.",
+                update.engine == .omlx
+                    ? "oMLX was drained, updated by Homebrew, restarted, and validated."
+                    : "\(update.displayName) was updated. The previous runtime remains available for rollback.",
                 tone: .success
             )
         } catch {
@@ -763,7 +794,11 @@ final class SettingsViewModel: ObservableObject {
     }
 
     func rollbackRuntimeUpdate(_ update: EngineRuntimeUpdate) async {
-        guard update.canRollback, updatingRuntimeEngine == nil else { return }
+        guard
+            update.canRollback,
+            updatingRuntimeEngine == nil,
+            !isResettingOMLXCache
+        else { return }
         updatingRuntimeEngine = update.engine
         setStatus("Rolling back \(update.displayName)…", tone: .normal)
         defer { updatingRuntimeEngine = nil }
@@ -771,9 +806,7 @@ final class SettingsViewModel: ObservableObject {
             runtimeUpdateSnapshot = try await client.rollbackRuntimeUpdate(
                 engine: update.engine
             )
-            if update.engine == libraryEngine {
-                await refreshModelLibrary()
-            }
+            await refreshModelLibrary()
             setStatus(
                 "\(update.displayName) was rolled back to the previous managed runtime.",
                 tone: .success
@@ -1088,15 +1121,6 @@ final class SettingsViewModel: ObservableObject {
             selectedLibraryRole = suggested
         } else if !roles.contains(selectedLibraryRole) {
             selectedLibraryRole = roles[0]
-        }
-    }
-
-    private func defaultLibraryRole(for engine: InferenceEngine) -> ModelRole {
-        switch engine {
-        case .mflux:
-            .image
-        case .llamaCpp, .omlx, .ds4:
-            .generation
         }
     }
 

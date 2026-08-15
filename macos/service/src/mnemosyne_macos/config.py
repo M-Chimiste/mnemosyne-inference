@@ -58,6 +58,17 @@ def suggested_model_alias(
     return alias if alias and _ALIAS_RE.fullmatch(alias) else fallback
 
 
+def ds4_wire_model_name(model: str) -> str:
+    """Return the canonical model id accepted by the upstream DS4 server."""
+
+    basename = Path(model).name.casefold()
+    if "glm-5.2" in basename:
+        return "glm-5.2"
+    if "deepseek-v4-pro" in basename:
+        return "deepseek-v4-pro"
+    return "deepseek-v4-flash"
+
+
 class ServerConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -65,7 +76,10 @@ class ServerConfig(BaseModel):
     inference_port: int = Field(default=1240, ge=1024, le=65535)
     control_bind: str = "127.0.0.1"
     control_port: int = Field(default=17321, ge=1024, le=65535)
-    idle_unload_seconds: int | None = Field(default=900, ge=1)
+    # Interactive Macs benefit far more from retaining one verified resident
+    # than from repeatedly reloading weights and rebuilding/scanning KV caches.
+    # Memory-conscious installations can opt into a positive idle timeout.
+    idle_unload_seconds: int | None = Field(default=None, ge=1)
     startup_timeout_seconds: float = Field(default=900, gt=0)
     swap_queue_timeout_seconds: float = Field(default=300, gt=0)
     max_concurrency: int | None = Field(default=None, ge=1)
@@ -351,7 +365,6 @@ class ModelProfile(BaseModel):
                 self.load.gpu_layers,
                 self.load.ubatch_size,
                 self.load.threads,
-                self.load.parallel,
                 self.load.pooling,
             )
         ):
@@ -408,10 +421,15 @@ class ModelProfile(BaseModel):
         )
         payload = json.dumps(load_options, sort_keys=True, separators=(",", ":"))
         digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
-        wire_model = self.served_model_name or (
-            self.alias
-            if self.engine in {EngineName.DS4, EngineName.LLAMA_CPP, EngineName.MFLUX}
-            else self.model
+        wire_model = (
+            ds4_wire_model_name(self.model)
+            if self.engine == EngineName.DS4
+            else self.served_model_name
+            or (
+                self.alias
+                if self.engine in {EngineName.LLAMA_CPP, EngineName.MFLUX}
+                else self.model
+            )
         )
         capabilities = (
             frozenset(self.capabilities)

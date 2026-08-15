@@ -75,39 +75,102 @@ class LibraryModelDetails:
 
 
 _DS4_REPO = "antirez/deepseek-v4-gguf"
+_DS4_GLM_UNSLOTH_REPO = "unsloth/GLM-5.2-GGUF"
+_DS4_GLM_ANTIREZ_REPO = "antirez/GLM-5.2-GGUF"
+_DS4_GLM_UNSLOTH_Q4_FILES = tuple(
+    f"UD-Q4_K_XL/GLM-5.2-UD-Q4_K_XL-{part:05d}-of-00011.gguf"
+    for part in range(1, 12)
+)
 _DS4_VARIANTS: tuple[LibraryModel, ...] = (
     LibraryModel(
         repo_id=_DS4_REPO,
         engine=EngineName.DS4.value,
-        display_name="DeepSeek V4 Flash — Q2 imatrix",
+        display_name="DeepSeek V4 Flash 0731 — Q2 imatrix",
         model_kind="language",
         compatibility="verified",
-        compatibility_reason="Exact DS4 project weight; recommended for 96/128 GB Macs.",
+        compatibility_reason=(
+            "Exact current DS4 Flash target; recommended for 96/128 GB Macs."
+        ),
         quantization="IQ2_XXS / Q2_K",
-        filename="DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf",
+        filename=(
+            "DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-"
+            "chat-v2-imatrix-0731.gguf"
+        ),
+        download_files=(
+            "DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-"
+            "chat-v2-imatrix-0731.gguf",
+        ),
         recommended_memory_gb=96,
+        suggested_role="generation",
+        family="deepseek-v4-flash",
     ),
     LibraryModel(
         repo_id=_DS4_REPO,
         engine=EngineName.DS4.value,
-        display_name="DeepSeek V4 Flash — mixed Q2/Q4 imatrix",
+        display_name="DeepSeek V4 Flash 0731 — mixed Q2/Q4 imatrix",
         model_kind="language",
         compatibility="verified",
-        compatibility_reason="Exact DS4 project weight with the final six expert layers at Q4.",
+        compatibility_reason=(
+            "Exact current DS4 Flash target with the final six expert layers at Q4."
+        ),
         quantization="mixed Q2/Q4",
-        filename="DeepSeek-V4-Flash-Layers37-42Q4KExperts-OtherExpertLayersIQ2XXSGateUp-Q2KDown-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-fixed.gguf",
-        recommended_memory_gb=96,
+        filename=(
+            "DeepSeek-V4-Flash-Layers37-42Q4KExperts-"
+            "OtherExpertLayersIQ2XXSGateUp-Q2KDown-AProjQ8-SExpQ8-OutQ8-"
+            "chat-v2-imatrix-fixed-0731.gguf"
+        ),
+        download_files=(
+            "DeepSeek-V4-Flash-Layers37-42Q4KExperts-"
+            "OtherExpertLayersIQ2XXSGateUp-Q2KDown-AProjQ8-SExpQ8-OutQ8-"
+            "chat-v2-imatrix-fixed-0731.gguf",
+        ),
+        recommended_memory_gb=128,
+        suggested_role="generation",
+        family="deepseek-v4-flash",
     ),
     LibraryModel(
         repo_id=_DS4_REPO,
         engine=EngineName.DS4.value,
-        display_name="DeepSeek V4 Flash — Q4 imatrix",
+        display_name="DeepSeek V4 Flash 0731 — Q4 imatrix",
         model_kind="language",
         compatibility="verified",
-        compatibility_reason="Exact DS4 project weight; intended for Macs with at least 256 GB memory.",
+        compatibility_reason=(
+            "Exact current DS4 Flash target; intended for Macs with at least 256 GB memory."
+        ),
         quantization="Q4_K",
-        filename="DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix.gguf",
+        filename=(
+            "DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-"
+            "Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix-0731.gguf"
+        ),
+        download_files=(
+            "DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-"
+            "Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix-0731.gguf",
+        ),
         recommended_memory_gb=256,
+        suggested_role="generation",
+        family="deepseek-v4-flash",
+    ),
+    LibraryModel(
+        repo_id=_DS4_REPO,
+        engine=EngineName.DS4.value,
+        display_name="DeepSeek V4 Flash 0731 — native MXFP4",
+        model_kind="language",
+        compatibility="verified",
+        compatibility_reason=(
+            "Exact current DS4 Flash MXFP4 target for Metal and CUDA."
+        ),
+        quantization="MXFP4",
+        filename=(
+            "DeepSeek-V4-Flash-MXFP4Experts-F16HC-F16Compressor-F16Indexer-"
+            "Q8Attn-Q8Shared-Q8Out-chat-v2-mxfp4-0731.gguf"
+        ),
+        download_files=(
+            "DeepSeek-V4-Flash-MXFP4Experts-F16HC-F16Compressor-F16Indexer-"
+            "Q8Attn-Q8Shared-Q8Out-chat-v2-mxfp4-0731.gguf",
+        ),
+        recommended_memory_gb=256,
+        suggested_role="generation",
+        family="deepseek-v4-flash",
     ),
     LibraryModel(
         repo_id=_DS4_REPO,
@@ -118,7 +181,75 @@ _DS4_VARIANTS: tuple[LibraryModel, ...] = (
         compatibility_reason="Exact DS4 project weight; intended for 512 GB Macs.",
         quantization="IQ2_XXS / Q2_K",
         filename="DeepSeek-V4-Pro-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-Instruct-imatrix.gguf",
+        download_files=(
+            "DeepSeek-V4-Pro-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-"
+            "Instruct-imatrix.gguf",
+        ),
         recommended_memory_gb=512,
+        suggested_role="generation",
+        family="deepseek-v4-pro",
+    ),
+    LibraryModel(
+        repo_id=_DS4_GLM_UNSLOTH_REPO,
+        engine=EngineName.DS4.value,
+        display_name="GLM 5.2 — Unsloth UD-Q4_K_XL (11 shards)",
+        model_kind="language",
+        compatibility="verified",
+        compatibility_reason=(
+            "Exact 11-shard GLM 5.2 layout tested by current DS4."
+        ),
+        quantization="UD-Q4_K_XL",
+        filename=_DS4_GLM_UNSLOTH_Q4_FILES[0],
+        download_files=_DS4_GLM_UNSLOTH_Q4_FILES,
+        recommended_memory_gb=512,
+        suggested_role="generation",
+        family="glm-5.2",
+    ),
+    LibraryModel(
+        repo_id=_DS4_GLM_ANTIREZ_REPO,
+        engine=EngineName.DS4.value,
+        display_name="GLM 5.2 — routed IQ2_XXS",
+        model_kind="language",
+        compatibility="verified",
+        compatibility_reason=(
+            "Exact reduced-memory GLM 5.2 layout tested by current DS4."
+        ),
+        quantization="IQ2_XXS / Q2_K",
+        filename="GLM-5.2-UD-IQ2_XXS_RoutedIQ2XXS_blk78Q2K.gguf",
+        download_files=(
+            "GLM-5.2-UD-IQ2_XXS_RoutedIQ2XXS_blk78Q2K.gguf",
+        ),
+        recommended_memory_gb=256,
+        suggested_role="generation",
+        family="glm-5.2",
+    ),
+    LibraryModel(
+        repo_id=_DS4_GLM_ANTIREZ_REPO,
+        engine=EngineName.DS4.value,
+        display_name="GLM 5.2 — routed Q2_K",
+        model_kind="language",
+        compatibility="verified",
+        compatibility_reason="Exact routed Q2_K GLM 5.2 layout tested by current DS4.",
+        quantization="Q2_K",
+        filename="GLM-5.2-UD-Q2_K_RoutedQ2K.gguf",
+        download_files=("GLM-5.2-UD-Q2_K_RoutedQ2K.gguf",),
+        recommended_memory_gb=512,
+        suggested_role="generation",
+        family="glm-5.2",
+    ),
+    LibraryModel(
+        repo_id=_DS4_GLM_ANTIREZ_REPO,
+        engine=EngineName.DS4.value,
+        display_name="GLM 5.2 — routed Q4_K",
+        model_kind="language",
+        compatibility="verified",
+        compatibility_reason="Exact routed Q4_K GLM 5.2 layout tested by current DS4.",
+        quantization="Q4_K",
+        filename="GLM-5.2-UD-Q4_K_RoutedQ4K.gguf",
+        download_files=("GLM-5.2-UD-Q4_K_RoutedQ4K.gguf",),
+        recommended_memory_gb=512,
+        suggested_role="generation",
+        family="glm-5.2",
     ),
 )
 
@@ -548,7 +679,7 @@ def model_details(
     model_card = bounded_markdown(card_bytes)
 
     file_metadata = ModelMetadata()
-    if engine == EngineName.LLAMA_CPP and filename:
+    if engine in {EngineName.LLAMA_CPP, EngineName.DS4} and filename:
         try:
             with filesystem.open(
                 _hub_path(repo_id, filename, resolved_revision),
@@ -601,6 +732,125 @@ def model_details(
     )
 
 
+def _candidate_files(model: LibraryModel) -> tuple[str, ...]:
+    if model.download_files:
+        return model.download_files
+    return (model.filename,) if model.filename else ()
+
+
+def _hub_file_inventory(info: Any) -> dict[str, int | None]:
+    inventory: dict[str, int | None] = {}
+    for sibling in getattr(info, "siblings", None) or ():
+        filename = getattr(sibling, "rfilename", None)
+        if not isinstance(filename, str) or not filename:
+            continue
+        size = getattr(sibling, "size", None)
+        inventory[filename] = (
+            int(size)
+            if isinstance(size, int) and not isinstance(size, bool) and size >= 0
+            else None
+        )
+    return inventory
+
+
+def _managed_ds4_declares(model: LibraryModel) -> bool | None:
+    """Check an installed managed DS4 source without executing its downloader."""
+
+    try:
+        runtime = resolve_active_runtime("ds4")
+        if runtime is None:
+            return None
+        script_path = runtime.path("working_directory") / "download_model.sh"
+        if not script_path.is_file() or script_path.stat().st_size > 512 * 1024:
+            return None
+        script = script_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError, ValueError, RuntimeError):
+        return None
+    if model.repo_id == _DS4_GLM_UNSLOTH_REPO:
+        return all(
+            marker in script
+            for marker in (
+                _DS4_GLM_UNSLOTH_REPO,
+                "glm-unsloth-q4",
+                "UD-Q4_K_XL/GLM-5.2-UD-Q4_K_XL",
+                "00011",
+            )
+        )
+    return model.repo_id in script and all(
+        filename in script for filename in _candidate_files(model)
+    )
+
+
+def _hydrate_ds4_models(
+    models: Iterable[LibraryModel], *, token: str | None
+) -> list[LibraryModel]:
+    """Prove that every exact DS4 file still exists before offering an install."""
+
+    api = HfApi(token=token or _hf_token())
+    repo_info: dict[str, Any] = {}
+    results: list[LibraryModel] = []
+    for model in models:
+        info = repo_info.get(model.repo_id)
+        if info is None:
+            info = api.model_info(model.repo_id, files_metadata=True)
+            repo_info[model.repo_id] = info
+        inventory = _hub_file_inventory(info)
+        required = _candidate_files(model)
+        missing = tuple(filename for filename in required if filename not in inventory)
+        resolved = getattr(info, "sha", None)
+        if missing or not resolved:
+            reason = (
+                "The exact file set declared by current DS4 is not published at this "
+                "Hugging Face revision. Update DS4 and refresh the catalog."
+                if missing
+                else "Hugging Face did not return an immutable revision for this model."
+            )
+            results.append(
+                replace(
+                    model,
+                    compatibility="unavailable",
+                    compatibility_reason=reason,
+                    installable=False,
+                    resolved_revision=None,
+                )
+            )
+            continue
+        if _managed_ds4_declares(model) is False:
+            results.append(
+                replace(
+                    model,
+                    compatibility="unavailable",
+                    compatibility_reason=(
+                        "The installed managed DS4 runtime does not declare this exact "
+                        "model target. Update DS4 in Runtime Updates, then refresh."
+                    ),
+                    installable=False,
+                    resolved_revision=str(resolved),
+                )
+            )
+            continue
+        sizes = [inventory[filename] for filename in required]
+        size_bytes = (
+            sum(int(value) for value in sizes)
+            if sizes and all(value is not None for value in sizes)
+            else None
+        )
+        results.append(
+            replace(
+                model,
+                compatibility_reason=(
+                    f"{model.compatibility_reason} Hugging Face verified "
+                    f"{len(required)} exact file{'s' if len(required) != 1 else ''}."
+                ),
+                downloads=_optional_int(getattr(info, "downloads", None)),
+                likes=_optional_int(getattr(info, "likes", None)),
+                size_bytes=size_bytes,
+                resolved_revision=str(resolved),
+            )
+        )
+    return results
+
+
 def search_models(
     query: str,
     *,
@@ -651,7 +901,17 @@ def search_models(
                 )
             )
         return results
-    if engine in {EngineName.DS4, EngineName.MFLUX}:
+    if engine == EngineName.DS4:
+        candidates = [
+            model
+            for model in recommended_models(engine)
+            if not normalized
+            or normalized in model.repo_id.casefold()
+            or normalized in model.display_name.casefold()
+            or normalized in (model.quantization or "").casefold()
+        ][:limit]
+        return _hydrate_ds4_models(candidates, token=token)
+    if engine == EngineName.MFLUX:
         return [
             model
             for model in recommended_models(engine)
@@ -726,7 +986,30 @@ def validate_install_candidate(
             raise ValueError(
                 "the selected model did not resolve to an immutable Hub revision"
             )
-        return replace(verified, resolved_revision=str(resolved_revision))
+        required = _candidate_files(verified)
+        inventory = _hub_file_inventory(info)
+        missing = tuple(value for value in required if value not in inventory)
+        if missing:
+            raise ValueError(
+                "the exact file set declared by the selected engine is no longer "
+                "published at that Hugging Face revision"
+            )
+        if engine == EngineName.DS4 and _managed_ds4_declares(verified) is False:
+            raise ValueError(
+                "the installed managed DS4 runtime does not declare this exact "
+                "model target; update DS4 before downloading it"
+            )
+        sizes = [inventory[value] for value in required]
+        size_bytes = (
+            sum(int(value) for value in sizes)
+            if sizes and all(value is not None for value in sizes)
+            else None
+        )
+        return replace(
+            verified,
+            resolved_revision=str(resolved_revision),
+            size_bytes=size_bytes,
+        )
     unavailable = next(
         (
             model

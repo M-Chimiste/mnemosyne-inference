@@ -395,13 +395,22 @@ def derive_macos_capacity(
     target: ResolvedTarget,
     *,
     configured_max_concurrency: int | None,
+    adapter_limit: int | None = None,
+    adapter_source: str | None = None,
+    adapter_confidence: str | None = None,
     active: int = 0,
     queued: int = 0,
     accepting: bool = True,
 ) -> Capacity:
     """Derive a conservative admission limit from native adapter contracts."""
 
-    if target.key.engine == EngineName.LLAMA_CPP:
+    if adapter_limit is not None:
+        if adapter_limit < 1:
+            raise ValueError("adapter concurrency limit must be positive")
+        derived = adapter_limit
+        source = adapter_source or f"{target.key.engine}-adapter"
+        confidence = adapter_confidence or "observed"
+    elif target.key.engine == EngineName.LLAMA_CPP:
         configured_parallel = target.load_options.get("parallel")
         if (
             isinstance(configured_parallel, int)
@@ -420,9 +429,19 @@ def derive_macos_capacity(
         source = "mflux-serial-worker"
         confidence = "authoritative"
     elif target.key.engine == EngineName.DS4:
-        derived = 1
-        source = "ds4-conservative"
-        confidence = "conservative"
+        configured_sessions = target.load_options.get("parallel")
+        if (
+            isinstance(configured_sessions, int)
+            and not isinstance(configured_sessions, bool)
+            and configured_sessions > 0
+        ):
+            derived = configured_sessions
+            source = "ds4-batched-sessions"
+            confidence = "configured"
+        else:
+            derived = 1
+            source = "ds4-single-session"
+            confidence = "authoritative"
     else:
         derived = 1
         source = "omlx-conservative"

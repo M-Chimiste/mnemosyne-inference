@@ -199,6 +199,27 @@ class ResidencyCoordinator:
         self._accepting = False
         self._last_used_monotonic = time.monotonic()
 
+    def capacity_for(
+        self,
+        target: ResolvedTarget,
+        *,
+        active: int = 0,
+        queued: int = 0,
+        accepting: bool = True,
+    ) -> Capacity:
+        adapter = self.adapters.get(target.key.engine)
+        hint = adapter.capacity_hint(target) if adapter is not None else None
+        return derive_macos_capacity(
+            target,
+            configured_max_concurrency=self.configured_max_concurrency,
+            adapter_limit=hint.limit if hint is not None else None,
+            adapter_source=hint.source if hint is not None else None,
+            adapter_confidence=hint.confidence if hint is not None else None,
+            active=active,
+            queued=queued,
+            accepting=accepting,
+        )
+
     async def initialize(self) -> None:
         """Fail closed unless every configured adapter confirms global empty."""
         async with self._condition:
@@ -262,9 +283,8 @@ class ResidencyCoordinator:
                 and self._state == CoordinatorState.READY
                 and self._transition_target is None
             ):
-                capacity = derive_macos_capacity(
+                capacity = self.capacity_for(
                     self._resident.target,
-                    configured_max_concurrency=self.configured_max_concurrency,
                     active=self._inflight,
                     queued=0,
                 )
@@ -438,9 +458,8 @@ class ResidencyCoordinator:
 
     def _grant_head_group_locked(self, identity: EffectiveLoadIdentity) -> int:
         assert self._resident is not None
-        capacity = derive_macos_capacity(
+        capacity = self.capacity_for(
             self._resident.target,
-            configured_max_concurrency=self.configured_max_concurrency,
             active=self._inflight,
             queued=len(self._queue),
         )
@@ -710,9 +729,8 @@ class ResidencyCoordinator:
                 )
             )
             capacity = (
-                derive_macos_capacity(
+                self.capacity_for(
                     resident.target,
-                    configured_max_concurrency=self.configured_max_concurrency,
                     active=self._inflight,
                     queued=queued,
                     accepting=resident_accepting,

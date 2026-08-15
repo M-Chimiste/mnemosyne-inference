@@ -115,7 +115,32 @@ struct MenuContentView: View {
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }
+            if let alias = viewModel.snapshot?.residentAlias,
+               let metrics = viewModel.snapshot?.performance?.byModel.first(
+                    where: { $0.alias == alias }
+               ) {
+                HStack(spacing: 10) {
+                    Text("P50 \(duration(metrics.p50TotalMs))")
+                    Text("P95 \(duration(metrics.p95TotalMs))")
+                    if let rate = metrics.averageOutputTokensPerSecond {
+                        Text(String(format: "%.1f tok/s", rate))
+                    }
+                    if metrics.coldStarts > 0 {
+                        Text("\(metrics.coldStarts) cold")
+                    }
+                }
+                .font(.caption2.monospacedDigit())
+                .foregroundStyle(.secondary)
+            }
         }
+    }
+
+    private func duration(_ milliseconds: Double?) -> String {
+        guard let milliseconds else { return "—" }
+        if milliseconds >= 1_000 {
+            return String(format: "%.1fs", milliseconds / 1_000)
+        }
+        return "\(Int(milliseconds.rounded()))ms"
     }
 
     private var backgroundService: some View {
