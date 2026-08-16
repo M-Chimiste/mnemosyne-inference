@@ -5,9 +5,11 @@ API while moving the single resident model between a manager-owned
 [llama.cpp](https://github.com/ggml-org/llama.cpp) process for GGUF models,
 [oMLX](https://github.com/jundot/omlx) for MLX models, and
 [DwarfStar/DS4](https://github.com/antirez/ds4), plus a manager-owned
-[MFLUX](https://github.com/filipstrand/mflux) image worker. The engines remain upstream
-projects; Mnemosyne coordinates and proxies them without modifying their model
-runtimes.
+[MFLUX](https://github.com/filipstrand/mflux) image worker. Preview adapters
+also support [mlxcel](https://github.com/lablup/mlxcel) for native MLX
+generation/VLM serving and [mistral.rs](https://github.com/EricLBuehler/mistral.rs)
+for pinned Safetensors models. The engines remain upstream projects; Mnemosyne
+coordinates and proxies them without modifying their model runtimes.
 
 For a fresh workstation, begin with the
 [end-user installation guide](INSTALL.md). It covers the Unified Inference
@@ -19,8 +21,8 @@ The runtime is deliberately not a Docker image. Docker Desktop runs ordinary
 containers in a Linux VM, so it is not the right boundary for arbitrary
 MLX/Metal processes. Mnemosyne Core and all engines run natively.
 
-The [V1 scope](V1_SCOPE.md) makes llama.cpp and oMLX Stable and keeps DS4 and
-MFLUX explicitly Preview. The [acceptance ledger](acceptance/v1.json) is the
+The [V1 scope](V1_SCOPE.md) makes llama.cpp and oMLX Stable and keeps DS4,
+MFLUX, mlxcel, and mistral.rs explicitly Preview. The [acceptance ledger](acceptance/v1.json) is the
 release truth; a 0.9 candidate is not V1 while any required gate remains
 pending. See [release and recovery](RELEASE.md) for versioning, signing,
 notarization, signed updates, and rollback.
@@ -61,8 +63,10 @@ on-disk model directory remains as a migration hint.
 | `17323` | `ds4-server` | Mnemosyne-owned model process |
 | `17324` | MFLUX worker | Mnemosyne-owned image process |
 | `17325` | `llama-server` | Unified Inference-owned GGUF process |
+| `17326` | `mlxcel-server` | Unified Inference-owned Preview MLX model process |
+| `17327` | `mistralrs serve` | Unified Inference-owned Preview Safetensors model process |
 
-All listeners default to loopback. Ports `17326` through `17329` are reserved
+All listeners default to loopback. Ports `17328` and `17329` remain reserved
 for future local engines and diagnostics.
 
 Mnemosyne Core is a per-user LaunchAgent. `Unified Inference.app` is only a controller,
@@ -92,6 +96,29 @@ FIFO order; another request is rejected before upstream inference with
 `X-Mnemosyne-Error: node_busy` proof header. A queued model switch closes
 old-target admission, drains all active streams, and preserves the one-resident
 invariant.
+
+Schema-v5 profiles can list exact engine alternatives for one public alias.
+The existing profile is always the fallback. The user can choose **Pinned
+engine** to prefer a declared engine regardless of benchmark rank, which is
+useful when the fastest candidate has quality or compatibility problems. If
+the pin is unavailable or cannot load before inference begins, the original
+profile handles the untouched request. Choosing **Best fresh benchmark** makes
+selection automatic; **Benchmark compatible engines** then runs each
+candidate sequentially through ordinary coordinator leases, including one
+warmup and repeated streamed samples. It records only success counts, TTFT,
+end-to-end latency, output tokens/sec, and hashed model/runtime/system/config
+identities—never prompts, generated text, credentials, arbitrary diagnostics,
+or unhashed local paths. Evidence becomes ineligible after this alias's
+candidate/model/load change, engine binary/version change, Mac/OS change, suite change, or configured
+age limit. Preview engines cannot win without explicit consent, and an absent,
+stale, failed, or marginal result keeps the fallback engine. If a selected
+alternative cannot load before upstream work begins, that request recovers
+through the fixed engine and invalidates the evidence. An ambiguous transport
+or upstream 5xx is never replayed, but invalidates an automatically selected
+alternative for the next request. A user pin persists until changed. The suite
+ranks stability and performance, not answer quality;
+attaching an alternative explicitly asserts that both profiles represent the
+same logical model and role.
 
 Fresh configurations keep the verified resident model warm. Settings provides
 Performance, Balanced, and Memory Saver residency presets; custom values may
@@ -123,7 +150,7 @@ and throughput. Omit `--compare-base-url` to measure Unified Inference alone.
 - Python 3.11–3.13 and `uv` for service development.
 - Swift 6 for menu development. Full Xcode is required for final app signing,
   `SMAppService` integration testing, and source builds of custom Metal kernels.
-- oMLX, DS4, and MFLUX are optional. An unavailable engine should be disabled;
+- oMLX, DS4, MFLUX, mlxcel, and mistral.rs are optional. An unavailable engine should be disabled;
   its profiles are retained but omitted from the callable model catalog until
   the engine is enabled again.
 
@@ -295,10 +322,12 @@ The selected root is then organized by engine:
   omlx/<owner>/<repository>/
   ds4/<owner>/<repository>/
   mflux/<owner>/<repository>/
+  mlxcel/<owner>/<repository>/
+  mistral.rs/<owner>/<repository>/
 ```
 
-Use **Settings → Model Library** to search one unified catalog across llama.cpp,
-oMLX, DS4, and MFLUX, choose one of the configured folders, and download. Every
+Use **Settings → Model Library** to search one unified catalog across all
+enabled and Preview-capable engines, choose one of the configured folders, and download. Every
 result carries an engine-support badge; selecting it retains the exact
 engine-specific validation and install path. Search results and details show
 bounded model-card prose plus
@@ -381,7 +410,7 @@ worker; it is not stored in YAML or SQLite.
 ## Engine runtime updates
 
 Open **Settings → Runtime Updates** to inspect installed and upstream versions
-of llama.cpp, oMLX, MFLUX, and DS4. oMLX owns its own installation: Unified
+of llama.cpp, oMLX, MFLUX, DS4, mlxcel, and mistral.rs. oMLX owns its own installation: Unified
 Inference selects the official DMG matching this Mac, detects the installed
 app, CLI shim, conventional Homebrew paths, or running server, and links to
 the official stable release without overwriting it. For a missing runtime, an
@@ -410,6 +439,14 @@ MFLUX imports and the DS4 binary are also validated before activation. Download
 and validation do not affect residency. The final switch runs inside the
 coordinator's all-engines-empty maintenance barrier and atomically updates a
 small pointer below:
+
+mlxcel and mistral.rs remain externally installed Preview binaries. The menu
+app detects their configured executables without claiming ownership of the
+installation: use the official `lablup/tap` Homebrew formula for mlxcel and
+the official mistral.rs installer plus `mistralrs update` for mistral.rs.
+Unified Inference owns only the exact child server process and requires Model
+Library to pin and download weights before load, so neither engine performs an
+implicit Hub download in the inference path.
 
 ```text
 ~/Library/Application Support/Mnemosyne/runtimes/

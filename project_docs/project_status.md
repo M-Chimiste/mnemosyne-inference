@@ -1,6 +1,6 @@
 # Mnemosyne Inference — Project Status
 
-**Last updated:** 2026-08-14
+**Last updated:** 2026-08-15
 
 ## Current state
 
@@ -36,7 +36,7 @@ Mac/CUDA hardware evidence remain release gates; see
 An isolated native macOS track is implemented, with frontier text-engine,
 protected-storage, and migration-soak acceptance still pending. It lives
 entirely below `macos/`, replaces the previous sidecar on `1240`, uses
-`17321-17325` for control and inner engines, and does not alter
+`17321-17327` for control and inner engines, and does not alter
 the CUDA image or its `8000-8002` topology. The first implementation includes:
 
 - a separately locked FastAPI service with inference and control planes;
@@ -87,13 +87,26 @@ the CUDA image or its `8000-8002` topology. The first implementation includes:
   retaining exception text; and
 - independent setup, architecture, and Apple Silicon smoke documentation.
 
+The native track now also has additive Preview adapters for mlxcel and
+mistral.rs. Both reuse strict manager-owned process identity and keep their
+upstream installation external. Schema-v5 model profiles retain their original
+engine as the fixed fallback, may attach one exact candidate per additional
+engine, can pin a user-selected engine when quality should override speed, and
+can opt into durable content-free benchmark selection. Automatic routing
+requires fresh successful evidence for the exact ordered candidate set,
+runtime, system, and suite; Preview winners require explicit consent. Fleet
+excludes aliases whose local policy can select a non-primary engine, preserving
+immutable deployment identity. The Settings sidebar exposes the packaged app
+version and build beside the product name.
+
 The native product is now a 0.9.0 release candidate with one enforced version,
 a guided Setup & Health flow, bounded secret-redacted readiness, real public
 listener self-tests with durable usage verification, Stable/Preview engine
 tiers, Sparkle integration, and separate CI/signed-release workflows. The
 Python schema, packaged YAML, and Swift defaults now agree: llama.cpp is
-enabled, external oMLX remains off until configured, and Preview DS4/MFLUX are
-opt-in. The build-47 private DMG was rejected after installation because dyld
+enabled, external oMLX remains off until configured, and Preview DS4, MFLUX,
+mlxcel, and mistral.rs are opt-in. The build-47 private DMG was rejected after
+installation because dyld
 could not resolve its packaged Sparkle framework. Corrected build 50 adds the
 `Contents/Frameworks` rpath and is independently verified against the
 dependency, embedded framework, and load command
@@ -155,10 +168,10 @@ Managed runtime acceptance now has the same durable treatment: the strict
 collector requires an ordered update/restart/rollback/restart/rejection chain
 and confirms the original managed version remains active.
 The current CUDA/manager suite passes 478 tests, and the independently locked
-Fleet suite passes 79 tests. The native service suite passes 318 tests on the
+Fleet suite passes 79 tests. The native service suite passes 367 tests on the
 development Mac; two real-bookmark tests skip in restricted runners.
 The isolated MFLUX worker passes 23 tests with real Metal access, the packaging
-suite passes 33 tests, and all 64 current Swift tests pass. The Fleet wheel
+suite passes 33 tests, and all 70 current Swift tests pass. The Fleet wheel
 contains its protocol schema and passed a clean build. The full relocatable
 build reports version 0.9.0 and its
 embedded service passes configuration validation without adding bytecode to or
@@ -251,14 +264,15 @@ see
 - The native app bundle contains separate `framework-mnemosyne-base` and
   `framework-mnemosyne-image` export layers plus separate service/worker
   source trees. No MLX runtime is added to Docker.
-- The native Runtime Updates page detects llama.cpp, oMLX, MFLUX, and DS4
-  versions. For oMLX it selects the official DMG matching the host macOS
+- The native Runtime Updates page detects llama.cpp, oMLX, MFLUX, DS4, mlxcel,
+  and mistral.rs versions. For oMLX it selects the official DMG matching the host macOS
   version, detects the app, CLI shim, conventional Homebrew paths, or running
   server, and delegates updates to oMLX. A missing oMLX runtime can instead be
   installed through an approval-gated, argument-bounded stable Homebrew
   action. llama.cpp comes from its official
   GitHub arm64 artifact, MFLUX installs from its official PyPI project, and DS4
-  builds from an exact official GitHub commit. Managed updates stage
+  builds from an exact official GitHub commit. mlxcel and mistral.rs retain
+  externally owned official upgrade paths. Managed updates stage
   independently, activate through the global-empty maintenance barrier, and
   retain the previous version for rollback without a repository-owned feed.
 - The native coordinator now reads oMLX's authoritative concurrent-request

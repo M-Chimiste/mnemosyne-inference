@@ -77,6 +77,17 @@ class EngineAdapter(ABC):
         del target
         return None
 
+    async def runtime_fingerprint(self, *, deadline: Deadline) -> str | None:
+        """Return a secret-free identity that changes with the runtime.
+
+        ``None`` makes durable benchmark evidence ineligible for automatic
+        selection. An adapter must not guess when no stable binary or upstream
+        version can be observed.
+        """
+
+        del deadline
+        return None
+
     @abstractmethod
     async def validate_control(self, *, deadline: Deadline) -> EngineSnapshot:
         raise NotImplementedError

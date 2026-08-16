@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
 import os
 from urllib.parse import quote
@@ -46,6 +47,37 @@ class OMLXAdapter(HttpEngineAdapter):
     def capacity_hint(self, target: ResolvedTarget) -> CapacityHint | None:
         del target
         return self._capacity_hint
+
+    async def runtime_fingerprint(self, *, deadline: Deadline) -> str | None:
+        """Fingerprint the authoritative running oMLX version when exposed."""
+
+        for endpoint in ("/health", "/api/status"):
+            remaining = min(deadline.remaining(), self.request_timeout_seconds)
+            if remaining <= 0:
+                return None
+            try:
+                response = await self._client.get(
+                    f"{self.base_url}{endpoint}",
+                    headers=self._bearer_headers(),
+                    timeout=remaining,
+                )
+                if response.status_code != 200:
+                    continue
+                payload = response.json()
+            except (httpx.HTTPError, ValueError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            version: str | None = None
+            for key in ("version", "app_version", "server_version"):
+                value = payload.get(key)
+                if isinstance(value, str) and value:
+                    version = value
+                    break
+            if version is not None:
+                material = f"{self.engine.value}\0{self.base_url}\0{version}"
+                return hashlib.sha256(material.encode("utf-8")).hexdigest()
+        return None
 
     @property
     def capacity_diagnostic(self) -> str | None:

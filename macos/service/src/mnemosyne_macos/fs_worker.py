@@ -33,6 +33,11 @@ def _parser() -> argparse.ArgumentParser:
     validate.add_argument("--projector")
     validate.add_argument("--expected-volume-uuid")
 
+    validate_directory = commands.add_parser("validate-directory")
+    validate_directory.add_argument("--root", required=True)
+    validate_directory.add_argument("--path", required=True)
+    validate_directory.add_argument("--expected-volume-uuid")
+
     size = commands.add_parser("directory-size")
     size.add_argument("--root", required=True)
     size.add_argument("--path", required=True)
@@ -154,6 +159,12 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
             "model": str(model),
             "projector": str(projector) if projector is not None else None,
         }
+    if args.command == "validate-directory":
+        root, status = _validated_root(args.root, args.expected_volume_uuid)
+        selected = _contained(root, args.path, must_exist=True)
+        if not selected.is_dir():
+            raise ValueError("model target is not a directory")
+        return {"status": status, "path": str(selected)}
     if args.command == "directory-size":
         root, _status = _validated_root(args.root, None)
         return {"bytes": _directory_size(root, args.path)}

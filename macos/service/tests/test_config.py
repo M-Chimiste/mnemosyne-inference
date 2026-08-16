@@ -39,7 +39,7 @@ from mnemosyne_macos.runtime import recommended_interactive_context_length
 
 def test_defaults_replace_the_legacy_sidecar_port() -> None:
     config = MacConfig()
-    assert config.schema_version == 3
+    assert config.schema_version == 5
     assert config.server.inference_port == 1240
     assert config.server.control_port == 17321
     assert config.engines.llama_cpp.port == 17325
@@ -103,7 +103,7 @@ def test_parse_config_migrates_v1_lmstudio_profiles_to_inert_import_records() ->
         source="in-memory configuration",
     )
 
-    assert config.schema_version == 3
+    assert config.schema_version == 5
     assert config.models == []
     assert [
         model.alias for model in config.migration.legacy_lmstudio_profiles
@@ -111,10 +111,10 @@ def test_parse_config_migrates_v1_lmstudio_profiles_to_inert_import_records() ->
     assert not hasattr(config.engines, "lmstudio")
 
 
-def test_v2_configuration_migrates_to_v3_concurrency_defaults() -> None:
+def test_v2_configuration_migrates_to_v5_concurrency_defaults() -> None:
     config = MacConfig.model_validate({"schema_version": 2})
 
-    assert config.schema_version == 3
+    assert config.schema_version == 5
     assert config.server.max_concurrency is None
     assert config.server.max_queue_depth == 128
     assert config.server.fleet_api_key_env == "FLEET_API_KEY"
@@ -334,6 +334,21 @@ def test_duplicate_or_conflicting_ports_are_rejected() -> None:
         )
 
 
+@pytest.mark.parametrize("engine", ["mlxcel", "mistral_rs"])
+def test_preview_engine_ports_cannot_collide_with_existing_planes(engine: str) -> None:
+    with pytest.raises(ValueError, match="ports must be distinct"):
+        MacConfig.model_validate(
+            {
+                "engines": {
+                    engine: {
+                        "enabled": True,
+                        "port": 17321,
+                    }
+                }
+            }
+        )
+
+
 def test_omlx_rejects_process_load_options() -> None:
     with pytest.raises(ValueError, match="oMLX load settings"):
         MacConfig.model_validate(
@@ -426,6 +441,167 @@ def test_mflux_image_profile_resolves_load_identity_and_defaults() -> None:
     assert target.load_options == {"family": "krea-2", "quantize": 8}
     assert target.image_defaults["num_inference_steps"] == 8
     assert target.capabilities == frozenset({Endpoint.IMAGES_GENERATIONS})
+
+
+def test_v4_profile_candidates_migrate_to_v5_and_remain_fixed_by_default(
+    tmp_path,
+) -> None:
+    config = MacConfig.model_validate(
+        {
+            "schema_version": 4,
+            "engines": {
+                "omlx": {"enabled": True},
+                "mlxcel": {"enabled": True},
+                "mistral_rs": {"enabled": True},
+            },
+            "models": [
+                {
+                    "alias": "qwen",
+                    "engine": "omlx",
+                    "model": "qwen",
+                    "alternatives": [
+                        {
+                            "engine": "mlxcel",
+                            "model": str(tmp_path / "mlx"),
+                            "load": {"parallel": 4},
+                        },
+                        {
+                            "engine": "mistral.rs",
+                            "model": str(tmp_path / "safetensors"),
+                        },
+                    ],
+                }
+            ],
+        }
+    )
+
+    assert config.models[0].selection.mode == "fixed"
+    assert config.schema_version == 5
+    assert config.profiles()["qwen"].key.engine == EngineName.OMLX
+    candidates = config.profile_candidates()["qwen"]
+    assert [candidate.key.engine for candidate in candidates] == [
+        EngineName.OMLX,
+        EngineName.MLXCEL,
+        EngineName.MISTRAL_RS,
+    ]
+    assert candidates[1].load_options["parallel"] == 4
+    assert candidates[2].wire_model == "default"
+
+
+def test_benchmark_selection_requires_an_alternative() -> None:
+    with pytest.raises(ValueError, match="requires at least one engine alternative"):
+        MacConfig.model_validate(
+            {
+                "models": [
+                    {
+                        "alias": "solo",
+                        "engine": "llama.cpp",
+                        "model": "/models/solo.gguf",
+                        "selection": {"mode": "benchmark"},
+                    }
+                ]
+            }
+        )
+
+
+def test_pinned_selection_accepts_a_declared_engine_without_benchmark_evidence(
+    tmp_path,
+) -> None:
+    config = MacConfig.model_validate(
+        {
+            "engines": {
+                "omlx": {"enabled": True},
+                "mlxcel": {"enabled": True},
+            },
+            "models": [
+                {
+                    "alias": "qwen",
+                    "engine": "omlx",
+                    "model": "qwen",
+                    "alternatives": [
+                        {
+                            "engine": "mlxcel",
+                            "model": str(tmp_path / "mlx"),
+                        }
+                    ],
+                    "selection": {
+                        "mode": "pinned",
+                        "pinned_engine": "mlxcel",
+                    },
+                }
+            ],
+        }
+    )
+
+    assert config.models[0].selection.pinned_engine == EngineName.MLXCEL
+
+
+def test_pinned_selection_rejects_an_engine_outside_the_candidate_set() -> None:
+    with pytest.raises(ValueError, match="primary engine or a declared alternative"):
+        MacConfig.model_validate(
+            {
+                "models": [
+                    {
+                        "alias": "qwen",
+                        "engine": "omlx",
+                        "model": "qwen",
+                        "selection": {
+                            "mode": "pinned",
+                            "pinned_engine": "mlxcel",
+                        },
+                    }
+                ]
+            }
+        )
+
+
+def test_benchmark_selection_requires_two_chat_capable_candidates() -> None:
+    with pytest.raises(ValueError, match="two enabled chat-capable"):
+        MacConfig.model_validate(
+            {
+                "engines": {
+                    "omlx": {"enabled": True},
+                    "llama_cpp": {"enabled": True},
+                },
+                "models": [
+                    {
+                        "alias": "embed",
+                        "engine": "omlx",
+                        "model": "embed-mlx",
+                        "capabilities": ["embeddings"],
+                        "alternatives": [
+                            {
+                                "engine": "llama.cpp",
+                                "model": "/models/embed.gguf",
+                                "capabilities": ["embeddings"],
+                            }
+                        ],
+                        "selection": {"mode": "benchmark"},
+                    }
+                ],
+            }
+        )
+
+
+def test_engine_alternatives_require_one_candidate_per_engine() -> None:
+    with pytest.raises(ValueError, match="at most one candidate per engine"):
+        MacConfig.model_validate(
+            {
+                "models": [
+                    {
+                        "alias": "qwen",
+                        "engine": "mlxcel",
+                        "model": "/models/qwen-primary",
+                        "alternatives": [
+                            {
+                                "engine": "mlxcel",
+                                "model": "/models/qwen-second",
+                            }
+                        ],
+                    }
+                ]
+            }
+        )
 
 
 def test_mflux_accepts_each_bundled_text_to_image_family() -> None:

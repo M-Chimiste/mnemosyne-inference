@@ -31,7 +31,14 @@ from uuid import uuid4
 
 import httpx
 
-from .config import DS4Config, LlamaCppConfig, MFluxConfig, OMLXConfig
+from .config import (
+    DS4Config,
+    LlamaCppConfig,
+    MFluxConfig,
+    MLXcelConfig,
+    MistralRSConfig,
+    OMLXConfig,
+)
 from .models import ENGINE_RELEASE_TIER, EngineName
 
 
@@ -49,7 +56,10 @@ LLAMA_CPP_RELEASE_API_URL = (
 MAX_SOURCE_ARCHIVE_BYTES = 2 * 1024**3
 _VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$")
 _ENGINES = ("llama.cpp", "omlx", "mflux", "ds4")
+_EXTERNAL_PREVIEW_ENGINES = ("mlxcel", "mistral.rs")
 _OMLX_RELEASES_URL = "https://github.com/jundot/omlx/releases"
+_MLXCEL_INSTALL_URL = "https://github.com/lablup/mlxcel#install-with-homebrew-macoslinux"
+_MISTRAL_RS_INSTALL_URL = "https://ericlbuehler.github.io/mistral.rs/quickstart/"
 _LIFECYCLE_LIMIT = 256
 _LIFECYCLE_ACTION_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _LIFECYCLE_EVENT_ID_RE = re.compile(
@@ -648,6 +658,8 @@ class RuntimeUpdateManager:
         mflux: MFluxConfig,
         ds4: DS4Config,
         llama_cpp: LlamaCppConfig | None = None,
+        mlxcel: MLXcelConfig | None = None,
+        mistral_rs: MistralRSConfig | None = None,
         root: str | Path | None = None,
         client: httpx.AsyncClient | None = None,
     ) -> None:
@@ -655,6 +667,8 @@ class RuntimeUpdateManager:
         self.omlx = omlx
         self.mflux = mflux
         self.ds4 = ds4
+        self.mlxcel = mlxcel or MLXcelConfig()
+        self.mistral_rs = mistral_rs or MistralRSConfig()
         self.root = _runtime_root(root)
         self.channel = "official"
         self._client = client or httpx.AsyncClient(timeout=30, follow_redirects=True)
@@ -1220,11 +1234,27 @@ class RuntimeUpdateManager:
     async def installed_status(self) -> dict[str, dict[str, Any]]:
         """Inspect local runtimes without contacting any upstream service."""
 
+        async def external_binary(config: MLXcelConfig | MistralRSConfig):
+            binary = Path(config.binary).expanduser()
+            if not binary.is_file() or not os.access(binary, os.X_OK):
+                return None, None, str(binary)
+            try:
+                output = await _run_version_command(str(binary), "--version")
+            except RuntimeUpdateError:
+                output = None
+            match = re.search(
+                r"\d+(?:\.\d+)+(?:[-+._A-Za-z0-9]*)?",
+                output or "",
+            )
+            return match.group(0) if match else "unknown", None, str(binary)
+
         installed_values = await asyncio.gather(
             self._installed_llama_cpp(),
             self._installed_omlx(),
             self._installed_mflux(),
             self._installed_ds4(),
+            external_binary(self.mlxcel),
+            external_binary(self.mistral_rs),
         )
         return {
             engine: {
@@ -1235,11 +1265,13 @@ class RuntimeUpdateManager:
                 "installation_kind": (
                     _omlx_installation_kind(path)
                     if engine == "omlx"
+                    else "external_cli"
+                    if engine in _EXTERNAL_PREVIEW_ENGINES
                     else "managed_or_configured"
                 ),
             }
             for engine, (version, revision, path) in zip(
-                _ENGINES,
+                (*_ENGINES, *_EXTERNAL_PREVIEW_ENGINES),
                 installed_values,
                 strict=True,
             )
@@ -1251,11 +1283,24 @@ class RuntimeUpdateManager:
                 await self._refresh_releases()
             local_status = await self.installed_status()
             statuses: list[dict[str, Any]] = []
-            for engine in _ENGINES:
+            for engine in (*_ENGINES, *_EXTERNAL_PREVIEW_ENGINES):
                 installed_version = local_status[engine]["version"]
                 installed_revision = local_status[engine]["revision"]
                 installed_path = local_status[engine]["path"]
-                if engine == "omlx":
+                if engine in _EXTERNAL_PREVIEW_ENGINES:
+                    release = None
+                    upstream_version = None
+                    upstream_url = (
+                        _MLXCEL_INSTALL_URL
+                        if engine == "mlxcel"
+                        else _MISTRAL_RS_INSTALL_URL
+                    )
+                    official_installer_url = upstream_url
+                    # These binaries remain externally owned. Do not claim an
+                    # available version without querying and validating their
+                    # distinct upstream release contracts.
+                    update_available = False
+                elif engine == "omlx":
                     (
                         upstream_version,
                         upstream_url,
@@ -1292,12 +1337,22 @@ class RuntimeUpdateManager:
                             "omlx": "oMLX",
                             "mflux": "MFLUX",
                             "ds4": "DS4",
+                            "mlxcel": "mlxcel",
+                            "mistral.rs": "mistral.rs",
                         }[engine],
-                        "ownership": "external" if engine == "omlx" else "managed_or_external",
+                        "ownership": (
+                            "external"
+                            if engine == "omlx"
+                            or engine in _EXTERNAL_PREVIEW_ENGINES
+                            else "managed_or_external"
+                        ),
                         "installed": installed_version is not None,
                         "installed_version": installed_version,
                         "installed_revision": installed_revision,
                         "installed_path": installed_path,
+                        "installation_kind": local_status[engine].get(
+                            "installation_kind"
+                        ),
                         "latest_upstream_version": upstream_version,
                         "latest_upstream_revision": release.source_revision if release else None,
                         "latest_upstream_url": upstream_url,
@@ -1316,7 +1371,11 @@ class RuntimeUpdateManager:
                             )
                         )
                         and update_available,
-                        "can_rollback": self._rollback_version(engine) is not None,
+                        "can_rollback": (
+                            False
+                            if engine in _EXTERNAL_PREVIEW_ENGINES
+                            else self._rollback_version(engine) is not None
+                        ),
                         "management_note": (
                             "Version and Apple Silicon binaries come directly from official ggml-org/llama.cpp GitHub releases."
                             if engine == "llama.cpp"
@@ -1326,7 +1385,15 @@ class RuntimeUpdateManager:
                                 else (
                                     "Version and dependencies come directly from the official MFLUX package on PyPI."
                                     if engine == "mflux"
-                                    else "Version and source come directly from the official antirez/ds4 repository."
+                                    else (
+                                        "Version and source come directly from the official antirez/ds4 repository."
+                                        if engine == "ds4"
+                                        else (
+                                            "Install and update the official Homebrew formula with brew upgrade mlxcel. Unified Inference owns only its child server process."
+                                            if engine == "mlxcel"
+                                            else "Use the official installer and mistralrs update. Unified Inference owns only its child server process."
+                                        )
+                                    )
                                 )
                             )
                         ),
@@ -1337,7 +1404,12 @@ class RuntimeUpdateManager:
                             and local_status[engine].get("installation_kind")
                             == "homebrew_stable"
                             and not self.omlx.enabled
-                            else self._diagnostics.get(engine)
+                            else (
+                                "Install the official external CLI, then check again."
+                                if engine in _EXTERNAL_PREVIEW_ENGINES
+                                and installed_version is None
+                                else self._diagnostics.get(engine)
+                            )
                         ),
                         "upgrade_strategy": (
                             {
@@ -1357,6 +1429,8 @@ class RuntimeUpdateManager:
                                 "managed",
                             )
                             if engine == "omlx"
+                            else "external_manual"
+                            if engine in _EXTERNAL_PREVIEW_ENGINES
                             else "managed"
                         ),
                     }

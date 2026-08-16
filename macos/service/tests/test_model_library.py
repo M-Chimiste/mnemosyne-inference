@@ -386,6 +386,84 @@ def test_omlx_install_candidate_retains_resolved_hub_revision(monkeypatch) -> No
     assert candidate.resolved_revision == "b" * 40
 
 
+def test_mlxcel_search_keeps_mlx_candidates_engine_scoped(monkeypatch) -> None:
+    class FakeAPI:
+        def __init__(self, token=None):
+            self.token = token
+
+        def list_models(self, **kwargs):
+            assert kwargs["filter"] == "mlx"
+            return [
+                SimpleNamespace(
+                    id="mlx-community/Qwen-4bit",
+                    tags=["mlx", "4bit"],
+                    pipeline_tag="text-generation",
+                    downloads=10,
+                    likes=2,
+                    usedStorage=123,
+                )
+            ]
+
+    monkeypatch.setattr("mnemosyne_macos.model_library.HfApi", FakeAPI)
+    results = search_models("qwen", engine=EngineName.MLXCEL)
+
+    assert len(results) == 1
+    assert results[0].engine == "mlxcel"
+    assert results[0].suggested_role == "generation"
+    assert "Final architecture compatibility" in results[0].compatibility_reason
+
+
+def test_mistral_rs_install_requires_pinned_safetensors_snapshot(monkeypatch) -> None:
+    class FakeAPI:
+        def __init__(self, token=None):
+            self.token = token
+
+        def model_info(self, repo_id, **kwargs):
+            assert repo_id == "owner/model"
+            assert kwargs == {"revision": "main", "files_metadata": True}
+            return SimpleNamespace(
+                sha="c" * 40,
+                tags=["text-generation"],
+                siblings=[
+                    SimpleNamespace(rfilename="config.json", size=100),
+                    SimpleNamespace(rfilename="model.safetensors", size=1_000),
+                ],
+            )
+
+    monkeypatch.setattr("mnemosyne_macos.model_library.HfApi", FakeAPI)
+    candidate = validate_install_candidate(
+        engine=EngineName.MISTRAL_RS,
+        repo_id="owner/model",
+        filename=None,
+        revision="main",
+    )
+
+    assert candidate.resolved_revision == "c" * 40
+    assert candidate.engine == "mistral.rs"
+    assert candidate.suggested_role == "generation"
+
+
+def test_mistral_rs_rejects_repositories_without_safetensors(monkeypatch) -> None:
+    class FakeAPI:
+        def __init__(self, token=None):
+            self.token = token
+
+        def model_info(self, *_args, **_kwargs):
+            return SimpleNamespace(
+                sha="d" * 40,
+                tags=["text-generation"],
+                siblings=[SimpleNamespace(rfilename="config.json", size=100)],
+            )
+
+    monkeypatch.setattr("mnemosyne_macos.model_library.HfApi", FakeAPI)
+    with pytest.raises(ValueError, match="Safetensors weights"):
+        validate_install_candidate(
+            engine=EngineName.MISTRAL_RS,
+            repo_id="owner/model",
+            filename=None,
+        )
+
+
 def test_download_size_uses_exact_file_or_complete_snapshot(monkeypatch) -> None:
     class FakeAPI:
         def __init__(self, token=None):

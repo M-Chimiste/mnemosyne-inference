@@ -919,13 +919,17 @@ def search_models(
             or normalized in model.repo_id.casefold()
             or normalized in model.display_name.casefold()
         ][:limit]
-    if engine != EngineName.OMLX:
+    if engine not in {
+        EngineName.OMLX,
+        EngineName.MLXCEL,
+        EngineName.MISTRAL_RS,
+    }:
         return []
 
     api = HfApi(token=token or _hf_token())
     raw_models: Iterable[Any] = api.list_models(
         search=query.strip() or None,
-        filter="mlx",
+        filter="mlx" if engine != EngineName.MISTRAL_RS else "text-generation",
         sort="downloads",
         limit=limit,
         full=True,
@@ -938,8 +942,21 @@ def search_models(
         tags = {str(tag).casefold() for tag in (getattr(raw, "tags", None) or [])}
         if {"adapter", "lora", "peft"} & tags:
             continue
-        if "mlx" not in tags and "mlx" not in repo_id.casefold():
+        if (
+            engine in {EngineName.OMLX, EngineName.MLXCEL}
+            and "mlx" not in tags
+            and "mlx" not in repo_id.casefold()
+        ):
             continue
+        compatibility_reason = (
+            "Published as an MLX model. Final architecture compatibility is "
+            "verified by mlxcel at load."
+            if engine == EngineName.MLXCEL
+            else "Published as Safetensors for text generation. Final architecture "
+            "compatibility is verified by mistral.rs at load."
+            if engine == EngineName.MISTRAL_RS
+            else "Published as an MLX model. Final load compatibility is verified by oMLX."
+        )
         results.append(
             LibraryModel(
                 repo_id=repo_id,
@@ -947,17 +964,19 @@ def search_models(
                 display_name=repo_id.rsplit("/", 1)[-1],
                 model_kind="language",
                 compatibility="likely",
-                compatibility_reason=(
-                    "Published as an MLX model. Final load compatibility is verified by oMLX."
-                ),
+                compatibility_reason=compatibility_reason,
                 downloads=_optional_int(getattr(raw, "downloads", None)),
                 likes=_optional_int(getattr(raw, "likes", None)),
                 size_bytes=_optional_int(getattr(raw, "usedStorage", None)),
                 quantization=_quantization(repo_id, tags),
-                suggested_role=_suggested_role(
-                    repo_id,
-                    tags,
-                    getattr(raw, "pipeline_tag", None),
+                suggested_role=(
+                    "generation"
+                    if engine in {EngineName.MLXCEL, EngineName.MISTRAL_RS}
+                    else _suggested_role(
+                        repo_id,
+                        tags,
+                        getattr(raw, "pipeline_tag", None),
+                    )
                 ),
             )
         )
@@ -1065,33 +1084,61 @@ def validate_install_candidate(
             parameter_count=details.parameter_count,
         )
         return candidate
-    if engine != EngineName.OMLX:
+    if engine not in {
+        EngineName.OMLX,
+        EngineName.MLXCEL,
+        EngineName.MISTRAL_RS,
+    }:
         raise ValueError(f"{engine.value} downloads are limited to verified models")
 
     api = HfApi(token=token or _hf_token())
-    info = api.model_info(repo_id, revision=revision, files_metadata=False)
+    info = api.model_info(repo_id, revision=revision, files_metadata=True)
     tags = {str(tag).casefold() for tag in (getattr(info, "tags", None) or [])}
-    if "mlx" not in tags and "mlx" not in repo_id.casefold():
+    if (
+        engine in {EngineName.OMLX, EngineName.MLXCEL}
+        and "mlx" not in tags
+        and "mlx" not in repo_id.casefold()
+    ):
         raise ValueError("the selected repository is not published as an MLX model")
     if {"adapter", "lora", "peft"} & tags:
-        raise ValueError("adapter-only repositories cannot be installed as standalone oMLX models")
+        raise ValueError("adapter-only repositories cannot be installed as standalone models")
+    inventory = _hub_file_inventory(info)
+    if engine == EngineName.MISTRAL_RS:
+        if "config.json" not in inventory or not any(
+            filename.endswith(".safetensors") for filename in inventory
+        ):
+            raise ValueError(
+                "mistral.rs installs require config.json and Safetensors weights"
+            )
+    resolved_revision = getattr(info, "sha", None) or revision
+    if not resolved_revision:
+        raise ValueError(
+            "the selected model did not resolve to an immutable Hub revision"
+        )
+    reason = (
+        "Published as an MLX model; mlxcel performs final architecture validation on load."
+        if engine == EngineName.MLXCEL
+        else "Published as Safetensors; mistral.rs performs final architecture validation on load."
+        if engine == EngineName.MISTRAL_RS
+        else "Published as an MLX model; oMLX performs final validation on load."
+    )
     return LibraryModel(
         repo_id=repo_id,
         engine=engine.value,
         display_name=repo_id.rsplit("/", 1)[-1],
         model_kind="language",
         compatibility="likely",
-        compatibility_reason="Published as an MLX model; oMLX performs final validation on load.",
+        compatibility_reason=reason,
         quantization=_quantization(repo_id, tags),
-        resolved_revision=(
-            str(getattr(info, "sha"))
-            if getattr(info, "sha", None) is not None
-            else revision
-        ),
-        suggested_role=_suggested_role(
-            repo_id,
-            tags,
-            getattr(info, "pipeline_tag", None),
+        resolved_revision=str(resolved_revision),
+        suggested_role=(
+            "generation"
+            if engine in {EngineName.MLXCEL, EngineName.MISTRAL_RS}
+            else _suggested_role(
+                repo_id,
+                tags,
+                getattr(info, "pipeline_tag", None),
+            )
         ),
     )
 

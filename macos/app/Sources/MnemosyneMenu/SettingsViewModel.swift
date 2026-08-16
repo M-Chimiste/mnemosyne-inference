@@ -67,6 +67,8 @@ final class SettingsViewModel: ObservableObject {
     @Published private(set) var libraryDetails: LibraryModelDetails?
     @Published private(set) var modelInstalls: [ModelInstall] = []
     @Published private(set) var runtimeUpdateSnapshot: RuntimeUpdateSnapshot?
+    @Published private(set) var benchmarkSnapshot: EngineBenchmarkSnapshot?
+    @Published private(set) var benchmarkingAlias: String?
     @Published private(set) var omlxCacheHealth: OMLXCacheHealth?
     @Published private(set) var readinessSnapshot: ReadinessSnapshot?
     @Published private(set) var lastSelfTest: ModelSelfTestResult?
@@ -197,6 +199,7 @@ final class SettingsViewModel: ObservableObject {
             Task { await refreshLocalModelSources() }
             Task { await refreshRuntimeUpdates() }
             Task { await refreshReadiness() }
+            Task { await refreshBenchmarks() }
         } catch {
             isLoaded = false
             setStatus("Could not load settings: \(error.localizedDescription)", tone: .error)
@@ -214,6 +217,16 @@ final class SettingsViewModel: ObservableObject {
                 "Could not refresh system health: \(error.localizedDescription)",
                 tone: .warning
             )
+        }
+    }
+
+    func refreshBenchmarks() async {
+        do {
+            benchmarkSnapshot = try await client.benchmarks(alias: nil)
+        } catch {
+            // Benchmark evidence is optional. Keep the rest of Settings fully
+            // usable when an older or degraded service cannot return it.
+            benchmarkSnapshot = nil
         }
     }
 
@@ -332,6 +345,7 @@ final class SettingsViewModel: ObservableObject {
                     tone: .success
                 )
             }
+            Task { await refreshBenchmarks() }
         } catch {
             setStatus("Could not save settings: \(error.localizedDescription)", tone: .error)
         }
@@ -845,6 +859,8 @@ final class SettingsViewModel: ObservableObject {
             return [.generation]
         case .mflux:
             return [.image]
+        case .mlxcel, .mistralRs:
+            return [.generation]
         }
     }
 
@@ -1092,6 +1108,189 @@ final class SettingsViewModel: ObservableObject {
     func selectRole(_ role: ModelRole, for index: Int) {
         guard settings.models.indices.contains(index) else { return }
         settings.models[index].applyRole(role)
+    }
+
+    func compatibleAlternativeSources(for targetIndex: Int) -> [Int] {
+        guard settings.models.indices.contains(targetIndex) else { return [] }
+        let target = settings.models[targetIndex]
+        guard
+            target.kind == .language,
+            target.configuredRole == .generation,
+            engineIsEnabled(target.engine)
+        else {
+            return []
+        }
+        let existingEngines = Set(
+            [target.engine] + target.alternatives.map(\.engine)
+        )
+        return settings.models.indices.filter { index in
+            guard index != targetIndex else { return false }
+            let candidate = settings.models[index]
+            guard
+                candidate.enabled,
+                candidate.kind == .language,
+                candidate.configuredRole == .generation,
+                candidate.alternatives.isEmpty,
+                candidate.selection.mode == "fixed",
+                engineIsEnabled(candidate.engine),
+                !existingEngines.contains(candidate.engine)
+            else { return false }
+            return true
+        }
+    }
+
+    func canBenchmarkModel(at index: Int) -> Bool {
+        guard settings.models.indices.contains(index) else { return false }
+        let profile = settings.models[index]
+        guard
+            profile.enabled,
+            profile.configuredRole == .generation,
+            engineIsEnabled(profile.engine)
+        else { return false }
+        let enabledAlternatives = profile.alternatives.filter {
+            $0.enabled && engineIsEnabled($0.engine)
+        }
+        return !enabledAlternatives.isEmpty
+    }
+
+    private func engineIsEnabled(_ engine: InferenceEngine) -> Bool {
+        switch engine {
+        case .llamaCpp: settings.engines.llamaCpp.enabled
+        case .omlx: settings.engines.omlx.enabled
+        case .ds4: settings.engines.ds4.enabled
+        case .mflux: settings.engines.mflux.enabled
+        case .mlxcel: settings.engines.mlxcel.enabled
+        case .mistralRs: settings.engines.mistralRs.enabled
+        }
+    }
+
+    func attachAlternative(sourceIndex: Int, to targetIndex: Int) {
+        guard
+            settings.models.indices.contains(sourceIndex),
+            settings.models.indices.contains(targetIndex),
+            sourceIndex != targetIndex,
+            compatibleAlternativeSources(for: targetIndex).contains(sourceIndex)
+        else { return }
+        let source = settings.models[sourceIndex]
+        let targetAlias = settings.models[targetIndex].alias
+        let alternative = ModelEngineAlternativeSettings(
+            engine: source.engine,
+            model: source.model,
+            sourceAlias: source.alias,
+            storage: source.storage,
+            servedModelName: source.servedModelName,
+            capabilities: source.capabilities,
+            load: source.load,
+            enabled: source.enabled
+        )
+        settings.models[targetIndex].alternatives.append(alternative)
+        // Keep the exact source profile as a disabled recovery record. It is
+        // omitted from the callable catalog but makes attachment reversible
+        // without reconstructing paths or downloading weights again.
+        settings.models[sourceIndex].enabled = false
+        selectedModelIndex = settings.models.firstIndex { $0.alias == targetAlias }
+        setStatus(
+            "Attached \(source.engine.displayName) as an alternative for \(targetAlias). Save, then benchmark the engines.",
+            tone: .normal
+        )
+    }
+
+    func detachAlternative(id: String, from targetIndex: Int) {
+        guard settings.models.indices.contains(targetIndex),
+              let alternativeIndex = settings.models[targetIndex].alternatives
+                .firstIndex(where: { $0.id == id })
+        else { return }
+        let alternative = settings.models[targetIndex].alternatives[alternativeIndex]
+        var restoredSource = false
+        if let sourceIndex = settings.models.indices.first(where: { index in
+            guard index != targetIndex else { return false }
+            let candidate = settings.models[index]
+            return !candidate.enabled
+                && (
+                    alternative.sourceAlias == nil
+                    || candidate.alias == alternative.sourceAlias
+                )
+                && candidate.engine == alternative.engine
+                && candidate.model == alternative.model
+                && candidate.storage == alternative.storage
+                && candidate.servedModelName == alternative.servedModelName
+                && candidate.capabilities == alternative.capabilities
+                && candidate.load == alternative.load
+        }) {
+            settings.models[sourceIndex].enabled = true
+            restoredSource = true
+        }
+        if !restoredSource {
+            let targetAlias = settings.models[targetIndex].alias
+            let preferred = alternative.sourceAlias
+                ?? "\(targetAlias)-\(alternative.engine.rawValue)"
+            let usedAliases = Set(settings.models.map(\.alias))
+            var restoredAlias = preferred
+            var stem = String(preferred.prefix(110))
+                .trimmingCharacters(in: CharacterSet(charactersIn: ".-"))
+            if stem.isEmpty { stem = "restored-model" }
+            if restoredAlias.count > 128 {
+                restoredAlias = stem
+            }
+            var suffix = 2
+            while usedAliases.contains(restoredAlias) {
+                restoredAlias = "\(stem)-\(suffix)"
+                suffix += 1
+            }
+            settings.models.append(
+                ModelProfileSettings(
+                    alias: restoredAlias,
+                    engine: alternative.engine,
+                    model: alternative.model,
+                    storage: alternative.storage,
+                    servedModelName: alternative.servedModelName,
+                    capabilities: alternative.capabilities,
+                    load: alternative.load,
+                    kind: .language,
+                    enabled: true
+                )
+            )
+        }
+        settings.models[targetIndex].alternatives.remove(at: alternativeIndex)
+        if settings.models[targetIndex].alternatives.isEmpty
+            || settings.models[targetIndex].selection.pinnedEngine
+                == alternative.engine {
+            settings.models[targetIndex].selection.mode = "fixed"
+            settings.models[targetIndex].selection.pinnedEngine = nil
+        }
+        setStatus(
+            "Detached \(alternative.engine.displayName). Its original profile and weights were preserved.",
+            tone: .normal
+        )
+    }
+
+    func runEngineBenchmark(alias: String) async {
+        guard benchmarkingAlias == nil, !hasUnsavedChanges else { return }
+        benchmarkingAlias = alias
+        setStatus("Benchmarking every compatible engine for \(alias)…", tone: .normal)
+        defer { benchmarkingAlias = nil }
+        do {
+            let sampleRuns = settings.models.first(where: { $0.alias == alias })?
+                .selection.minimumSamples ?? 3
+            let run = try await client.runBenchmark(
+                alias: alias,
+                sampleRuns: sampleRuns
+            )
+            benchmarkSnapshot = try await client.benchmarks(alias: nil)
+            let failures = run.failures.count
+            let suffix = failures == 0
+                ? ""
+                : " (\(failures) engine\(failures == 1 ? "" : "s") failed)"
+            setStatus(
+                "Selected \(run.decision.selectedEngine.displayName) for \(alias)\(suffix).",
+                tone: failures == 0 ? .success : .warning
+            )
+        } catch {
+            setStatus(
+                "Could not benchmark \(alias): \(error.localizedDescription)",
+                tone: .error
+            )
+        }
     }
 
     func credentialBinding(_ credential: ManagedCredential) -> Binding<String> {

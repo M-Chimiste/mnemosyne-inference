@@ -183,6 +183,26 @@ class FilesystemProbe:
         )
         return str(payload["path"])
 
+    async def validate_directory(
+        self,
+        *,
+        root: str,
+        path: str,
+        expected_volume_uuid: str | None,
+        scope_id: str | None,
+        timeout_seconds: float | None = None,
+    ) -> str:
+        arguments = ["validate-directory", "--root", root, "--path", path]
+        if expected_volume_uuid is not None:
+            arguments.extend(["--expected-volume-uuid", expected_volume_uuid])
+        payload = await self._run(
+            *arguments,
+            scope_id=scope_id,
+            scope_path=root,
+            timeout_seconds=timeout_seconds,
+        )
+        return str(payload["path"])
+
     async def directory_size(
         self,
         *,

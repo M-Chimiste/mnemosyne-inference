@@ -107,14 +107,14 @@ uv run --project macos/service mnemosyne-macos --check-config \
   --env "$HOME/Library/Application Support/Mnemosyne/.env"
 lsof -nP \
   -iTCP:1240 -iTCP:17321 -iTCP:17322 -iTCP:17323 \
-  -iTCP:17324 -iTCP:17325 \
+  -iTCP:17324 -iTCP:17325 -iTCP:17326 -iTCP:17327 \
   -sTCP:LISTEN
 ```
 
 Confirm Unified Inference owns `1240`/`17321` and every inner listener is
 loopback-only. oMLX owns `17322` when that optional engine is enabled.
-Manager-owned DS4, MFLUX, and llama.cpp should be absent from `17323`,
-`17324`, and `17325` while unloaded. LM Studio is not part of the inference
+Manager-owned DS4, MFLUX, llama.cpp, mlxcel, and mistral.rs should be absent
+from `17323` through `17327` while unloaded. LM Studio is not part of the inference
 topology. The previous token sidecar is not required in the inference path.
 
 With every configured engine empty, confirm both status and the aggregate model
@@ -270,7 +270,7 @@ fail-closed ownership/port error and never signals that process.
 ## 4. Managed Hugging Face downloads
 
 In **Settings → Model Library**, search once and confirm llama.cpp, oMLX, DS4,
-and MFLUX candidates share one result list with explicit engine-support badges;
+MFLUX, mlxcel, and mistral.rs candidates share one result list with explicit engine-support badges;
 there must be no engine tabs or picker. Choose a llama.cpp GGUF repository and
 confirm Download remains disabled until an exact quant/shard set is selected.
 Confirm Hugging Face YAML front matter is absent, Markdown headings/lists/links
@@ -374,6 +374,44 @@ curl -X POST http://127.0.0.1:17321/manager/reconcile | jq
 
 Mnemosyne must detect the drift, unload it, and never load another target while
 any enabled adapter has uncertain state.
+
+### Per-model engine alternatives, pinning, and automatic selection
+
+Install or import the same logical generation model for two engines. In
+**Models → Engine selection**, attach the second installed profile to the
+first, save, choose **Best fresh benchmark**, and explicitly allow Preview
+engines only when this is intentional. Then choose **Benchmark compatible
+engines** and confirm:
+
+- each exact target becomes resident sequentially and never overlaps another
+  engine;
+- the results contain only fixed metric fields and hashed identities—not the
+  prompt, generated text, credentials, local paths, or upstream log output;
+- fewer than the configured successful samples, any failure rate above 5%, or
+  an improvement below the configured threshold retains the original engine;
+- a selected alternative that fails during model load transparently serves
+  the untouched request through the fallback and clears the stale evidence;
+  a failure after upstream work may have started is not replayed, but the next
+  request uses the fallback;
+- restarting with a changed engine binary, changing the model/load config, or
+  aging the record beyond its limit makes the original engine win until a new
+  benchmark passes;
+- an alternative resident is not advertised to Fleet as the warm primary
+  deployment merely because it shares the public alias; and
+- switching the policy back to **Fixed fallback engine** immediately restores
+  the original routing behavior without deleting weights or benchmark rows.
+
+After benchmarking, choose **Pinned engine**, select the non-winning candidate,
+save, and send both streaming and non-streaming requests. Confirm every new
+request uses the pin regardless of the stored recommendation. Disable that
+engine and confirm an untouched request uses the original fallback. Re-enable
+it and confirm the saved pin resumes. Pinning a non-primary engine must make
+the alias ineligible in the Fleet snapshot so its primary deployment identity
+cannot route to different weights or an engine-specific implementation.
+
+The same content-free evidence is available from
+`GET /manager/benchmarks?alias=<alias>`. Re-run this matrix once with a failed
+alternative load and once while cancelling the benchmark client.
 
 ## 8. MFLUX image lifecycle
 
@@ -564,7 +602,7 @@ This gate applies only to a machine with an older LM Studio-backed
 configuration or model library.
 
 1. Stop LM Studio before starting Unified Inference.
-2. Open the upgraded schema-version-3 configuration and confirm there is no
+2. Open the upgraded schema-version-5 configuration and confirm there is no
    `engines.lmstudio` block. Old LM Studio profiles should appear only under
    `migration.legacy_lmstudio_profiles` and must not appear in `/v1/models`.
 3. Confirm **Detected model folders** offers the configured

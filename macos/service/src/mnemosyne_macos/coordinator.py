@@ -73,6 +73,8 @@ class CoordinatorStatus:
     initialized: bool
     accepting: bool
     transition_target: str | None
+    transition_engine: EngineName | None
+    transition_model: str | None
     queued_by_deployment: Mapping[str, int]
     capacity: Capacity | None
 
@@ -755,6 +757,16 @@ class ResidencyCoordinator:
                 ),
                 transition_target=(
                     self._transition_target.alias
+                    if self._transition_target is not None
+                    else None
+                ),
+                transition_engine=(
+                    self._transition_target.key.engine
+                    if self._transition_target is not None
+                    else None
+                ),
+                transition_model=(
+                    self._transition_target.key.canonical_model_id
                     if self._transition_target is not None
                     else None
                 ),

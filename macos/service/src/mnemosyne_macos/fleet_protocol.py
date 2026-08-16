@@ -329,8 +329,18 @@ def portable_load_config(target: ResolvedTarget) -> dict[str, Any]:
             "image_defaults": dict(target.image_defaults),
         }
 
-    # DS4 is native-only in v1. Retain its output-affecting settings while
-    # replacing the machine-local KV path with a path-neutral mode bit.
+    if target.key.engine not in {
+        EngineName.DS4,
+        EngineName.MLXCEL,
+        EngineName.MISTRAL_RS,
+    }:
+        raise ValueError(
+            f"unsupported native Fleet engine '{target.key.engine.value}'"
+        )
+
+    # These manager-owned native servers retain output-affecting settings.
+    # Scheduler parallelism is capacity-only, and DS4's machine-local KV path
+    # becomes a path-neutral mode bit.
     load.pop("parallel", None)
     if "kv_disk_directory" in load:
         load["kv_disk_enabled"] = bool(load.pop("kv_disk_directory", None))

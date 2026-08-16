@@ -110,6 +110,16 @@ class DeleteManagedModelRequest(BaseModel):
     revision: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
 
 
+class BenchmarkModelRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    warmup_runs: int = Field(default=1, ge=0, le=5)
+    sample_runs: int = Field(default=3, ge=1, le=20)
+    # Output length is part of the benchmark suite contract. Keeping it fixed
+    # prevents incomparable throughput runs from sharing one evidence key.
+    max_tokens: int = Field(default=128, ge=128, le=128)
+
+
 class InstallModelRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -154,6 +164,12 @@ _INSTALL_ROLE_CAPABILITY_SETS: dict[
     },
     EngineName.MFLUX: {
         "image": (frozenset({Endpoint.IMAGES_GENERATIONS}),),
+    },
+    EngineName.MLXCEL: {
+        "generation": (DEFAULT_CAPABILITIES[EngineName.MLXCEL],),
+    },
+    EngineName.MISTRAL_RS: {
+        "generation": (_GENERATION_WITH_MESSAGES,),
     },
 }
 
@@ -479,6 +495,14 @@ class _StreamingProxyOwnership:
                     and self.target.key.engine != EngineName.MFLUX
                 ):
                     await _audit_after_upstream_failure(self.runtime)
+                if (
+                    self.runtime.is_engine_alternative(self.target)
+                    and (
+                        self.upstream_failed
+                        or self.upstream.status_code >= 500
+                    )
+                ):
+                    self.runtime.invalidate_automatic_selection(self.target.alias)
                 self.performance_timer.finish(
                     status_code=self.upstream.status_code,
                     error_code=(
@@ -574,11 +598,15 @@ def _control_authorized(runtime: NativeRuntime, request: Request) -> bool:
     return username == "admin" and hmac.compare_digest(password, expected)
 
 
-async def _resolve_target(runtime: NativeRuntime, model: str) -> Any:
+async def _resolve_target(
+    runtime: NativeRuntime,
+    model: str,
+    endpoint: Endpoint | None = None,
+) -> Any:
     """Resolve storage-backed profiles without blocking either HTTP plane."""
 
     try:
-        return await runtime.resolve_target(model)
+        return await runtime.resolve_target(model, endpoint=endpoint)
     except FilesystemProbeError as exc:
         raise HTTPException(
             503,
@@ -654,7 +682,7 @@ def create_inference_app(runtime: NativeRuntime) -> FastAPI:
         body = await request.body()
         requested_model = _json_model(body)
         try:
-            target = await _resolve_target(runtime, requested_model)
+            target = await _resolve_target(runtime, requested_model, endpoint)
         except KeyError as exc:
             raise HTTPException(404, str(exc)) from exc
         if endpoint not in target.capabilities:
@@ -683,6 +711,7 @@ def create_inference_app(runtime: NativeRuntime) -> FastAPI:
         before_admission = await runtime.coordinator.status()
         cold_start = not (
             before_admission.resident_alias == target.alias
+            and before_admission.resident_engine == target.key.engine
             and before_admission.state == CoordinatorState.READY
         )
         lease = None
@@ -696,10 +725,44 @@ def create_inference_app(runtime: NativeRuntime) -> FastAPI:
                 if endpoint == Endpoint.IMAGES_GENERATIONS
                 else None
             )
-            lease = await runtime.coordinator.acquire(
-                target,
-                timeout_seconds=lease_timeout,
-            )
+            try:
+                lease = await runtime.coordinator.acquire(
+                    target,
+                    timeout_seconds=lease_timeout,
+                )
+            except (QueueFull, QueueTimeout):
+                raise
+            except (AdapterError, CoordinatorError):
+                primary = runtime.resolve(target.alias)
+                status = await runtime.coordinator.status()
+                can_fallback = bool(
+                    target.key.engine != primary.key.engine
+                    and status.initialized
+                    and status.accepting
+                    and status.resident_alias is None
+                )
+                if not can_fallback:
+                    raise
+                # The selected candidate failed before an upstream request
+                # existed. Automatic choices lose their stale evidence; an
+                # explicit user pin remains saved. Recover this untouched
+                # request through the original fixed target.
+                runtime.invalidate_automatic_selection(target.alias)
+                target = await runtime.resolve_fixed_target(
+                    target.alias,
+                    endpoint=endpoint,
+                )
+                performance_timer.engine = target.key.engine.value
+                retry_status = await runtime.coordinator.status()
+                cold_start = not (
+                    retry_status.resident_alias == target.alias
+                    and retry_status.resident_engine == target.key.engine
+                    and retry_status.state == CoordinatorState.READY
+                )
+                lease = await runtime.coordinator.acquire(
+                    target,
+                    timeout_seconds=lease_timeout,
+                )
             performance_timer.mark_admitted(cold_start=cold_start)
             route = lease.route(endpoint)
             prepared, requested_model, streamed, client_asked_usage = prepare_request_body(
@@ -723,6 +786,13 @@ def create_inference_app(runtime: NativeRuntime) -> FastAPI:
             else:
                 upstream = await runtime.proxy_client.send(upstream_request, stream=True)
             performance_timer.mark_upstream_headers()
+            if (
+                upstream.status_code >= 500
+                and runtime.is_engine_alternative(target)
+            ):
+                # Work may already have begun, so never replay this request.
+                # The evidence is removed only for subsequent requests.
+                runtime.invalidate_automatic_selection(target.alias)
         except asyncio.CancelledError:
             performance_timer.finish(status_code=499, error_code="cancelled")
             if target.key.engine == EngineName.MFLUX:
@@ -770,6 +840,8 @@ def create_inference_app(runtime: NativeRuntime) -> FastAPI:
             )
             await _close_proxy_resources(upstream, lease)
             if isinstance(exc, httpx.HTTPError):
+                if runtime.is_engine_alternative(target):
+                    runtime.invalidate_automatic_selection(target.alias)
                 await _audit_after_upstream_failure(runtime)
             raise HTTPException(_error_status(exc), str(exc)) from exc
 
@@ -890,6 +962,8 @@ def create_inference_app(runtime: NativeRuntime) -> FastAPI:
                 await _close_proxy_resources(upstream, lease)
             if upstream_failed and target.key.engine != EngineName.MFLUX:
                 await _audit_after_upstream_failure(runtime)
+            if upstream_failed and runtime.is_engine_alternative(target):
+                runtime.invalidate_automatic_selection(target.alias)
 
     @app.post("/v1/chat/completions")
     async def chat_completions(request: Request) -> Response:
@@ -942,6 +1016,29 @@ def create_control_app(runtime: NativeRuntime) -> FastAPI:
     @app.get("/manager/performance")
     async def performance() -> dict:
         return runtime.performance.snapshot()
+
+    @app.get("/manager/benchmarks")
+    async def benchmarks(alias: str | None = Query(default=None)) -> dict:
+        return runtime.benchmark_snapshot(alias)
+
+    @app.post("/manager/benchmarks/{alias}")
+    async def benchmark_model(alias: str, payload: BenchmarkModelRequest) -> dict:
+        try:
+            return await runtime.benchmark_model(
+                alias,
+                warmup_runs=payload.warmup_runs,
+                sample_runs=payload.sample_runs,
+                max_tokens=payload.max_tokens,
+            )
+        except Exception as exc:
+            raise HTTPException(_error_status(exc), str(exc)) from exc
+
+    @app.delete("/manager/benchmarks/{alias}")
+    async def clear_benchmarks(alias: str) -> dict:
+        return {
+            "alias": alias,
+            "deleted": runtime.reject_benchmark_evidence(alias),
+        }
 
     @app.get("/manager/readiness")
     async def readiness() -> dict:
@@ -1333,7 +1430,18 @@ def create_control_app(runtime: NativeRuntime) -> FastAPI:
                 ModelProfile(
                     alias=alias,
                     engine=payload.engine,
-                    model=payload.repo_id,
+                    model=(
+                        str(destination)
+                        if payload.engine
+                        in {EngineName.MLXCEL, EngineName.MISTRAL_RS}
+                        else payload.repo_id
+                    ),
+                    storage=(
+                        storage_name
+                        if payload.engine
+                        in {EngineName.MLXCEL, EngineName.MISTRAL_RS}
+                        else None
+                    ),
                     capabilities=set(capabilities),
                 )
             record = await runtime.installer.create(

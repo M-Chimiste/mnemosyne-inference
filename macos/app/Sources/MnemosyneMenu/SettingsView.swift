@@ -18,6 +18,8 @@ struct SettingsView: View {
     let restartService: () -> Void
     @State private var previewedCredentialDrafts: Set<ManagedCredential> = []
     @State private var selfTestAlias = ""
+    @State private var alternativeSourceIndex: Int?
+    private let productBuildIdentity = ProductBuildIdentity.current
 
     var body: some View {
         HStack(spacing: 0) {
@@ -131,10 +133,21 @@ struct SettingsView: View {
                 .buttonStyle(.plain)
             }
             Spacer()
-            Text("Unified Inference")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .padding(12)
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                Text("Unified Inference")
+                    .font(.caption)
+                    .lineLimit(1)
+                Spacer(minLength: 2)
+                Text(productBuildIdentity.compactLabel)
+                    .font(.caption2)
+                    .monospacedDigit()
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.75)
+                    .accessibilityLabel(productBuildIdentity.accessibilityLabel)
+            }
+            .foregroundStyle(.secondary)
+            .help(productBuildIdentity.accessibilityLabel)
+            .padding(12)
         }
         .frame(width: 180)
         .background(Color(nsColor: .controlBackgroundColor).opacity(0.55))
@@ -608,6 +621,10 @@ struct SettingsView: View {
             viewModel.settings.engines.ds4.enabled
         case .mflux:
             viewModel.settings.engines.mflux.enabled
+        case .mlxcel:
+            viewModel.settings.engines.mlxcel.enabled
+        case .mistralRs:
+            viewModel.settings.engines.mistralRs.enabled
         }
     }
 
@@ -859,6 +876,74 @@ struct SettingsView: View {
                 engineHeader("MFLUX", detail: "Qwen Image and Krea 2")
             }
 
+            Section {
+                Toggle(
+                    "Enable mlxcel (Preview)",
+                    isOn: $viewModel.settings.engines.mlxcel.enabled
+                )
+                LabeledContent("Local port") {
+                    TextField(
+                        "Port",
+                        value: $viewModel.settings.engines.mlxcel.port,
+                        format: .number.grouping(.never)
+                    )
+                    .labelsHidden()
+                    .textFieldStyle(.roundedBorder)
+                    .multilineTextAlignment(.trailing)
+                    .frame(width: 80)
+                }
+                TextField(
+                    "mlxcel-server executable",
+                    text: $viewModel.settings.engines.mlxcel.binary
+                )
+                TextField(
+                    "Working folder",
+                    text: $viewModel.settings.engines.mlxcel.workingDirectory
+                )
+                LabeledContent("Request timeout") {
+                    secondsField($viewModel.settings.engines.mlxcel.requestTimeoutSeconds)
+                }
+                Text("Install and upgrade the official Homebrew formula with `brew tap lablup/tap` and `brew install mlxcel`. Unified Inference owns only the model server process.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } header: {
+                engineHeader("mlxcel", detail: "Native MLX text and vision serving")
+            }
+
+            Section {
+                Toggle(
+                    "Enable mistral.rs (Preview)",
+                    isOn: $viewModel.settings.engines.mistralRs.enabled
+                )
+                LabeledContent("Local port") {
+                    TextField(
+                        "Port",
+                        value: $viewModel.settings.engines.mistralRs.port,
+                        format: .number.grouping(.never)
+                    )
+                    .labelsHidden()
+                    .textFieldStyle(.roundedBorder)
+                    .multilineTextAlignment(.trailing)
+                    .frame(width: 80)
+                }
+                TextField(
+                    "mistralrs executable",
+                    text: $viewModel.settings.engines.mistralRs.binary
+                )
+                TextField(
+                    "Working folder",
+                    text: $viewModel.settings.engines.mistralRs.workingDirectory
+                )
+                LabeledContent("Request timeout") {
+                    secondsField($viewModel.settings.engines.mistralRs.requestTimeoutSeconds)
+                }
+                Text("The official mistral.rs installer owns the binary and its `mistralrs update` path. Unified Inference launches it offline against a pinned local snapshot.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } header: {
+                engineHeader("mistral.rs", detail: "Safetensors language and multimodal models")
+            }
+
         }
         .formStyle(.grouped)
     }
@@ -914,12 +999,12 @@ struct SettingsView: View {
                     ContentUnavailableView(
                         "No Update Information",
                         systemImage: "arrow.triangle.2.circlepath",
-                            description: Text("Choose Check Now to inspect llama.cpp, oMLX, MFLUX, and DS4.")
+                            description: Text("Choose Check Now to inspect llama.cpp, oMLX, MFLUX, DS4, mlxcel, and mistral.rs.")
                     )
                     .frame(maxWidth: .infinity, minHeight: 260)
                 }
 
-                Text("Official downloads are staged and import/build-validated while inference remains available. Activation waits for active requests, unloads the current model through the residency coordinator, and atomically switches runtimes. The previous managed runtime is retained for rollback.")
+                Text("Managed runtime downloads are staged and validated while inference remains available; activation drains through the residency coordinator and retains the previous runtime for rollback. Externally owned engines show their detected binary and official install or update path without Unified Inference replacing vendor files.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -1055,6 +1140,15 @@ struct SettingsView: View {
             }
 
             HStack {
+                if (update.engine == .mlxcel || update.engine == .mistralRs),
+                   let target = update.officialInstallerUrl,
+                   let url = URL(string: target) {
+                    Link(
+                        update.installed ? "Update Instructions" : "Install Instructions",
+                        destination: url
+                    )
+                    .buttonStyle(.borderedProminent)
+                }
                 if update.engine == .omlx,
                    !update.installed,
                    let target = update.officialInstallerUrl,
@@ -1739,6 +1833,7 @@ struct SettingsView: View {
                     }
                 }
 
+                engineSelectionOptions(index)
                 modelRoleOptions(index)
                 if viewModel.settings.models[index].engine == .mflux {
                     imageModelOptions(index)
@@ -1777,14 +1872,188 @@ struct SettingsView: View {
     }
 
     @ViewBuilder
+    private func engineSelectionOptions(_ index: Int) -> some View {
+        let profile = viewModel.settings.models[index]
+        let alternatives = viewModel.settings.models[index].alternatives
+        let pinnableEngines = [profile.engine] + alternatives
+            .filter(\.enabled)
+            .map(\.engine)
+        let sources = viewModel.compatibleAlternativeSources(for: index)
+        if !alternatives.isEmpty || !sources.isEmpty {
+            Section("Engine selection") {
+                if !sources.isEmpty {
+                    Picker("Attach installed profile", selection: $alternativeSourceIndex) {
+                        Text("Choose a compatible model…").tag(nil as Int?)
+                        ForEach(sources, id: \.self) { sourceIndex in
+                            let source = viewModel.settings.models[sourceIndex]
+                            Text("\(source.alias) — \(source.engine.displayName)")
+                                .tag(sourceIndex as Int?)
+                        }
+                    }
+                    Button("Use as engine alternative") {
+                        guard let sourceIndex = alternativeSourceIndex else { return }
+                        viewModel.attachAlternative(sourceIndex: sourceIndex, to: index)
+                        alternativeSourceIndex = nil
+                    }
+                    .disabled(alternativeSourceIndex == nil)
+                    Text("Download or import the same logical model as a separate profile, then attach it here. Its exact engine, path, role, and load settings are preserved; no weights are copied.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                if !alternatives.isEmpty {
+                Picker(
+                    "Policy",
+                    selection: engineSelectionModeBinding(for: index)
+                ) {
+                    Text("Fixed fallback engine").tag("fixed")
+                    Text("Best fresh benchmark").tag("benchmark")
+                    Text("Pinned engine").tag("pinned")
+                }
+                if profile.selection.mode == "pinned" {
+                    Picker(
+                        "Pinned engine",
+                        selection: pinnedEngineBinding(for: index)
+                    ) {
+                        ForEach(pinnableEngines) { engine in
+                            Text(
+                                engine == profile.engine
+                                    ? "\(engine.displayName) — original fallback"
+                                    : engine.displayName
+                            )
+                            .tag(engine)
+                        }
+                    }
+                    Text(
+                        "Pinned selection bypasses benchmark recommendations. The original fallback is still used if the pinned engine cannot load before inference starts."
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                } else if profile.selection.mode == "benchmark" {
+                    Picker(
+                        "Optimize for",
+                        selection: $viewModel.settings.models[index].selection.objective
+                    ) {
+                        Text("Balanced").tag("balanced")
+                        Text("First-token latency").tag("latency")
+                        Text("Output throughput").tag("throughput")
+                    }
+                    Toggle(
+                        "Allow Preview engines to win",
+                        isOn: $viewModel.settings.models[index].selection.allowPreview
+                    )
+                    LabeledContent("Minimum samples") {
+                        integerField(
+                            $viewModel.settings.models[index].selection.minimumSamples,
+                            unit: "runs"
+                        )
+                    }
+                    LabeledContent("Evidence lifetime") {
+                        integerField(
+                            $viewModel.settings.models[index].selection.maxBenchmarkAgeHours,
+                            unit: "hours"
+                        )
+                    }
+                    LabeledContent("Minimum improvement") {
+                        doubleField(
+                            $viewModel.settings.models[index].selection.minimumImprovementPercent,
+                            unit: "%"
+                        )
+                    }
+                }
+                ForEach(alternatives) { alternative in
+                    LabeledContent(alternative.engine.displayName) {
+                        HStack {
+                            Text(alternative.model)
+                                .font(.system(.caption, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                            Button("Detach") {
+                                viewModel.detachAlternative(
+                                    id: alternative.id,
+                                    from: index
+                                )
+                            }
+                            .buttonStyle(.borderless)
+                        }
+                    }
+                }
+                if let decision = viewModel.benchmarkSnapshot?.decisions.first(
+                    where: { $0.alias == viewModel.settings.models[index].alias }
+                ) {
+                    LabeledContent("Current decision") {
+                        Text(decision.selectedEngine.displayName)
+                            .foregroundStyle(.secondary)
+                    }
+                    Text(decision.reason)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                HStack {
+                    Button("Benchmark compatible engines") {
+                        let alias = viewModel.settings.models[index].alias
+                        Task { await viewModel.runEngineBenchmark(alias: alias) }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(
+                        viewModel.hasUnsavedChanges
+                            || viewModel.benchmarkingAlias != nil
+                            || !viewModel.canBenchmarkModel(at: index)
+                    )
+                    if viewModel.benchmarkingAlias
+                        == viewModel.settings.models[index].alias {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text("This can take several minutes.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                Text("The original engine remains the fallback. Benchmark mode uses only fresh results for this exact model, load configuration, runtime version, and Mac.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                }
+            }
+        }
+    }
+
+    private func engineSelectionModeBinding(for index: Int) -> Binding<String> {
+        Binding(
+            get: { viewModel.settings.models[index].selection.mode },
+            set: { mode in
+                viewModel.settings.models[index].selection.mode = mode
+                if mode == "pinned",
+                   viewModel.settings.models[index].selection.pinnedEngine == nil {
+                    viewModel.settings.models[index].selection.pinnedEngine =
+                        viewModel.settings.models[index].engine
+                }
+            }
+        )
+    }
+
+    private func pinnedEngineBinding(for index: Int) -> Binding<InferenceEngine> {
+        Binding(
+            get: {
+                viewModel.settings.models[index].selection.pinnedEngine
+                    ?? viewModel.settings.models[index].engine
+            },
+            set: {
+                viewModel.settings.models[index].selection.pinnedEngine = $0
+            }
+        )
+    }
+
+    @ViewBuilder
     private func languageModelOptions(_ index: Int) -> some View {
         let engine = viewModel.settings.models[index].engine
         if engine != .omlx {
             Section("Loading") {
-                optionalIntegerField(
-                    "Context length",
-                    value: $viewModel.settings.models[index].load.contextLength
-                )
+                if engine != .mistralRs {
+                    optionalIntegerField(
+                        "Context length",
+                        value: $viewModel.settings.models[index].load.contextLength
+                    )
+                }
                 if engine == .llamaCpp {
                     optionalIntegerField(
                         "Evaluation batch size",
@@ -1858,6 +2127,20 @@ struct SettingsView: View {
                         "KV cache disk limit (MB)",
                         value: $viewModel.settings.models[index].load.kvDiskSpaceMb
                     )
+                }
+                if engine == .mlxcel {
+                    optionalIntegerField(
+                        "Parallel request slots",
+                        value: $viewModel.settings.models[index].load.parallel
+                    )
+                    Text("mlxcel defaults to four continuously batched slots. Set an explicit value when memory pressure or benchmark results favor a different scheduler width.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                if engine == .mistralRs {
+                    Text("mistral.rs starts with a conservative single manager admission slot on Metal. Advanced runtime arguments remain configuration-only until upstream exposes an authoritative scheduler-capacity contract.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
             }
         } else {
@@ -2362,6 +2645,8 @@ struct SettingsView: View {
         case .omlx: .purple
         case .ds4: .orange
         case .mflux: .pink
+        case .mlxcel: .indigo
+        case .mistralRs: .teal
         }
         return Label(engine.displayName, systemImage: "checkmark.circle.fill")
             .font(.caption2.weight(.semibold))
@@ -2421,6 +2706,24 @@ struct SettingsView: View {
 
     private func integerField(
         _ value: Binding<Int>,
+        unit: String,
+        fieldWidth: CGFloat = 104
+    ) -> some View {
+        HStack(spacing: 8) {
+            TextField("Value", value: value, format: .number)
+                .labelsHidden()
+                .textFieldStyle(.roundedBorder)
+                .multilineTextAlignment(.trailing)
+                .frame(width: fieldWidth)
+            Text(unit)
+                .foregroundStyle(.secondary)
+                .frame(width: 58, alignment: .leading)
+        }
+        .frame(minWidth: fieldWidth + 70, alignment: .trailing)
+    }
+
+    private func doubleField(
+        _ value: Binding<Double>,
         unit: String,
         fieldWidth: CGFloat = 104
     ) -> some View {

@@ -75,7 +75,9 @@ The native service listens on `127.0.0.1:1240` for inference and
 `127.0.0.1:17321` for control. It is the workstation's token sidecar and
 enforces one resident model globally across a manager-owned llama.cpp process
 (`:17325`), oMLX (`:17322`), a manager-owned DS4 process (`:17323`), and the
-MFLUX image worker (`:17324`). LM Studio is not an engine and is never
+MFLUX image worker (`:17324`). Optional Preview mlxcel (`:17326`) and
+mistral.rs (`:17327`) processes provide additional native language paths.
+LM Studio is not an engine and is never
 contacted; only its configured or conventional model directory is offered as a
 read-only migration hint. After the service is enabled from the menu app, a
 per-user LaunchAgent keeps inference alive when the controller quits.
@@ -87,7 +89,9 @@ resident model, model load/unload controls, usage-outbox depth, background
 service registration, and login-item controls. **Settings…** opens a dedicated
 native settings window with pages for general behavior, engines, runtime
 updates, storage, a Hugging Face model library, model profiles, usage
-reporting, and credentials.
+reporting, and credentials. Model profiles stay fixed to their original engine
+by default; an explicit same-model alternative can be benchmarked and selected
+automatically with the original engine retained as the fallback.
 Storage is chosen with the native macOS folder picker, including exact nested
 paths such as `/Volumes/Athena/models`; it is never entered as a raw path.
 While the picker grant is live, the menu app creates an ordinary Finder
@@ -192,8 +196,8 @@ The Model Library page can search engine-compatible Hugging Face models and
 download them into a GUI-selected internal or external folder before first
 use. Downloads are process-isolated, resumable, cancellable, and do not load
 the model. The app contains Unified Inference's core and isolated MFLUX worker;
-oMLX remains separately installed through its official app or Homebrew, and
-model weights are never embedded.
+oMLX, Preview mlxcel, and Preview mistral.rs remain separately installed
+through their official distribution paths, and model weights are never embedded.
 See [macos/README.md](macos/README.md) for engine preparation, storage,
 configuration, development mode, and signing details.
 
@@ -202,14 +206,16 @@ app with precompiled custom kernels and the in-app llama.cpp, DS4, and MFLUX
 installation paths—follow [macos/INSTALL.md](macos/INSTALL.md). A stable
 headless Homebrew oMLX path remains available.
 
-The Runtime Updates page compares llama.cpp, oMLX, MFLUX, and DS4 with their
-official upstream projects. Unified Inference downloads the official
+The Runtime Updates page reports all six native engines and their official
+ownership/update paths. Unified Inference downloads the official
 `ggml-org/llama.cpp` Apple Silicon archive, verifies the asset size and
 GitHub-published SHA-256, and validates the server contract before activation.
 oMLX remains externally owned; the page selects its matching official DMG and
 opens its official update path. MFLUX comes
 from its official PyPI project; DS4 is downloaded at an exact commit from
-`antirez/ds4` and built locally with the Apple toolchain. Managed updates are
+`antirez/ds4` and built locally with the Apple toolchain. mlxcel and mistral.rs
+remain externally upgraded through their official Homebrew/installer tools.
+Managed updates are
 staged without replacing `Unified Inference.app`. Activation drains requests
 and unloads the resident model; the previous runtime remains available for
 one-click rollback. Managed runtimes live

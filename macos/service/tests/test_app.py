@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+import time
 from types import SimpleNamespace
 
 import httpx
@@ -16,9 +17,16 @@ from mnemosyne_macos.app import (
     create_control_app,
     create_inference_app,
 )
+from mnemosyne_macos.benchmarking import (
+    BENCHMARK_SUITE_VERSION,
+    BenchmarkRecord,
+    candidate_set_fingerprint,
+    system_fingerprint,
+    target_fingerprint,
+)
 from mnemosyne_macos.config import MacConfig, load_config, save_config
 from mnemosyne_macos.coordinator import CoordinatorError, CoordinatorState
-from mnemosyne_macos.engines.base import Deadline, EngineAdapter
+from mnemosyne_macos.engines.base import AdapterError, Deadline, EngineAdapter
 from mnemosyne_macos.install_store import InstallRecord
 from mnemosyne_macos.model_library import LibraryModel
 from mnemosyne_macos.models import (
@@ -258,6 +266,8 @@ async def test_model_library_search_unifies_all_engine_catalogs(
         EngineName.OMLX: 40,
         EngineName.DS4: 30,
         EngineName.MFLUX: 20,
+        EngineName.MLXCEL: 25,
+        EngineName.MISTRAL_RS: 15,
     }
 
     def fake_search(query, *, engine, limit):
@@ -292,7 +302,9 @@ async def test_model_library_search_unifies_all_engine_catalogs(
         assert [item["engine"] for item in unified.json()["models"]] == [
             "omlx",
             "ds4",
+            "mlxcel",
             "mflux",
+            "mistral.rs",
             "llama.cpp",
         ]
 
@@ -381,6 +393,223 @@ async def test_non_streaming_proxy_rewrites_model_strips_credentials_and_records
         assert performance["by_model"][0]["cold_starts"] == 1
         assert performance["recent"][0]["status_code"] == 200
         assert performance["recent"][0]["admission_ms"] is not None
+    finally:
+        await client.aclose()
+        await runtime.stop()
+        await upstream_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_failed_benchmark_winner_falls_back_before_upstream_work(
+    tmp_path,
+) -> None:
+    class FailingLoadAdapter(FakeAdapter):
+        async def runtime_fingerprint(self, *, deadline: Deadline) -> str:
+            del deadline
+            return "mlxcel-v1"
+
+        async def load(
+            self,
+            target: ResolvedTarget,
+            *,
+            deadline: Deadline,
+        ) -> LoadedHandle:
+            del target, deadline
+            self.loads += 1
+            raise AdapterError(self.engine, "load", "candidate rejected the model")
+
+    config = MacConfig.model_validate(
+        {
+            "server": {"idle_unload_seconds": None},
+            "engines": {
+                "omlx": {"enabled": True},
+                "mlxcel": {"enabled": True},
+            },
+            "paths": {"state_database": str(tmp_path / "state.db")},
+            "models": [
+                {
+                    "alias": "frontier",
+                    "engine": "omlx",
+                    "model": "publisher/upstream-model",
+                    "alternatives": [
+                        {
+                            "engine": "mlxcel",
+                            "model": str(tmp_path / "mlx-model"),
+                        }
+                    ],
+                    "selection": {
+                        "mode": "benchmark",
+                        "objective": "latency",
+                        "minimum_samples": 1,
+                        "allow_preview": True,
+                    },
+                }
+            ],
+        }
+    )
+    adapters = _adapters()
+    failing = FailingLoadAdapter(EngineName.MLXCEL)
+    adapters[EngineName.MLXCEL] = failing
+    upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {"message": {"role": "assistant", "content": "ok"}}
+                    ],
+                    "usage": {
+                        "prompt_tokens": 2,
+                        "completion_tokens": 1,
+                        "total_tokens": 3,
+                    },
+                },
+            )
+        )
+    )
+    runtime = NativeRuntime(
+        config,
+        adapters=adapters,
+        proxy_client=upstream_client,
+    )
+    await runtime.start(raise_on_degraded=True)
+    primary, alternative = runtime.profile_candidates["frontier"]
+    revision = candidate_set_fingerprint((primary, alternative))
+    runtime._runtime_fingerprints = {  # noqa: SLF001
+        EngineName.OMLX: "omlx-v1",
+        EngineName.MLXCEL: "mlxcel-v1",
+    }
+    for target, runtime_id, ttft in (
+        (primary, "omlx-v1", 200.0),
+        (alternative, "mlxcel-v1", 50.0),
+    ):
+        runtime.benchmark_store.record(
+            BenchmarkRecord(
+                created_at=time.time(),
+                alias="frontier",
+                endpoint="chat/completions",
+                engine=target.key.engine.value,
+                target_fingerprint=target_fingerprint(target),
+                runtime_fingerprint=runtime_id,
+                system_fingerprint=system_fingerprint(),
+                config_revision=revision,
+                suite_version=BENCHMARK_SUITE_VERSION,
+                successful_samples=1,
+                failed_samples=0,
+                p50_ttft_ms=ttft,
+                p50_total_ms=500,
+                p50_output_tps=20,
+            )
+        )
+    runtime._reload_benchmark_records("frontier")  # noqa: SLF001
+    client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=create_inference_app(runtime)),
+        base_url="http://mnemosyne.test",
+    )
+    request = {
+        "model": "frontier",
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+    try:
+        first = await client.post("/v1/chat/completions", json=request)
+        second = await client.post("/v1/chat/completions", json=request)
+        assert first.status_code == 200, first.text
+        assert second.status_code == 200, second.text
+        assert failing.loads == 1
+        assert adapters[EngineName.OMLX].loads == 1
+        assert runtime.benchmark_store.list(alias="frontier") == []
+        status = await runtime.coordinator.status()
+        assert status.state == CoordinatorState.READY
+        assert status.resident_engine == EngineName.OMLX
+    finally:
+        await client.aclose()
+        await runtime.stop()
+        await upstream_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_user_pin_routes_to_the_selected_engine_without_benchmark_evidence(
+    tmp_path,
+) -> None:
+    seen: dict = {}
+
+    def upstream_handler(request: httpx.Request) -> httpx.Response:
+        seen["host"] = request.url.host
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+                "usage": {
+                    "prompt_tokens": 2,
+                    "completion_tokens": 1,
+                    "total_tokens": 3,
+                },
+            },
+        )
+
+    config = MacConfig.model_validate(
+        {
+            "server": {"idle_unload_seconds": None},
+            "engines": {
+                "omlx": {"enabled": True},
+                "mlxcel": {"enabled": True},
+            },
+            "paths": {"state_database": str(tmp_path / "state.db")},
+            "models": [
+                {
+                    "alias": "frontier",
+                    "engine": "omlx",
+                    "model": "publisher/upstream-model",
+                    "alternatives": [
+                        {
+                            "engine": "mlxcel",
+                            "model": str(tmp_path / "mlx-model"),
+                        }
+                    ],
+                    "selection": {
+                        "mode": "pinned",
+                        "pinned_engine": "mlxcel",
+                    },
+                }
+            ],
+        }
+    )
+    adapters = _adapters()
+    upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(upstream_handler)
+    )
+    runtime = NativeRuntime(
+        config,
+        adapters=adapters,
+        proxy_client=upstream_client,
+    )
+    await runtime.start(raise_on_degraded=True)
+    client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=create_inference_app(runtime)),
+        base_url="http://mnemosyne.test",
+    )
+    try:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "frontier",
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+
+        assert response.status_code == 200, response.text
+        assert seen == {
+            "host": "mlxcel.test",
+            "body": {
+                "model": "frontier",
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        }
+        assert adapters[EngineName.MLXCEL].loads == 1
+        assert adapters[EngineName.OMLX].loads == 0
+        rows = await runtime.usage.list_usage()
+        assert rows[0]["backend"] == "mlxcel"
     finally:
         await client.aclose()
         await runtime.stop()
@@ -2069,6 +2298,121 @@ async def test_fleet_snapshot_maps_internal_verifying_state_and_transition_targe
         await client.aclose()
         await runtime.stop()
         await upstream_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_fleet_does_not_report_an_automatic_alternative_as_primary_warm(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """Fleet identities remain exact even when local policy uses an alternative."""
+
+    monkeypatch.setenv("FLEET_API_KEY", "fleet-secret")
+    monkeypatch.setenv("INFERENCE_API_KEY", "inference-secret")
+    config = MacConfig.model_validate(
+        {
+            "server": {"idle_unload_seconds": None},
+            "engines": {
+                "omlx": {"enabled": True},
+                "mlxcel": {"enabled": True},
+            },
+            "paths": {"state_database": str(tmp_path / "state.db")},
+            "models": [
+                {
+                    "alias": "frontier",
+                    "engine": "omlx",
+                    "model": "publisher/upstream-model",
+                    "alternatives": [
+                        {
+                            "engine": "mlxcel",
+                            "model": str(tmp_path / "mlx-model"),
+                        }
+                    ],
+                }
+            ],
+        }
+    )
+    runtime = NativeRuntime(config, adapters=_adapters())
+    await runtime.start(raise_on_degraded=True)
+    client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=create_inference_app(runtime)),
+        base_url="http://inference.test",
+    )
+    lease = await runtime.coordinator.acquire(
+        runtime.profile_candidates["frontier"][1]
+    )
+    try:
+        response = await client.get(
+            "/fleet/v1/snapshot",
+            headers={"Authorization": "Bearer fleet-secret"},
+        )
+        assert response.status_code == 200
+        snapshot = response.json()
+        assert snapshot["residency"]["alias"] == "frontier"
+        assert snapshot["residency"]["engine"] == "mlxcel"
+        assert snapshot["residency"]["deployment_id"] is None
+        assert snapshot["deployments"][0]["warm"] is False
+    finally:
+        await lease.release()
+        await client.aclose()
+        await runtime.stop()
+
+
+@pytest.mark.asyncio
+async def test_fleet_excludes_alias_pinned_to_a_nonprimary_engine(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """Fleet must not route an immutable primary ID through a pinned alternative."""
+
+    monkeypatch.setenv("FLEET_API_KEY", "fleet-secret")
+    monkeypatch.setenv("INFERENCE_API_KEY", "inference-secret")
+    config = MacConfig.model_validate(
+        {
+            "server": {"idle_unload_seconds": None},
+            "engines": {
+                "omlx": {"enabled": True},
+                "mlxcel": {"enabled": True},
+            },
+            "paths": {"state_database": str(tmp_path / "state.db")},
+            "models": [
+                {
+                    "alias": "frontier",
+                    "engine": "omlx",
+                    "model": "publisher/upstream-model",
+                    "alternatives": [
+                        {
+                            "engine": "mlxcel",
+                            "model": str(tmp_path / "mlx-model"),
+                        }
+                    ],
+                    "selection": {
+                        "mode": "pinned",
+                        "pinned_engine": "mlxcel",
+                    },
+                }
+            ],
+        }
+    )
+    runtime = NativeRuntime(config, adapters=_adapters())
+    await runtime.start(raise_on_degraded=True)
+    client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=create_inference_app(runtime)),
+        base_url="http://inference.test",
+    )
+    try:
+        response = await client.get(
+            "/fleet/v1/snapshot",
+            headers={"Authorization": "Bearer fleet-secret"},
+        )
+
+        assert response.status_code == 200
+        deployment = response.json()["deployments"][0]
+        assert deployment["fleet_eligible"] is False
+        assert deployment["loadable"] is False
+    finally:
+        await client.aclose()
+        await runtime.stop()
 
 
 @pytest.mark.asyncio

@@ -12,7 +12,9 @@ func defaultControlPort() {
     #expect(!NativeSettings().engines.omlx.enabled)
     #expect(!NativeSettings().engines.ds4.enabled)
     #expect(!NativeSettings().engines.mflux.enabled)
-    #expect(NativeSettings().schemaVersion == 3)
+    #expect(!NativeSettings().engines.mlxcel.enabled)
+    #expect(!NativeSettings().engines.mistralRs.enabled)
+    #expect(NativeSettings().schemaVersion == 5)
     #expect(NativeSettings().server.maxConcurrency == nil)
     #expect(NativeSettings().server.maxQueueDepth == 128)
     #expect(NativeSettings().server.idleUnloadSeconds == nil)
@@ -70,6 +72,30 @@ func loadRequestEncoding() throws {
     let body = try #require(request.httpBody)
     let payload = try JSONDecoder().decode(LoadModelRequest.self, from: body)
     #expect(payload == LoadModelRequest(model: "glm-5-2"))
+}
+
+@Test("Engine benchmarks use a bounded fixed suite request")
+func benchmarkRequestEncoding() throws {
+    let client = ControlAPIClient(
+        baseURL: URL(string: "http://localhost:17321")!,
+        adminPassword: "secret"
+    )
+    let request = try client.benchmarkRequest(alias: "qwen-3.5", sampleRuns: 7)
+
+    #expect(
+        request.url?.absoluteString
+            == "http://localhost:17321/manager/benchmarks/qwen-3.5"
+    )
+    #expect(request.httpMethod == "POST")
+    #expect(request.timeoutInterval == 3_600)
+    #expect(request.value(forHTTPHeaderField: "Authorization") == "Basic YWRtaW46c2VjcmV0")
+    let body = try #require(request.httpBody)
+    let object = try #require(
+        JSONSerialization.jsonObject(with: body) as? [String: Any]
+    )
+    #expect(object["warmup_runs"] as? Int == 1)
+    #expect(object["sample_runs"] as? Int == 7)
+    #expect(object["max_tokens"] as? Int == 128)
 }
 
 @Test("Model self-test requests use the public-path verifier with bounded options")
@@ -150,7 +176,7 @@ func configurationSaveRequestEncoding() throws {
     let locations = try #require(storage["locations"] as? [[String: Any]])
     let load = try #require(models.first?["load"] as? [String: Any])
     #expect(server["inference_port"] as? Int == 17_330)
-    #expect(config["schema_version"] as? Int == 3)
+    #expect(config["schema_version"] as? Int == 5)
     #expect(server["max_concurrency"] as? Int == 3)
     #expect(server["max_queue_depth"] as? Int == 128)
     #expect(server["fleet_api_key_env"] as? String == "FLEET_API_KEY")
@@ -237,14 +263,49 @@ func futureConfigurationSchemaSaveRefused() throws {
     let client = ControlAPIClient(
         baseURL: URL(string: "http://localhost:17321")!
     )
-    let settings = NativeSettings(schemaVersion: 4)
+    let settings = NativeSettings(schemaVersion: 6)
 
-    #expect(throws: ControlAPIError.unsupportedConfigurationSchema(4)) {
+    #expect(throws: ControlAPIError.unsupportedConfigurationSchema(6)) {
         _ = try client.configurationSaveRequest(
             settings: settings,
             revision: String(repeating: "f", count: 64)
         )
     }
+}
+
+@Test("Pinned engine selection round-trips through schema five")
+func pinnedEngineSelectionRoundTrip() throws {
+    let value = ModelSelectionSettings(
+        mode: "pinned",
+        pinnedEngine: .mlxcel,
+        objective: "latency",
+        minimumImprovementPercent: 12
+    )
+
+    let data = try JSONEncoder.nativeSettingsEncoder().encode(value)
+    let object = try #require(
+        JSONSerialization.jsonObject(with: data) as? [String: Any]
+    )
+    #expect(object["mode"] as? String == "pinned")
+    #expect(object["pinned_engine"] as? String == "mlxcel")
+    #expect(object["minimum_improvement_percent"] as? Double == 12)
+    #expect(
+        try JSONDecoder.nativeSettingsDecoder().decode(
+            ModelSelectionSettings.self,
+            from: data
+        ) == value
+    )
+}
+
+@Test("Product version and build have a compact sidebar label")
+func productBuildIdentityFormatting() {
+    let release = ProductBuildIdentity(version: " 0.9.0 ", build: "50")
+    #expect(release.compactLabel == "0.9.0 (50)")
+    #expect(release.accessibilityLabel == "Version 0.9.0, build 50")
+    #expect(
+        ProductBuildIdentity(version: nil, build: nil).compactLabel
+            == "development"
+    )
 }
 
 @Test("Structured configuration decodes every engine and image setting")

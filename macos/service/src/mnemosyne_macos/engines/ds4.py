@@ -14,6 +14,7 @@ from collections import deque
 import contextlib
 import ctypes
 from dataclasses import dataclass
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -494,6 +495,20 @@ class DS4Adapter(EngineAdapter):
             source="ds4-single-session",
             confidence="authoritative",
         )
+
+    async def runtime_fingerprint(self, *, deadline: Deadline) -> str | None:
+        del deadline
+        config = self._effective_config()
+        binary = Path(config.binary).expanduser()
+        try:
+            stat = await asyncio.to_thread(binary.stat)
+        except OSError:
+            return None
+        material = (
+            f"{self.engine.value}\0{binary.resolve(strict=False)}\0"
+            f"{stat.st_size}\0{stat.st_mtime_ns}"
+        )
+        return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
     def _effective_config(self) -> DS4Config:
         managed = resolve_active_runtime("ds4", root=self._runtime_root)

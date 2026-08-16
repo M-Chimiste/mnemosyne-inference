@@ -12,6 +12,19 @@ read-only discovery hint.
 - llama.cpp and oMLX are the V1 Stable language engines. DS4 and MFLUX remain
   clearly labeled Preview while their remaining hardware acceptance checks are
   completed.
+- Preview mlxcel and mistral.rs adapters add two isolated native Apple Silicon
+  language paths without changing existing fixed profiles. They use strict
+  manager-owned child-process identity while their official Homebrew/installer
+  binaries remain externally owned and independently upgradeable.
+- A profile can attach one exact candidate per engine and opt into durable
+  cross-engine selection. Repeated streamed samples rank first-token latency,
+  throughput, or a balanced objective; stale, failed, marginal, or unapproved
+  Preview evidence always falls back to the original engine. Benchmark state
+  retains metrics and hashed identities only.
+- Each model can instead pin a declared engine, bypassing benchmark ranking
+  when generation quality or compatibility matters more than measured speed.
+  The Settings sidebar now shows the app version and build beside the product
+  name for at-a-glance support identification.
 - Native inference now uses oMLX's authoritative scheduler capacity instead of
   serializing it at one request, keeps fresh-install residents warm, bounds new
   GGUF contexts to responsive interactive defaults, and exposes content-free

@@ -189,7 +189,7 @@ The live `docker-compose.yml` is intentionally machine-specific and may live out
 
 ### Native macOS deployment
 
-- Inference is on `127.0.0.1:1240` so Unified Inference is a drop-in replacement for the previous token sidecar; control is on `127.0.0.1:17321`, oMLX uses `:17322`, the manager-owned DS4 child uses `:17323`, the manager-owned MFLUX worker uses `:17324`, and manager-owned llama.cpp uses `:17325`. Reserve `17320` and `17326-17329` for later native services. The legacy sidecar must be booted out and persistently disabled or removed before Unified Inference binds `:1240`; merely unloading it lets it return at the next login.
+- Inference is on `127.0.0.1:1240` so Unified Inference is a drop-in replacement for the previous token sidecar; control is on `127.0.0.1:17321`, oMLX uses `:17322`, the manager-owned DS4 child uses `:17323`, the manager-owned MFLUX worker uses `:17324`, manager-owned llama.cpp uses `:17325`, Preview mlxcel uses `:17326`, and Preview mistral.rs uses `:17327`. Reserve `17320` and `17328-17329` for later native services. The legacy sidecar must be booted out and persistently disabled or removed before Unified Inference binds `:1240`; merely unloading it lets it return at the next login.
 - The inference plane also exposes read-only `GET /fleet/v1/snapshot` only
   when its independent `FLEET_API_KEY` is configured. Discovery fails closed
   with `fleet_inference_auth_unconfigured` unless the inference key is also
@@ -206,6 +206,9 @@ The live `docker-compose.yml` is intentionally machine-specific and may live out
   metadata-only: never retain prompts, responses, credentials, or arbitrary
   upstream diagnostics.
 - oMLX is an external loopback service controlled through its native lifecycle APIs. llama.cpp and DS4 are model-specific process groups started by Mnemosyne. Never kill an unknown PID or listener; persisted managed-process identity must match executable, argv, start identity, and process group before recovery or signaling.
+- Preview mlxcel and mistral.rs are also model-specific process groups and must reuse the same hardened managed-process ownership proof. Their upstream installations remain externally owned; enabling an adapter must never install, update, or replace its binary. Model Library must pin and download local snapshots before load so an engine process never performs an implicit model download.
+- Configuration schema v5 may attach exact engine alternatives to one public model alias. The original profile remains the unconditional fallback and `selection.mode` defaults to `fixed`. A user may explicitly set `selection.mode: pinned` plus `pinned_engine` to bypass benchmark ranking and prefer that declared engine; if it is disabled or cannot load before inference starts, use the original fallback without replaying ambiguous upstream work. Benchmark selection is opt-in, applies only to capabilities the selected alternative actually supports, and requires fresh content-free evidence matching the exact ordered candidate/load fingerprint, runtime fingerprint, benchmark suite, and local Mac. Unrelated settings or other-model edits must not invalidate that evidence. A missing/stale/failed result must select the fallback; it must never make a profile disappear. Fleet must exclude any alias whose local policy can route away from the exact advertised primary deployment.
+- Cross-engine benchmark rows may retain only fixed engine/model fingerprints, sample counts, success rate, TTFT, total latency, output throughput, suite/config/runtime/system fingerprints, and timestamps. Never persist prompts, generated text, arbitrary upstream diagnostics, credentials, or unhashed local model paths. Benchmarks must use coordinator leases sequentially and hold each lease through the complete response stream.
 - Persisted llama.cpp survivor metadata must also retain the exact storage
   root, scope ID, and volume UUID so restart recovery can reconstruct and
   revalidate the protected-path target before adopting or signaling a child.
@@ -328,7 +331,7 @@ The live `docker-compose.yml` is intentionally machine-specific and may live out
 - The menu app reads and writes structured configuration through the control plane. The service remains the schema authority and atomically persists validated YAML; credential values are write-only in the UI and never returned by the API. Preserve `schema_version`; an older app must refuse to save a newer schema instead of dropping unknown fields. Config snapshots carry an optimistic revision that every save must echo. Serialize saves, download-completion profile creation, and local imports through the same mutation lock; reject a stale Settings save instead of overwriting a concurrent model addition.
 - Setup & Health is the native first-run authority. It must remain usable when
   the service is disabled or degraded, present bounded and secret-redacted
-  readiness, distinguish Stable llama.cpp/oMLX from Preview DS4/MFLUX, and
+  readiness, distinguish Stable llama.cpp/oMLX from Preview DS4/MFLUX/mlxcel/mistral.rs, and
   provide recovery actions. First-run setup completes only after its self-test
   sends a real request through the public listener and verifies the matching
   durable local usage row; Postgres delivery is separately authoritative from

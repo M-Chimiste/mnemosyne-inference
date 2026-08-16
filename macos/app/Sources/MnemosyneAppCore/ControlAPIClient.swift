@@ -10,6 +10,8 @@ public protocol ControlAPI: Sendable {
         unloadAfter: Bool
     ) async throws -> ModelSelfTestResult
     func models() async throws -> ModelCatalogSnapshot
+    func benchmarks(alias: String?) async throws -> EngineBenchmarkSnapshot
+    func runBenchmark(alias: String, sampleRuns: Int) async throws -> EngineBenchmarkRun
     func load(model: String) async throws -> ServiceSnapshot
     func unload() async throws
     func storageLocations() async throws -> StorageSnapshot
@@ -175,6 +177,56 @@ public struct ControlAPIClient: ControlAPI, Sendable {
         let (data, response) = try await session.data(for: request)
         try validate(response, data: data)
         return try JSONDecoder().decode(ServiceSnapshot.self, from: data)
+    }
+
+    public func benchmarks(alias: String? = nil) async throws -> EngineBenchmarkSnapshot {
+        var components = URLComponents(
+            url: endpointURL("/manager/benchmarks"),
+            resolvingAgainstBaseURL: false
+        )!
+        if let alias {
+            components.queryItems = [URLQueryItem(name: "alias", value: alias)]
+        }
+        var request = URLRequest(url: components.url!)
+        request.httpMethod = "GET"
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        addAuthorization(to: &request)
+        let (data, response) = try await session.data(for: request)
+        try validate(response, data: data)
+        return try JSONDecoder.nativeSettingsDecoder().decode(
+            EngineBenchmarkSnapshot.self,
+            from: data
+        )
+    }
+
+    public func runBenchmark(
+        alias: String,
+        sampleRuns: Int
+    ) async throws -> EngineBenchmarkRun {
+        let request = try benchmarkRequest(alias: alias, sampleRuns: sampleRuns)
+        let (data, response) = try await session.data(for: request)
+        try validate(response, data: data)
+        return try JSONDecoder.nativeSettingsDecoder().decode(
+            EngineBenchmarkRun.self,
+            from: data
+        )
+    }
+
+    func benchmarkRequest(alias: String, sampleRuns: Int) throws -> URLRequest {
+        var request = makeRequest(
+            path: "/manager/benchmarks/\(alias)",
+            method: "POST"
+        )
+        request.timeoutInterval = 60 * 60
+        request.httpBody = try JSONEncoder.nativeSettingsEncoder().encode(
+            RunEngineBenchmarkRequest(
+                warmupRuns: 1,
+                sampleRuns: min(max(sampleRuns, 1), 20),
+                maxTokens: 128
+            )
+        )
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        return request
     }
 
     public func readiness() async throws -> ReadinessSnapshot {

@@ -397,6 +397,17 @@ async def test_update_check_uses_only_official_upstreams(
         assert by_engine["omlx"]["release_tier"] == "stable"
         assert by_engine["mflux"]["release_tier"] == "preview"
         assert by_engine["ds4"]["release_tier"] == "preview"
+        assert by_engine["mlxcel"]["release_tier"] == "preview"
+        assert by_engine["mlxcel"]["ownership"] == "external"
+        assert by_engine["mlxcel"]["upgrade_strategy"] == "external_manual"
+        assert by_engine["mlxcel"]["official_installer_url"].startswith(
+            "https://github.com/lablup/mlxcel"
+        )
+        assert by_engine["mistral.rs"]["release_tier"] == "preview"
+        assert by_engine["mistral.rs"]["ownership"] == "external"
+        assert by_engine["mistral.rs"]["official_installer_url"].startswith(
+            "https://ericlbuehler.github.io/mistral.rs"
+        )
         assert by_engine["llama.cpp"]["available_version"] == "b7777"
         assert by_engine["llama.cpp"]["can_install"] is True
         assert "ggml-org/llama.cpp" in by_engine["llama.cpp"]["release_notes_url"]
@@ -439,9 +450,18 @@ async def test_installed_status_never_contacts_upstream(
     try:
         status = await manager.installed_status()
 
-        assert set(status) == {"llama.cpp", "omlx", "mflux", "ds4"}
+        assert set(status) == {
+            "llama.cpp",
+            "omlx",
+            "mflux",
+            "ds4",
+            "mlxcel",
+            "mistral.rs",
+        }
         assert status["llama.cpp"]["installed"] is False
         assert status["ds4"]["installed"] is False
+        assert status["mlxcel"]["installation_kind"] == "external_cli"
+        assert status["mistral.rs"]["installation_kind"] == "external_cli"
         # A bounded loopback oMLX probe is local runtime discovery, not an
         # upstream release query. Nothing may contact GitHub or PyPI.
         assert all(

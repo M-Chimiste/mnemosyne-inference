@@ -12,6 +12,8 @@ class EngineName(StrEnum):
     OMLX = "omlx"
     DS4 = "ds4"
     MFLUX = "mflux"
+    MLXCEL = "mlxcel"
+    MISTRAL_RS = "mistral.rs"
 
 
 ENGINE_RELEASE_TIER: dict[EngineName, str] = {
@@ -19,6 +21,8 @@ ENGINE_RELEASE_TIER: dict[EngineName, str] = {
     EngineName.OMLX: "stable",
     EngineName.DS4: "preview",
     EngineName.MFLUX: "preview",
+    EngineName.MLXCEL: "preview",
+    EngineName.MISTRAL_RS: "preview",
 }
 
 
@@ -67,6 +71,21 @@ DEFAULT_CAPABILITIES: dict[EngineName, frozenset[Endpoint]] = {
         }
     ),
     EngineName.MFLUX: frozenset({Endpoint.IMAGES_GENERATIONS}),
+    EngineName.MLXCEL: frozenset(
+        {
+            Endpoint.CHAT_COMPLETIONS,
+            Endpoint.COMPLETIONS,
+            Endpoint.RESPONSES,
+        }
+    ),
+    EngineName.MISTRAL_RS: frozenset(
+        {
+            Endpoint.CHAT_COMPLETIONS,
+            Endpoint.COMPLETIONS,
+            Endpoint.RESPONSES,
+            Endpoint.MESSAGES,
+        }
+    ),
 }
 
 
