@@ -14,7 +14,7 @@ Core runtime files:
 - [hf_search.py](hf_search.py), [repo_probe.py](repo_probe.py), [vllm_supported_architectures.json](vllm_supported_architectures.json), [scripts/refresh_arch_list.py](scripts/refresh_arch_list.py) — HuggingFace search, vLLM architecture filtering, and GGUF candidate detection for llama.cpp installs.
 - [ui/](ui/) — React/Vite/TypeScript/Tailwind admin UI built into `/app/static` by the Dockerfile and served from the admin plane.
 - [Dockerfile](Dockerfile) — CUDA 13 / Python image that builds the UI, compiles a pinned `llama-server` with CUDA, then installs PyTorch (cu129) and a pinned stable vLLM. There is no runtime `requirements.txt` / `pyproject.toml`; runtime deps live only here. Host-side test deps are in [requirements-dev.txt](requirements-dev.txt).
-- [vllm-ctl](vllm-ctl) — Bash CLI that wraps `docker compose` + the manager HTTP API.
+- [vllm-ctl](vllm-ctl) — Bash CLI that wraps `docker compose` + the manager HTTP API. Its `update` command pulls/builds, force-recreates, waits for health, verifies both engines, and refreshes the vLLM architecture snapshot.
 
 The live `docker-compose.yml` is machine-specific and may live outside this repo. `vllm-ctl` expects it at `$VLLM_COMPOSE_DIR` (default `~/vllm-manager`). Use [docker-compose.example.yml](docker-compose.example.yml) as the maintained template. When making changes that touch container config (env vars, volumes, ports, mounts, container name, build args), flag that the external compose file may need updating too.
 
@@ -42,6 +42,7 @@ All real runtime workflows go through Docker — `vllm_manager.py` cannot run on
 
 ```bash
 # Container lifecycle (wraps docker compose against $VLLM_COMPOSE_DIR/docker-compose.yml)
+./vllm-ctl update           # rebuild/recreate safely and refresh engine metadata
 ./vllm-ctl build
 ./vllm-ctl start            # waits for /health, then prints status
 ./vllm-ctl stop             # docker compose down — also unloads the model
@@ -110,3 +111,4 @@ When behavior touches process launch, ports, engine argv, Docker mounts, or GPU 
 - The external compose file must publish both `8000:8000` and `8001:8001` for host-side admin commands. Without `ADMIN_PASSWORD`, the admin app intentionally binds loopback inside the container and the published admin port will not be reachable.
 - Keep the manager a thin wrapper: don't fork or embed vLLM/llama.cpp serving logic, don't leak admin Basic auth or inference bearer headers into the inner engine, and don't move mutation endpoints onto the inference plane.
 - If vLLM is bumped: regenerate `vllm_supported_architectures.json` (see README §"Refreshing architecture support"). If llama.cpp is bumped: re-check `llama-server` CLI flags and the `CMAKE_CUDA_ARCHITECTURES` build arg in the Dockerfile.
+- Use `vllm-ctl update` after an engine/image bump. `docker compose restart` does not recreate a container from a newly built image.

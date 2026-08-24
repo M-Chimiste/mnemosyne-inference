@@ -279,32 +279,32 @@ generated from the running vLLM's registry. After bumping vLLM you should
 regenerate it; otherwise the UI will under- or over-filter against new model
 families.
 
-The maintenance workflow:
+After bumping the engine pins in [Dockerfile](Dockerfile), the normal
+maintenance workflow is one command:
 
-1. **Bump the pinned vLLM** in [Dockerfile](Dockerfile) after checking the
-   upstream release notes and install guidance. Update the nearby `Last
-   refreshed:` comment.
-2. **Rebuild and restart** so the new vLLM is loaded:
-   ```bash
-   vllm-ctl build && vllm-ctl restart
-   ```
-3. **Regenerate the architecture list inside the container** (the script
-   imports vLLM, which can only run on the CUDA host):
-   ```bash
-   docker exec vllm-manager \
-     python /app/scripts/refresh_arch_list.py /tmp/vllm_supported_architectures.json
-   ```
-4. **Copy the file back to the checkout**:
-   ```bash
-   docker cp \
-     vllm-manager:/tmp/vllm_supported_architectures.json \
-     ~/src/mnemosyne-inference/vllm_supported_architectures.json
-   ```
-5. **Diff and commit** if the JSON changed.
-6. **Restart the container** so the runtime picks up the new bundled list:
-   ```bash
-   vllm-ctl restart
-   ```
+```bash
+vllm-ctl update
+```
+
+`update` pulls refreshed base-image layers, builds the pinned engines,
+recreates the container from the new image, waits for its healthcheck, prints
+the installed engine/CUDA versions, and regenerates
+`vllm_supported_architectures.json` from the live vLLM registry. If the
+architecture metadata changed, it performs one fast cached app-layer rebuild
+so the new fallback is included in the running image. It preserves all bind
+mounts and named volumes declared in the Compose file.
+
+If upstream moves the registry API and architecture regeneration fails, fix
+`scripts/refresh_arch_list.py` and rerun. For an urgent engine-only update,
+the explicit recovery escape hatch is:
+
+```bash
+vllm-ctl update --skip-architecture-refresh
+```
+
+`vllm-ctl restart` only restarts the existing container; it does not adopt a
+newly built image. Use `update`, or `vllm-ctl build && vllm-ctl start`, when
+the Dockerfile or image changed.
 
 If you bump llama.cpp's `LLAMA_CPP_TAG` in the same Dockerfile, check the
 `llama-server` CLI flags used by `runtime.py`, keep
@@ -412,7 +412,8 @@ A short tour of the CLI; mirrors `vllm-ctl help` ordering.
 
 | Group       | Command                          | What it does                                                     |
 |-------------|----------------------------------|------------------------------------------------------------------|
-| Container   | `vllm-ctl build`                 | Build the image. First build is slow.                            |
+| Container   | `vllm-ctl update`                | Pull, rebuild, recreate, verify engines, and refresh metadata.   |
+|             | `vllm-ctl build`                 | Build the image. First build is slow.                            |
 |             | `vllm-ctl start`                 | `docker compose up -d` and wait for `/health`.                   |
 |             | `vllm-ctl stop`                  | `docker compose down`. Unloads the model.                        |
 |             | `vllm-ctl restart`               | Restart the container in place.                                  |

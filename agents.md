@@ -9,7 +9,7 @@ This repository contains **Mnemosyne Inference**, a containerized single-worksta
 - `downloader.py` and `download_worker.py` implement install/download orchestration. Installs run as killable subprocesses and persist state in SQLite.
 - `hf_search.py`, `repo_probe.py`, `vllm_supported_architectures.json`, and `scripts/refresh_arch_list.py` support HuggingFace discovery, vLLM architecture filtering, and GGUF probing.
 - `ui/` contains the React/Vite/TypeScript/Tailwind admin UI that is built into `/app/static` by the Dockerfile and served from the admin plane.
-- `vllm-ctl` is the Bash CLI for Docker lifecycle, admin API calls, model loading, installs, cache deletion, status, logs, and one-shot chat.
+- `vllm-ctl` is the Bash CLI for Docker lifecycle and engine updates, admin API calls, model loading, installs, cache deletion, status, logs, and one-shot chat. `vllm-ctl update` pulls/builds, force-recreates, health-checks, verifies both engines, and refreshes the bundled vLLM architecture snapshot.
 - `Dockerfile` defines the CUDA/Python runtime, builds the UI, builds a pinned `llama-server`, installs PyTorch cu129, and installs pinned vLLM plus manager dependencies. Runtime dependencies live here, not in a runtime `requirements.txt` or `pyproject.toml`.
 - `requirements-dev.txt`, `pytest.ini`, `tests/`, and `ui/package.json` define the host-side Python and UI test/build workflows.
 - `project_docs/project_status.md` records the current milestone/feature state, and `project_docs/smoke_checks.md` is the manual GPU-host release checklist for routes pytest can't exercise.
@@ -85,6 +85,7 @@ Model profiles support aliases, HF model IDs, revision, quantization, GPU plan, 
 Most real runtime workflows happen through Docker because vLLM/CUDA and llama.cpp CUDA builds are container-host concerns.
 
 ```bash
+./vllm-ctl update
 ./vllm-ctl build
 ./vllm-ctl start
 ./vllm-ctl stop
@@ -167,6 +168,7 @@ When behavior touches process launch, ports, engine argv construction, Docker mo
 - Keep multimodal request payloads opaque through the proxy.
 - If vLLM is bumped, rebuild the image and regenerate `vllm_supported_architectures.json` from the new runtime registry.
 - If llama.cpp is bumped, rebuild the image, check `llama-server` CLI compatibility, and verify the CUDA-linked binary with GPU passthrough.
+- Use `vllm-ctl update` to adopt a rebuilt image. `docker compose restart` restarts the existing container and does not recreate it from a new image.
 
 ## Useful Reading Order
 

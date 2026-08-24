@@ -3,7 +3,7 @@
 # vllm-ctl — Control tool for the containerized vLLM Manager
 #
 # Usage (see `vllm-ctl help` for the full list):
-#   Container:  build, start, stop, restart, logs [-f], shell
+#   Container:  update, build, start, stop, restart, logs [-f], shell
 #   Model:      status, load <model> [opts], unload, list, models
 #   Config:     reload, storage
 #   Installs:   install, install-cancel, install-retry, install-status,
@@ -12,6 +12,8 @@
 #   Testing:    chat <prompt>
 # ──────────────────────────────────────────────────────────────────
 
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
+REPO_DIR="$(dirname "${SCRIPT_PATH}")"
 COMPOSE_DIR="${VLLM_COMPOSE_DIR:-$HOME/vllm-manager}"
 # VLLM_MANAGER_URL is the legacy variable from the single-plane prototype; it
 # now serves as a backward-compatible fallback for the admin URL only.
@@ -51,8 +53,116 @@ api() {
 
 cmd_build() {
   green "Building vLLM Manager image (this takes a few minutes first time) ..."
-  compose build
+  compose build || { red "Image build failed."; return 1; }
   green "✓ Image built."
+}
+
+recreate_and_wait() {
+  local timeout="${VLLM_UPDATE_WAIT_TIMEOUT:-180}"
+  green "Recreating vLLM Manager and waiting for its healthcheck ..."
+  compose up -d --force-recreate --wait --wait-timeout "${timeout}" vllm-manager \
+    || { red "Container recreation or healthcheck failed."; return 1; }
+  green "✓ Updated container is healthy."
+}
+
+verify_engine_versions() {
+  green "Installed engine versions:"
+  compose exec -T vllm-manager python -c \
+    'import torch, vllm; print(f"  vLLM {vllm.__version__} | PyTorch {torch.__version__} | CUDA {torch.version.cuda}")' \
+    || { red "Could not import vLLM/PyTorch in the updated container."; return 1; }
+  compose exec -T vllm-manager /usr/local/bin/llama-server --version \
+    || { red "Could not run llama-server in the updated container."; return 1; }
+}
+
+refresh_architecture_snapshot() {
+  local snapshot="${REPO_DIR}/vllm_supported_architectures.json"
+  local candidate
+  candidate="$(mktemp "${TMPDIR:-/tmp}/mnemosyne-architectures.XXXXXX.json")" \
+    || { red "Could not create a temporary architecture snapshot."; return 1; }
+
+  compose exec -T vllm-manager \
+    python /app/scripts/refresh_arch_list.py /tmp/vllm_supported_architectures.json \
+    || { rm -f "${candidate}"; red "Architecture refresh failed."; return 1; }
+  compose cp \
+    vllm-manager:/tmp/vllm_supported_architectures.json "${candidate}" \
+    || { rm -f "${candidate}"; red "Could not copy the architecture snapshot."; return 1; }
+
+  python3 - "${candidate}" "${snapshot}" <<'PY'
+import json
+import sys
+
+candidate_path, current_path = sys.argv[1:]
+try:
+    with open(candidate_path) as f:
+        candidate = json.load(f)
+except (FileNotFoundError, json.JSONDecodeError):
+    raise SystemExit(1)
+try:
+    with open(current_path) as f:
+        current = json.load(f)
+except (FileNotFoundError, json.JSONDecodeError):
+    raise SystemExit(2)
+
+keys = ("vllm_version", "architectures")
+raise SystemExit(0 if all(candidate.get(k) == current.get(k) for k in keys) else 2)
+PY
+  local compare_status=$?
+  if [[ ${compare_status} -eq 0 ]]; then
+    rm -f "${candidate}"
+    green "✓ Bundled architecture snapshot is already current."
+    return 0
+  fi
+  if [[ ${compare_status} -ne 2 ]]; then
+    rm -f "${candidate}"
+    red "Generated architecture snapshot is missing or invalid."
+    return 1
+  fi
+
+  cp "${candidate}" "${snapshot}" \
+    || { rm -f "${candidate}"; red "Could not update ${snapshot}."; return 1; }
+  rm -f "${candidate}"
+  green "✓ Updated ${snapshot}."
+  return 2
+}
+
+cmd_update() {
+  local refresh_archs=true
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --skip-architecture-refresh) refresh_archs=false; shift ;;
+      *)
+        red "Unknown update option: $1"
+        red "Usage: vllm-ctl update [--skip-architecture-refresh]"
+        return 1
+        ;;
+    esac
+  done
+
+  green "Updating Mnemosyne inference engines ..."
+  compose build --pull vllm-manager \
+    || { red "Updated image build failed; the existing container was not replaced."; return 1; }
+  recreate_and_wait || return 1
+  verify_engine_versions || return 1
+
+  if ! $refresh_archs; then
+    yellow "Skipped architecture snapshot refresh."
+    green "✓ Inference engines updated."
+    return 0
+  fi
+
+  refresh_architecture_snapshot
+  local refresh_status=$?
+  if [[ ${refresh_status} -eq 1 ]]; then
+    return 1
+  fi
+  if [[ ${refresh_status} -eq 2 ]]; then
+    green "Rebuilding the app layer with the refreshed architecture snapshot ..."
+    compose build vllm-manager \
+      || { red "Snapshot rebuild failed; the healthy updated container is still running."; return 1; }
+    recreate_and_wait || return 1
+  fi
+
+  green "✓ Inference engines and architecture metadata are updated."
 }
 
 cmd_start() {
@@ -806,6 +916,8 @@ Admin URL: ${ADMIN_URL}
 Inference URL: ${INFERENCE_URL}
 
 $(bold "Container:")
+  update [--skip-architecture-refresh]
+                          Pull, rebuild, recreate, verify, and refresh metadata
   build                   Build the Docker image
   start                   Start container (docker compose up -d)
   stop                    Stop container + unload model
@@ -857,6 +969,7 @@ $(bold "Testing:")
   chat <prompt>           Quick one-shot chat with loaded model
 
 $(bold "Examples:")
+  vllm-ctl update
   vllm-ctl build
   vllm-ctl start
   vllm-ctl load Qwen/Qwen2.5-72B-Instruct-AWQ
@@ -871,6 +984,8 @@ $(bold "Environment:")
   VLLM_INFERENCE_URL   Override inference URL (default: http://localhost:8000)
   VLLM_MANAGER_URL     Legacy admin URL fallback when VLLM_ADMIN_URL is unset
   VLLM_COMPOSE_DIR     Path to docker-compose.yml dir (default: ~/vllm-manager)
+  VLLM_UPDATE_WAIT_TIMEOUT
+                       Seconds update waits for container health (default: 180)
   ADMIN_PASSWORD       Admin Basic password; auto-loaded from ${COMPOSE_DIR}/.env
   INFERENCE_API_KEY    Optional bearer token for /v1/* chat requests
 
@@ -883,6 +998,7 @@ EOF
 
 # ── dispatch ───────────────────────────────────────────────────────
 case "${1:-help}" in
+  update)  shift; cmd_update "$@" ;;
   build)   cmd_build ;;
   start)   cmd_start ;;
   stop)    cmd_stop ;;

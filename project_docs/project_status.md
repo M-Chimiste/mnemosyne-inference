@@ -1,6 +1,6 @@
 # Mnemosyne Inference — Project Status
 
-**Last updated:** 2026-05-07
+**Last updated:** 2026-08-23
 
 ## Current state
 
@@ -394,19 +394,17 @@ Workstation/GPU smoke validation is still outstanding:
   `config.yaml` to be bind-mounted; the example file gets a multi-drive
   comment block update. Phase 7 documents the final canonical layout.
 - **Phase 5 bundled architecture snapshot.** The committed
-  `vllm_supported_architectures.json` is a temporary fallback. This host
-  cannot import vLLM, so after the next workstation rebuild run
-  `docker exec vllm-manager python scripts/refresh_arch_list.py` once and
-  commit the regenerated file so the fallback exactly matches the pinned
-  vLLM release.
-- **vLLM pin staleness.** Refresh the pinned release deliberately after
-  checking upstream release notes. After bumping vLLM, rerun
-  `scripts/refresh_arch_list.py` to keep the bundled fallback aligned.
+  `vllm_supported_architectures.json` is the fallback. `vllm-ctl update`
+  regenerates it from the newly built runtime and performs a cached rebuild
+  when its version or architecture set changes.
+- **vLLM pin cadence.** Refresh the pinned release deliberately after
+  checking upstream release notes, then run `vllm-ctl update` to rebuild,
+  verify, and keep the bundled fallback aligned.
 - **Free-space pre-check absent on manual installs.** `vllm-ctl install`
   warns when `--size-gb` is not supplied; the Phase 6 UI sets it from search
   results when available, so the warning should primarily appear on
   hand-crafted curl/CLI calls or search rows without a size estimate.
-- **llama.cpp tag pin.** The Dockerfile pins `LLAMA_CPP_TAG=b9548`. Refresh
+- **llama.cpp tag pin.** The Dockerfile pins stable `LLAMA_CPP_TAG=v0.2.0`. Refresh
   deliberately after checking llama.cpp release notes (CLI flags can shift
   on minor bumps). The argv builders cover the documented stable flags;
   rare additions land via `extra_args` in the catalog row.
