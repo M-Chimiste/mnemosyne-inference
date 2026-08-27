@@ -13,6 +13,10 @@ let package = Package(
             name: "mnemosyne-service-bootstrap",
             targets: ["MnemosyneServiceBootstrap"]
         ),
+        .executable(
+            name: "mnemosyne-file-trash",
+            targets: ["MnemosyneFileTrash"]
+        ),
     ],
     dependencies: [
         .package(
@@ -36,6 +40,10 @@ let package = Package(
         .executableTarget(
             name: "MnemosyneServiceBootstrap",
             path: "Sources/MnemosyneServiceBootstrap"
+        ),
+        .executableTarget(
+            name: "MnemosyneFileTrash",
+            path: "Sources/MnemosyneFileTrash"
         ),
         .testTarget(
             name: "MnemosyneAppCoreTests",

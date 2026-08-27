@@ -28,6 +28,8 @@
     <true/>
     <key>NSHighResolutionCapable</key>
     <true/>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>Unified Inference accepts OpenAI-compatible inference requests from devices on your local network when you enable local network access.</string>
     <key>NSDocumentsFolderUsageDescription</key>
     <string>Unified Inference uses model folders you select to discover, download, and run local models.</string>
     <key>NSDesktopFolderUsageDescription</key>

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from dataclasses import asdict
 import hashlib
 import ipaddress
@@ -113,6 +114,10 @@ class ConfigurationConflict(RuntimeConfigurationError):
     pass
 
 
+class ModelCleanupRejected(RuntimeConfigurationError):
+    pass
+
+
 _SELF_TEST_VISION_IMAGE = (
     "data:image/png;base64,"
     "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAAcklEQVR42u3a"
@@ -199,12 +204,10 @@ def _is_loopback(value: str) -> bool:
 
 
 def validate_exposure(config: MacConfig) -> None:
-    if not _is_loopback(config.server.inference_bind):
-        key = os.environ.get(config.server.inference_api_key_env, "").strip()
-        if not key:
-            raise RuntimeConfigurationError(
-                "a non-loopback inference bind requires an inference API key"
-            )
+    # Inference bearer authentication is intentionally optional on every bind.
+    # The inference-plane middleware requires it whenever the configured
+    # environment variable is non-empty and otherwise accepts unauthenticated
+    # requests, including on an explicitly selected LAN bind.
     if not _is_loopback(config.server.control_bind):
         password = os.environ.get(config.server.control_password_env, "").strip()
         if not password:
@@ -217,6 +220,15 @@ def _lexical_path(value: str | Path) -> str:
     return os.path.normcase(
         os.path.normpath(os.path.abspath(os.path.expanduser(str(value))))
     )
+
+
+def _path_is_within(root: str | Path, candidate: str | Path) -> bool:
+    root_value = _lexical_path(root)
+    candidate_value = _lexical_path(candidate)
+    try:
+        return os.path.commonpath([root_value, candidate_value]) == root_value
+    except ValueError:
+        return False
 
 
 def _profile_uses_install_destination(
@@ -382,6 +394,46 @@ def _fleet_deployment_identity(
         load_config=portable_load_config(target),
     )
     return deployment_id, identity, authoritative
+
+
+def _profile_filesystem_references(profile: ModelProfile) -> tuple[str, ...]:
+    """Return exact absolute paths a configured profile can reference."""
+
+    references: list[str] = []
+    if os.path.isabs(os.path.expanduser(profile.model)):
+        references.append(profile.model)
+    projector = profile.load.projector_path
+    if projector is not None and os.path.isabs(os.path.expanduser(projector)):
+        references.append(projector)
+    return tuple(references)
+
+
+def _cleanup_targets_overlap_other_profiles(
+    profiles: list[ModelProfile],
+    *,
+    alias: str,
+    targets: tuple[str, ...],
+    omlx_model_id: str | None = None,
+) -> str | None:
+    """Return the conflicting alias when an exact cleanup target is shared."""
+
+    for profile in profiles:
+        if profile.alias == alias:
+            continue
+        if (
+            omlx_model_id is not None
+            and profile.engine == EngineName.OMLX
+            and Path(profile.model).name == omlx_model_id
+        ):
+            return profile.alias
+        for reference in _profile_filesystem_references(profile):
+            if any(
+                _path_is_within(target, reference)
+                or _path_is_within(reference, target)
+                for target in targets
+            ):
+                return profile.alias
+    return None
 
 
 def _storage_scope_for_path(
@@ -790,92 +842,212 @@ class NativeRuntime:
         alias: str,
         *,
         expected_revision: str,
-    ) -> tuple[MacConfig, str, bool]:
-        """Delete one app-managed download and remove its profile atomically.
+    ) -> tuple[MacConfig, str, bool, str]:
+        """Clean up one model's exact files and remove its profile.
 
-        The install ledger supplies the exact manager-owned destination. Finder
-        imports and hand-authored profiles deliberately cannot use this path.
-        The coordinator maintenance barrier prevents a new lease from opening
-        while the bounded filesystem helper removes the directory.
+        Managed downloads keep their ledger-owned directory deletion. A model
+        without managed provenance must be uniquely rediscovered by a fresh,
+        bounded scan of its registered storage; those exact paths are moved to
+        the macOS Trash. The coordinator barrier prevents new leases while the
+        filesystem mutation and configuration update run.
         """
 
         if self.config_path is None:
             raise RuntimeConfigurationError("runtime has no configured YAML path")
 
-        removed_files = False
-        updated_config: MacConfig | None = None
-
-        async def remove(deadline) -> None:
-            nonlocal removed_files, updated_config
-            async with self._reload_lock:
-                fresh = load_config(self.config_path, env_path=self.env_path)
-                current_revision = configuration_revision(fresh)
-                if expected_revision != current_revision:
-                    raise ConfigurationConflict(
-                        "settings changed while this window was open; reload them before deleting"
-                    )
-                profile = next(
-                    (item for item in fresh.models if item.alias == alias),
-                    None,
+        async with self._reload_lock:
+            fresh = load_config(self.config_path, env_path=self.env_path)
+            current_revision = configuration_revision(fresh)
+            if expected_revision != current_revision:
+                raise ConfigurationConflict(
+                    "settings changed while this window was open; reload them before deleting"
                 )
-                if profile is None:
-                    raise KeyError(f"unknown model alias '{alias}'")
-                install = await self.installer.latest_for_alias(alias)
-                if install is None or install.status != "installed":
-                    raise RuntimeConfigurationError(
-                        "model files can only be deleted for a completed download "
-                        "owned by Unified Inference"
+            profile = next(
+                (item for item in fresh.models if item.alias == alias),
+                None,
+            )
+            if profile is None:
+                raise KeyError(f"unknown model alias '{alias}'")
+            if profile.storage is None:
+                raise ModelCleanupRejected(
+                    "select and save a registered model storage folder before "
+                    "cleaning up this model"
+                )
+            location = next(
+                (
+                    item
+                    for item in fresh.storage.locations
+                    if item.name == profile.storage
+                ),
+                None,
+            )
+            if location is None:
+                raise ModelCleanupRejected(
+                    "the model's registered storage folder is no longer configured"
+                )
+
+            install = await self.installer.latest_for_alias(alias)
+            managed_install = (
+                install
+                if install is not None and install.status == "installed"
+                else None
+            )
+            cleanup_paths: tuple[str, ...]
+            disposition: str
+            if managed_install is not None:
+                if (
+                    profile.engine.value != managed_install.engine
+                    or profile.storage != managed_install.storage
+                    or not _profile_uses_install_destination(
+                        profile, managed_install
                     )
-                if profile.engine.value != install.engine:
-                    raise RuntimeConfigurationError(
+                ):
+                    raise ModelCleanupRejected(
                         "the model profile no longer matches its managed download"
                     )
-                location = next(
-                    (
-                        item
-                        for item in fresh.storage.locations
-                        if item.name == install.storage
-                    ),
-                    None,
+                cleanup_paths = (managed_install.destination,)
+                disposition = "deleted"
+            else:
+                if profile.engine not in {
+                    EngineName.LLAMA_CPP,
+                    EngineName.OMLX,
+                }:
+                    raise ModelCleanupRejected(
+                        "only llama.cpp and oMLX models can be rediscovered for "
+                        "cleanup in a registered storage folder"
+                    )
+                status, candidates = await self.filesystem.scan(
+                    location.path,
+                    scope_id=location.scope_id,
+                    scope_path=location.path,
+                )
+                volume_matches = (
+                    location.volume_uuid is None
+                    or (
+                        status.volume_uuid is not None
+                        and status.volume_uuid.casefold()
+                        == location.volume_uuid.casefold()
+                    )
                 )
                 if (
-                    location is None
-                    or profile.storage != install.storage
-                    or not _profile_uses_install_destination(profile, install)
+                    not status.exists
+                    or not status.is_directory
+                    or not status.writable
+                    or not volume_matches
                 ):
-                    raise RuntimeConfigurationError(
-                        "the model profile no longer points at its managed download"
+                    raise ModelCleanupRejected(
+                        status.diagnostic
+                        or "the model's registered storage folder is unavailable"
                     )
 
-                removed_files = await self.filesystem.delete_directory(
-                    root=location.path,
-                    path=install.destination,
-                    expected_volume_uuid=location.volume_uuid,
-                    scope_id=location.scope_id,
+                if profile.engine == EngineName.LLAMA_CPP:
+                    matches = [
+                        candidate
+                        for candidate in candidates
+                        if candidate.engine == EngineName.LLAMA_CPP.value
+                        and _lexical_path(candidate.model_path)
+                        == _lexical_path(profile.model)
+                    ]
+                else:
+                    if profile.model != Path(profile.model).name:
+                        raise ModelCleanupRejected(
+                            "the oMLX profile is not a rediscoverable imported model ID"
+                        )
+                    matches = [
+                        candidate
+                        for candidate in candidates
+                        if candidate.engine == EngineName.OMLX.value
+                        and Path(candidate.model_path).name == profile.model
+                    ]
+                if len(matches) != 1:
+                    raise ModelCleanupRejected(
+                        "the model could not be matched to exactly one item in "
+                        "its registered folder; scan and import that folder again"
+                    )
+                candidate = matches[0]
+                if profile.engine == EngineName.LLAMA_CPP:
+                    targets = list(candidate.all_paths)
+                    projector = profile.load.projector_path
+                    if projector is not None:
+                        selected_projector = next(
+                            (
+                                item.path
+                                for item in candidate.projector_options
+                                if _lexical_path(item.path)
+                                == _lexical_path(projector)
+                            ),
+                            None,
+                        )
+                        if selected_projector is None:
+                            raise ModelCleanupRejected(
+                                "the configured projector no longer matches the "
+                                "freshly scanned model"
+                            )
+                        targets.append(selected_projector)
+                    cleanup_paths = tuple(dict.fromkeys(targets))
+                    omlx_model_id = None
+                else:
+                    cleanup_paths = (candidate.model_path,)
+                    omlx_model_id = profile.model
+                if not cleanup_paths:
+                    raise ModelCleanupRejected(
+                        "the fresh model scan did not identify any cleanup targets"
+                    )
+                conflicting_alias = _cleanup_targets_overlap_other_profiles(
+                    fresh.models,
+                    alias=alias,
+                    targets=cleanup_paths,
+                    omlx_model_id=omlx_model_id,
                 )
-                updated_config = fresh.model_copy(
-                    update={
-                        "models": [
-                            item for item in fresh.models if item.alias != alias
-                        ]
-                    }
-                )
-                updated_config = MacConfig.model_validate(
-                    updated_config.model_dump(mode="json")
-                )
+                if conflicting_alias is not None:
+                    raise ModelCleanupRejected(
+                        "model cleanup was refused because profile "
+                        f"'{conflicting_alias}' shares the selected files"
+                    )
+                disposition = "trashed"
+
+            updated_config = fresh.model_copy(
+                update={
+                    "models": [
+                        item for item in fresh.models if item.alias != alias
+                    ]
+                }
+            )
+            updated_config = MacConfig.model_validate(
+                updated_config.model_dump(mode="json")
+            )
+            removed_files = False
+
+            async def remove(deadline) -> None:
+                nonlocal removed_files
+                if managed_install is not None:
+                    removed_files = await self.filesystem.delete_directory(
+                        root=location.path,
+                        path=managed_install.destination,
+                        expected_volume_uuid=location.volume_uuid,
+                        scope_id=location.scope_id,
+                    )
+                else:
+                    removed_files = await self.filesystem.trash_paths(
+                        root=location.path,
+                        paths=cleanup_paths,
+                        expected_volume_uuid=location.volume_uuid,
+                        scope_id=location.scope_id,
+                    )
                 save_config(updated_config, self.config_path)
                 self.config = updated_config
                 self._apply_profiles(updated_config)
                 self.installer.storage = updated_config.storage
-                await asyncio.to_thread(
-                    self.installer.store.update,
-                    install.id,
-                    status="deleted",
-                    hidden=1,
-                    pid=None,
-                    download_speed_bps=None,
-                    error=None,
-                )
+                if managed_install is not None:
+                    await asyncio.to_thread(
+                        self.installer.store.update,
+                        managed_install.id,
+                        status="deleted",
+                        hidden=1,
+                        pid=None,
+                        download_speed_bps=None,
+                        error=None,
+                    )
 
                 if profile.engine == EngineName.OMLX:
                     adapter = self.adapters.get(EngineName.OMLX)
@@ -907,16 +1079,25 @@ class NativeRuntime:
                             )
                         self._omlx_directory_sync_pending = False
 
-        await self.coordinator.run_empty_maintenance(
-            remove,
-            name=f"delete managed model {alias}",
-        )
-        assert updated_config is not None
-        return (
-            updated_config,
-            configuration_revision(updated_config),
-            removed_files,
-        )
+            try:
+                await self.coordinator.run_empty_maintenance(
+                    remove,
+                    name=f"clean up model {alias}",
+                )
+            except FilesystemProbeError:
+                # Filesystem refusal/failure does not make engine state
+                # uncertain. The barrier has already failed closed, so prove
+                # emptiness and reopen admission instead of leaving Setup
+                # degraded after a rejected cleanup request.
+                with contextlib.suppress(Exception):
+                    await self.coordinator.reconcile()
+                raise
+            return (
+                updated_config,
+                configuration_revision(updated_config),
+                removed_files,
+                disposition,
+            )
 
     async def register_security_scope(self, path: str, bookmark_data: str) -> str:
         return (await self.security_scope_process.register(path, bookmark_data)).id

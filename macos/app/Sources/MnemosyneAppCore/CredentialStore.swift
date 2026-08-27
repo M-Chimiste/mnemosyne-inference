@@ -29,7 +29,8 @@ public enum ManagedCredential: String, CaseIterable, Identifiable, Sendable {
         case .omlxAdminSession: "Session used to unload models through the oMLX admin API."
         case .huggingFaceToken:
             "Optional token for authenticated Hugging Face downloads and required for gated or private models."
-        case .inferenceAPIKey: "Required only when the inference API is exposed beyond this Mac."
+        case .inferenceAPIKey:
+            "Optional. When configured, /v1/* requests require this bearer key. Leave it unset to allow unauthenticated inference, including from the local network."
         case .fleetAPIKey:
             "Dedicated bearer credential used by the Nyx gateway to read this Mac's fleet snapshot."
         case .adminPassword: "Required only when the control API is exposed beyond this Mac."

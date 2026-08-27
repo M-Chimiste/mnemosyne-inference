@@ -60,6 +60,14 @@ class AppLayoutTests(unittest.TestCase):
             "--identifier com.mnemosyne.inference.service",
             script,
         )
+        self.assertIn(
+            'FILE_TRASH_HELPER="$CONTENTS/MacOS/mnemosyne-file-trash"',
+            script,
+        )
+        self.assertIn(
+            "--identifier com.mnemosyne.inference.file-trash",
+            script,
+        )
         self.assertNotIn("MnemosyneService.app", script)
         self.assertFalse(
             (PACKAGING_ROOT / "MnemosyneService-Info.plist").exists()
@@ -94,6 +102,14 @@ class AppLayoutTests(unittest.TestCase):
             'install -m 644 "$SCRIPT_DIR/AppIcon.icns" "$RESOURCES/AppIcon.icns"',
             script,
         )
+
+    def test_bundle_explains_optional_local_network_inference(self) -> None:
+        with INFO_PLIST.open("rb") as stream:
+            info = plistlib.load(stream)
+
+        description = info["NSLocalNetworkUsageDescription"]
+        self.assertIn("inference requests", description)
+        self.assertIn("local network", description)
 
     def test_build_injects_and_verifies_the_single_native_version(self) -> None:
         script = BUILD_SCRIPT.read_text(encoding="utf-8")
@@ -152,6 +168,7 @@ class AppLayoutTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             app = Path(directory) / "Unified Inference.app"
             executable = app / "Contents" / "MacOS" / "UnifiedInference"
+            trash_helper = app / "Contents" / "MacOS" / "mnemosyne-file-trash"
             sparkle = (
                 app
                 / "Contents"
@@ -164,6 +181,7 @@ class AppLayoutTests(unittest.TestCase):
             executable.parent.mkdir(parents=True)
             sparkle.parent.mkdir(parents=True)
             executable.touch()
+            trash_helper.touch(mode=0o755)
             sparkle.touch()
             valid = [
                 subprocess.CompletedProcess(

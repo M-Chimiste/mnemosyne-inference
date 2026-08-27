@@ -307,6 +307,63 @@ async def test_filesystem_probe_refuses_storage_root_and_symlink_deletion(
     assert outside.is_dir()
 
 
+@pytest.mark.asyncio
+async def test_filesystem_probe_trashes_only_explicit_paths_with_bundled_helper(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "Models"
+    root.mkdir()
+    first = _gguf(root / "publisher" / "model-00001-of-00002.gguf")
+    second = _gguf(root / "publisher" / "model-00002-of-00002.gguf")
+    helper = tmp_path / "mnemosyne-file-trash"
+    helper.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    helper.chmod(0o755)
+    probe = FilesystemProbe(
+        scope_root=tmp_path / "state" / "security-scopes",
+        timeout_seconds=5,
+        trash_helper=helper,
+    )
+    captured: dict[str, object] = {}
+
+    async def fake_inspect(*_args: object, **_kwargs: object):
+        return inspect_path(str(root))
+
+    async def fake_run_argv(
+        argv: list[str],
+        **kwargs: object,
+    ) -> dict[str, object]:
+        captured["argv"] = argv
+        captured["kwargs"] = kwargs
+        return {"ok": True, "trashed": [str(first), str(second)], "skipped": []}
+
+    monkeypatch.setattr(probe, "inspect", fake_inspect)
+    monkeypatch.setattr(probe, "_run_argv", fake_run_argv)
+
+    removed = await probe.trash_paths(
+        root=str(root),
+        paths=[str(first), str(second)],
+        expected_volume_uuid=None,
+        scope_id="a" * 64,
+    )
+
+    assert removed is True
+    assert captured["argv"] == [
+        str(helper),
+        "--root",
+        str(root),
+        "--path",
+        str(first),
+        "--path",
+        str(second),
+    ]
+    assert captured["kwargs"] == {
+        "scope_id": "a" * 64,
+        "scope_path": str(root),
+        "timeout_seconds": 120.0,
+    }
+
+
 def _process_is_running(pid: int) -> bool:
     try:
         os.kill(pid, 0)

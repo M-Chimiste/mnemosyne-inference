@@ -9,6 +9,11 @@ read-only discovery hint.
   Clean-install evidence is scoped to the exact app version/build and records
   first presentation separately from completion, so an older preference bit
   cannot clear the release gate.
+- General settings can expose only the public inference listener to the local
+  network. Bearer authentication is optional in the same style as LM Studio:
+  a configured Inference API key protects `/v1/*`, while an unset key permits
+  unauthenticated clients. The control and inner-engine listeners remain
+  loopback-only.
 - llama.cpp and oMLX are the V1 Stable language engines. DS4 and MFLUX remain
   clearly labeled Preview while their remaining hardware acceptance checks are
   completed.

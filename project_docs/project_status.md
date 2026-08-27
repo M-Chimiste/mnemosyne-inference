@@ -1,6 +1,6 @@
 # Mnemosyne Inference — Project Status
 
-**Last updated:** 2026-08-16
+**Last updated:** 2026-08-27
 
 ## Current state
 
@@ -62,6 +62,9 @@ the CUDA image or its `8000-8002` topology. The first implementation includes:
   LM Studio settings/default-folder hints that never contact its engine,
   model-card and GGUF/config metadata, exact quant selection, automatic vision
   projector selection with opt-out, and alias-preserving migration;
+- optional local-network exposure for the public native inference listener,
+  with a guarded Settings toggle, optional bearer authentication, an explicit
+  unauthenticated warning, and loopback-only control/inner-engine listeners;
 - receiver-owned durable Finder bookmarks stored privately across LaunchAgent
   restarts and scoped child `exec`, with bounded killable receipt/reactivation,
   configuration-save preflight, startup revalidation/pruning, only SHA-256
@@ -373,9 +376,12 @@ see
   durable registration state, so a failed/interrupted profile write can be
   retried without downloading the model again. The native GUI renders
   transferred/total bytes, percentage, progress, and smoothed transfer speed.
-  Hiding completed history preserves internal managed-download provenance;
-  explicit file deletion is restricted to that exact app-owned destination,
-  refuses roots/escapes/symlinks, and never applies to Finder imports.
+  Hiding completed history preserves internal managed-download provenance.
+  Managed cleanup is restricted to the exact app-owned destination. A
+  llama.cpp or oMLX import can be cleaned up only after a fresh bounded scan
+  uniquely rediscovers its payload under the registered storage, at which
+  point the exact imported paths move to the macOS Trash. Root, escape,
+  symlink, ambiguous, and shared targets remain refused.
 - Runtime version probes, installs, and activation helpers all use bounded
   process-group cleanup; timeout or cancellation cannot leave an updater child
   running.

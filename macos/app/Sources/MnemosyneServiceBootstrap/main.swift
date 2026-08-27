@@ -172,6 +172,9 @@ private func execPython() throws -> Never {
         environment["MNEMOSYNE_MACOS_CONFIG_PATH"] ?? paths.config.path
     environment["MNEMOSYNE_MACOS_ENV_PATH"] =
         environment["MNEMOSYNE_MACOS_ENV_PATH"] ?? paths.environment.path
+    environment["MNEMOSYNE_FILE_TRASH_HELPER"] =
+        environment["MNEMOSYNE_FILE_TRASH_HELPER"]
+            ?? contents.appending(path: "MacOS/mnemosyne-file-trash").path
     environment["PATH"] = environment["PATH"]
         ?? "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 

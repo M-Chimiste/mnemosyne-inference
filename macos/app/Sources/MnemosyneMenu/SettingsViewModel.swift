@@ -135,6 +135,18 @@ final class SettingsViewModel: ObservableObject {
         settings.schemaVersion <= NativeSettings.supportedSchemaVersion
     }
 
+    var inferenceAPIKeyWillBeConfigured: Bool {
+        if credentialsToClear.contains(.inferenceAPIKey) {
+            return false
+        }
+        if let draft = credentialDrafts[.inferenceAPIKey],
+           !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        {
+            return true
+        }
+        return configuredCredentials.contains(.inferenceAPIKey)
+    }
+
     var statusColor: Color {
         switch statusTone {
         case .normal: .secondary
@@ -1087,7 +1099,7 @@ final class SettingsViewModel: ObservableObject {
 
         let alias = settings.models[index].alias
         isWorking = true
-        setStatus("Deleting \(alias) and its managed files…", tone: .normal)
+        setStatus("Cleaning up \(alias) and its model files…", tone: .normal)
         defer { isWorking = false }
         do {
             let result = try await client.deleteManagedModel(
@@ -1106,10 +1118,10 @@ final class SettingsViewModel: ObservableObject {
             } else {
                 selectedModelIndex = min(index, settings.models.count - 1)
             }
-            setStatus(
-                "Deleted \(alias), removed its profile, and released its model storage.",
-                tone: .success
-            )
+            let action = result.filesDisposition == "trashed"
+                ? "Moved \(alias)'s imported model files to Trash"
+                : "Deleted \(alias)'s managed download"
+            setStatus("\(action) and removed its profile.", tone: .success)
         } catch {
             setStatus(
                 "Could not delete \(alias): \(error.localizedDescription)",

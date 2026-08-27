@@ -395,6 +395,14 @@ API key:  any non-empty placeholder, unless INFERENCE_API_KEY is configured
 Model:    an alias returned by GET /v1/models
 ```
 
+To serve other devices, open **Settings → General**, enable **Allow
+connections from the local network**, save, and restart the background
+service. Clients then use `http://<this-Mac's-LAN-address>:1240/v1`. The
+listener binds every reachable interface, including VPN interfaces. Leave the
+Inference API key unset for LM Studio-style unauthenticated access, or set it
+under **Settings → Credentials** and configure clients to send
+`Authorization: Bearer <key>`. The control API remains private to this Mac.
+
 Language usage is recorded locally and central Postgres reporting defaults on.
 The workstation identifier is inherited from the previous token sidecar when
 available, then falls back to the normalized macOS Computer Name.

@@ -189,7 +189,7 @@ The live `docker-compose.yml` is intentionally machine-specific and may live out
 
 ### Native macOS deployment
 
-- Inference is on `127.0.0.1:1240` so Unified Inference is a drop-in replacement for the previous token sidecar; control is on `127.0.0.1:17321`, oMLX uses `:17322`, the manager-owned DS4 child uses `:17323`, the manager-owned MFLUX worker uses `:17324`, manager-owned llama.cpp uses `:17325`, Preview mlxcel uses `:17326`, and Preview mistral.rs uses `:17327`. Reserve `17320` and `17328-17329` for later native services. The legacy sidecar must be booted out and persistently disabled or removed before Unified Inference binds `:1240`; merely unloading it lets it return at the next login.
+- Inference defaults to `127.0.0.1:1240` so Unified Inference is a drop-in replacement for the previous token sidecar; the native Settings UI may deliberately switch only that public inference listener to `0.0.0.0:1240` for LAN/VPN clients. Control stays on `127.0.0.1:17321`, oMLX uses `:17322`, the manager-owned DS4 child uses `:17323`, the manager-owned MFLUX worker uses `:17324`, manager-owned llama.cpp uses `:17325`, Preview mlxcel uses `:17326`, and Preview mistral.rs uses `:17327`. Reserve `17320` and `17328-17329` for later native services. The legacy sidecar must be booted out and persistently disabled or removed before Unified Inference binds `:1240`; merely unloading it lets it return at the next login.
 - The inference plane also exposes read-only `GET /fleet/v1/snapshot` only
   when its independent `FLEET_API_KEY` is configured. Discovery fails closed
   with `fleet_inference_auth_unconfigured` unless the inference key is also
@@ -294,11 +294,13 @@ The live `docker-compose.yml` is intentionally machine-specific and may live out
   downloaded-but-not-registered weights as a durable retryable state; retry
   profile registration without redownloading them. Report durable byte/total
   progress and smoothed transfer speed. Hiding completed history must retain
-  internal managed-download provenance. File deletion is an explicit separate
-  action limited to an exact app-managed destination under configured storage;
-  run it in a bounded helper behind the global empty-residency barrier, refuse
-  roots/escapes/symlinks, and never delete Finder imports or hand-authored
-  model paths.
+  internal managed-download provenance. File cleanup is an explicit separate
+  action behind the global empty-residency barrier. Managed downloads may
+  permanently delete only their exact ledger-owned destination. A llama.cpp
+  or oMLX profile without managed provenance may clean up only when a fresh
+  bounded scan uniquely rediscovers its exact payload inside its registered
+  storage; move those imported paths to the macOS Trash. Refuse roots,
+  escapes, symlinks, ambiguous matches, and paths shared by another profile.
 - DS4's typed `load.parallel` maps to upstream `--batched-session` and owns
   coordinator/Fleet admission capacity; for llama.cpp the same typed setting
   maps to its parallel slots. Never permit `extra_args` to override either
@@ -420,8 +422,10 @@ Model profiles support aliases, HF model IDs, revision, quantization, GPU plan, 
   must go through `CudaResidencyCoordinator`; never call the process teardown
   hook beneath an active epoch lease. Queue keys and transition targets are
   strict deployment IDs, not aliases.
-- Keep inner Mac engines on loopback. A non-loopback Mnemosyne inference bind
-  requires `INFERENCE_API_KEY`; a non-loopback control bind requires
+- Keep inner Mac engines on loopback. The public Mnemosyne inference listener
+  may bind non-loopback with optional authentication: when `INFERENCE_API_KEY`
+  is set, `/v1/*` requires its bearer token; when it is absent, inference is
+  deliberately unauthenticated. A non-loopback control bind still requires
   `ADMIN_PASSWORD`.
 
 ## Common Commands

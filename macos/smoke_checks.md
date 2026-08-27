@@ -112,7 +112,10 @@ lsof -nP \
 ```
 
 Confirm Unified Inference owns `1240`/`17321` and every inner listener is
-loopback-only. oMLX owns `17322` when that optional engine is enabled.
+loopback-only. In the default **This Mac only** mode, `1240` is loopback-only;
+with **Allow connections from the local network** enabled, only `1240` may
+listen on `0.0.0.0`. The control listener on `17321` stays loopback-only. oMLX
+owns `17322` when that optional engine is enabled.
 Manager-owned DS4, MFLUX, llama.cpp, mlxcel, and mistral.rs should be absent
 from `17323` through `17327` while unloaded. LM Studio is not part of the inference
 topology. The previous token sidecar is not required in the inference path.
@@ -125,6 +128,18 @@ curl -s http://127.0.0.1:17321/manager/status | jq
 curl -s http://127.0.0.1:17321/manager/readiness | jq
 curl -s http://127.0.0.1:1240/v1/models | jq
 ```
+
+Exercise both local-network inference modes from a second device:
+
+1. Enable **Settings → General → Allow connections from the local network**,
+   leave the Inference API key unset, save, and restart. Confirm an
+   unauthenticated request to `http://<Mac-LAN-address>:1240/v1/models`
+   succeeds.
+2. Set **Settings → Credentials → Inference API key**, save, and restart.
+   Confirm the same unauthenticated request returns `401` and a request with
+   `Authorization: Bearer <key>` succeeds.
+3. Confirm `17321` and every inner-engine port remain unreachable from the
+   second device.
 
 Open **Settings → Setup & Health** and compare it with the readiness payload.
 Confirm the product version matches `macos/VERSION`, diagnostics contain no
@@ -298,9 +313,12 @@ window. Exercise cancel and retry, then clear the completed history row and
 verify the model profile and files remain. Remove that profile with
 **Keep Files** and verify only configuration changes; separately use
 **Delete Files** on an app-managed test download and verify its exact directory
-and profile disappear. Confirm Finder-imported profiles cannot delete files,
-and no unrelated files are touched. Repeat with a gated repository to prove
-the write-only `HF_TOKEN` reaches only the download worker.
+and profile disappear. Import a llama.cpp GGUF and an oMLX directory from a
+registered folder, use **Delete Files**, and confirm the freshly rediscovered
+payload moves to Trash while each profile is removed. Confirm ambiguous,
+shared, root, escape, and symlink targets are refused and no unrelated files
+are touched. Repeat with a gated repository to prove the write-only `HF_TOKEN`
+reaches only the download worker.
 
 Use an empty unified search and identify results with the DS4 support badge.
 Confirm nine current single-node choices appear: five DeepSeek V4 and four GLM

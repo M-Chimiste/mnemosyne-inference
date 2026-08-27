@@ -46,6 +46,7 @@ from .proxy import (
 )
 from .runtime import (
     ConfigurationConflict,
+    ModelCleanupRejected,
     NativeRuntime,
     RestartRequired,
     RuntimeConfigurationError,
@@ -382,6 +383,8 @@ def _error_status(exc: Exception) -> int:
     if isinstance(exc, (RestartRequired, ConfigurationConflict)):
         return 409
     if isinstance(exc, RuntimeUpdateError):
+        return 400
+    if isinstance(exc, ModelCleanupRejected):
         return 400
     if isinstance(exc, (CoordinatorError, AdapterError, RuntimeConfigurationError)):
         return 503
@@ -1086,7 +1089,12 @@ def create_control_app(runtime: NativeRuntime) -> FastAPI:
         payload: DeleteManagedModelRequest,
     ) -> dict:
         try:
-            config, revision, deleted_files = await runtime.delete_managed_model(
+            (
+                config,
+                revision,
+                deleted_files,
+                files_disposition,
+            ) = await runtime.delete_managed_model(
                 alias,
                 expected_revision=payload.revision,
             )
@@ -1098,6 +1106,7 @@ def create_control_app(runtime: NativeRuntime) -> FastAPI:
                 "revision": revision,
                 "config": config.model_dump(mode="json"),
                 "deleted_files": deleted_files,
+                "files_disposition": files_disposition,
             }
         except Exception as exc:
             raise HTTPException(_error_status(exc), str(exc)) from exc

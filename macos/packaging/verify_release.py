@@ -126,6 +126,7 @@ def _mach_o_output(*arguments: str) -> str:
 
 def _validate_app_runtime_links(app: Path) -> None:
     executable = app / "Contents" / "MacOS" / "UnifiedInference"
+    trash_helper = app / "Contents" / "MacOS" / "mnemosyne-file-trash"
     sparkle = (
         app
         / "Contents"
@@ -139,6 +140,8 @@ def _validate_app_runtime_links(app: Path) -> None:
         raise ValueError(f"{executable} is missing")
     if not sparkle.is_file():
         raise ValueError(f"{sparkle} is missing")
+    if not trash_helper.is_file() or not trash_helper.stat().st_mode & 0o111:
+        raise ValueError(f"{trash_helper} is missing or not executable")
 
     dependencies = _mach_o_output("/usr/bin/otool", "-L", str(executable))
     load_commands = _mach_o_output("/usr/bin/otool", "-l", str(executable))

@@ -55,7 +55,7 @@ struct SettingsView: View {
             }
         } message: {
             Text(
-                "Keep Files removes only the profile after you save. Delete Files immediately removes the profile and its app-managed download. Finder imports and manually configured paths are never eligible for file deletion."
+                "Keep Files removes only the profile after you save. Delete Files immediately removes the profile and cleans up the matching model inside its registered storage folder. Imported models are moved to Trash so they can be recovered."
             )
         }
         .alert(
@@ -697,6 +697,55 @@ struct SettingsView: View {
                         .frame(width: 76)
                     }
                 }
+                Toggle(
+                    "Allow connections from the local network",
+                    isOn: Binding(
+                        get: {
+                            viewModel.settings.server.allowsLocalNetworkInference
+                        },
+                        set: {
+                            viewModel.settings.server.allowsLocalNetworkInference = $0
+                        }
+                    )
+                )
+                LabeledContent("Inference authentication") {
+                    HStack {
+                        Text(
+                            viewModel.inferenceAPIKeyWillBeConfigured
+                                ? "Bearer API key"
+                                : "None"
+                        )
+                        .foregroundStyle(
+                            viewModel.settings.server.allowsLocalNetworkInference
+                                && !viewModel.inferenceAPIKeyWillBeConfigured
+                                ? Color.orange
+                                : Color.secondary
+                        )
+                        Button("Configure…") {
+                            viewModel.selectedSection = .credentials
+                        }
+                    }
+                }
+                if viewModel.settings.server.allowsLocalNetworkInference {
+                    Label(
+                        viewModel.inferenceAPIKeyWillBeConfigured
+                            ? "Devices that can reach this Mac must send the configured bearer key."
+                            : "No API key is configured. Any device that can reach this Mac can use inference without authentication.",
+                        systemImage: viewModel.inferenceAPIKeyWillBeConfigured
+                            ? "lock.fill"
+                            : "exclamationmark.triangle.fill"
+                    )
+                    .font(.caption)
+                    .foregroundStyle(
+                        viewModel.inferenceAPIKeyWillBeConfigured
+                            ? Color.secondary
+                            : Color.orange
+                    )
+                } else {
+                    Text("Inference accepts connections only from applications on this Mac.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
                 LabeledContent("Control API") {
                     HStack {
                         Text(viewModel.settings.server.controlBind).foregroundStyle(.secondary)
@@ -712,7 +761,7 @@ struct SettingsView: View {
                         .frame(width: 76)
                     }
                 }
-                Text("Both services stay private to this Mac. Changing a port requires a restart.")
+                Text("The control API stays private to this Mac. Changing network access or a port requires a restart.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

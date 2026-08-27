@@ -45,8 +45,12 @@ from mnemosyne_macos.models import (
     ResolvedTarget,
     ServiceState,
 )
-from mnemosyne_macos.runtime import NativeRuntime
-from mnemosyne_macos.runtime import _redact_diagnostic
+from mnemosyne_macos.runtime import (
+    NativeRuntime,
+    RuntimeConfigurationError,
+    _redact_diagnostic,
+    validate_exposure,
+)
 from mnemosyne_macos.runtime_updates import RuntimeUpdateError
 from mnemosyne_macos.storage import StorageStatus
 
@@ -155,6 +159,26 @@ def _config(tmp_path, *, endpoint: Endpoint | None = None) -> MacConfig:
             "models": [model],
         }
     )
+
+
+def test_lan_inference_allows_optional_authentication(tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv("INFERENCE_API_KEY", raising=False)
+    config = _config(tmp_path)
+    config.server.inference_bind = "0.0.0.0"
+
+    validate_exposure(config)
+
+
+def test_lan_control_still_requires_authentication(tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv("ADMIN_PASSWORD", raising=False)
+    config = _config(tmp_path)
+    config.server.control_bind = "0.0.0.0"
+
+    with pytest.raises(
+        RuntimeConfigurationError,
+        match="non-loopback control bind requires an admin password",
+    ):
+        validate_exposure(config)
 
 
 def _adapters() -> dict[EngineName, FakeAdapter]:
@@ -2081,6 +2105,7 @@ async def test_control_plane_deletes_only_an_exact_managed_model_destination(
 
         assert deleted.status_code == 200, deleted.text
         assert deleted.json()["deleted_files"] is True
+        assert deleted.json()["files_disposition"] == "deleted"
         assert deleted.json()["model_count"] == 0
         assert not destination.exists()
         assert model_root.is_dir()
@@ -2098,6 +2123,245 @@ async def test_control_plane_deletes_only_an_exact_managed_model_destination(
             ("history_dismissed", "installed"),
             ("status", "deleted"),
         ]
+    finally:
+        await client.aclose()
+        await runtime.stop()
+        await upstream_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_imported_gguf_files_move_to_trash_and_profile_is_removed(
+    tmp_path,
+) -> None:
+    model_root = tmp_path / "Models"
+    model_path = model_root / "publisher" / "model-Q4_K_M.gguf"
+    model_path.parent.mkdir(parents=True)
+    model_path.write_bytes(b"GGUFimported")
+    config = MacConfig.model_validate(
+        {
+            "server": {"idle_unload_seconds": None},
+            "engines": {"llama_cpp": {"enabled": True}},
+            "paths": {"state_database": str(tmp_path / "state.db")},
+            "storage": {
+                "default": "existing-models",
+                "locations": [
+                    {"name": "existing-models", "path": str(model_root)}
+                ],
+            },
+            "models": [
+                {
+                    "alias": "imported-model",
+                    "engine": "llama.cpp",
+                    "model": str(model_path),
+                    "storage": "existing-models",
+                }
+            ],
+        }
+    )
+    config_path = tmp_path / "config.yaml"
+    save_config(config, config_path)
+    upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _r: httpx.Response(500))
+    )
+    runtime = NativeRuntime(
+        config,
+        config_path=config_path,
+        adapters=_adapters(),
+        proxy_client=upstream_client,
+    )
+    await runtime.start(raise_on_degraded=True)
+    trash = tmp_path / "Trash"
+    trash.mkdir()
+    captured: dict[str, object] = {}
+
+    async def fake_trash_paths(**kwargs: object) -> bool:
+        captured.update(kwargs)
+        paths = kwargs["paths"]
+        assert isinstance(paths, tuple)
+        for value in paths:
+            Path(value).rename(trash / Path(value).name)
+        return True
+
+    runtime.filesystem.trash_paths = fake_trash_paths  # type: ignore[method-assign]
+    client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=create_control_app(runtime)),
+        base_url="http://mnemosyne-control.test",
+    )
+    try:
+        revision = (await client.get("/manager/config")).json()["revision"]
+        deleted = await client.request(
+            "DELETE",
+            "/manager/models/imported-model",
+            json={"revision": revision},
+        )
+
+        assert deleted.status_code == 200, deleted.text
+        assert deleted.json()["deleted_files"] is True
+        assert deleted.json()["files_disposition"] == "trashed"
+        assert deleted.json()["model_count"] == 0
+        assert not model_path.exists()
+        assert (trash / model_path.name).is_file()
+        assert captured == {
+            "root": str(model_root),
+            "paths": (str(model_path.resolve()),),
+            "expected_volume_uuid": None,
+            "scope_id": None,
+        }
+        assert load_config(config_path).models == []
+        assert (await runtime.coordinator.status()).state.value == "idle"
+    finally:
+        await client.aclose()
+        await runtime.stop()
+        await upstream_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_imported_omlx_directory_moves_to_trash(
+    tmp_path,
+) -> None:
+    model_root = tmp_path / "Models"
+    model_directory = model_root / "publisher" / "omlx-model"
+    model_directory.mkdir(parents=True)
+    (model_directory / "config.json").write_text(
+        '{"architectures":["ExampleForCausalLM"]}',
+        encoding="utf-8",
+    )
+    (model_directory / "model.safetensors").write_bytes(b"weights")
+    config = MacConfig.model_validate(
+        {
+            "server": {"idle_unload_seconds": None},
+            "engines": {
+                "omlx": {
+                    "enabled": True,
+                    "model_directories": [str(model_root)],
+                }
+            },
+            "paths": {"state_database": str(tmp_path / "state.db")},
+            "storage": {
+                "default": "existing-models",
+                "locations": [
+                    {"name": "existing-models", "path": str(model_root)}
+                ],
+            },
+            "models": [
+                {
+                    "alias": "imported-omlx",
+                    "engine": "omlx",
+                    "model": "omlx-model",
+                    "storage": "existing-models",
+                }
+            ],
+        }
+    )
+    config_path = tmp_path / "config.yaml"
+    save_config(config, config_path)
+    upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _r: httpx.Response(500))
+    )
+    runtime = NativeRuntime(
+        config,
+        config_path=config_path,
+        adapters=_adapters(),
+        proxy_client=upstream_client,
+    )
+    await runtime.start(raise_on_degraded=True)
+    trash = tmp_path / "Trash"
+    trash.mkdir()
+
+    async def fake_trash_paths(**kwargs: object) -> bool:
+        paths = kwargs["paths"]
+        assert paths == (str(model_directory.resolve()),)
+        model_directory.rename(trash / model_directory.name)
+        return True
+
+    runtime.filesystem.trash_paths = fake_trash_paths  # type: ignore[method-assign]
+    client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=create_control_app(runtime)),
+        base_url="http://mnemosyne-control.test",
+    )
+    try:
+        revision = (await client.get("/manager/config")).json()["revision"]
+        deleted = await client.request(
+            "DELETE",
+            "/manager/models/imported-omlx",
+            json={"revision": revision},
+        )
+
+        assert deleted.status_code == 200, deleted.text
+        assert deleted.json()["files_disposition"] == "trashed"
+        assert not model_directory.exists()
+        assert (trash / model_directory.name / "model.safetensors").is_file()
+        assert load_config(config_path).models == []
+    finally:
+        await client.aclose()
+        await runtime.stop()
+        await upstream_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_imported_cleanup_refuses_files_shared_by_another_profile(
+    tmp_path,
+) -> None:
+    model_root = tmp_path / "Models"
+    model_path = model_root / "publisher" / "model-Q4_K_M.gguf"
+    model_path.parent.mkdir(parents=True)
+    model_path.write_bytes(b"GGUFshared")
+    config = MacConfig.model_validate(
+        {
+            "server": {"idle_unload_seconds": None},
+            "engines": {"llama_cpp": {"enabled": True}},
+            "paths": {"state_database": str(tmp_path / "state.db")},
+            "storage": {
+                "default": "existing-models",
+                "locations": [
+                    {"name": "existing-models", "path": str(model_root)}
+                ],
+            },
+            "models": [
+                {
+                    "alias": "first-profile",
+                    "engine": "llama.cpp",
+                    "model": str(model_path),
+                    "storage": "existing-models",
+                },
+                {
+                    "alias": "second-profile",
+                    "engine": "llama.cpp",
+                    "model": str(model_path),
+                    "storage": "existing-models",
+                },
+            ],
+        }
+    )
+    config_path = tmp_path / "config.yaml"
+    save_config(config, config_path)
+    upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _r: httpx.Response(500))
+    )
+    runtime = NativeRuntime(
+        config,
+        config_path=config_path,
+        adapters=_adapters(),
+        proxy_client=upstream_client,
+    )
+    await runtime.start(raise_on_degraded=True)
+    client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=create_control_app(runtime)),
+        base_url="http://mnemosyne-control.test",
+    )
+    try:
+        revision = (await client.get("/manager/config")).json()["revision"]
+        deleted = await client.request(
+            "DELETE",
+            "/manager/models/first-profile",
+            json={"revision": revision},
+        )
+
+        assert deleted.status_code == 400
+        assert "second-profile" in deleted.json()["detail"]
+        assert model_path.is_file()
+        assert len(load_config(config_path).models) == 2
+        assert (await runtime.coordinator.status()).state.value == "idle"
     finally:
         await client.aclose()
         await runtime.stop()
@@ -2359,12 +2623,47 @@ async def test_structured_configuration_rejects_unusable_folder_grant_before_wri
 
 
 @pytest.mark.asyncio
+async def test_lan_inference_without_key_accepts_unauthenticated_requests(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("INFERENCE_API_KEY", raising=False)
+    config = _config(tmp_path)
+    config.server.inference_bind = "0.0.0.0"
+    upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _r: httpx.Response(500))
+    )
+    runtime = NativeRuntime(
+        config,
+        adapters=_adapters(),
+        proxy_client=upstream_client,
+    )
+    await runtime.start(raise_on_degraded=True)
+    inference = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=create_inference_app(runtime)),
+        base_url="http://inference.test",
+    )
+    try:
+        response = await inference.get("/v1/models")
+        assert response.status_code == 200
+    finally:
+        await inference.aclose()
+        await runtime.stop()
+        await upstream_client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_inference_and_control_auth_are_independent(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("INFERENCE_API_KEY", "inference-secret")
     monkeypatch.setenv("ADMIN_PASSWORD", "admin-secret")
-    upstream_client = httpx.AsyncClient(transport=httpx.MockTransport(lambda _r: httpx.Response(500)))
+    config = _config(tmp_path)
+    config.server.inference_bind = "0.0.0.0"
+    config.server.control_bind = "0.0.0.0"
+    upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _r: httpx.Response(500))
+    )
     runtime = NativeRuntime(
-        _config(tmp_path),
+        config,
         adapters=_adapters(),
         proxy_client=upstream_client,
     )
