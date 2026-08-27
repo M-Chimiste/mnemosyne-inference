@@ -478,6 +478,19 @@ class SecurityScopeRegistry:
                 with contextlib.suppress(OSError):
                     bookmark_path.unlink()
 
+    def discard(self, scope_id: str) -> None:
+        """Remove one failed, not-yet-configured grant without broad pruning."""
+
+        normalized_id = self.validate_id(scope_id)
+        with self._lock:
+            self._ensure_open()
+            handle = self._active.pop(normalized_id, None)
+        if handle is not None:
+            handle.close()
+        bookmark_path = self.root / f"{normalized_id}.bookmark"
+        with contextlib.suppress(OSError):
+            bookmark_path.unlink()
+
     def _persist(self, scope_id: str, bookmark: bytes) -> None:
         with self._lock:
             self._ensure_open()

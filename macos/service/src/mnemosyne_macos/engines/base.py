@@ -7,6 +7,8 @@ from dataclasses import dataclass
 import time
 
 from ..models import (
+    ContextWindowHint,
+    ContextWindowProfileResult,
     Endpoint,
     EngineName,
     EngineSnapshot,
@@ -86,6 +88,45 @@ class EngineAdapter(ABC):
         """
 
         del deadline
+        return None
+
+    async def context_window(
+        self,
+        target: ResolvedTarget,
+        *,
+        deadline: Deadline,
+    ) -> ContextWindowHint:
+        """Return the effective context contract without loading a model.
+
+        Manager-owned engines use the exact typed load setting. External
+        adapters should override this method when their authoritative control
+        plane can report a more precise value.
+        """
+
+        del deadline
+        configured = target.requested_context_length
+        return ContextWindowHint(
+            effective_tokens=configured,
+            native_tokens=target.native_context_length,
+            source="configured-load" if configured is not None else "unknown",
+            confidence="authoritative" if configured is not None else "unknown",
+        )
+
+    async def profile_context_window(
+        self,
+        target: ResolvedTarget,
+        requested_tokens: int,
+        *,
+        deadline: Deadline,
+    ) -> ContextWindowProfileResult | None:
+        """Use an engine-native safe profiler when one is available.
+
+        ``None`` delegates to Mnemosyne's portable long-prefill suite.
+        Native implementations may change residency only while the caller
+        holds the coordinator's global-empty maintenance barrier.
+        """
+
+        del target, requested_tokens, deadline
         return None
 
     @abstractmethod

@@ -24,9 +24,15 @@ from mnemosyne_macos.benchmarking import (
     system_fingerprint,
     target_fingerprint,
 )
-from mnemosyne_macos.config import MacConfig, load_config, save_config
+from mnemosyne_macos.config import (
+    MacConfig,
+    ModelContextConfig,
+    load_config,
+    save_config,
+)
 from mnemosyne_macos.coordinator import CoordinatorError, CoordinatorState
 from mnemosyne_macos.engines.base import AdapterError, Deadline, EngineAdapter
+from mnemosyne_macos.filesystem import FilesystemProbeError
 from mnemosyne_macos.install_store import InstallRecord
 from mnemosyne_macos.model_library import LibraryModel
 from mnemosyne_macos.models import (
@@ -42,6 +48,7 @@ from mnemosyne_macos.models import (
 from mnemosyne_macos.runtime import NativeRuntime
 from mnemosyne_macos.runtime import _redact_diagnostic
 from mnemosyne_macos.runtime_updates import RuntimeUpdateError
+from mnemosyne_macos.storage import StorageStatus
 
 
 FLEET_SNAPSHOT_SCHEMA = (
@@ -393,6 +400,94 @@ async def test_non_streaming_proxy_rewrites_model_strips_credentials_and_records
         assert performance["by_model"][0]["cold_starts"] == 1
         assert performance["recent"][0]["status_code"] == 200
         assert performance["recent"][0]["admission_ms"] is not None
+    finally:
+        await client.aclose()
+        await runtime.stop()
+        await upstream_client.aclose()
+
+
+@pytest.mark.parametrize(
+    ("engine", "budget_field"),
+    [
+        (EngineName.OMLX, "thinking_budget"),
+        (EngineName.LLAMA_CPP, "reasoning_budget_tokens"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_proxy_translates_qwen_controls_for_the_resolved_engine(
+    tmp_path,
+    engine: EngineName,
+    budget_field: str,
+) -> None:
+    seen: dict = {}
+    engine_config_key = (
+        "llama_cpp" if engine == EngineName.LLAMA_CPP else engine.value
+    )
+
+    def upstream_handler(request: httpx.Request) -> httpx.Response:
+        seen.update(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+                "usage": {
+                    "prompt_tokens": 2,
+                    "completion_tokens": 1,
+                    "total_tokens": 3,
+                },
+            },
+        )
+
+    config = MacConfig.model_validate(
+        {
+            "server": {"idle_unload_seconds": None},
+            "engines": {engine_config_key: {"enabled": True}},
+            "paths": {"state_database": str(tmp_path / "state.db")},
+            "models": [
+                {
+                    "alias": "qwen38",
+                    "engine": engine.value,
+                    "model": "publisher/qwen38",
+                }
+            ],
+        }
+    )
+    upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(upstream_handler)
+    )
+    runtime = NativeRuntime(
+        config,
+        adapters=_adapters(),
+        proxy_client=upstream_client,
+    )
+    await runtime.start(raise_on_degraded=True)
+    client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=create_inference_app(runtime)),
+        base_url="http://mnemosyne.test",
+    )
+    try:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "qwen38",
+                "messages": [{"role": "user", "content": "Solve this."}],
+                "reasoning_effort": "medium",
+                "thinking_budget": 4096,
+                "enable_thinking": True,
+                "preserve_thinking": False,
+            },
+        )
+
+        assert response.status_code == 200, response.text
+        assert seen["model"] == (
+            "qwen38" if engine == EngineName.LLAMA_CPP else "publisher/qwen38"
+        )
+        assert seen[budget_field] == 4096
+        assert seen["chat_template_kwargs"] == {
+            "enable_thinking": True,
+            "preserve_thinking": False,
+            "reasoning_effort": "medium",
+        }
     finally:
         await client.aclose()
         await runtime.stop()
@@ -1454,8 +1549,14 @@ async def test_streaming_proxy_hides_forced_usage_event_but_persists_it(tmp_path
 @pytest.mark.asyncio
 async def test_control_plane_lists_loads_and_unloads_models(tmp_path) -> None:
     upstream_client = httpx.AsyncClient(transport=httpx.MockTransport(lambda _r: httpx.Response(500)))
+    config = _config(tmp_path)
+    config.models[0].context = ModelContextConfig(
+        mode="fixed",
+        native_tokens=131_072,
+        fixed_tokens=65_536,
+    )
     runtime = NativeRuntime(
-        _config(tmp_path),
+        config,
         adapters=_adapters(),
         proxy_client=upstream_client,
     )
@@ -1468,6 +1569,23 @@ async def test_control_plane_lists_loads_and_unloads_models(tmp_path) -> None:
         listed = await client.get("/manager/models")
         assert listed.status_code == 200
         assert listed.json()["models"][0]["id"] == "frontier"
+        assert listed.json()["models"][0]["max_model_len"] == 65_536
+        assert listed.json()["models"][0]["context_window"] == {
+            "mode": "fixed",
+            "native_tokens": 131_072,
+            "configured_tokens": 65_536,
+            "effective_tokens": 65_536,
+            "verified_tokens": None,
+            "guaranteed_tokens": 65_536,
+            "source": "configured-load",
+            "confidence": "authoritative",
+        }
+
+        contexts = await client.get("/manager/contexts", params={"alias": "frontier"})
+        assert contexts.status_code == 200
+        assert contexts.json()["models"][0]["candidates"][0][
+            "guaranteed_tokens"
+        ] == 65_536
 
         loaded = await client.post("/manager/load", json={"model": "frontier"})
         assert loaded.status_code == 200
@@ -1762,6 +1880,122 @@ async def test_control_plane_reads_saves_and_applies_structured_configuration(tm
 
 
 @pytest.mark.asyncio
+async def test_storage_health_keeps_other_locations_when_one_grant_is_stale(
+    tmp_path,
+) -> None:
+    healthy = tmp_path / "Healthy"
+    broken = tmp_path / "Broken"
+    healthy.mkdir()
+    broken.mkdir()
+    payload = _config(tmp_path).model_dump(mode="json")
+    payload["storage"] = {
+        "default": "healthy",
+        "locations": [
+            {"name": "healthy", "path": str(healthy)},
+            {"name": "broken", "path": str(broken)},
+        ],
+    }
+    config = MacConfig.model_validate(payload)
+    upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _r: httpx.Response(500))
+    )
+    runtime = NativeRuntime(
+        config,
+        adapters=_adapters(),
+        proxy_client=upstream_client,
+    )
+    await runtime.start(raise_on_degraded=True)
+
+    class _StorageProbe:
+        async def inspect(
+            self,
+            path: str,
+            *,
+            name: str | None = None,
+            expected_volume_uuid: str | None = None,
+            scope_id: str | None = None,
+        ) -> StorageStatus:
+            del scope_id
+            if name == "broken":
+                raise FilesystemProbeError(
+                    "macOS could not resolve the selected-folder bookmark; choose it again"
+                )
+            return StorageStatus(
+                name=name,
+                path=path,
+                exists=True,
+                is_directory=True,
+                writable=True,
+                mount_path="/",
+                volume_uuid=None,
+                expected_volume_uuid=expected_volume_uuid,
+                volume_matches=True,
+                total_bytes=1_000,
+                free_bytes=500,
+                diagnostic=None,
+            )
+
+    runtime.filesystem = _StorageProbe()  # type: ignore[assignment]
+    client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=create_control_app(runtime)),
+        base_url="http://mnemosyne-control.test",
+    )
+    try:
+        response = await client.get("/manager/storage")
+
+        assert response.status_code == 200
+        locations = {item["name"]: item for item in response.json()["locations"]}
+        assert locations["healthy"]["writable"] is True
+        assert locations["broken"]["writable"] is False
+        assert "choose it again" in locations["broken"]["diagnostic"]
+    finally:
+        await client.aclose()
+        await runtime.stop()
+        await upstream_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_selected_accessible_storage_does_not_persist_a_bookmark(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    selected = tmp_path / "Selected"
+    selected.mkdir()
+    config = _config(tmp_path)
+    upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _r: httpx.Response(500))
+    )
+    runtime = NativeRuntime(
+        config,
+        adapters=_adapters(),
+        proxy_client=upstream_client,
+    )
+    await runtime.start(raise_on_degraded=True)
+
+    async def unexpected_registration(_path: str, _bookmark: str) -> str:
+        raise AssertionError("an already-accessible folder must not retain a bookmark")
+
+    monkeypatch.setattr(runtime, "register_security_scope", unexpected_registration)
+    client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=create_control_app(runtime)),
+        base_url="http://mnemosyne-control.test",
+    )
+    try:
+        response = await client.post(
+            "/manager/storage/inspect",
+            json={"path": str(selected), "bookmark_data": "dHJhbnNmZXI="},
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.json()["path"] == str(selected)
+        assert response.json()["scope_id"] is None
+    finally:
+        await client.aclose()
+        await runtime.stop()
+        await upstream_client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_control_plane_deletes_only_an_exact_managed_model_destination(
     tmp_path,
 ) -> None:
@@ -1972,6 +2206,31 @@ async def test_each_runtime_start_reactivates_configured_folder_scope(
         async def activate(self, value: str, path: str) -> None:
             activations.append((value, path))
 
+    class _ProtectedStorageProbe:
+        async def inspect(
+            self,
+            path: str,
+            *,
+            name: str | None = None,
+            expected_volume_uuid: str | None = None,
+            scope_id: str | None = None,
+        ) -> StorageStatus:
+            del scope_id
+            return StorageStatus(
+                name=name,
+                path=path,
+                exists=False,
+                is_directory=False,
+                writable=False,
+                mount_path=None,
+                volume_uuid=None,
+                expected_volume_uuid=expected_volume_uuid,
+                volume_matches=False,
+                total_bytes=None,
+                free_bytes=None,
+                diagnostic="permission required",
+            )
+
     for _ in range(2):
         upstream_client = httpx.AsyncClient(
             transport=httpx.MockTransport(lambda _r: httpx.Response(500))
@@ -1982,6 +2241,7 @@ async def test_each_runtime_start_reactivates_configured_folder_scope(
             adapters=_adapters(),
             proxy_client=upstream_client,
             security_scope_process=_RecordingScopeProcess(),  # type: ignore[arg-type]
+            filesystem_probe=_ProtectedStorageProbe(),  # type: ignore[arg-type]
         )
         try:
             await runtime.start(raise_on_degraded=True)
@@ -1990,6 +2250,59 @@ async def test_each_runtime_start_reactivates_configured_folder_scope(
             await upstream_client.aclose()
 
     assert activations == [(scope_id, str(selected)), (scope_id, str(selected))]
+
+
+@pytest.mark.asyncio
+async def test_runtime_removes_unnecessary_scope_without_folder_reselection(
+    tmp_path,
+) -> None:
+    scope_id = "b" * 64
+    selected = tmp_path / "Models"
+    selected.mkdir()
+    payload = _config(tmp_path).model_dump(mode="json")
+    payload["storage"] = {
+        "default": "selected",
+        "locations": [
+            {
+                "name": "selected",
+                "path": str(selected),
+                "scope_id": scope_id,
+            }
+        ],
+    }
+    payload["models"][0]["storage"] = "selected"
+    config = MacConfig.model_validate(payload)
+    config_path = tmp_path / "settings" / "config.yaml"
+    save_config(config, config_path)
+    scope_root = config_path.parent / "state" / "security-scopes"
+    scope_root.mkdir(parents=True)
+    obsolete = scope_root / f"{scope_id}.bookmark"
+    obsolete.write_bytes(b"obsolete")
+
+    class _UnexpectedScopeProcess:
+        async def activate(self, _value: str, _path: str) -> None:
+            raise AssertionError("ordinary accessible storage must not reactivate a scope")
+
+    upstream_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _r: httpx.Response(500))
+    )
+    runtime = NativeRuntime(
+        config,
+        config_path=config_path,
+        adapters=_adapters(),
+        proxy_client=upstream_client,
+        security_scope_process=_UnexpectedScopeProcess(),  # type: ignore[arg-type]
+    )
+    try:
+        await runtime.start(raise_on_degraded=True)
+
+        assert runtime.config.storage.locations[0].scope_id is None
+        assert runtime.resolve("frontier").scope_id is None
+        assert load_config(config_path).storage.locations[0].scope_id is None
+        assert not obsolete.exists()
+    finally:
+        await runtime.stop()
+        await upstream_client.aclose()
 
 
 @pytest.mark.asyncio

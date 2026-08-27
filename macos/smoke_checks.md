@@ -196,8 +196,13 @@ Confirm:
 - an LM Studio model root that is a symlink to a nested external-SSD folder
   remains recorded under the selected symlink path while volume inspection,
   GGUF validation, and model loading operate on its authorized target;
-- `config.yaml` contains a 64-character SHA-256 `scope_id` for a
-  Finder-authorized protected folder but contains no raw/base64 bookmark;
+- an ordinarily accessible Finder-selected folder persists its exact path and
+  volume identity without a `scope_id`, survives app/LaunchAgent restarts and
+  a new login without another selection, and an older unnecessary `scope_id`
+  is removed automatically on the first successful startup probe;
+- `config.yaml` contains a 64-character SHA-256 `scope_id` only for a folder
+  that actually requires the transferred Finder grant, and contains no
+  raw/base64 bookmark;
 - the matching receiver-owned durable bookmark exists only below the
   mode-`0700` private `state/security-scopes/` directory with file mode `0600`;
 - that scope directory remains beside `config.yaml` when
@@ -212,12 +217,13 @@ rejected. Unmount an external library, or mount a different volume at the same
 path, and confirm a request fails before the currently resident model is
 drained.
 
-Quit the menu app, restart the LaunchAgent, and request a model in the
-Finder-authorized folder. Confirm the service reactivates its receiver-owned
-bookmark and that the scoped launcher reactivates it again before `exec` starts
-the managed child. Remove a storage location, restart, and confirm its
-unreferenced private bookmark is pruned while bookmarks still referenced by
-the persisted configuration remain.
+Quit the menu app, restart the LaunchAgent, and request a model from an ordinary
+Finder-selected folder. Confirm the exact persisted path remains usable without
+another selection or a bookmark. For a folder that genuinely requires a grant,
+confirm the service reactivates its receiver-owned bookmark and that the scoped
+launcher reactivates it again before `exec` starts the managed child. Remove a
+storage location, restart, and confirm its unreferenced private bookmark is
+pruned while bookmarks still referenced by the persisted configuration remain.
 
 Also test a protected path whose authorization is unavailable: poll
 `/manager/status` concurrently and confirm the control plane remains responsive
@@ -231,10 +237,12 @@ These protected-folder checks are an outstanding packaged-Mac gate. Confirm
 the app is using either the intended stable `CODESIGN_IDENTITY` or a known
 ad-hoc build. Theseus now has a valid Developer ID Application identity and its
 installed stable-signed bundle should retain that identity across updates;
-switching to an ad-hoc or different signing identity may require folder
-re-selection. Do not expect or claim App Sandbox bookmark entitlements: verify
-the ordinary bookmark's implicit interprocess handoff, receiver-owned bookmark
-creation, LaunchAgent restart, helper restart, and child `exec` directly.
+ordinary accessible folders must remain usable even when the signing identity
+changes. A genuinely protected path may require re-authorization after a
+signing-identity change. Do not expect or claim App Sandbox bookmark
+entitlements: verify the ordinary bookmark's implicit interprocess handoff,
+conditional receiver-owned bookmark creation, LaunchAgent restart, helper
+restart, and child `exec` directly.
 
 ## 3. Managed llama.cpp lifecycle
 
@@ -413,6 +421,33 @@ The same content-free evidence is available from
 `GET /manager/benchmarks?alias=<alias>`. Re-run this matrix once with a failed
 alternative load and once while cancelling the benchmark client.
 
+### Per-model context contract
+
+For a generation model with detected native context, open **Models → Context
+window** and verify the detected-native, current-engine, verified, and
+guaranteed values are distinct and clearly labeled. Exercise all three
+policies:
+
+- **Automatic** retains the prior safe value before evidence exists. Choose
+  **Profile usable context** and confirm candidates run sequentially, no model
+  overlap occurs, and a fresh result becomes the advertised guarantee.
+- **Model native maximum** requests the detected value without presenting it as
+  a locally profiled result. If the allocation cannot load, the failure occurs
+  before inference and no smaller ambiguous replay is attempted.
+- **Explicit limit** survives save, service restart, unload/load, and oMLX
+  restart. For oMLX, confirm its official model status reports that exact value
+  after Mnemosyne loads the model; the global 32K fallback must not replace it.
+
+Confirm `GET :1240/v1/models` returns the selected guarantee in
+`max_model_len` and the structured `context_window`, and compare it with
+`GET :17321/manager/contexts?alias=<alias>`. Upgrade one engine runtime (or
+expire the evidence), reconcile, and verify Automatic returns to the persisted
+safe fallback until it is profiled again. Attach an alternative with a smaller
+context guarantee and confirm it cannot win the speed benchmark. Inspect the
+SQLite context row and verify it contains only fingerprints, fixed token
+counts, suite/runtime/system identities, and timestamps—never probe text,
+generated output, paths, credentials, or diagnostics.
+
 ## 8. MFLUX image lifecycle
 
 Request each configured MFLUX alias through `POST :1240/v1/images/generations`.
@@ -472,10 +507,12 @@ section.
 - **Storage → Add Model Folder…** opens the native directory chooser; selecting
   an exact nested folder such as `/Volumes/Athena/models` displays that path,
   its containing mount and free space, and never reduces it to `/Volumes/Athena`;
-  the menu transfers its Finder bookmark to the service, the service creates a
-  receiver-owned durable bookmark, only the resulting SHA-256 `scope_id`
-  appears in YAML, and selecting the folder again repairs a missing or stale
-  private bookmark;
+  the menu transfers its Finder bookmark to the service, but an ordinary
+  read/write-accessible folder persists without a `scope_id` and remains usable
+  after restart/login without reselection; only a folder that fails the
+  unscoped capability probe creates a receiver-owned durable bookmark, only its
+  resulting SHA-256 `scope_id` appears in YAML, and selecting that protected
+  folder again repairs a missing or stale private bookmark;
   unmount the drive and confirm the location becomes unavailable, then mount a
   different volume at the same path and confirm the UUID mismatch fails closed;
 - **Model Library** exposes one cross-engine list with engine-support badges,

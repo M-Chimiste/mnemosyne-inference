@@ -28,7 +28,13 @@ public enum ServiceRegistrationPollingError: Error, Equatable, LocalizedError, S
 
 public enum ServiceRegistrationPolling {
     public typealias StateProbe = @MainActor () -> ManagedServiceRegistrationState
-    public static let reregistrationSettleDuration: Duration = .seconds(2)
+    // Background Task Management can continue enforcing the previous helper's
+    // launch requirement well after SMAppService reports `.notRegistered`.
+    // On macOS 26 this has been observed for more than ten seconds during an
+    // in-place Developer ID update; registering sooner makes launchd kill the
+    // new helper with a Launch Constraint Violation. Restarts are rare and a
+    // bounded delay is preferable to a crash/throttle/retry loop.
+    public static let reregistrationSettleDuration: Duration = .seconds(20)
 
     @MainActor
     public static func waitUntilUnregistered(

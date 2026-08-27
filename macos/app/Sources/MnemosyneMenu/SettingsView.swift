@@ -1054,6 +1054,10 @@ struct SettingsView: View {
                             ).opacity(0.12),
                             in: Capsule()
                         )
+                } else if update.diagnostic != nil {
+                    Text("CHECK FAILED")
+                        .font(.caption2.weight(.bold))
+                        .foregroundStyle(.orange)
                 } else if update.installed {
                     Text("CURRENT")
                         .font(.caption2.weight(.bold))
@@ -2046,14 +2050,9 @@ struct SettingsView: View {
     @ViewBuilder
     private func languageModelOptions(_ index: Int) -> some View {
         let engine = viewModel.settings.models[index].engine
+        contextWindowOptions(index)
         if engine != .omlx {
             Section("Loading") {
-                if engine != .mistralRs {
-                    optionalIntegerField(
-                        "Context length",
-                        value: $viewModel.settings.models[index].load.contextLength
-                    )
-                }
                 if engine == .llamaCpp {
                     optionalIntegerField(
                         "Evaluation batch size",
@@ -2149,6 +2148,118 @@ struct SettingsView: View {
                     .foregroundStyle(.secondary)
             }
         }
+    }
+
+    @ViewBuilder
+    private func contextWindowOptions(_ index: Int) -> some View {
+        let profile = viewModel.settings.models[index]
+        let observed = viewModel.contextSnapshot?.models
+            .first(where: { $0.alias == profile.alias })?.candidates
+            .first(where: { $0.engine == profile.engine })
+        Section("Context window") {
+            if profile.engine == .mistralRs {
+                LabeledContent("Policy") {
+                    Text("Engine automatic")
+                        .foregroundStyle(.secondary)
+                }
+                Text("mistral.rs remains on its reviewed engine default until its Metal runtime exposes an authoritative context-setting contract.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                Picker(
+                    "Policy",
+                    selection: contextModeBinding(for: index, observed: observed)
+                ) {
+                    Text("Automatic — verified when profiled").tag("automatic")
+                    if profile.context.nativeTokens != nil {
+                        Text("Model native maximum").tag("native")
+                    }
+                    Text("Explicit limit").tag("fixed")
+                }
+                if profile.context.mode == "fixed" {
+                    optionalIntegerField(
+                        "Explicit token limit",
+                        value: $viewModel.settings.models[index].context.fixedTokens
+                    )
+                }
+                LabeledContent("Detected native limit") {
+                    Text(
+                        profile.context.nativeTokens?.formatted()
+                            ?? observed?.nativeTokens?.formatted()
+                            ?? "Unknown"
+                    )
+                    .foregroundStyle(.secondary)
+                }
+                LabeledContent("Guaranteed API limit") {
+                    Text(observed?.guaranteedTokens?.formatted() ?? "Not yet observed")
+                        .foregroundStyle(.secondary)
+                }
+                if let verified = observed?.verifiedTokens {
+                    LabeledContent("Verified on this Mac") {
+                        Text("\(verified.formatted()) tokens")
+                            .foregroundStyle(.green)
+                    }
+                } else if let effective = observed?.effectiveTokens {
+                    LabeledContent("Current engine setting") {
+                        Text("\(effective.formatted()) tokens")
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                if !profile.alternatives.isEmpty,
+                   let candidates = viewModel.contextSnapshot?.models
+                    .first(where: { $0.alias == profile.alias })?.candidates {
+                    ForEach(candidates.filter { $0.engine != profile.engine }) { candidate in
+                        LabeledContent("\(candidate.engine.displayName) guarantee") {
+                            Text(candidate.guaranteedTokens?.formatted() ?? "Unknown")
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+            }
+            HStack {
+                Button("Profile usable context") {
+                    Task { await viewModel.runContextProfile(alias: profile.alias) }
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(
+                    viewModel.hasUnsavedChanges
+                        || viewModel.profilingContextAlias != nil
+                        || profile.configuredRole != .generation
+                )
+                if viewModel.profilingContextAlias == profile.alias {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text("Large prefills can take several minutes.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            Text("Automatic mode uses fresh long-prefill evidence for this exact model, engine runtime, and Mac. Without valid evidence it keeps the configured safe fallback. Native mode requests the model's advertised maximum without proving it fits; an explicit limit is always honored.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private func contextModeBinding(
+        for index: Int,
+        observed: ContextWindowCandidate?
+    ) -> Binding<String> {
+        Binding(
+            get: { viewModel.settings.models[index].context.mode },
+            set: { mode in
+                viewModel.settings.models[index].context.mode = mode
+                if mode == "fixed" {
+                    viewModel.settings.models[index].context.fixedTokens =
+                        viewModel.settings.models[index].context.fixedTokens
+                        ?? observed?.guaranteedTokens
+                        ?? viewModel.settings.models[index].context.nativeTokens
+                        ?? viewModel.settings.models[index].load.contextLength
+                        ?? 32_768
+                } else {
+                    viewModel.settings.models[index].context.fixedTokens = nil
+                }
+            }
+        )
     }
 
     private func imageModelOptions(_ index: Int) -> some View {

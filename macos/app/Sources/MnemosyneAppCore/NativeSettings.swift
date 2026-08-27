@@ -1,7 +1,7 @@
 import Foundation
 
 public struct NativeSettings: Codable, Equatable, Sendable {
-    public static let supportedSchemaVersion = 5
+    public static let supportedSchemaVersion = 6
 
     public var schemaVersion: Int
     public var server: ServerSettings
@@ -264,6 +264,25 @@ public enum ModelKindSetting: String, Codable, Sendable {
     case image
 }
 
+public struct ModelContextSettings: Codable, Equatable, Sendable {
+    public var mode: String
+    public var nativeTokens: Int?
+    public var fixedTokens: Int?
+    public var maxVerifiedAgeHours: Int
+
+    public init(
+        mode: String = "automatic",
+        nativeTokens: Int? = nil,
+        fixedTokens: Int? = nil,
+        maxVerifiedAgeHours: Int = 720
+    ) {
+        self.mode = mode
+        self.nativeTokens = nativeTokens
+        self.fixedTokens = fixedTokens
+        self.maxVerifiedAgeHours = maxVerifiedAgeHours
+    }
+}
+
 public struct ModelProfileSettings: Codable, Equatable, Sendable {
     public var alias: String
     public var engine: InferenceEngine
@@ -272,6 +291,7 @@ public struct ModelProfileSettings: Codable, Equatable, Sendable {
     public var servedModelName: String?
     public var capabilities: [String]?
     public var load: ModelLoadSettings
+    public var context: ModelContextSettings
     public var kind: ModelKindSetting
     public var image: ImageProfileSettings?
     public var alternatives: [ModelEngineAlternativeSettings]
@@ -286,6 +306,7 @@ public struct ModelProfileSettings: Codable, Equatable, Sendable {
         servedModelName: String? = nil,
         capabilities: [String]? = nil,
         load: ModelLoadSettings = .init(),
+        context: ModelContextSettings = .init(),
         kind: ModelKindSetting = .language,
         image: ImageProfileSettings? = nil,
         alternatives: [ModelEngineAlternativeSettings] = [],
@@ -299,6 +320,7 @@ public struct ModelProfileSettings: Codable, Equatable, Sendable {
         self.servedModelName = servedModelName
         self.capabilities = capabilities
         self.load = load
+        self.context = context
         self.kind = kind
         self.image = image
         self.alternatives = alternatives
@@ -308,7 +330,7 @@ public struct ModelProfileSettings: Codable, Equatable, Sendable {
 
     enum CodingKeys: String, CodingKey {
         case alias, engine, model, storage, servedModelName, capabilities
-        case load, kind, image, alternatives, selection, enabled
+        case load, context, kind, image, alternatives, selection, enabled
     }
 
     public init(from decoder: Decoder) throws {
@@ -326,6 +348,8 @@ public struct ModelProfileSettings: Codable, Equatable, Sendable {
             forKey: .capabilities
         )
         load = try container.decodeIfPresent(ModelLoadSettings.self, forKey: .load)
+            ?? .init()
+        context = try container.decodeIfPresent(ModelContextSettings.self, forKey: .context)
             ?? .init()
         kind = try container.decodeIfPresent(ModelKindSetting.self, forKey: .kind)
             ?? .language
@@ -350,6 +374,7 @@ public struct ModelProfileSettings: Codable, Equatable, Sendable {
         try container.encodeIfPresent(servedModelName, forKey: .servedModelName)
         try container.encodeIfPresent(capabilities, forKey: .capabilities)
         try container.encode(load, forKey: .load)
+        try container.encode(context, forKey: .context)
         try container.encode(kind, forKey: .kind)
         try container.encodeIfPresent(image, forKey: .image)
         try container.encode(alternatives, forKey: .alternatives)
@@ -366,6 +391,7 @@ public struct ModelEngineAlternativeSettings: Codable, Equatable, Sendable, Iden
     public var servedModelName: String?
     public var capabilities: [String]?
     public var load: ModelLoadSettings
+    public var context: ModelContextSettings
     public var enabled: Bool
 
     public var id: String { "\(engine.rawValue):\(model)" }
@@ -378,6 +404,7 @@ public struct ModelEngineAlternativeSettings: Codable, Equatable, Sendable, Iden
         servedModelName: String? = nil,
         capabilities: [String]? = nil,
         load: ModelLoadSettings = .init(),
+        context: ModelContextSettings = .init(),
         enabled: Bool = true
     ) {
         self.engine = engine
@@ -387,7 +414,34 @@ public struct ModelEngineAlternativeSettings: Codable, Equatable, Sendable, Iden
         self.servedModelName = servedModelName
         self.capabilities = capabilities
         self.load = load
+        self.context = context
         self.enabled = enabled
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case engine, model, sourceAlias, storage, servedModelName, capabilities
+        case load, context, enabled
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        engine = try container.decode(InferenceEngine.self, forKey: .engine)
+        model = try container.decode(String.self, forKey: .model)
+        sourceAlias = try container.decodeIfPresent(String.self, forKey: .sourceAlias)
+        storage = try container.decodeIfPresent(String.self, forKey: .storage)
+        servedModelName = try container.decodeIfPresent(
+            String.self,
+            forKey: .servedModelName
+        )
+        capabilities = try container.decodeIfPresent(
+            [String].self,
+            forKey: .capabilities
+        )
+        load = try container.decodeIfPresent(ModelLoadSettings.self, forKey: .load)
+            ?? .init()
+        context = try container.decodeIfPresent(ModelContextSettings.self, forKey: .context)
+            ?? .init()
+        enabled = try container.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
     }
 }
 

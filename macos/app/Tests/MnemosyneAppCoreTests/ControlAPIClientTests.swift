@@ -14,7 +14,7 @@ func defaultControlPort() {
     #expect(!NativeSettings().engines.mflux.enabled)
     #expect(!NativeSettings().engines.mlxcel.enabled)
     #expect(!NativeSettings().engines.mistralRs.enabled)
-    #expect(NativeSettings().schemaVersion == 5)
+    #expect(NativeSettings().schemaVersion == 6)
     #expect(NativeSettings().server.maxConcurrency == nil)
     #expect(NativeSettings().server.maxQueueDepth == 128)
     #expect(NativeSettings().server.idleUnloadSeconds == nil)
@@ -98,6 +98,30 @@ func benchmarkRequestEncoding() throws {
     #expect(object["max_tokens"] as? Int == 128)
 }
 
+@Test("Context profiling uses the explicit long-running manager route")
+func contextProfileRequestEncoding() throws {
+    let client = ControlAPIClient(
+        baseURL: URL(string: "http://localhost:17321")!,
+        adminPassword: "secret"
+    )
+    let request = try client.contextProfileRequest(
+        alias: "qwen-3.5",
+        targetTokens: 262_144
+    )
+
+    #expect(
+        request.url?.absoluteString
+            == "http://localhost:17321/manager/contexts/qwen-3.5/profile"
+    )
+    #expect(request.httpMethod == "POST")
+    #expect(request.timeoutInterval == 3_600)
+    let body = try #require(request.httpBody)
+    let object = try #require(
+        JSONSerialization.jsonObject(with: body) as? [String: Any]
+    )
+    #expect(object["target_tokens"] as? Int == 262_144)
+}
+
 @Test("Model self-test requests use the public-path verifier with bounded options")
 func selfTestRequestEncoding() throws {
     let client = ControlAPIClient(
@@ -153,6 +177,11 @@ func configurationSaveRequestEncoding() throws {
                 projectorPath: "/Volumes/Athena/models/mmproj.gguf",
                 gpuLayers: 99,
                 ubatchSize: 512
+            ),
+            context: ModelContextSettings(
+                mode: "fixed",
+                nativeTokens: 131_072,
+                fixedTokens: 65_536
             )
         )
     ]
@@ -175,8 +204,9 @@ func configurationSaveRequestEncoding() throws {
     let storage = try #require(config["storage"] as? [String: Any])
     let locations = try #require(storage["locations"] as? [[String: Any]])
     let load = try #require(models.first?["load"] as? [String: Any])
+    let context = try #require(models.first?["context"] as? [String: Any])
     #expect(server["inference_port"] as? Int == 17_330)
-    #expect(config["schema_version"] as? Int == 5)
+    #expect(config["schema_version"] as? Int == 6)
     #expect(server["max_concurrency"] as? Int == 3)
     #expect(server["max_queue_depth"] as? Int == 128)
     #expect(server["fleet_api_key_env"] as? String == "FLEET_API_KEY")
@@ -184,6 +214,9 @@ func configurationSaveRequestEncoding() throws {
     #expect(load["projector_path"] as? String == "/Volumes/Athena/models/mmproj.gguf")
     #expect(load["gpu_layers"] as? Int == 99)
     #expect(load["ubatch_size"] as? Int == 512)
+    #expect(context["mode"] as? String == "fixed")
+    #expect(context["native_tokens"] as? Int == 131_072)
+    #expect(context["fixed_tokens"] as? Int == 65_536)
     #expect(models.first?["engine"] as? String == "llama.cpp")
     #expect(locations.first?["path"] as? String == "/Volumes/Athena/models")
     #expect(locations.first?["volume_uuid"] as? String == "ATHENA-UUID")
@@ -263,9 +296,9 @@ func futureConfigurationSchemaSaveRefused() throws {
     let client = ControlAPIClient(
         baseURL: URL(string: "http://localhost:17321")!
     )
-    let settings = NativeSettings(schemaVersion: 6)
+    let settings = NativeSettings(schemaVersion: 7)
 
-    #expect(throws: ControlAPIError.unsupportedConfigurationSchema(6)) {
+    #expect(throws: ControlAPIError.unsupportedConfigurationSchema(7)) {
         _ = try client.configurationSaveRequest(
             settings: settings,
             revision: String(repeating: "f", count: 64)
@@ -273,7 +306,7 @@ func futureConfigurationSchemaSaveRefused() throws {
     }
 }
 
-@Test("Pinned engine selection round-trips through schema five")
+@Test("Pinned engine selection round-trips through schema six")
 func pinnedEngineSelectionRoundTrip() throws {
     let value = ModelSelectionSettings(
         mode: "pinned",

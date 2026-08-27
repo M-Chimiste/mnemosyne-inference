@@ -189,6 +189,30 @@ def test_active_scope_still_requires_a_durable_authenticated_bookmark(
     registry.close()
 
 
+def test_scope_registry_discards_only_the_requested_failed_grant(
+    tmp_path: Path,
+) -> None:
+    first_bookmark = b"first receiver-owned bookmark"
+    second_bookmark = b"second receiver-owned bookmark"
+    first = SecurityScopeRegistry(
+        tmp_path / "state" / "security-scopes",
+        resolver=_Resolver(tmp_path, owned_bookmark=first_bookmark),
+    )
+    first_scope = first.register(str(tmp_path), _encoded(b"first transfer"))
+    first.close()
+    second = SecurityScopeRegistry(
+        first.root,
+        resolver=_Resolver(tmp_path, owned_bookmark=second_bookmark),
+    )
+    second_scope = second.register(str(tmp_path), _encoded(b"second transfer"))
+
+    second.discard(second_scope.id)
+
+    assert not (second.root / f"{second_scope.id}.bookmark").exists()
+    assert (second.root / f"{first_scope.id}.bookmark").exists()
+    second.close()
+
+
 def test_scope_registry_rejects_mismatch_stale_and_tampering(
     tmp_path: Path,
 ) -> None:

@@ -1,6 +1,6 @@
 # Mnemosyne Inference — Project Status
 
-**Last updated:** 2026-08-15
+**Last updated:** 2026-08-16
 
 ## Current state
 
@@ -99,6 +99,18 @@ excludes aliases whose local policy can select a non-primary engine, preserving
 immutable deployment identity. The Settings sidebar exposes the packaged app
 version and build beside the product name.
 
+- Schema-v6 language candidates now carry detected-native, configured,
+  effective, and locally verified context-window contracts. Settings can apply
+  fresh exact-Mac profiling automatically, request the model-native maximum, or
+  pin an explicit token limit. oMLX is inspected and configured through its
+  official APIs, `/v1/models` advertises `max_model_len`, and an otherwise faster
+  engine cannot win automatic selection by silently reducing usable context.
+- Qwen3.8 request-level thinking controls are portable across stable native
+  language engines. Unified Inference retains the model-native `low`, `medium`,
+  and `xhigh` reasoning effort, normalizes thinking/preservation template
+  controls, and translates one token-budget surface to the selected oMLX or
+  llama.cpp dialect without persisting prompts or reasoning content.
+
 The native product is now a 0.9.0 release candidate with one enforced version,
 a guided Setup & Health flow, bounded secret-redacted readiness, real public
 listener self-tests with durable usage verification, Stable/Preview engine
@@ -168,10 +180,10 @@ Managed runtime acceptance now has the same durable treatment: the strict
 collector requires an ordered update/restart/rollback/restart/rejection chain
 and confirms the original managed version remains active.
 The current CUDA/manager suite passes 478 tests, and the independently locked
-Fleet suite passes 79 tests. The native service suite passes 367 tests on the
+Fleet suite passes 79 tests. The native service suite passes 402 tests on the
 development Mac; two real-bookmark tests skip in restricted runners.
 The isolated MFLUX worker passes 23 tests with real Metal access, the packaging
-suite passes 33 tests, and all 70 current Swift tests pass. The Fleet wheel
+suite passes 33 tests, and all 73 current Swift tests pass. The Fleet wheel
 contains its protocol schema and passed a clean build. The full relocatable
 build reports version 0.9.0 and its
 embedded service passes configuration validation without adding bytecode to or

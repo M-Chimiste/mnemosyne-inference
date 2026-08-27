@@ -120,6 +120,12 @@ class BenchmarkModelRequest(BaseModel):
     max_tokens: int = Field(default=128, ge=128, le=128)
 
 
+class ContextProfileRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    target_tokens: int | None = Field(default=None, ge=4_096, le=1_048_576)
+
+
 class InstallModelRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -769,6 +775,7 @@ def create_inference_app(runtime: NativeRuntime) -> FastAPI:
                 body,
                 route=route,
                 endpoint=endpoint,
+                engine=target.key.engine,
             )
             performance_timer.streamed = streamed
             upstream_request = runtime.proxy_client.build_request(
@@ -1040,6 +1047,27 @@ def create_control_app(runtime: NativeRuntime) -> FastAPI:
             "deleted": runtime.reject_benchmark_evidence(alias),
         }
 
+    @app.get("/manager/contexts")
+    async def contexts(alias: str | None = Query(default=None)) -> dict:
+        return runtime.context_snapshot(alias)
+
+    @app.post("/manager/contexts/{alias}/profile")
+    async def profile_context(alias: str, payload: ContextProfileRequest) -> dict:
+        try:
+            return await runtime.profile_model_context(
+                alias,
+                target_tokens=payload.target_tokens,
+            )
+        except Exception as exc:
+            raise HTTPException(_error_status(exc), str(exc)) from exc
+
+    @app.delete("/manager/contexts/{alias}")
+    async def clear_contexts(alias: str) -> dict:
+        return {
+            "alias": alias,
+            "deleted": runtime.reject_context_evidence(alias),
+        }
+
     @app.get("/manager/readiness")
     async def readiness() -> dict:
         return await runtime.readiness()
@@ -1076,20 +1104,41 @@ def create_control_app(runtime: NativeRuntime) -> FastAPI:
 
     @app.get("/manager/storage")
     async def storage_locations() -> dict:
-        statuses = await asyncio.gather(
-            *(
-                runtime.filesystem.inspect(
+        async def inspect_location(location) -> dict:
+            try:
+                status = await runtime.filesystem.inspect(
                     location.path,
                     name=location.name,
                     expected_volume_uuid=location.volume_uuid,
                     scope_id=location.scope_id,
                 )
-                for location in runtime.config.storage.locations
-            )
+                return status.to_dict()
+            except FilesystemProbeError as exc:
+                # One stale or temporarily unavailable Finder grant must not
+                # turn the complete Settings storage card into an HTTP 500.
+                # Retain the exact configured path and return a typed,
+                # unavailable row so the user can repair that location.
+                return {
+                    "name": location.name,
+                    "path": str(Path(location.path).expanduser().absolute()),
+                    "exists": False,
+                    "is_directory": False,
+                    "writable": False,
+                    "mount_path": None,
+                    "volume_uuid": None,
+                    "expected_volume_uuid": location.volume_uuid,
+                    "volume_matches": False,
+                    "total_bytes": None,
+                    "free_bytes": None,
+                    "diagnostic": str(exc),
+                }
+
+        statuses = await asyncio.gather(
+            *(inspect_location(location) for location in runtime.config.storage.locations)
         )
         return {
             "default": runtime.config.storage.default,
-            "locations": [status.to_dict() for status in statuses],
+            "locations": statuses,
         }
 
     @app.get("/manager/storage/inspect")
@@ -1104,23 +1153,58 @@ def create_control_app(runtime: NativeRuntime) -> FastAPI:
 
     @app.post("/manager/storage/inspect")
     async def inspect_selected_storage(payload: StorageInspectRequest) -> dict:
+        scope_id: str | None = None
         try:
-            scope_id = (
-                await runtime.register_security_scope(
-                    payload.path,
-                    payload.bookmark_data,
+            # A selected folder that the unsandboxed service can already use
+            # needs no persistent security scope. Persisting one anyway makes
+            # ordinary folders depend on a bookmark contract intended for
+            # protected/sandboxed access and can force needless reselection.
+            unscoped = None
+            try:
+                unscoped = await runtime.filesystem.inspect(payload.path)
+            except FilesystemProbeError:
+                pass
+            if (
+                unscoped is not None
+                and unscoped.exists
+                and unscoped.is_directory
+                and unscoped.writable
+                and unscoped.volume_matches
+            ):
+                value = unscoped.to_dict()
+                value["scope_id"] = None
+                return value
+
+            if payload.bookmark_data is None:
+                if unscoped is not None:
+                    return unscoped.to_dict()
+                raise FilesystemProbeError(
+                    "the selected model folder could not be inspected"
                 )
-                if payload.bookmark_data is not None
-                else None
+
+            scope_id = await runtime.register_security_scope(
+                payload.path,
+                payload.bookmark_data,
             )
             status = await runtime.filesystem.inspect(
                 payload.path,
                 scope_id=scope_id,
             )
+            if not (
+                status.exists
+                and status.is_directory
+                and status.writable
+                and status.volume_matches
+            ):
+                raise FilesystemProbeError(
+                    status.diagnostic or "the selected model folder is unavailable"
+                )
             value = status.to_dict()
             value["scope_id"] = scope_id
             return value
         except (FilesystemProbeError, ValueError, SecurityScopeError) as exc:
+            if scope_id is not None:
+                await runtime.discard_security_scope(scope_id)
             raise HTTPException(400, str(exc)) from exc
 
     @app.get("/manager/model-library/recommendations")

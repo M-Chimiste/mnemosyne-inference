@@ -122,6 +122,37 @@ class EffectiveLoadIdentity:
 
 
 @dataclass(frozen=True)
+class ContextWindowHint:
+    """Content-free context capability reported by an engine adapter."""
+
+    effective_tokens: int | None
+    native_tokens: int | None = None
+    source: str = "unknown"
+    confidence: str = "unknown"
+
+    def __post_init__(self) -> None:
+        for value in (self.effective_tokens, self.native_tokens):
+            if value is not None and value < 1:
+                raise ValueError("context window values must be positive")
+
+
+@dataclass(frozen=True)
+class ContextWindowProfileResult:
+    """Fixed, content-free result returned by an engine-native profiler."""
+
+    requested_tokens: int
+    verified_tokens: int
+    prompt_tokens: int
+    source: str
+
+    def __post_init__(self) -> None:
+        if min(self.requested_tokens, self.verified_tokens, self.prompt_tokens) < 1:
+            raise ValueError("context profile token counts must be positive")
+        if self.verified_tokens > self.requested_tokens:
+            raise ValueError("verified context cannot exceed the requested target")
+
+
+@dataclass(frozen=True)
 class ResolvedTarget:
     alias: str
     key: TargetKey
@@ -133,6 +164,10 @@ class ResolvedTarget:
     storage_path: str | None = None
     scope_id: str | None = None
     storage_volume_uuid: str | None = None
+    context_mode: str = "automatic"
+    native_context_length: int | None = None
+    requested_context_length: int | None = None
+    context_max_verified_age_hours: int = 720
 
 
 def llama_cpp_process_mode(capabilities: frozenset[Endpoint]) -> str:

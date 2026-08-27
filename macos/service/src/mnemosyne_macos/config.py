@@ -341,6 +341,33 @@ class ModelSelectionConfig(BaseModel):
     allow_preview: bool = False
 
 
+class ModelContextConfig(BaseModel):
+    """User policy and immutable metadata for one engine candidate."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    mode: Literal["automatic", "native", "fixed"] = "automatic"
+    native_tokens: int | None = Field(default=None, gt=0, le=10_000_000)
+    fixed_tokens: int | None = Field(default=None, gt=0, le=10_000_000)
+    max_verified_age_hours: int = Field(default=720, ge=1, le=24 * 365)
+
+    @model_validator(mode="after")
+    def _validate_mode(self) -> "ModelContextConfig":
+        if self.mode == "fixed" and self.fixed_tokens is None:
+            raise ValueError("fixed context policy requires fixed_tokens")
+        if self.mode != "fixed" and self.fixed_tokens is not None:
+            raise ValueError("fixed_tokens requires mode='fixed'")
+        if self.mode == "native" and self.native_tokens is None:
+            raise ValueError("native context policy requires detected native_tokens")
+        if (
+            self.fixed_tokens is not None
+            and self.native_tokens is not None
+            and self.fixed_tokens > self.native_tokens
+        ):
+            raise ValueError("fixed context cannot exceed the detected native limit")
+        return self
+
+
 def _validate_language_engine_options(
     *,
     engine: EngineName,
@@ -423,6 +450,15 @@ def _validate_language_engine_options(
             raise ValueError("llama.cpp projectors require a generation-capable profile")
 
 
+def _validate_context_engine_options(
+    *, engine: EngineName, context: ModelContextConfig
+) -> None:
+    if engine == EngineName.MISTRAL_RS and context.mode != "automatic":
+        raise ValueError(
+            "mistral.rs explicit/native context policy requires a reviewed runtime flag contract"
+        )
+
+
 def _resolve_language_target(
     *,
     alias: str,
@@ -431,11 +467,24 @@ def _resolve_language_target(
     served_model_name: str | None,
     capabilities: set[Endpoint] | None,
     load: ModelLoadConfig,
+    context: ModelContextConfig,
     storage_path: str | None,
     scope_id: str | None,
     storage_volume_uuid: str | None,
 ) -> ResolvedTarget:
     load_options = load.model_dump(exclude_none=True, exclude_defaults=True)
+    requested_context = (
+        context.fixed_tokens
+        if context.mode == "fixed"
+        else context.native_tokens
+        if context.mode == "native"
+        else load.context_length
+    )
+    if engine in {EngineName.LLAMA_CPP, EngineName.DS4, EngineName.MLXCEL}:
+        if requested_context is None:
+            load_options.pop("context_length", None)
+        else:
+            load_options["context_length"] = requested_context
     canonical = (
         os.path.abspath(os.path.expanduser(model))
         if engine
@@ -447,7 +496,15 @@ def _resolve_language_target(
         }
         else model
     )
-    payload = json.dumps(load_options, sort_keys=True, separators=(",", ":"))
+    payload = json.dumps(
+        {
+            "load": load_options,
+            "context_mode": context.mode,
+            "requested_context": requested_context,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
     digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
     wire_model = (
         ds4_wire_model_name(model)
@@ -474,6 +531,10 @@ def _resolve_language_target(
         storage_path=storage_path,
         scope_id=scope_id,
         storage_volume_uuid=storage_volume_uuid,
+        context_mode=context.mode,
+        native_context_length=context.native_tokens,
+        requested_context_length=requested_context,
+        context_max_verified_age_hours=context.max_verified_age_hours,
     )
 
 
@@ -491,6 +552,7 @@ class ModelEngineAlternative(BaseModel):
     served_model_name: str | None = None
     capabilities: set[Endpoint] | None = None
     load: ModelLoadConfig = Field(default_factory=ModelLoadConfig)
+    context: ModelContextConfig = Field(default_factory=ModelContextConfig)
     enabled: bool = True
 
     @field_validator("model")
@@ -523,6 +585,7 @@ class ModelEngineAlternative(BaseModel):
             load=self.load,
             capabilities=self.capabilities,
         )
+        _validate_context_engine_options(engine=self.engine, context=self.context)
         return self
 
     def resolve(
@@ -540,6 +603,7 @@ class ModelEngineAlternative(BaseModel):
             served_model_name=self.served_model_name,
             capabilities=self.capabilities,
             load=self.load,
+            context=self.context,
             storage_path=storage_path,
             scope_id=scope_id,
             storage_volume_uuid=storage_volume_uuid,
@@ -556,6 +620,7 @@ class ModelProfile(BaseModel):
     served_model_name: str | None = None
     capabilities: set[Endpoint] | None = None
     load: ModelLoadConfig = Field(default_factory=ModelLoadConfig)
+    context: ModelContextConfig = Field(default_factory=ModelContextConfig)
     kind: ModelKind = ModelKind.LANGUAGE
     image: ImageProfileConfig | None = None
     alternatives: list[ModelEngineAlternative] = Field(default_factory=list)
@@ -592,6 +657,8 @@ class ModelProfile(BaseModel):
                 raise ValueError("MFLUX profiles require kind='image' and image settings")
             if self.load != ModelLoadConfig():
                 raise ValueError("MFLUX profiles use image settings, not language load settings")
+            if self.context != ModelContextConfig():
+                raise ValueError("MFLUX profiles do not use language context settings")
             if self.capabilities is not None and self.capabilities != {
                 Endpoint.IMAGES_GENERATIONS
             }:
@@ -610,6 +677,7 @@ class ModelProfile(BaseModel):
                 load=self.load,
                 capabilities=self.capabilities,
             )
+            _validate_context_engine_options(engine=self.engine, context=self.context)
         if self.selection.mode == "benchmark" and not self.alternatives:
             raise ValueError("benchmark selection requires at least one engine alternative")
         if self.selection.mode == "pinned":
@@ -647,7 +715,10 @@ class ModelProfile(BaseModel):
                 alternative.engine,
                 alternative.model,
                 json.dumps(
-                    alternative.load.model_dump(mode="json"),
+                    {
+                        "load": alternative.load.model_dump(mode="json"),
+                        "context": alternative.context.model_dump(mode="json"),
+                    },
                     sort_keys=True,
                     separators=(",", ":"),
                 ),
@@ -716,6 +787,7 @@ class ModelProfile(BaseModel):
             served_model_name=self.served_model_name,
             capabilities=self.capabilities,
             load=self.load,
+            context=self.context,
             storage_path=storage_path,
             scope_id=scope_id,
             storage_volume_uuid=storage_volume_uuid,
@@ -793,6 +865,28 @@ class StorageLocationConfig(BaseModel):
             raise ValueError("storage scope_id must be a SHA-256 identifier")
         return normalized
 
+    @model_validator(mode="after")
+    def _internal_storage_does_not_need_a_bookmark(self) -> "StorageLocationConfig":
+        """Drop obsolete Finder grants for the app-owned internal model root.
+
+        Older builds allowed the internal Application Support folder to be
+        selected through Finder and persisted a security-scoped bookmark for
+        it. A signing-identity change can invalidate that bookmark even though
+        the unsandboxed per-user service already owns this private folder.
+        Keeping the stale scope would unnecessarily degrade startup and every
+        model-storage probe.
+        """
+
+        configured = os.path.normcase(
+            os.path.normpath(os.path.abspath(os.path.expanduser(self.path)))
+        )
+        internal = os.path.normcase(
+            os.path.normpath(os.path.abspath(str(_APP_SUPPORT / "models")))
+        )
+        if configured == internal:
+            self.scope_id = None
+        return self
+
 
 def _default_storage_locations() -> list[StorageLocationConfig]:
     return [
@@ -829,7 +923,7 @@ class StorageConfig(BaseModel):
 class MacConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    schema_version: Literal[5] = 5
+    schema_version: Literal[6] = 6
     server: ServerConfig = Field(default_factory=ServerConfig)
     engines: EnginesConfig = Field(default_factory=EnginesConfig)
     paths: PathsConfig = Field(default_factory=PathsConfig)
@@ -845,10 +939,35 @@ class MacConfig(BaseModel):
             return value
         raw = copy.deepcopy(value)
         version = raw.get("schema_version", 1)
-        if version in {2, 3, 4}:
-            raw["schema_version"] = 5
+
+        def add_context_policy(candidate: Any) -> None:
+            if not isinstance(candidate, dict) or candidate.get("engine") == "mflux":
+                return
+            if "context" not in candidate:
+                load = candidate.get("load")
+                configured = (
+                    load.get("context_length")
+                    if isinstance(load, dict)
+                    else None
+                )
+                candidate["context"] = (
+                    {"mode": "fixed", "fixed_tokens": configured}
+                    if isinstance(configured, int) and configured > 0
+                    else {"mode": "automatic"}
+                )
+            alternatives = candidate.get("alternatives")
+            if isinstance(alternatives, list):
+                for alternative in alternatives:
+                    add_context_policy(alternative)
+
+        if version in {2, 3, 4, 5}:
+            models = raw.get("models")
+            if isinstance(models, list):
+                for profile in models:
+                    add_context_policy(profile)
+            raw["schema_version"] = 6
             return raw
-        if version == 5:
+        if version == 6:
             return raw
         if version != 1:
             return raw
@@ -890,7 +1009,11 @@ class MacConfig(BaseModel):
             migrated_profiles = [*previous, *migrated_profiles]
         migration["legacy_lmstudio_profiles"] = migrated_profiles
         raw["migration"] = migration
-        raw["schema_version"] = 5
+        models = raw.get("models")
+        if isinstance(models, list):
+            for profile in models:
+                add_context_policy(profile)
+        raw["schema_version"] = 6
         return raw
 
     @model_validator(mode="after")

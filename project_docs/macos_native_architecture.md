@@ -113,7 +113,7 @@ ranking while preserving the original profile as the pre-work fallback.
 Conceptual configuration:
 
 ```yaml
-schema_version: 5
+schema_version: 6
 
 server:
   inference_bind: 127.0.0.1
@@ -197,9 +197,15 @@ nested paths are retained rather than collapsed to a volume root.
 The menu app creates ordinary bookmark data while the `NSOpenPanel` selection
 grant is live and sends it only to the control plane. The ordinary bookmark's
 implicit extension is Apple's supported single interprocess handoff.
-Mnemosyne resolves it without presenting UI, explicitly starts the transferred
-grant, rejects stale or path-mismatched access, and creates a new
-receiver-owned security-scoped bookmark. The durable bookmark's SHA-256 is the
+Mnemosyne first runs a bounded unscoped read/write probe. An ordinary folder
+that the unsandboxed service can already use persists only its exact path and
+volume identity. Startup repeats that proof for older configured locations,
+atomically removes unnecessary `scope_id` values, and prunes their bookmarks.
+
+Only a path that fails the unscoped proof consumes the transfer grant.
+Mnemosyne resolves it without presenting UI, explicitly starts it, rejects
+stale or path-mismatched access, and creates a new receiver-owned
+security-scoped bookmark. The durable bookmark's SHA-256 is the
 opaque `scope_id`. Only those receiver-owned bytes are stored as mode-`0600`
 files below the mode-`0700` `state/security-scopes` directory beside the
 active config; this root does not follow the configurable SQLite path. YAML
@@ -209,9 +215,10 @@ entitlements; this design must not be described as entitlement-backed.
 
 Before replacing YAML, the configuration endpoint freshly reactivates every
 referenced bookmark and rejects a missing, stale, path-mismatched, or
-non-reactivatable grant. At startup Mnemosyne revalidates every configured
-bookmark before coordinator initialization, then removes private bookmarks no
-longer referenced by the loaded configuration. Bookmark receipt and
+non-reactivatable grant. At startup Mnemosyne first retires a scope only after
+ordinary access succeeds, then revalidates every remaining configured bookmark
+before coordinator initialization and removes private bookmarks no longer
+referenced by the loaded configuration. Bookmark receipt and
 reactivation run in bounded, killable helper process groups. Scoped filesystem
 helpers and manager-owned engine/download children reactivate the durable
 bookmark in their own process, then `exec` the real upstream command without
@@ -251,9 +258,14 @@ trusting the coordinator's cache. `load` is idempotent for the exact target.
 engine name, operation, retryability, and actionable detail suitable for the
 control API and menu bar.
 
-Language inference is proxied without translating between wire protocols. The gateway
-only canonicalizes the `model` field, injects usage opt-in where supported, and
-removes outer authorization/cookie headers before forwarding.
+Language inference is proxied without translating between wire protocols. The
+gateway canonicalizes the `model` field, injects usage opt-in where supported,
+and removes outer authorization/cookie headers before forwarding. The one
+request-level compatibility shim runs after native engine selection: for oMLX
+and llama.cpp it maps a portable reasoning-token ceiling to the upstream field
+name and puts Qwen thinking/preservation controls into chat-template kwargs.
+All other request and response content stays opaque, and reasoning content is
+never persisted.
 Image generation uses a deliberately narrow OpenAI-compatible contract:
 `POST /v1/images/generations`, one base64 PNG, bounded dimensions, seed,
 steps, guidance, and negative prompt. It does not emit token-usage events.

@@ -70,6 +70,173 @@ async def test_omlx_load_unload_and_encoded_model_id() -> None:
 
 
 @pytest.mark.asyncio
+async def test_omlx_context_contract_reads_native_and_effective_limits() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/models/status":
+            return httpx.Response(
+                200,
+                json={
+                    "models": [
+                        {
+                            "id": "mlx-community/GLM",
+                            "max_context_window": 131_072,
+                        }
+                    ]
+                },
+            )
+        if request.url.path == "/admin/api/models":
+            return httpx.Response(
+                200,
+                json={
+                    "models": [
+                        {
+                            "id": "mlx-community/GLM",
+                            "model_context_length": 262_144,
+                        }
+                    ]
+                },
+            )
+        return httpx.Response(404)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    adapter = OMLXAdapter(OMLXConfig(), client=client)
+
+    hint = await adapter.context_window(_target(), deadline=Deadline.after(1))
+
+    assert hint.effective_tokens == 131_072
+    assert hint.native_tokens == 262_144
+    assert hint.confidence == "authoritative"
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_omlx_applies_the_profile_context_before_loading() -> None:
+    effective = 32_768
+    loaded = False
+    mutations: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal effective, loaded
+        if request.method == "GET" and request.url.path == "/v1/models/status":
+            return httpx.Response(
+                200,
+                json={
+                    "models": [
+                        {
+                            "id": "mlx-community/GLM",
+                            "max_context_window": effective,
+                        }
+                    ]
+                },
+            )
+        if request.method == "GET" and request.url.path == "/admin/api/models":
+            return httpx.Response(
+                200,
+                json={
+                    "models": [
+                        {
+                            "id": "mlx-community/GLM",
+                            "loaded": loaded,
+                            "is_loading": False,
+                            "model_context_length": 262_144,
+                        }
+                    ]
+                },
+            )
+        if request.method == "PUT" and request.url.path.endswith("/settings"):
+            mutations.append("settings")
+            assert request.read() == b'{"max_context_window":131072}'
+            effective = 131_072
+            return httpx.Response(200, json={"success": True})
+        if request.method == "POST" and request.url.path.endswith("/load"):
+            mutations.append("load")
+            loaded = True
+            return httpx.Response(
+                200,
+                json={"status": "ok", "model_id": "mlx-community/GLM"},
+            )
+        return httpx.Response(404)
+
+    target = MacConfig.model_validate(
+        {
+            "engines": {"omlx": {"enabled": True}},
+            "models": [
+                {
+                    "alias": "glm",
+                    "engine": "omlx",
+                    "model": "mlx-community/GLM",
+                    "context": {
+                        "mode": "fixed",
+                        "native_tokens": 262_144,
+                        "fixed_tokens": 131_072,
+                    },
+                }
+            ],
+        }
+    ).profiles()["glm"]
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    adapter = OMLXAdapter(OMLXConfig(), client=client)
+
+    await adapter.load(target, deadline=Deadline.after(1))
+
+    assert mutations == ["settings", "load"]
+    assert effective == 131_072
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_omlx_delegates_context_profiling_to_its_memory_guard_benchmark() -> None:
+    polls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal polls
+        if request.method == "POST" and request.url.path.endswith("/context/start"):
+            assert request.read() == (
+                b'{"model_id":"mlx-community/GLM","target_tokens":262144}'
+            )
+            return httpx.Response(
+                200,
+                json={"bench_id": "context-run", "status": "started"},
+            )
+        if request.method == "GET" and request.url.path.endswith("/results"):
+            polls += 1
+            if polls == 1:
+                return httpx.Response(
+                    200,
+                    json={"status": "running", "result": None},
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "status": "completed",
+                    "result": {
+                        "applied": True,
+                        "applied_tokens": 245_760,
+                        "verified_prompt_tokens": 247_808,
+                    },
+                },
+            )
+        return httpx.Response(404)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    adapter = OMLXAdapter(OMLXConfig(), client=client, poll_interval_seconds=0)
+
+    result = await adapter.profile_context_window(
+        _target(),
+        262_144,
+        deadline=Deadline.after(1),
+    )
+
+    assert result is not None
+    assert result.requested_tokens == 262_144
+    assert result.verified_tokens == 245_760
+    assert result.prompt_tokens == 247_808
+    assert result.source == "omlx-native-context-benchmark"
+    assert polls == 2
+    await client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_omlx_cache_health_is_sanitized_and_reset_uses_vendor_api() -> None:
     requests: list[tuple[str, str]] = []
 

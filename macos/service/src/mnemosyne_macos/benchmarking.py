@@ -10,7 +10,7 @@ import platform
 import sqlite3
 import statistics
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -20,11 +20,12 @@ import httpx
 from .config import ModelSelectionConfig
 from .coordinator import ModelLease, ResidencyCoordinator
 from .engines.base import Deadline, EngineAdapter
-from .models import ENGINE_RELEASE_TIER, Endpoint, EngineName, ResolvedTarget
+from .models import ENGINE_RELEASE_TIER, Endpoint, EngineName, ResolvedTarget, TargetKey
 from .usage import normalize_usage
 
 
 BENCHMARK_SUITE_VERSION = 1
+CONTEXT_SUITE_VERSION = 1
 BENCHMARK_ENDPOINT = Endpoint.CHAT_COMPLETIONS
 MAX_RECORDS_PER_ALIAS = 64
 MAX_RECORDS_TOTAL = 2048
@@ -61,6 +62,57 @@ def target_fingerprint(target: ResolvedTarget) -> str:
         separators=(",", ":"),
     )
     return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def context_target_fingerprint(target: ResolvedTarget) -> str:
+    """Hash model/load identity while excluding the context value being tested."""
+
+    load = dict(target.load_options)
+    load.pop("context_length", None)
+    material = json.dumps(
+        {
+            "engine": target.key.engine.value,
+            "model": target.key.canonical_model_id,
+            "load_without_context": load,
+            "native_context_length": target.native_context_length,
+            "capabilities": sorted(item.value for item in target.capabilities),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def target_with_context_window(target: ResolvedTarget, tokens: int) -> ResolvedTarget:
+    """Return an exact candidate whose resident/load identity owns ``tokens``."""
+
+    load = dict(target.load_options)
+    if target.key.engine in {
+        EngineName.LLAMA_CPP,
+        EngineName.DS4,
+        EngineName.MLXCEL,
+    }:
+        load["context_length"] = tokens
+    material = json.dumps(
+        {
+            "load": load,
+            "context_mode": target.context_mode,
+            "requested_context": tokens,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    digest = hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
+    return replace(
+        target,
+        key=TargetKey(
+            engine=target.key.engine,
+            canonical_model_id=target.key.canonical_model_id,
+            load_config_digest=digest,
+        ),
+        load_options=load,
+        requested_context_length=tokens,
+    )
 
 
 def candidate_set_fingerprint(candidates: Sequence[ResolvedTarget]) -> str:
@@ -108,6 +160,23 @@ class BenchmarkRecord:
         value = asdict(self)
         value["success_rate"] = self.success_rate
         return value
+
+
+@dataclass(frozen=True, slots=True)
+class ContextBenchmarkRecord:
+    created_at: float
+    alias: str
+    engine: str
+    target_fingerprint: str
+    runtime_fingerprint: str
+    system_fingerprint: str
+    suite_version: int
+    requested_tokens: int
+    verified_tokens: int
+    prompt_tokens: int
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
 
 
 @dataclass(frozen=True, slots=True)
@@ -167,6 +236,26 @@ class BenchmarkStore:
                         alias, endpoint, engine, target_fingerprint,
                         runtime_fingerprint, system_fingerprint,
                         config_revision, suite_version
+                    )
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS native_context_benchmarks (
+                    created_at REAL NOT NULL,
+                    alias TEXT NOT NULL,
+                    engine TEXT NOT NULL,
+                    target_fingerprint TEXT NOT NULL,
+                    runtime_fingerprint TEXT NOT NULL,
+                    system_fingerprint TEXT NOT NULL,
+                    suite_version INTEGER NOT NULL,
+                    requested_tokens INTEGER NOT NULL,
+                    verified_tokens INTEGER NOT NULL,
+                    prompt_tokens INTEGER NOT NULL,
+                    PRIMARY KEY (
+                        alias, engine, target_fingerprint,
+                        runtime_fingerprint, system_fingerprint, suite_version
                     )
                 )
                 """
@@ -265,6 +354,89 @@ class BenchmarkStore:
             )
             return max(0, cursor.rowcount)
 
+    def record_context(self, value: ContextBenchmarkRecord) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO native_context_benchmarks (
+                    created_at, alias, engine, target_fingerprint,
+                    runtime_fingerprint, system_fingerprint, suite_version,
+                    requested_tokens, verified_tokens, prompt_tokens
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (
+                    alias, engine, target_fingerprint,
+                    runtime_fingerprint, system_fingerprint, suite_version
+                ) DO UPDATE SET
+                    created_at=excluded.created_at,
+                    requested_tokens=excluded.requested_tokens,
+                    verified_tokens=excluded.verified_tokens,
+                    prompt_tokens=excluded.prompt_tokens
+                """,
+                (
+                    value.created_at,
+                    value.alias,
+                    value.engine,
+                    value.target_fingerprint,
+                    value.runtime_fingerprint,
+                    value.system_fingerprint,
+                    value.suite_version,
+                    value.requested_tokens,
+                    value.verified_tokens,
+                    value.prompt_tokens,
+                ),
+            )
+            connection.execute(
+                """
+                DELETE FROM native_context_benchmarks
+                WHERE alias = ? AND rowid NOT IN (
+                    SELECT rowid FROM native_context_benchmarks
+                    WHERE alias = ?
+                    ORDER BY created_at DESC
+                    LIMIT ?
+                )
+                """,
+                (value.alias, value.alias, MAX_RECORDS_PER_ALIAS),
+            )
+            connection.execute(
+                """
+                DELETE FROM native_context_benchmarks
+                WHERE rowid NOT IN (
+                    SELECT rowid FROM native_context_benchmarks
+                    ORDER BY created_at DESC
+                    LIMIT ?
+                )
+                """,
+                (MAX_RECORDS_TOTAL,),
+            )
+
+    def list_context(
+        self, *, alias: str | None = None, limit: int = 200
+    ) -> list[ContextBenchmarkRecord]:
+        where = "WHERE alias = ?" if alias is not None else ""
+        parameters: tuple[Any, ...] = (alias, limit) if alias is not None else (limit,)
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT created_at, alias, engine, target_fingerprint,
+                       runtime_fingerprint, system_fingerprint, suite_version,
+                       requested_tokens, verified_tokens, prompt_tokens
+                FROM native_context_benchmarks
+                {where}
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                parameters,
+            ).fetchall()
+        return [ContextBenchmarkRecord(**dict(row)) for row in rows]
+
+    def clear_context_alias(self, alias: str) -> int:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "DELETE FROM native_context_benchmarks WHERE alias = ?",
+                (alias,),
+            )
+            return max(0, cursor.rowcount)
+
 
 def _first_output_delta(payload: Mapping[str, Any]) -> bool:
     event_type = payload.get("type")
@@ -358,6 +530,52 @@ async def _stream_sample(
             await response.aclose()
 
 
+async def _context_probe(
+    *,
+    client: httpx.AsyncClient,
+    lease: ModelLease,
+    target_tokens: int,
+) -> int:
+    """Verify a large local prefill and return the engine-reported prompt size."""
+
+    route = lease.route(BENCHMARK_ENDPOINT)
+    # ``x `` is one token on the common tokenizer families, but the usage
+    # block remains authoritative. Retry with a bounded correction when a
+    # tokenizer encodes it differently. The synthetic text is never stored.
+    repeats = max(1, target_tokens - 512)
+    minimum = max(1, target_tokens - max(2048, target_tokens // 50))
+    for _ in range(3):
+        response = await client.post(
+            f"{route.base_url}{route.path}",
+            headers={"content-type": "application/json", **dict(route.headers)},
+            json={
+                "model": route.wire_model,
+                "messages": [{"role": "user", "content": "x " * repeats}],
+                "temperature": 0,
+                "max_tokens": 1,
+                "stream": False,
+            },
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise RuntimeError("context probe returned a non-object response")
+        usage = normalize_usage(
+            payload,
+            endpoint=f"/v1/{BENCHMARK_ENDPOINT.value}",
+        )
+        if usage is None or usage.prompt_tokens is None:
+            raise RuntimeError("context probe response omitted prompt token usage")
+        prompt_tokens = usage.prompt_tokens
+        if prompt_tokens >= minimum:
+            return prompt_tokens
+        repeats = min(
+            target_tokens * 4,
+            max(repeats + 1, math.ceil(repeats * target_tokens / prompt_tokens)),
+        )
+    raise RuntimeError("context probe could not reach the requested token window")
+
+
 class BenchmarkSuite:
     """Run exact candidates sequentially through coordinator-owned leases."""
 
@@ -443,6 +661,94 @@ class BenchmarkSuite:
         self.store.record(record)
         return record
 
+    async def profile_context_candidate(
+        self,
+        target: ResolvedTarget,
+        *,
+        adapter: EngineAdapter,
+        requested_tokens: int,
+    ) -> ContextBenchmarkRecord:
+        """Find the largest preset up to ``requested_tokens`` that really prefills."""
+
+        runtime = await adapter.runtime_fingerprint(deadline=Deadline.after(5))
+        if runtime is None:
+            raise RuntimeError(
+                f"{target.key.engine.value} does not expose a stable runtime identity"
+            )
+        initial_hint = None
+        try:
+            initial_hint = await adapter.context_window(
+                target,
+                deadline=Deadline.after(5),
+            )
+        except Exception:
+            pass
+        presets = {
+            16_384,
+            32_768,
+            65_536,
+            131_072,
+            262_144,
+            524_288,
+            1_048_576,
+            requested_tokens,
+        }
+        native = target.native_context_length
+        ceiling = min(requested_tokens, native) if native is not None else requested_tokens
+        levels = sorted((value for value in presets if value <= ceiling), reverse=True)
+        if not levels:
+            levels = [ceiling]
+
+        failure: Exception | None = None
+        for level in levels:
+            candidate = target_with_context_window(target, level)
+            lease: ModelLease | None = None
+            try:
+                lease = await self.coordinator.acquire(candidate)
+                prompt_tokens = await _context_probe(
+                    client=self.client,
+                    lease=lease,
+                    target_tokens=level,
+                )
+                verified = max(1, min(level, (prompt_tokens // 1024) * 1024))
+                record = ContextBenchmarkRecord(
+                    created_at=time.time(),
+                    alias=target.alias,
+                    engine=target.key.engine.value,
+                    target_fingerprint=context_target_fingerprint(target),
+                    runtime_fingerprint=runtime,
+                    system_fingerprint=system_fingerprint(),
+                    suite_version=CONTEXT_SUITE_VERSION,
+                    requested_tokens=requested_tokens,
+                    verified_tokens=verified,
+                    prompt_tokens=prompt_tokens,
+                )
+                self.store.record_context(record)
+                return record
+            except Exception as exc:
+                failure = exc
+            finally:
+                if lease is not None:
+                    await lease.release()
+
+        # An oMLX trial changes its explicit per-model setting. Restore the
+        # previously observed value when none of the probes succeeded.
+        restore = getattr(adapter, "set_context_window", None)
+        if (
+            restore is not None
+            and initial_hint is not None
+            and initial_hint.effective_tokens is not None
+        ):
+            try:
+                await restore(
+                    target,
+                    initial_hint.effective_tokens,
+                    deadline=Deadline.after(10),
+                )
+            except Exception:
+                pass
+        raise RuntimeError("candidate could not verify a usable context window") from failure
+
 
 def choose_target(
     *,
@@ -452,6 +758,8 @@ def choose_target(
     records: Sequence[BenchmarkRecord],
     runtime_fingerprints: Mapping[EngineName, str | None],
     config_revision: str,
+    context_limits: Mapping[str, int | None] | None = None,
+    required_context_tokens: int | None = None,
     now: float | None = None,
 ) -> tuple[ResolvedTarget, BenchmarkDecision]:
     """Select only from fresh exact evidence, retaining the primary fallback."""
@@ -510,6 +818,14 @@ def choose_target(
         if runtime is None:
             continue
         fingerprint = target_fingerprint(candidate)
+        if required_context_tokens is not None:
+            candidate_context = (
+                context_limits.get(fingerprint)
+                if context_limits is not None
+                else candidate.requested_context_length
+            )
+            if candidate_context is None or candidate_context < required_context_tokens:
+                continue
         match = next(
             (
                 record
@@ -590,12 +906,16 @@ def choose_target(
 __all__ = [
     "BENCHMARK_ENDPOINT",
     "BENCHMARK_SUITE_VERSION",
+    "CONTEXT_SUITE_VERSION",
     "BenchmarkDecision",
     "BenchmarkRecord",
     "BenchmarkStore",
     "BenchmarkSuite",
+    "ContextBenchmarkRecord",
     "candidate_set_fingerprint",
     "choose_target",
+    "context_target_fingerprint",
     "system_fingerprint",
     "target_fingerprint",
+    "target_with_context_window",
 ]

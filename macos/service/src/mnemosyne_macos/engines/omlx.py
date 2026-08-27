@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import hashlib
 import math
 import os
@@ -13,6 +15,8 @@ from .base import AdapterError, CapacityHint, Deadline
 from .http import HttpAdapterError, HttpEngineAdapter, JsonObjectResponse
 from ..config import OMLXConfig
 from ..models import (
+    ContextWindowHint,
+    ContextWindowProfileResult,
     Endpoint,
     EngineName,
     EngineSnapshot,
@@ -25,6 +29,15 @@ from ..models import (
 
 
 class OMLXAdapter(HttpEngineAdapter):
+    _CONTEXT_BENCHMARK_TARGETS = (
+        16_384,
+        32_768,
+        65_536,
+        131_072,
+        262_144,
+        524_288,
+    )
+
     def __init__(
         self,
         config: OMLXConfig,
@@ -78,6 +91,221 @@ class OMLXAdapter(HttpEngineAdapter):
                 material = f"{self.engine.value}\0{self.base_url}\0{version}"
                 return hashlib.sha256(material.encode("utf-8")).hexdigest()
         return None
+
+    async def context_window(
+        self,
+        target: ResolvedTarget,
+        *,
+        deadline: Deadline,
+    ) -> ContextWindowHint:
+        """Read oMLX's effective window rather than trusting its 32K fallback."""
+
+        payload = await self._request_json(
+            "GET",
+            "/v1/models/status",
+            operation="inspect context window",
+            deadline=deadline,
+            headers=self._bearer_headers(),
+        )
+        models = payload.get("models")
+        if not isinstance(models, list):
+            raise AdapterError(
+                self.engine,
+                "inspect context window",
+                "oMLX model status omitted the models array",
+            )
+        ids = {target.key.canonical_model_id, target.wire_model}
+        effective: int | None = None
+        for item in models:
+            if not isinstance(item, dict):
+                continue
+            if item.get("id") not in ids and item.get("source_model_id") not in ids:
+                continue
+            value = item.get("max_context_window")
+            if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+                effective = value
+                break
+
+        native: int | None = target.native_context_length
+        try:
+            admin = await self._request_json(
+                "GET",
+                "/admin/api/models",
+                operation="inspect native context window",
+                deadline=deadline,
+                headers=self._admin_headers(),
+            )
+            entries = admin.get("models")
+            if isinstance(entries, list):
+                for item in entries:
+                    if not isinstance(item, dict) or item.get("id") not in ids:
+                        continue
+                    value = item.get("model_context_length")
+                    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+                        native = value
+                    break
+        except AdapterError:
+            # The bearer-authenticated status route is the serving contract.
+            # Native metadata is useful UI detail, not a reason to hide an
+            # otherwise authoritative effective value.
+            pass
+
+        if effective is None:
+            raise AdapterError(
+                self.engine,
+                "inspect context window",
+                f"oMLX did not report an effective context for '{target.key.canonical_model_id}'",
+            )
+        return ContextWindowHint(
+            effective_tokens=effective,
+            native_tokens=native,
+            source="omlx-model-status",
+            confidence="authoritative",
+        )
+
+    async def set_context_window(
+        self,
+        target: ResolvedTarget,
+        tokens: int,
+        *,
+        deadline: Deadline,
+    ) -> ContextWindowHint:
+        """Persist an explicit oMLX per-model window through its admin API."""
+
+        model_path = quote(target.key.canonical_model_id, safe="")
+        response = await self._request_json_response(
+            "PUT",
+            f"/admin/api/models/{model_path}/settings",
+            operation="set context window",
+            deadline=deadline,
+            headers=self._admin_headers(),
+            json_body={"max_context_window": tokens},
+            ok_statuses=(200,),
+        )
+        if response.payload.get("success") is not True:
+            raise AdapterError(
+                self.engine,
+                "set context window",
+                "oMLX did not confirm the context setting",
+            )
+        observed = await self.context_window(target, deadline=deadline)
+        if observed.effective_tokens != tokens:
+            raise AdapterError(
+                self.engine,
+                "set context window",
+                "oMLX did not expose the requested effective context",
+            )
+        return observed
+
+    async def profile_context_window(
+        self,
+        target: ResolvedTarget,
+        requested_tokens: int,
+        *,
+        deadline: Deadline,
+    ) -> ContextWindowProfileResult | None:
+        """Delegate to oMLX's memory-guard-aware native context benchmark."""
+
+        supported = [
+            value
+            for value in self._CONTEXT_BENCHMARK_TARGETS
+            if value <= requested_tokens
+        ]
+        if not supported:
+            return None
+        benchmark_target = max(supported)
+        try:
+            started = await self._request_json(
+                "POST",
+                "/admin/api/bench/context/start",
+                operation="start native context profile",
+                deadline=deadline,
+                headers=self._admin_headers(),
+                json_body={
+                    "model_id": target.key.canonical_model_id,
+                    "target_tokens": benchmark_target,
+                },
+            )
+        except HttpAdapterError as exc:
+            # Older official releases do not expose this additive endpoint;
+            # the portable coordinator-owned suite remains compatible.
+            if exc.status_code == 404:
+                return None
+            raise
+        bench_id = started.get("bench_id")
+        if not isinstance(bench_id, str) or not bench_id:
+            raise AdapterError(
+                self.engine,
+                "start native context profile",
+                "oMLX omitted the benchmark identifier",
+            )
+
+        terminal = False
+        try:
+            while deadline.remaining() > 0:
+                payload = await self._request_json(
+                    "GET",
+                    f"/admin/api/bench/context/{quote(bench_id, safe='')}/results",
+                    operation="poll native context profile",
+                    deadline=deadline,
+                    headers=self._admin_headers(),
+                )
+                status = payload.get("status")
+                if status == "completed":
+                    terminal = True
+                    result = payload.get("result")
+                    if not isinstance(result, dict) or result.get("applied") is not True:
+                        raise AdapterError(
+                            self.engine,
+                            "native context profile",
+                            "oMLX completed without applying a verified context",
+                        )
+                    applied = result.get("applied_tokens")
+                    prompt = result.get("verified_prompt_tokens")
+                    if (
+                        not isinstance(applied, int)
+                        or isinstance(applied, bool)
+                        or applied < 1
+                        or applied > benchmark_target
+                        or not isinstance(prompt, int)
+                        or isinstance(prompt, bool)
+                        or prompt < 1
+                    ):
+                        raise AdapterError(
+                            self.engine,
+                            "native context profile",
+                            "oMLX returned invalid fixed token evidence",
+                        )
+                    return ContextWindowProfileResult(
+                        requested_tokens=requested_tokens,
+                        verified_tokens=applied,
+                        prompt_tokens=prompt,
+                        source="omlx-native-context-benchmark",
+                    )
+                if status in {"error", "cancelled"}:
+                    terminal = True
+                    raise AdapterError(
+                        self.engine,
+                        "native context profile",
+                        "oMLX could not complete its context benchmark",
+                    )
+                await asyncio.sleep(min(self.poll_interval_seconds, deadline.remaining()))
+            raise AdapterError(
+                self.engine,
+                "native context profile",
+                "deadline expired",
+                retryable=True,
+            )
+        finally:
+            if not terminal:
+                with contextlib.suppress(Exception):
+                    await self._request_json(
+                        "POST",
+                        f"/admin/api/bench/context/{quote(bench_id, safe='')}/cancel",
+                        operation="cancel native context profile",
+                        deadline=Deadline.after(5),
+                        headers=self._admin_headers(),
+                    )
 
     @property
     def capacity_diagnostic(self) -> str | None:
@@ -452,6 +680,15 @@ class OMLXAdapter(HttpEngineAdapter):
     async def load(self, target: ResolvedTarget, *, deadline: Deadline) -> LoadedHandle:
         if target.key.engine != self.engine:
             raise AdapterError(self.engine, "load", "target belongs to another engine")
+        requested_context = target.requested_context_length
+        if requested_context is not None:
+            observed = await self.context_window(target, deadline=deadline)
+            if observed.effective_tokens != requested_context:
+                await self.set_context_window(
+                    target,
+                    requested_context,
+                    deadline=deadline,
+                )
         before = await self.inspect(deadline=deadline)
         if not before.authoritative:
             raise AdapterError(self.engine, "load", before.diagnostic or "unknown state")

@@ -1,7 +1,7 @@
 # Mnemosyne native macOS configuration.
 # Copy to ~/Library/Application Support/Mnemosyne/config.yaml.
 
-schema_version: 5
+schema_version: 6
 
 server:
   inference_bind: 127.0.0.1
@@ -138,10 +138,21 @@ models: []
 #     engine: omlx
 #     model: Qwen-4bit
 #     storage: internal
+#     context:
+#       # automatic applies a fresh long-prefill result for this exact runtime
+#       # and Mac, otherwise it retains the safe load/engine fallback.
+#       mode: automatic
+#       native_tokens: 262144
+#       max_verified_age_hours: 720
+#       # Use mode: native to request the advertised maximum without profiling,
+#       # or mode: fixed plus fixed_tokens for an explicit user-owned limit.
 #     alternatives:
 #       - engine: mlxcel
 #         model: ~/Library/Application Support/Mnemosyne/models/mlxcel/mlx-community/Qwen-4bit
 #         storage: internal
+#         context:
+#           mode: automatic
+#           native_tokens: 262144
 #         load:
 #           parallel: 4
 #     selection:

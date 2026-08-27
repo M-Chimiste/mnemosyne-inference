@@ -39,7 +39,7 @@ from mnemosyne_macos.runtime import recommended_interactive_context_length
 
 def test_defaults_replace_the_legacy_sidecar_port() -> None:
     config = MacConfig()
-    assert config.schema_version == 5
+    assert config.schema_version == 6
     assert config.server.inference_port == 1240
     assert config.server.control_port == 17321
     assert config.engines.llama_cpp.port == 17325
@@ -103,7 +103,7 @@ def test_parse_config_migrates_v1_lmstudio_profiles_to_inert_import_records() ->
         source="in-memory configuration",
     )
 
-    assert config.schema_version == 5
+    assert config.schema_version == 6
     assert config.models == []
     assert [
         model.alias for model in config.migration.legacy_lmstudio_profiles
@@ -111,12 +111,59 @@ def test_parse_config_migrates_v1_lmstudio_profiles_to_inert_import_records() ->
     assert not hasattr(config.engines, "lmstudio")
 
 
-def test_v2_configuration_migrates_to_v5_concurrency_defaults() -> None:
+def test_v2_configuration_migrates_to_v6_concurrency_defaults() -> None:
     config = MacConfig.model_validate({"schema_version": 2})
 
-    assert config.schema_version == 5
+    assert config.schema_version == 6
     assert config.server.max_concurrency is None
     assert config.server.max_queue_depth == 128
+
+
+def test_v5_context_length_migrates_to_an_explicit_context_policy() -> None:
+    config = MacConfig.model_validate(
+        {
+            "schema_version": 5,
+            "engines": {"llama_cpp": {"enabled": True}},
+            "models": [
+                {
+                    "alias": "qwen",
+                    "engine": "llama.cpp",
+                    "model": "/models/qwen.gguf",
+                    "load": {"context_length": 65_536},
+                }
+            ],
+        }
+    )
+
+    profile = config.models[0]
+    assert config.schema_version == 6
+    assert profile.context.mode == "fixed"
+    assert profile.context.fixed_tokens == 65_536
+    assert config.profiles()["qwen"].requested_context_length == 65_536
+
+
+def test_omlx_context_policy_uses_the_manager_contract_not_load_options() -> None:
+    config = MacConfig.model_validate(
+        {
+            "engines": {"omlx": {"enabled": True}},
+            "models": [
+                {
+                    "alias": "qwen",
+                    "engine": "omlx",
+                    "model": "owner/qwen",
+                    "context": {
+                        "mode": "native",
+                        "native_tokens": 262_144,
+                    },
+                }
+            ],
+        }
+    )
+
+    target = config.profiles()["qwen"]
+    assert target.requested_context_length == 262_144
+    assert target.native_context_length == 262_144
+    assert "context_length" not in target.load_options
     assert config.server.fleet_api_key_env == "FLEET_API_KEY"
 
 
@@ -443,7 +490,7 @@ def test_mflux_image_profile_resolves_load_identity_and_defaults() -> None:
     assert target.capabilities == frozenset({Endpoint.IMAGES_GENERATIONS})
 
 
-def test_v4_profile_candidates_migrate_to_v5_and_remain_fixed_by_default(
+def test_v4_profile_candidates_migrate_to_v6_and_remain_fixed_by_default(
     tmp_path,
 ) -> None:
     config = MacConfig.model_validate(
@@ -476,7 +523,7 @@ def test_v4_profile_candidates_migrate_to_v5_and_remain_fixed_by_default(
     )
 
     assert config.models[0].selection.mode == "fixed"
-    assert config.schema_version == 5
+    assert config.schema_version == 6
     assert config.profiles()["qwen"].key.engine == EngineName.OMLX
     candidates = config.profile_candidates()["qwen"]
     assert [candidate.key.engine for candidate in candidates] == [
@@ -680,3 +727,23 @@ def test_storage_scope_uses_only_an_opaque_sha256_identifier() -> None:
                 }
             }
         )
+
+
+def test_app_owned_internal_storage_discards_an_obsolete_bookmark() -> None:
+    internal = Path.home() / "Library" / "Application Support" / "Mnemosyne" / "models"
+    config = MacConfig.model_validate(
+        {
+            "storage": {
+                "default": "internal",
+                "locations": [
+                    {
+                        "name": "internal",
+                        "path": str(internal),
+                        "scope_id": "a" * 64,
+                    }
+                ],
+            }
+        }
+    )
+
+    assert config.storage.locations[0].scope_id is None

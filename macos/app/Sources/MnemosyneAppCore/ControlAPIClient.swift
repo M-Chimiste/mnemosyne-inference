@@ -12,6 +12,8 @@ public protocol ControlAPI: Sendable {
     func models() async throws -> ModelCatalogSnapshot
     func benchmarks(alias: String?) async throws -> EngineBenchmarkSnapshot
     func runBenchmark(alias: String, sampleRuns: Int) async throws -> EngineBenchmarkRun
+    func contexts(alias: String?) async throws -> ContextWindowSnapshot
+    func profileContext(alias: String, targetTokens: Int?) async throws -> ContextProfileRun
     func load(model: String) async throws -> ServiceSnapshot
     func unload() async throws
     func storageLocations() async throws -> StorageSnapshot
@@ -224,6 +226,52 @@ public struct ControlAPIClient: ControlAPI, Sendable {
                 sampleRuns: min(max(sampleRuns, 1), 20),
                 maxTokens: 128
             )
+        )
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        return request
+    }
+
+    public func contexts(alias: String? = nil) async throws -> ContextWindowSnapshot {
+        var components = URLComponents(
+            url: endpointURL("/manager/contexts"),
+            resolvingAgainstBaseURL: false
+        )!
+        if let alias {
+            components.queryItems = [URLQueryItem(name: "alias", value: alias)]
+        }
+        var request = URLRequest(url: components.url!)
+        request.httpMethod = "GET"
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        addAuthorization(to: &request)
+        let (data, response) = try await session.data(for: request)
+        try validate(response, data: data)
+        return try JSONDecoder.nativeSettingsDecoder().decode(
+            ContextWindowSnapshot.self,
+            from: data
+        )
+    }
+
+    public func profileContext(
+        alias: String,
+        targetTokens: Int? = nil
+    ) async throws -> ContextProfileRun {
+        let request = try contextProfileRequest(alias: alias, targetTokens: targetTokens)
+        let (data, response) = try await session.data(for: request)
+        try validate(response, data: data)
+        return try JSONDecoder.nativeSettingsDecoder().decode(
+            ContextProfileRun.self,
+            from: data
+        )
+    }
+
+    func contextProfileRequest(alias: String, targetTokens: Int?) throws -> URLRequest {
+        var request = makeRequest(
+            path: "/manager/contexts/\(alias)/profile",
+            method: "POST"
+        )
+        request.timeoutInterval = 60 * 60
+        request.httpBody = try JSONEncoder.nativeSettingsEncoder().encode(
+            RunContextProfileRequest(targetTokens: targetTokens)
         )
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         return request

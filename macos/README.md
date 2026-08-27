@@ -97,7 +97,7 @@ FIFO order; another request is rejected before upstream inference with
 old-target admission, drains all active streams, and preserves the one-resident
 invariant.
 
-Schema-v5 profiles can list exact engine alternatives for one public alias.
+Schema-v6 profiles can list exact engine alternatives for one public alias.
 The existing profile is always the fallback. The user can choose **Pinned
 engine** to prefer a declared engine regardless of benchmark rank, which is
 useful when the fastest candidate has quality or compatibility problems. If
@@ -125,7 +125,24 @@ Performance, Balanced, and Memory Saver residency presets; custom values may
 cap concurrency or unload after a chosen idle interval. Newly discovered GGUF
 profiles start with an interactive context no larger than 64K (32K when no
 metadata is available) rather than blindly allocating a model-card maximum of
-128K–1M. An explicitly saved context remains authoritative.
+128K–1M.
+
+Every language candidate also has an explicit context-window policy. **Automatic**
+uses a fresh, content-free long-prefill profile for the exact model, runtime,
+Mac, and suite; when evidence is missing or stale it keeps the configured safe
+fallback. **Model native maximum** requests the detected training limit without
+first proving the allocation fits, while **Explicit limit** always requests the
+saved token count. For oMLX, Mnemosyne reads the effective limit from the
+official model-status API and writes a requested limit through its official
+per-model settings API before load, so oMLX's global 32K fallback does not
+silently cap a configured model. **Profile usable context** delegates to
+oMLX's memory-guard-aware native benchmark inside a global-empty maintenance
+barrier; other engines test descending windows sequentially through coordinator leases. It persists only token counts,
+fixed fingerprints, and timestamps—never the synthetic prompt or output. A
+speed benchmark candidate cannot win if it would reduce the primary model's
+guaranteed context. `GET /v1/models` exposes the selected value as
+`max_model_len` plus a structured `context_window` explanation; the same
+evidence is available from `GET /manager/contexts`.
 
 The service keeps a bounded, in-memory, content-free performance window. The
 menu shows rolling p50/p95 latency and streamed output tokens/second for the
@@ -280,9 +297,17 @@ the same mount path is reported as unavailable and downloads fail closed.
 While `NSOpenPanel` still owns the user's selection grant, the menu app creates
 an ordinary bookmark and sends it to the loopback control API. Foundation's
 implicit extension on that bookmark is Apple's supported single interprocess
-handoff. The service explicitly starts the transferred grant, validates the
-exact selected path, creates a receiver-owned durable security-scoped
-bookmark, and stores only the durable bytes as a mode-`0600` file below
+handoff. The service first probes the exact path without a scope in a bounded
+helper. When its deliberately unsandboxed process already has read/write
+access, configuration stores only the exact path and volume identity; no
+bookmark is retained or required on later starts. Startup applies the same
+proof to older locations and atomically removes unnecessary stale `scope_id`
+values, so ordinary model folders do not need to be selected again.
+
+Only a path that fails the ordinary-access proof consumes the transferred
+grant. The service explicitly starts that grant, validates the exact selected
+path, creates a receiver-owned durable security-scoped bookmark, and stores
+only the durable bytes as a mode-`0600` file below
 `state/security-scopes/` next to the active `config.yaml` (normally
 `~/Library/Application Support/Mnemosyne/state/security-scopes/`). This stable
 location does not move if `paths.state_database` changes. The durable
@@ -298,7 +323,8 @@ this handoff as entitlement-backed. A real protected-folder selection,
 LaunchAgent restart, helper restart, and managed-child `exec` still need
 acceptance smoke from the final installed bundle and signature.
 
-Every scoped filesystem helper and manager-owned llama.cpp, DS4, MFLUX, or
+For a location that genuinely requires a scope, every scoped filesystem helper
+and manager-owned llama.cpp, DS4, MFLUX, or
 download child reactivates the persisted bookmark in its own process before
 `exec` preserves that process identity for the upstream command. Raw bookmark
 data is never placed in YAML, SQLite, logs, or a control response.
@@ -524,6 +550,64 @@ curl -X POST http://127.0.0.1:1240/v1/chat/completions \
   -d '{"model":"local-qwen","messages":[{"role":"user","content":"Hello"}]}'
 curl http://127.0.0.1:17321/manager/status
 ```
+
+### Qwen3.8 thinking controls
+
+[Qwen3.8](https://huggingface.co/Qwen/Qwen3.8-27B) thinks by default. Its
+model-native `reasoning_effort` values are `xhigh` (the default), `medium`, and
+`low`. Unified Inference also accepts a portable `thinking_budget` token
+ceiling and translates it after engine selection: oMLX receives
+`thinking_budget`, while llama.cpp receives `reasoning_budget_tokens`. The
+llama.cpp-native `thinking_budget_tokens` and `reasoning_budget_tokens`
+spellings are accepted as input aliases, so an existing client can keep
+working if the model is later pinned to oMLX.
+
+```bash
+curl -X POST http://127.0.0.1:1240/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "local-qwen38",
+    "messages": [{"role": "user", "content": "Solve this carefully."}],
+    "reasoning_effort": "medium",
+    "thinking_budget": 8192,
+    "enable_thinking": true,
+    "preserve_thinking": true,
+    "max_tokens": 12288,
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "top_k": 20,
+    "min_p": 0.0,
+    "presence_penalty": 0.0
+  }'
+```
+
+`reasoning_effort` and `thinking_budget` are independent: effort changes how
+the Qwen chat template asks the model to reason, while the budget is a hard
+engine-enforced ceiling. Keep the overall output limit above the thinking
+budget so the model has room for its final answer. A very tight ceiling can
+cut reasoning at an awkward boundary, so verify answer quality before making
+one a client default.
+
+The top-level `enable_thinking` and `preserve_thinking` convenience fields are
+normalized into `chat_template_kwargs` for current oMLX and llama.cpp. Sending
+the official self-hosted form directly is also supported:
+
+```json
+{
+  "reasoning_effort": "low",
+  "chat_template_kwargs": {
+    "enable_thinking": true,
+    "preserve_thinking": false
+  }
+}
+```
+
+For a direct non-thinking response, send `"enable_thinking": false`; Qwen
+recommends `temperature=0.7`, `top_p=0.8`, `top_k=20`, `min_p=0.0`, and
+`presence_penalty=1.5` for that mode. `/v1/responses` also maps
+`reasoning.effort` into the Qwen template. Reasoning response fields are passed
+through unchanged because current clients and engines may use either
+`reasoning_content` or `reasoning`.
 
 With either example MFLUX profile enabled:
 

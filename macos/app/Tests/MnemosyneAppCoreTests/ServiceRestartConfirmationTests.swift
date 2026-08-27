@@ -80,8 +80,8 @@ func restartConfirmationTimeoutIsActionable() async {
         appliedRevision: staleRevision,
         lastServiceError: nil
     ).localizedDescription
-    #expect(diagnostic.contains("still require a restart"))
-    #expect(diagnostic.contains("choose Restart Service again"))
+    #expect(diagnostic.contains("save itself is durable"))
+    #expect(diagnostic.contains("restart again only if"))
     #expect(diagnostic.contains("applied \(staleRevision)"))
 
     let sequence = RestartProbeSequence([

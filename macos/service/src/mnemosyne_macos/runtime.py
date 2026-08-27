@@ -20,14 +20,21 @@ import httpx
 from . import __version__
 from .benchmarking import (
     BENCHMARK_ENDPOINT,
+    CONTEXT_SUITE_VERSION,
     BenchmarkStore,
     BenchmarkSuite,
+    ContextBenchmarkRecord,
     candidate_set_fingerprint,
     choose_target,
+    context_target_fingerprint,
+    system_fingerprint,
+    target_fingerprint,
+    target_with_context_window,
 )
 from .config import (
     ImageProfileConfig,
     MacConfig,
+    ModelContextConfig,
     ModelLoadConfig,
     ModelProfile,
     StorageLocationConfig,
@@ -52,6 +59,7 @@ from .fleet_protocol import (
     portable_load_config,
 )
 from .models import (
+    ContextWindowHint,
     ENGINE_RELEASE_TIER,
     Endpoint,
     EngineName,
@@ -537,6 +545,11 @@ class NativeRuntime:
             alias: tuple(self.benchmark_store.list(alias=alias))
             for alias in self.profile_candidates
         }
+        self._context_records = {
+            alias: tuple(self.benchmark_store.list_context(alias=alias))
+            for alias in self.profile_candidates
+        }
+        self._context_hints: dict[str, ContextWindowHint] = {}
         self.benchmarks = BenchmarkSuite(
             self.benchmark_store,
             coordinator=self.coordinator,
@@ -652,13 +665,58 @@ class NativeRuntime:
 
     async def _activate_configured_security_scopes(self) -> None:
         referenced: set[str] = set()
+        locations: list[StorageLocationConfig] = []
+        removed_unnecessary_scope = False
         for location in self.config.storage.locations:
-            if location.scope_id is not None:
-                await self.security_scope_process.activate(
-                    location.scope_id,
-                    location.path,
+            effective = location
+            if effective.scope_id is not None:
+                # Most user-selected model folders are already available to
+                # this deliberately unsandboxed per-user service. Prove that
+                # in the same bounded helper used by normal storage checks and
+                # remove an unnecessary bookmark instead of depending on a
+                # security-scope reactivation contract the process does not
+                # need. Protected paths still take the strict bookmark path.
+                unscoped = None
+                try:
+                    unscoped = await self.filesystem.inspect(
+                        effective.path,
+                        name=effective.name,
+                        expected_volume_uuid=effective.volume_uuid,
+                    )
+                except FilesystemProbeError:
+                    pass
+                if (
+                    unscoped is not None
+                    and unscoped.exists
+                    and unscoped.is_directory
+                    and unscoped.writable
+                    and unscoped.volume_matches
+                ):
+                    effective = effective.model_copy(update={"scope_id": None})
+                    removed_unnecessary_scope = True
+                else:
+                    await self.security_scope_process.activate(
+                        effective.scope_id,
+                        effective.path,
+                    )
+                    referenced.add(effective.scope_id)
+            locations.append(effective)
+
+        if removed_unnecessary_scope:
+            storage = self.config.storage.model_copy(update={"locations": locations})
+            migrated = MacConfig.model_validate(
+                self.config.model_copy(update={"storage": storage}).model_dump(
+                    mode="json"
                 )
-                referenced.add(location.scope_id)
+            )
+            if self.config_path is not None:
+                save_config(migrated, self.config_path)
+            self.config = migrated
+            self._apply_profiles(migrated)
+            self.installer.storage = migrated.storage
+            logger.info(
+                "removed unnecessary selected-folder grants from accessible model storage"
+            )
         self.security_scopes.prune(referenced)
 
     async def validate_security_scopes(self, config: MacConfig) -> None:
@@ -863,6 +921,9 @@ class NativeRuntime:
     async def register_security_scope(self, path: str, bookmark_data: str) -> str:
         return (await self.security_scope_process.register(path, bookmark_data)).id
 
+    async def discard_security_scope(self, scope_id: str) -> None:
+        await asyncio.to_thread(self.security_scopes.discard, scope_id)
+
     async def require_security_scope(self, scope_id: str | None, path: str) -> None:
         if scope_id is None:
             return
@@ -931,8 +992,12 @@ class NativeRuntime:
         return profile
 
     def _apply_profiles(self, config: MacConfig) -> None:
-        self.profiles = config.profiles()
         self.profile_candidates = config.profile_candidates()
+        self.profiles = {
+            alias: candidates[0]
+            for alias, candidates in self.profile_candidates.items()
+            if candidates
+        }
         existing_records = getattr(self, "_benchmark_records", {})
         benchmark_store = getattr(self, "benchmark_store", None)
         self._benchmark_records = {
@@ -947,11 +1012,156 @@ class NativeRuntime:
             )
             for alias in self.profile_candidates
         }
+        existing_context = getattr(self, "_context_records", {})
+        self._context_records = {
+            alias: (
+                existing_context[alias]
+                if alias in existing_context
+                else (
+                    tuple(benchmark_store.list_context(alias=alias))
+                    if benchmark_store is not None
+                    else ()
+                )
+            )
+            for alias in self.profile_candidates
+        }
+        self._apply_context_evidence()
 
     def _reload_benchmark_records(self, alias: str) -> None:
         self._benchmark_records[alias] = tuple(
             self.benchmark_store.list(alias=alias)
         )
+
+    def _reload_context_records(self, alias: str) -> None:
+        self._context_records[alias] = tuple(
+            self.benchmark_store.list_context(alias=alias)
+        )
+
+    def _fresh_context_record(self, target: ResolvedTarget):
+        runtime = getattr(self, "_runtime_fingerprints", {}).get(target.key.engine)
+        if runtime is None:
+            return None
+        cutoff = time.time() - target.context_max_verified_age_hours * 3600
+        fingerprint = context_target_fingerprint(target)
+        machine = system_fingerprint()
+        return next(
+            (
+                record
+                for record in self._context_records.get(target.alias, ())
+                if record.engine == target.key.engine.value
+                and record.target_fingerprint == fingerprint
+                and record.runtime_fingerprint == runtime
+                and record.system_fingerprint == machine
+                and record.suite_version == CONTEXT_SUITE_VERSION
+                and record.created_at >= cutoff
+            ),
+            None,
+        )
+
+    def _eligible_context_record(self, target: ResolvedTarget):
+        if target.context_mode != "automatic":
+            return None
+        return self._fresh_context_record(target)
+
+    def _apply_context_evidence(self) -> None:
+        if not hasattr(self, "profile_candidates"):
+            return
+        # Always start from persisted configuration. Otherwise an automatic
+        # value applied during a prior refresh could survive after its runtime
+        # fingerprint or age made the evidence stale.
+        baseline = (
+            self.config.profile_candidates()
+            if hasattr(self, "config")
+            else self.profile_candidates
+        )
+        updated: dict[str, tuple[ResolvedTarget, ...]] = {}
+        for alias, candidates in baseline.items():
+            resolved: list[ResolvedTarget] = []
+            for target in candidates:
+                record = self._eligible_context_record(target)
+                resolved.append(
+                    target_with_context_window(target, record.verified_tokens)
+                    if record is not None
+                    else target
+                )
+            updated[alias] = tuple(resolved)
+        self.profile_candidates = updated
+        self.profiles = {
+            alias: candidates[0]
+            for alias, candidates in updated.items()
+            if candidates
+        }
+
+    async def _refresh_context_hints(self) -> None:
+        if not hasattr(self, "profile_candidates"):
+            self._context_hints = {}
+            return
+
+        async def inspect(target: ResolvedTarget) -> tuple[str, ContextWindowHint]:
+            fingerprint = target_fingerprint(target)
+            adapter = self.adapters[target.key.engine]
+            try:
+                hint = await adapter.context_window(
+                    target,
+                    deadline=Deadline.after(5),
+                )
+            except Exception:
+                hint = ContextWindowHint(
+                    effective_tokens=target.requested_context_length,
+                    native_tokens=target.native_context_length,
+                    source=(
+                        "configured-load"
+                        if target.requested_context_length is not None
+                        else "unavailable"
+                    ),
+                    confidence=(
+                        "authoritative"
+                        if target.requested_context_length is not None
+                        else "unknown"
+                    ),
+                )
+            return fingerprint, hint
+
+        unique = {
+            target_fingerprint(target): target
+            for candidates in self.profile_candidates.values()
+            for target in candidates
+        }
+        values = await asyncio.gather(*(inspect(target) for target in unique.values()))
+        self._context_hints = dict(values)
+
+    def context_contract(self, target: ResolvedTarget) -> dict:
+        hint = self._context_hints.get(target_fingerprint(target))
+        record = self._fresh_context_record(target)
+        effective = (
+            hint.effective_tokens
+            if hint is not None and hint.effective_tokens is not None
+            else target.requested_context_length
+        )
+        native = (
+            hint.native_tokens
+            if hint is not None and hint.native_tokens is not None
+            else target.native_context_length
+        )
+        verified = record.verified_tokens if record is not None else None
+        guaranteed = (
+            target.requested_context_length
+            if target.context_mode in {"fixed", "native"}
+            and target.requested_context_length is not None
+            else verified
+            if target.context_mode == "automatic" and verified is not None
+            else effective
+        )
+        return {
+            "mode": target.context_mode,
+            "native_tokens": native,
+            "configured_tokens": target.requested_context_length,
+            "effective_tokens": effective,
+            "verified_tokens": verified,
+            "guaranteed_tokens": guaranteed,
+            "source": hint.source if hint is not None else "configuration",
+            "confidence": hint.confidence if hint is not None else "unknown",
+        }
 
     async def _refresh_runtime_fingerprints(self) -> None:
         async def fingerprint(
@@ -968,12 +1178,21 @@ class NativeRuntime:
             *(fingerprint(engine, adapter) for engine, adapter in self.adapters.items())
         )
         self._runtime_fingerprints = dict(values)
+        self._apply_context_evidence()
+        await self._refresh_context_hints()
 
     def benchmark_decision(self, alias: str) -> tuple[ResolvedTarget, dict]:
         profile = self._profile(alias)
         candidates = self.profile_candidates.get(alias)
         if not candidates:
             raise KeyError(f"unknown model alias '{alias}'")
+        primary_contract = self.context_contract(candidates[0])
+        context_limits = {
+            target_fingerprint(candidate): self.context_contract(candidate).get(
+                "guaranteed_tokens"
+            )
+            for candidate in candidates
+        }
         selected, decision = choose_target(
             alias=alias,
             candidates=candidates,
@@ -981,6 +1200,8 @@ class NativeRuntime:
             records=self._benchmark_records.get(alias, ()),
             runtime_fingerprints=self._runtime_fingerprints,
             config_revision=candidate_set_fingerprint(candidates),
+            context_limits=context_limits,
+            required_context_tokens=primary_contract.get("guaranteed_tokens"),
         )
         return selected, decision.to_dict()
 
@@ -1060,6 +1281,149 @@ class NativeRuntime:
                 "failures": failures,
                 "decision": decision,
             }
+
+    async def profile_model_context(
+        self,
+        alias: str,
+        *,
+        target_tokens: int | None = None,
+    ) -> dict:
+        """Measure usable context for every chat candidate, sequentially."""
+
+        profile = self._profile(alias)
+        candidates = tuple(
+            target
+            for target in self.profile_candidates.get(alias, ())
+            if BENCHMARK_ENDPOINT in target.capabilities
+        )
+        if not candidates:
+            raise RuntimeConfigurationError(
+                "context profiling requires a chat-capable language model"
+            )
+        async with self._benchmark_lock:
+            await self._refresh_runtime_fingerprints()
+            results: list[dict] = []
+            failures: list[dict[str, str]] = []
+            for target in candidates:
+                requested = target_tokens
+                if requested is None:
+                    requested = (
+                        target.native_context_length
+                        or target.requested_context_length
+                        or 262_144
+                    )
+                if target.native_context_length is not None:
+                    requested = min(requested, target.native_context_length)
+                try:
+                    await self._validate_target_storage(target)
+                    adapter = self.adapters[target.key.engine]
+                    runtime_fingerprint = await adapter.runtime_fingerprint(
+                        deadline=Deadline.after(5)
+                    )
+                    if runtime_fingerprint is None:
+                        raise RuntimeError(
+                            f"{target.key.engine.value} does not expose a stable runtime identity"
+                        )
+                    native_result = None
+                    native_error: Exception | None = None
+
+                    async def run_native(deadline: Deadline) -> None:
+                        nonlocal native_error, native_result
+                        try:
+                            native_result = await adapter.profile_context_window(
+                                target,
+                                requested,
+                                deadline=deadline,
+                            )
+                        except Exception as exc:
+                            # Let the barrier perform its post-operation empty
+                            # proof before surfacing a vendor precondition or
+                            # benchmark error. A rejected native benchmark is
+                            # not residency uncertainty by itself.
+                            native_error = exc
+
+                    if target.key.engine == EngineName.OMLX:
+                        await self.coordinator.run_empty_maintenance(
+                            run_native,
+                            name=f"{target.alias} oMLX context profile",
+                        )
+                    if native_error is not None:
+                        raise native_error
+                    if native_result is not None:
+                        record = ContextBenchmarkRecord(
+                            created_at=time.time(),
+                            alias=target.alias,
+                            engine=target.key.engine.value,
+                            target_fingerprint=context_target_fingerprint(target),
+                            runtime_fingerprint=runtime_fingerprint,
+                            system_fingerprint=system_fingerprint(),
+                            suite_version=CONTEXT_SUITE_VERSION,
+                            requested_tokens=native_result.requested_tokens,
+                            verified_tokens=native_result.verified_tokens,
+                            prompt_tokens=native_result.prompt_tokens,
+                        )
+                        self.benchmark_store.record_context(record)
+                    else:
+                        record = await self.benchmarks.profile_context_candidate(
+                            target,
+                            adapter=adapter,
+                            requested_tokens=requested,
+                        )
+                    results.append(record.to_dict())
+                except Exception:
+                    failures.append(
+                        {
+                            "engine": target.key.engine.value,
+                            "code": "context_profile_failed",
+                            "detail": (
+                                "candidate could not complete a verified long-context "
+                                "prefill; its prior context contract remains active"
+                            ),
+                        }
+                    )
+            self._reload_context_records(alias)
+            if results:
+                # A changed automatic context becomes part of the effective
+                # load identity, so short-prompt speed evidence must be rerun.
+                self.benchmark_store.clear_alias(alias)
+                self._reload_benchmark_records(alias)
+            self._apply_profiles(self.config)
+            await self._refresh_runtime_fingerprints()
+            return {
+                "schema_version": 1,
+                "alias": alias,
+                "policy": profile.context.model_dump(mode="json"),
+                "results": results,
+                "failures": failures,
+                "contexts": self.context_snapshot(alias)["models"],
+            }
+
+    def context_snapshot(self, alias: str | None = None) -> dict:
+        aliases = [alias] if alias is not None else sorted(self.profile_candidates)
+        models: list[dict] = []
+        for candidate_alias in aliases:
+            candidates = self.profile_candidates.get(candidate_alias, ())
+            if not candidates:
+                continue
+            models.append(
+                {
+                    "alias": candidate_alias,
+                    "candidates": [
+                        {
+                            "engine": target.key.engine.value,
+                            "target_fingerprint": target_fingerprint(target),
+                            **self.context_contract(target),
+                        }
+                        for target in candidates
+                    ],
+                }
+            )
+        records = self.benchmark_store.list_context(alias=alias)
+        return {
+            "schema_version": 1,
+            "models": models,
+            "records": [record.to_dict() for record in records],
+        }
 
     def benchmark_snapshot(self, alias: str | None = None) -> dict:
         records = self.benchmark_store.list(alias=alias)
@@ -1167,6 +1531,15 @@ class NativeRuntime:
 
         removed = self.benchmark_store.clear_alias(alias)
         self._benchmark_records[alias] = ()
+        return removed
+
+    def reject_context_evidence(self, alias: str) -> int:
+        """Discard automatic context evidence and return to configured safety."""
+
+        self._profile(alias)
+        removed = self.benchmark_store.clear_context_alias(alias)
+        self._context_records[alias] = ()
+        self._apply_profiles(self.config)
         return removed
 
     def invalidate_automatic_selection(self, alias: str) -> int:
@@ -1479,6 +1852,14 @@ class NativeRuntime:
                         served_model_name=alias,
                         capabilities=capabilities,
                         load=load,
+                        context=(
+                            existing.context
+                            if existing is not None
+                            and existing.engine == EngineName.LLAMA_CPP
+                            else ModelContextConfig(
+                                native_tokens=candidate.context_length
+                            )
+                        ),
                         enabled=prior.enabled if prior is not None else True,
                     )
                 else:
@@ -1514,6 +1895,14 @@ class NativeRuntime:
                         capabilities={
                             Endpoint(value) for value in candidate.capabilities
                         },
+                        context=(
+                            existing.context
+                            if existing is not None
+                            and existing.engine == EngineName.OMLX
+                            else ModelContextConfig(
+                                native_tokens=candidate.context_length
+                            )
+                        ),
                         enabled=prior.enabled if prior is not None else True,
                     )
                 if existing_index is None:
@@ -2631,6 +3020,7 @@ class NativeRuntime:
                 ),
                 capabilities=requested_capabilities,
                 load=load,
+                context=ModelContextConfig(native_tokens=install.context_length),
             )
         elif engine == EngineName.MFLUX:
             from .model_library import image_profile_defaults, verified_model
@@ -2723,6 +3113,9 @@ class NativeRuntime:
                 model=Path(candidate.model_path).name,
                 storage=install.storage,
                 capabilities=detected_capabilities,
+                context=ModelContextConfig(
+                    native_tokens=candidate.context_length
+                ),
             )
         elif engine in {EngineName.MLXCEL, EngineName.MISTRAL_RS}:
             profile = ModelProfile(
@@ -2731,6 +3124,7 @@ class NativeRuntime:
                 model=install.destination,
                 storage=install.storage,
                 capabilities=requested_capabilities,
+                context=ModelContextConfig(native_tokens=install.context_length),
             )
         else:
             raise RuntimeConfigurationError("unsupported native download engine")
@@ -2803,6 +3197,7 @@ class NativeRuntime:
         rows: list[dict] = []
         for primary in self.profiles.values():
             selected, decision = self.benchmark_decision(primary.alias)
+            context = self.context_contract(selected)
             rows.append(
                 {
                     "id": primary.alias,
@@ -2818,9 +3213,21 @@ class NativeRuntime:
                     ),
                     "model_kind": primary.kind,
                     "load_config_digest": selected.key.load_config_digest,
+                    # OpenAI-compatible clients commonly recognize
+                    # max_model_len. The structured companion preserves how
+                    # that guaranteed value was obtained.
+                    "max_model_len": context["guaranteed_tokens"],
+                    "context_window": context,
                     "selection": decision,
                     "candidate_engines": [
                         item.key.engine.value
+                        for item in self.profile_candidates.get(primary.alias, (primary,))
+                    ],
+                    "candidate_contexts": [
+                        {
+                            "engine": item.key.engine.value,
+                            **self.context_contract(item),
+                        }
                         for item in self.profile_candidates.get(primary.alias, (primary,))
                     ],
                 }

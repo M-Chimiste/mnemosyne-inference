@@ -26,8 +26,8 @@ public enum ServiceRestartConfirmationError: Error, Equatable, LocalizedError, S
             }
             return """
             The background service was re-registered, but it did not confirm the saved \
-            configuration before the restart check timed out. The saved changes still require \
-            a restart. Check the background-service logs, then choose Restart Service again. \
+            configuration before the restart check timed out. The save itself is durable. \
+            Refresh Settings; restart again only if it still reports a pending restart. \
             Details: \(details.joined(separator: "; ")).
             """
         }
@@ -44,7 +44,7 @@ public enum ServiceRestartConfirmation {
     /// service must no longer report a pending restart.
     public static func waitForAppliedConfiguration(
         expectedRevision: String,
-        timeout: Duration = .seconds(45),
+        timeout: Duration = .seconds(90),
         pollInterval: Duration = .milliseconds(500),
         probe: @escaping ConfigurationProbe
     ) async throws -> ConfigurationSnapshot {

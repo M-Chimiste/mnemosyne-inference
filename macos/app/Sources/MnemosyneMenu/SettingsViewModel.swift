@@ -69,6 +69,8 @@ final class SettingsViewModel: ObservableObject {
     @Published private(set) var runtimeUpdateSnapshot: RuntimeUpdateSnapshot?
     @Published private(set) var benchmarkSnapshot: EngineBenchmarkSnapshot?
     @Published private(set) var benchmarkingAlias: String?
+    @Published private(set) var contextSnapshot: ContextWindowSnapshot?
+    @Published private(set) var profilingContextAlias: String?
     @Published private(set) var omlxCacheHealth: OMLXCacheHealth?
     @Published private(set) var readinessSnapshot: ReadinessSnapshot?
     @Published private(set) var lastSelfTest: ModelSelfTestResult?
@@ -200,6 +202,7 @@ final class SettingsViewModel: ObservableObject {
             Task { await refreshRuntimeUpdates() }
             Task { await refreshReadiness() }
             Task { await refreshBenchmarks() }
+            Task { await refreshContexts() }
         } catch {
             isLoaded = false
             setStatus("Could not load settings: \(error.localizedDescription)", tone: .error)
@@ -227,6 +230,16 @@ final class SettingsViewModel: ObservableObject {
             // Benchmark evidence is optional. Keep the rest of Settings fully
             // usable when an older or degraded service cannot return it.
             benchmarkSnapshot = nil
+        }
+    }
+
+    func refreshContexts() async {
+        do {
+            contextSnapshot = try await client.contexts(alias: nil)
+        } catch {
+            // Context metadata is additive. An older service must not make
+            // the rest of Settings unusable.
+            contextSnapshot = nil
         }
     }
 
@@ -1181,6 +1194,7 @@ final class SettingsViewModel: ObservableObject {
             servedModelName: source.servedModelName,
             capabilities: source.capabilities,
             load: source.load,
+            context: source.context,
             enabled: source.enabled
         )
         settings.models[targetIndex].alternatives.append(alternative)
@@ -1216,6 +1230,7 @@ final class SettingsViewModel: ObservableObject {
                 && candidate.servedModelName == alternative.servedModelName
                 && candidate.capabilities == alternative.capabilities
                 && candidate.load == alternative.load
+                && candidate.context == alternative.context
         }) {
             settings.models[sourceIndex].enabled = true
             restoredSource = true
@@ -1246,6 +1261,7 @@ final class SettingsViewModel: ObservableObject {
                     servedModelName: alternative.servedModelName,
                     capabilities: alternative.capabilities,
                     load: alternative.load,
+                    context: alternative.context,
                     kind: .language,
                     enabled: true
                 )
@@ -1288,6 +1304,30 @@ final class SettingsViewModel: ObservableObject {
         } catch {
             setStatus(
                 "Could not benchmark \(alias): \(error.localizedDescription)",
+                tone: .error
+            )
+        }
+    }
+
+    func runContextProfile(alias: String) async {
+        guard profilingContextAlias == nil, !hasUnsavedChanges else { return }
+        profilingContextAlias = alias
+        setStatus("Profiling the usable context window for \(alias)…", tone: .normal)
+        defer { profilingContextAlias = nil }
+        do {
+            let run = try await client.profileContext(alias: alias, targetTokens: nil)
+            contextSnapshot = try await client.contexts(alias: nil)
+            benchmarkSnapshot = try? await client.benchmarks(alias: nil)
+            let best = run.results.map(\.verifiedTokens).max()
+            let detail = best.map { " Verified \($0.formatted()) tokens." } ?? ""
+            let failures = run.failures.count
+            setStatus(
+                "Context profiling finished for \(alias).\(detail)",
+                tone: failures == 0 ? .success : .warning
+            )
+        } catch {
+            setStatus(
+                "Could not profile context for \(alias): \(error.localizedDescription)",
                 tone: .error
             )
         }

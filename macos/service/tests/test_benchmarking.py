@@ -1,4 +1,5 @@
 from dataclasses import replace
+import json
 import time
 from types import SimpleNamespace
 
@@ -7,17 +8,21 @@ import pytest
 
 from mnemosyne_macos.benchmarking import (
     BENCHMARK_SUITE_VERSION,
+    CONTEXT_SUITE_VERSION,
     MAX_RECORDS_PER_ALIAS,
     BenchmarkRecord,
     BenchmarkStore,
     BenchmarkSuite,
+    ContextBenchmarkRecord,
     choose_target,
+    context_target_fingerprint,
     system_fingerprint,
     target_fingerprint,
 )
-from mnemosyne_macos.config import ModelProfile, ModelSelectionConfig
+from mnemosyne_macos.config import MacConfig, ModelProfile, ModelSelectionConfig
 from mnemosyne_macos.engines.base import Deadline, EngineAdapter
 from mnemosyne_macos.models import (
+    ContextWindowHint,
     Endpoint,
     EngineName,
     LoadedHandle,
@@ -90,6 +95,71 @@ def test_benchmark_store_bounds_upgrade_history_per_alias(tmp_path) -> None:
     assert values[0].runtime_fingerprint == (
         f"runtime-{MAX_RECORDS_PER_ALIAS + 4}"
     )
+
+
+def test_context_store_retains_only_fixed_content_free_measurements(tmp_path) -> None:
+    store = BenchmarkStore(tmp_path / "state.db")
+    primary, _alternative = _targets()
+    value = ContextBenchmarkRecord(
+        created_at=time.time(),
+        alias="qwen",
+        engine="omlx",
+        target_fingerprint=context_target_fingerprint(primary),
+        runtime_fingerprint="omlx-v1",
+        system_fingerprint=system_fingerprint(),
+        suite_version=CONTEXT_SUITE_VERSION,
+        requested_tokens=262_144,
+        verified_tokens=261_120,
+        prompt_tokens=261_632,
+    )
+
+    store.record_context(value)
+    result = store.list_context(alias="qwen")
+
+    assert result == [value]
+    assert "prompt" not in result[0].to_dict()
+    assert store.clear_context_alias("qwen") == 1
+
+
+def test_stale_context_evidence_restores_the_persisted_safe_fallback() -> None:
+    config = MacConfig.model_validate(
+        {
+            "models": [
+                {
+                    "alias": "qwen",
+                    "engine": "llama.cpp",
+                    "model": "/models/qwen.gguf",
+                    "load": {"context_length": 32_768},
+                    "context": {"mode": "automatic", "native_tokens": 131_072},
+                }
+            ]
+        }
+    )
+    baseline = config.profile_candidates()["qwen"][0]
+    record = ContextBenchmarkRecord(
+        created_at=time.time(),
+        alias="qwen",
+        engine="llama.cpp",
+        target_fingerprint=context_target_fingerprint(baseline),
+        runtime_fingerprint="llama-v1",
+        system_fingerprint=system_fingerprint(),
+        suite_version=CONTEXT_SUITE_VERSION,
+        requested_tokens=131_072,
+        verified_tokens=130_048,
+        prompt_tokens=130_560,
+    )
+    runtime = object.__new__(NativeRuntime)
+    runtime.config = config
+    runtime.profile_candidates = config.profile_candidates()
+    runtime._context_records = {"qwen": (record,)}
+    runtime._runtime_fingerprints = {EngineName.LLAMA_CPP: "llama-v1"}
+
+    runtime._apply_context_evidence()
+    assert runtime.profiles["qwen"].requested_context_length == 130_048
+
+    runtime._runtime_fingerprints[EngineName.LLAMA_CPP] = "llama-v2"
+    runtime._apply_context_evidence()
+    assert runtime.profiles["qwen"].requested_context_length == 32_768
 
 
 @pytest.mark.asyncio
@@ -239,6 +309,37 @@ def test_selection_requires_preview_consent_and_exact_fresh_primary_baseline() -
     assert selected is primary
 
 
+def test_speed_winner_cannot_reduce_the_primary_context_contract() -> None:
+    primary, alternative = _targets()
+    records = [
+        _record(primary, runtime="omlx-v1", ttft=200, tps=20),
+        _record(alternative, runtime="mlxcel-v1", ttft=50, tps=50),
+    ]
+    selected, decision = choose_target(
+        alias="qwen",
+        candidates=(primary, alternative),
+        policy=ModelSelectionConfig(
+            mode="benchmark",
+            objective="latency",
+            allow_preview=True,
+        ),
+        records=records,
+        runtime_fingerprints={
+            EngineName.OMLX: "omlx-v1",
+            EngineName.MLXCEL: "mlxcel-v1",
+        },
+        config_revision="a" * 64,
+        context_limits={
+            target_fingerprint(primary): 131_072,
+            target_fingerprint(alternative): 32_768,
+        },
+        required_context_tokens=131_072,
+    )
+
+    assert selected is primary
+    assert decision.reason == "benchmark evidence unavailable"
+
+
 def test_user_pin_bypasses_benchmark_ranking_and_preview_consent() -> None:
     primary, alternative = _targets()
 
@@ -298,6 +399,81 @@ def test_explicit_preview_fallback_can_compare_against_a_stable_alternative() ->
     )
     assert selected is stable
     assert decision.fallback_engine == "mlxcel"
+
+
+@pytest.mark.asyncio
+async def test_context_profile_uses_a_lease_and_persists_only_token_evidence(
+    tmp_path,
+) -> None:
+    primary, _alternative = _targets()
+
+    class FakeLease:
+        released = False
+
+        def route(self, endpoint: Endpoint) -> ProxyRoute:
+            assert endpoint == Endpoint.CHAT_COMPLETIONS
+            return ProxyRoute(
+                base_url="http://context.test",
+                path="/v1/chat/completions",
+                wire_model="qwen",
+            )
+
+        async def release(self) -> None:
+            self.released = True
+
+    class FakeCoordinator:
+        lease = FakeLease()
+        requested_context: int | None = None
+
+        async def acquire(self, target):
+            self.requested_context = target.requested_context_length
+            return self.lease
+
+    class FakeAdapter:
+        async def runtime_fingerprint(self, *, deadline: Deadline) -> str:
+            del deadline
+            return "omlx-v1"
+
+        async def context_window(self, target, *, deadline: Deadline):
+            del target, deadline
+            return ContextWindowHint(effective_tokens=32_768)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        assert payload["max_tokens"] == 1
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+                "usage": {
+                    "prompt_tokens": 3_584,
+                    "completion_tokens": 1,
+                    "total_tokens": 3_585,
+                },
+            },
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    store = BenchmarkStore(tmp_path / "state.db")
+    coordinator = FakeCoordinator()
+    suite = BenchmarkSuite(
+        store,
+        coordinator=coordinator,  # type: ignore[arg-type]
+        client=client,
+    )
+    try:
+        record = await suite.profile_context_candidate(
+            primary,
+            adapter=FakeAdapter(),  # type: ignore[arg-type]
+            requested_tokens=4_096,
+        )
+    finally:
+        await client.aclose()
+
+    assert coordinator.requested_context == 4_096
+    assert coordinator.lease.released is True
+    assert record.verified_tokens == 3_072
+    assert store.list_context(alias="qwen") == [record]
 
 
 @pytest.mark.asyncio
