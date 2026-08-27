@@ -158,6 +158,12 @@ async def test_filesystem_probe_ensures_directory_and_measures_size(
         expected_volume_uuid=None,
         scope_id=None,
     )
+    validated = await probe.validate_directory(
+        root=str(root),
+        path=str(destination),
+        expected_volume_uuid=None,
+        scope_id=None,
+    )
     (destination / "weights.bin").write_bytes(b"weights")
     nested = destination / "metadata"
     nested.mkdir()
@@ -170,6 +176,7 @@ async def test_filesystem_probe_ensures_directory_and_measures_size(
     )
 
     assert created == str(destination.resolve())
+    assert validated == str(destination.resolve())
     assert destination.is_dir()
     assert size == len(b"weights") + len(b"{}")
 
@@ -191,6 +198,7 @@ async def test_filesystem_probe_ensures_directory_and_measures_size(
         "validate-model",
         "validate-projector",
         "ensure-directory",
+        "validate-directory",
         "directory-size",
         "delete-directory",
     ],
@@ -231,6 +239,13 @@ async def test_filesystem_probe_rejects_paths_outside_selected_root(
         request = probe.ensure_directory(
             root=str(root),
             path=str(outside / "new-model"),
+            expected_volume_uuid=None,
+            scope_id=None,
+        )
+    elif operation == "validate-directory":
+        request = probe.validate_directory(
+            root=str(root),
+            path=str(outside),
             expected_volume_uuid=None,
             scope_id=None,
         )

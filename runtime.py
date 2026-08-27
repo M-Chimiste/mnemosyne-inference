@@ -25,7 +25,7 @@ from profiles import ResolvedProfile
 
 
 class UsageEntry(NamedTuple):
-    """One per-request token-usage record buffered in `_runtime.usage_rows`.
+    """One idempotent per-request token-usage record.
 
     The first 8 fields back the existing SQLite `request_usage` analytics
     table (catalog.record_usage_batch slices them positionally). The
@@ -59,8 +59,8 @@ class RuntimeState:
     last_used_at: Optional[float] = None
     request_count_delta: int = 0
     inflight: int = 0
-    # Pending per-request token-usage rows drained by `_flush_loop`.
-    # See `UsageEntry` for field layout.
+    # Retry-only queue for a usage event whose immediate atomic SQLite write
+    # failed. `_flush_loop` removes rows only after a later successful commit.
     usage_rows: deque = field(default_factory=deque)
 
 
@@ -212,6 +212,13 @@ def build_llama_argv(
         argv += ["-c", str(profile.max_model_len)]
     if isinstance(profile.gpus, list) and len(profile.gpus) > 1:
         argv += ["--tensor-split", ",".join("1" for _ in profile.gpus)]
+    capabilities = set(profile.capabilities)
+    if capabilities == {"rerank"}:
+        argv += ["--embedding", "--reranking", "--pooling", "rank"]
+    elif capabilities == {"embeddings"}:
+        argv += ["--embedding"]
+    if profile.projector_model_path is not None:
+        argv += ["--mmproj", profile.projector_model_path]
     argv += list(profile.extra_args)
     return argv
 

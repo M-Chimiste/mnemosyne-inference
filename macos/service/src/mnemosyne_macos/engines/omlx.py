@@ -2,15 +2,21 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import hashlib
+import math
 import os
 from urllib.parse import quote
 
 import httpx
 
-from .base import AdapterError, Deadline
+from .base import AdapterError, CapacityHint, Deadline
 from .http import HttpAdapterError, HttpEngineAdapter, JsonObjectResponse
 from ..config import OMLXConfig
 from ..models import (
+    ContextWindowHint,
+    ContextWindowProfileResult,
     Endpoint,
     EngineName,
     EngineSnapshot,
@@ -23,6 +29,15 @@ from ..models import (
 
 
 class OMLXAdapter(HttpEngineAdapter):
+    _CONTEXT_BENCHMARK_TARGETS = (
+        16_384,
+        32_768,
+        65_536,
+        131_072,
+        262_144,
+        524_288,
+    )
+
     def __init__(
         self,
         config: OMLXConfig,
@@ -39,6 +54,358 @@ class OMLXAdapter(HttpEngineAdapter):
             poll_interval_seconds=poll_interval_seconds,
         )
         self.admin_session_env = config.admin_session_env
+        self._capacity_hint: CapacityHint | None = None
+        self._capacity_diagnostic: str | None = None
+
+    def capacity_hint(self, target: ResolvedTarget) -> CapacityHint | None:
+        del target
+        return self._capacity_hint
+
+    async def runtime_fingerprint(self, *, deadline: Deadline) -> str | None:
+        """Fingerprint the authoritative running oMLX version when exposed."""
+
+        for endpoint in ("/health", "/api/status"):
+            remaining = min(deadline.remaining(), self.request_timeout_seconds)
+            if remaining <= 0:
+                return None
+            try:
+                response = await self._client.get(
+                    f"{self.base_url}{endpoint}",
+                    headers=self._bearer_headers(),
+                    timeout=remaining,
+                )
+                if response.status_code != 200:
+                    continue
+                payload = response.json()
+            except (httpx.HTTPError, ValueError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            version: str | None = None
+            for key in ("version", "app_version", "server_version"):
+                value = payload.get(key)
+                if isinstance(value, str) and value:
+                    version = value
+                    break
+            if version is not None:
+                material = f"{self.engine.value}\0{self.base_url}\0{version}"
+                return hashlib.sha256(material.encode("utf-8")).hexdigest()
+        return None
+
+    async def context_window(
+        self,
+        target: ResolvedTarget,
+        *,
+        deadline: Deadline,
+    ) -> ContextWindowHint:
+        """Read oMLX's effective window rather than trusting its 32K fallback."""
+
+        payload = await self._request_json(
+            "GET",
+            "/v1/models/status",
+            operation="inspect context window",
+            deadline=deadline,
+            headers=self._bearer_headers(),
+        )
+        models = payload.get("models")
+        if not isinstance(models, list):
+            raise AdapterError(
+                self.engine,
+                "inspect context window",
+                "oMLX model status omitted the models array",
+            )
+        ids = {target.key.canonical_model_id, target.wire_model}
+        effective: int | None = None
+        for item in models:
+            if not isinstance(item, dict):
+                continue
+            if item.get("id") not in ids and item.get("source_model_id") not in ids:
+                continue
+            value = item.get("max_context_window")
+            if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+                effective = value
+                break
+
+        native: int | None = target.native_context_length
+        try:
+            admin = await self._request_json(
+                "GET",
+                "/admin/api/models",
+                operation="inspect native context window",
+                deadline=deadline,
+                headers=self._admin_headers(),
+            )
+            entries = admin.get("models")
+            if isinstance(entries, list):
+                for item in entries:
+                    if not isinstance(item, dict) or item.get("id") not in ids:
+                        continue
+                    value = item.get("model_context_length")
+                    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+                        native = value
+                    break
+        except AdapterError:
+            # The bearer-authenticated status route is the serving contract.
+            # Native metadata is useful UI detail, not a reason to hide an
+            # otherwise authoritative effective value.
+            pass
+
+        if effective is None:
+            raise AdapterError(
+                self.engine,
+                "inspect context window",
+                f"oMLX did not report an effective context for '{target.key.canonical_model_id}'",
+            )
+        return ContextWindowHint(
+            effective_tokens=effective,
+            native_tokens=native,
+            source="omlx-model-status",
+            confidence="authoritative",
+        )
+
+    async def set_context_window(
+        self,
+        target: ResolvedTarget,
+        tokens: int,
+        *,
+        deadline: Deadline,
+    ) -> ContextWindowHint:
+        """Persist an explicit oMLX per-model window through its admin API."""
+
+        model_path = quote(target.key.canonical_model_id, safe="")
+        response = await self._request_json_response(
+            "PUT",
+            f"/admin/api/models/{model_path}/settings",
+            operation="set context window",
+            deadline=deadline,
+            headers=self._admin_headers(),
+            json_body={"max_context_window": tokens},
+            ok_statuses=(200,),
+        )
+        if response.payload.get("success") is not True:
+            raise AdapterError(
+                self.engine,
+                "set context window",
+                "oMLX did not confirm the context setting",
+            )
+        observed = await self.context_window(target, deadline=deadline)
+        if observed.effective_tokens != tokens:
+            raise AdapterError(
+                self.engine,
+                "set context window",
+                "oMLX did not expose the requested effective context",
+            )
+        return observed
+
+    async def profile_context_window(
+        self,
+        target: ResolvedTarget,
+        requested_tokens: int,
+        *,
+        deadline: Deadline,
+    ) -> ContextWindowProfileResult | None:
+        """Delegate to oMLX's memory-guard-aware native context benchmark."""
+
+        supported = [
+            value
+            for value in self._CONTEXT_BENCHMARK_TARGETS
+            if value <= requested_tokens
+        ]
+        if not supported:
+            return None
+        benchmark_target = max(supported)
+        try:
+            started = await self._request_json(
+                "POST",
+                "/admin/api/bench/context/start",
+                operation="start native context profile",
+                deadline=deadline,
+                headers=self._admin_headers(),
+                json_body={
+                    "model_id": target.key.canonical_model_id,
+                    "target_tokens": benchmark_target,
+                },
+            )
+        except HttpAdapterError as exc:
+            # Older official releases do not expose this additive endpoint;
+            # the portable coordinator-owned suite remains compatible.
+            if exc.status_code == 404:
+                return None
+            raise
+        bench_id = started.get("bench_id")
+        if not isinstance(bench_id, str) or not bench_id:
+            raise AdapterError(
+                self.engine,
+                "start native context profile",
+                "oMLX omitted the benchmark identifier",
+            )
+
+        terminal = False
+        try:
+            while deadline.remaining() > 0:
+                payload = await self._request_json(
+                    "GET",
+                    f"/admin/api/bench/context/{quote(bench_id, safe='')}/results",
+                    operation="poll native context profile",
+                    deadline=deadline,
+                    headers=self._admin_headers(),
+                )
+                status = payload.get("status")
+                if status == "completed":
+                    terminal = True
+                    result = payload.get("result")
+                    if not isinstance(result, dict) or result.get("applied") is not True:
+                        raise AdapterError(
+                            self.engine,
+                            "native context profile",
+                            "oMLX completed without applying a verified context",
+                        )
+                    applied = result.get("applied_tokens")
+                    prompt = result.get("verified_prompt_tokens")
+                    if (
+                        not isinstance(applied, int)
+                        or isinstance(applied, bool)
+                        or applied < 1
+                        or applied > benchmark_target
+                        or not isinstance(prompt, int)
+                        or isinstance(prompt, bool)
+                        or prompt < 1
+                    ):
+                        raise AdapterError(
+                            self.engine,
+                            "native context profile",
+                            "oMLX returned invalid fixed token evidence",
+                        )
+                    return ContextWindowProfileResult(
+                        requested_tokens=requested_tokens,
+                        verified_tokens=applied,
+                        prompt_tokens=prompt,
+                        source="omlx-native-context-benchmark",
+                    )
+                if status in {"error", "cancelled"}:
+                    terminal = True
+                    raise AdapterError(
+                        self.engine,
+                        "native context profile",
+                        "oMLX could not complete its context benchmark",
+                    )
+                await asyncio.sleep(min(self.poll_interval_seconds, deadline.remaining()))
+            raise AdapterError(
+                self.engine,
+                "native context profile",
+                "deadline expired",
+                retryable=True,
+            )
+        finally:
+            if not terminal:
+                with contextlib.suppress(Exception):
+                    await self._request_json(
+                        "POST",
+                        f"/admin/api/bench/context/{quote(bench_id, safe='')}/cancel",
+                        operation="cancel native context profile",
+                        deadline=Deadline.after(5),
+                        headers=self._admin_headers(),
+                    )
+
+    @property
+    def capacity_diagnostic(self) -> str | None:
+        return self._capacity_diagnostic
+
+    async def cache_health(self, *, deadline: Deadline) -> dict[str, object]:
+        """Return a bounded, content-free view of oMLX's own cache metrics."""
+
+        payload = await self._request_json(
+            "GET",
+            "/admin/api/stats?scope=alltime",
+            operation="inspect cache health",
+            deadline=deadline,
+            headers=self._admin_headers(),
+        )
+        runtime_cache = payload.get("runtime_cache")
+        if not isinstance(runtime_cache, dict):
+            raise AdapterError(
+                self.engine,
+                "inspect cache health",
+                "oMLX stats omitted runtime_cache observability",
+            )
+
+        def nonnegative_int(value: object) -> int:
+            return (
+                value
+                if isinstance(value, int)
+                and not isinstance(value, bool)
+                and value >= 0
+                else 0
+            )
+
+        total_requests = nonnegative_int(payload.get("total_requests"))
+        cached_tokens = nonnegative_int(payload.get("total_cached_tokens"))
+        total_size_bytes = nonnegative_int(runtime_cache.get("total_size_bytes"))
+        total_num_files = nonnegative_int(runtime_cache.get("total_num_files"))
+        disk_max_bytes = nonnegative_int(runtime_cache.get("disk_max_bytes"))
+        hot_cache_size_bytes = nonnegative_int(
+            runtime_cache.get("hot_cache_size_bytes")
+        )
+        hot_cache_max_bytes = nonnegative_int(
+            runtime_cache.get("hot_cache_max_bytes")
+        )
+        cache_efficiency = payload.get("cache_efficiency")
+        if not isinstance(cache_efficiency, (int, float)) or isinstance(
+            cache_efficiency, bool
+        ) or not math.isfinite(cache_efficiency):
+            cache_efficiency = None
+
+        # A large persistent cache with a meaningful request history and no
+        # observed reuse is worth surfacing. It is only a recommendation:
+        # different prompts can legitimately produce no prefix hits.
+        reset_recommended = (
+            total_size_bytes >= 8 * 1024**3
+            and total_requests >= 10
+            and cached_tokens == 0
+        )
+        return {
+            "available": True,
+            "total_requests": total_requests,
+            "total_cached_tokens": cached_tokens,
+            "cache_efficiency": float(cache_efficiency)
+            if cache_efficiency is not None
+            else None,
+            "ssd_file_count": total_num_files,
+            "ssd_size_bytes": total_size_bytes,
+            "ssd_limit_bytes": disk_max_bytes,
+            "hot_size_bytes": hot_cache_size_bytes,
+            "hot_limit_bytes": hot_cache_max_bytes,
+            "reset_recommended": reset_recommended,
+            "diagnostic": (
+                "The persistent oMLX cache is large but has recorded no prefix-cache reuse; reset it if warm requests remain slow."
+                if reset_recommended
+                else None
+            ),
+        }
+
+    async def clear_ssd_cache(self, *, deadline: Deadline) -> int:
+        """Clear oMLX's SSD KV cache through its official admin API."""
+
+        payload = await self._request_json(
+            "POST",
+            "/admin/api/ssd-cache/clear",
+            operation="reset SSD cache",
+            deadline=deadline,
+            headers=self._admin_headers(),
+        )
+        deleted = payload.get("total_deleted")
+        if (
+            payload.get("status") != "ok"
+            or not isinstance(deleted, int)
+            or isinstance(deleted, bool)
+            or deleted < 0
+        ):
+            raise AdapterError(
+                self.engine,
+                "reset SSD cache",
+                "oMLX returned an invalid cache-reset result",
+            )
+        return deleted
 
     def _admin_headers(self) -> dict[str, str]:
         headers = self._bearer_headers()
@@ -172,7 +539,45 @@ class OMLXAdapter(HttpEngineAdapter):
         )
 
     async def validate_control(self, *, deadline: Deadline) -> EngineSnapshot:
-        return await self.inspect(deadline=deadline)
+        snapshot = await self.inspect(deadline=deadline)
+        if not snapshot.authoritative or snapshot.service_state != ServiceState.READY:
+            self._capacity_hint = None
+            return snapshot
+        try:
+            payload = await self._request_json(
+                "GET",
+                "/admin/api/global-settings",
+                operation="inspect scheduler capacity",
+                deadline=deadline,
+                headers=self._admin_headers(),
+            )
+            scheduler = payload.get("scheduler")
+            value = (
+                scheduler.get("max_concurrent_requests")
+                if isinstance(scheduler, dict)
+                else None
+            )
+            if (
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or not 1 <= value <= 1024
+            ):
+                raise ValueError(
+                    "oMLX global settings omitted a valid scheduler.max_concurrent_requests"
+                )
+            self._capacity_hint = CapacityHint(
+                limit=value,
+                source="omlx-admin-settings",
+                confidence="authoritative",
+            )
+            self._capacity_diagnostic = None
+        except (AdapterError, ValueError) as exc:
+            # Scheduler discovery is an optimization contract. Inventory and
+            # unload authority remain valid, so keep the engine callable at a
+            # conservative single request and expose the reason in diagnostics.
+            self._capacity_hint = None
+            self._capacity_diagnostic = str(exc)
+        return snapshot
 
     async def register_model_directories(
         self,
@@ -275,6 +680,15 @@ class OMLXAdapter(HttpEngineAdapter):
     async def load(self, target: ResolvedTarget, *, deadline: Deadline) -> LoadedHandle:
         if target.key.engine != self.engine:
             raise AdapterError(self.engine, "load", "target belongs to another engine")
+        requested_context = target.requested_context_length
+        if requested_context is not None:
+            observed = await self.context_window(target, deadline=deadline)
+            if observed.effective_tokens != requested_context:
+                await self.set_context_window(
+                    target,
+                    requested_context,
+                    deadline=deadline,
+                )
         before = await self.inspect(deadline=deadline)
         if not before.authoritative:
             raise AdapterError(self.engine, "load", before.diagnostic or "unknown state")

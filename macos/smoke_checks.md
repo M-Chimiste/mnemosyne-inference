@@ -107,7 +107,7 @@ uv run --project macos/service mnemosyne-macos --check-config \
   --env "$HOME/Library/Application Support/Mnemosyne/.env"
 lsof -nP \
   -iTCP:1240 -iTCP:17321 -iTCP:17322 -iTCP:17323 \
-  -iTCP:17324 -iTCP:17325 \
+  -iTCP:17324 -iTCP:17325 -iTCP:17326 -iTCP:17327 \
   -sTCP:LISTEN
 ```
 
@@ -116,8 +116,8 @@ loopback-only. In the default **This Mac only** mode, `1240` is loopback-only;
 with **Allow connections from the local network** enabled, only `1240` may
 listen on `0.0.0.0`. The control listener on `17321` stays loopback-only. oMLX
 owns `17322` when that optional engine is enabled.
-Manager-owned DS4, MFLUX, and llama.cpp should be absent from `17323`,
-`17324`, and `17325` while unloaded. LM Studio is not part of the inference
+Manager-owned DS4, MFLUX, llama.cpp, mlxcel, and mistral.rs should be absent
+from `17323` through `17327` while unloaded. LM Studio is not part of the inference
 topology. The previous token sidecar is not required in the inference path.
 
 With every configured engine empty, confirm both status and the aggregate model
@@ -148,6 +148,44 @@ available when their runtime is installed, external oMLX is not described as
 ready unless its authoritative service responds, and DS4/MFLUX are labeled
 Preview rather than Stable.
 
+### Fleet snapshot and bounded admission
+
+Set different values for `INFERENCE_API_KEY` and `FLEET_API_KEY` in the private
+`.env`, restart the service, and verify the fleet credential boundary:
+
+```bash
+curl -si http://127.0.0.1:1240/fleet/v1/snapshot
+curl -si http://127.0.0.1:1240/fleet/v1/snapshot \
+  -H "Authorization: Bearer $INFERENCE_API_KEY"
+curl -s http://127.0.0.1:1240/fleet/v1/snapshot \
+  -H "Authorization: Bearer $FLEET_API_KEY" | jq
+```
+
+The first two calls must return `401`; the third must return schema version 1
+without a credential, DSN, absolute model path, storage root, or bookmark.
+Successive snapshots must retain `node.node_id` and `node.instance_id` while
+increasing `snapshot_sequence`. Restarting the service must change only the
+instance ID. A managed install pinned to a 40–64 hex Hub revision must be
+`fleet_eligible`; a Finder/manual profile or symbolic revision must be
+`unverified` and ineligible.
+
+For the Nyx rollout, change only `server.inference_bind` from loopback to the
+Mac's trusted LAN or Tailscale address, leave `server.control_bind` on
+loopback, restart, and restrict `:1240` with the host firewall or Tailscale
+ACLs. From Nyx, repeat the authenticated snapshot request against that private
+address before enrolling it in Fleet. Do not expose this bearer-authenticated
+plain-HTTP listener on an untrusted network.
+
+Set `server.max_concurrency` below a llama.cpp profile's `load.parallel`, set
+`server.max_queue_depth: 1`, and issue enough overlapping long requests to
+occupy every permit and the one waiter. Confirm the next request receives
+`429` with `detail.code=node_busy` and `Retry-After: 1` before the inner engine
+sees it. During the run, snapshot `capacity.active`, `capacity.available`,
+`admission.queue_depth`, and `queued_by_deployment` must agree. Queue a
+different model and verify no later request to the old model bypasses it; the
+snapshot must show `draining` and the target deployment ID until every old
+stream closes.
+
 ## 2. Local-library adoption
 
 In **Settings → Models**, choose **Add Existing Models…** and select the exact
@@ -173,8 +211,13 @@ Confirm:
 - an LM Studio model root that is a symlink to a nested external-SSD folder
   remains recorded under the selected symlink path while volume inspection,
   GGUF validation, and model loading operate on its authorized target;
-- `config.yaml` contains a 64-character SHA-256 `scope_id` for a
-  Finder-authorized protected folder but contains no raw/base64 bookmark;
+- an ordinarily accessible Finder-selected folder persists its exact path and
+  volume identity without a `scope_id`, survives app/LaunchAgent restarts and
+  a new login without another selection, and an older unnecessary `scope_id`
+  is removed automatically on the first successful startup probe;
+- `config.yaml` contains a 64-character SHA-256 `scope_id` only for a folder
+  that actually requires the transferred Finder grant, and contains no
+  raw/base64 bookmark;
 - the matching receiver-owned durable bookmark exists only below the
   mode-`0700` private `state/security-scopes/` directory with file mode `0600`;
 - that scope directory remains beside `config.yaml` when
@@ -189,12 +232,13 @@ rejected. Unmount an external library, or mount a different volume at the same
 path, and confirm a request fails before the currently resident model is
 drained.
 
-Quit the menu app, restart the LaunchAgent, and request a model in the
-Finder-authorized folder. Confirm the service reactivates its receiver-owned
-bookmark and that the scoped launcher reactivates it again before `exec` starts
-the managed child. Remove a storage location, restart, and confirm its
-unreferenced private bookmark is pruned while bookmarks still referenced by
-the persisted configuration remain.
+Quit the menu app, restart the LaunchAgent, and request a model from an ordinary
+Finder-selected folder. Confirm the exact persisted path remains usable without
+another selection or a bookmark. For a folder that genuinely requires a grant,
+confirm the service reactivates its receiver-owned bookmark and that the scoped
+launcher reactivates it again before `exec` starts the managed child. Remove a
+storage location, restart, and confirm its unreferenced private bookmark is
+pruned while bookmarks still referenced by the persisted configuration remain.
 
 Also test a protected path whose authorization is unavailable: poll
 `/manager/status` concurrently and confirm the control plane remains responsive
@@ -208,10 +252,12 @@ These protected-folder checks are an outstanding packaged-Mac gate. Confirm
 the app is using either the intended stable `CODESIGN_IDENTITY` or a known
 ad-hoc build. Theseus now has a valid Developer ID Application identity and its
 installed stable-signed bundle should retain that identity across updates;
-switching to an ad-hoc or different signing identity may require folder
-re-selection. Do not expect or claim App Sandbox bookmark entitlements: verify
-the ordinary bookmark's implicit interprocess handoff, receiver-owned bookmark
-creation, LaunchAgent restart, helper restart, and child `exec` directly.
+ordinary accessible folders must remain usable even when the signing identity
+changes. A genuinely protected path may require re-authorization after a
+signing-identity change. Do not expect or claim App Sandbox bookmark
+entitlements: verify the ordinary bookmark's implicit interprocess handoff,
+conditional receiver-owned bookmark creation, LaunchAgent restart, helper
+restart, and child `exec` directly.
 
 ## 3. Managed llama.cpp lifecycle
 
@@ -246,10 +292,14 @@ fail-closed ownership/port error and never signals that process.
 
 ## 4. Managed Hugging Face downloads
 
-In **Settings → Model Library**, choose llama.cpp and search for a GGUF
-repository. Confirm Download remains disabled until an exact quant/shard set is
-selected. Confirm the model-card preview and detected architecture, context
-length, parameter count, and license match the repository metadata. When the
+In **Settings → Model Library**, search once and confirm llama.cpp, oMLX, DS4,
+MFLUX, mlxcel, and mistral.rs candidates share one result list with explicit engine-support badges;
+there must be no engine tabs or picker. Choose a llama.cpp GGUF repository and
+confirm Download remains disabled until an exact quant/shard set is selected.
+Confirm Hugging Face YAML front matter is absent, Markdown headings/lists/links
+are rendered, the card and full detail pane scroll without truncating install
+controls, and detected architecture, context length, parameter count, and
+license match the repository metadata. When the
 repository publishes a vision projector beside the selected GGUF, confirm the
 highest-fidelity option is selected automatically; then exercise both a manual
 choice and **Text only (opt out)**. Choose a GUI-configured storage folder and
@@ -270,6 +320,21 @@ shared, root, escape, and symlink targets are refused and no unrelated files
 are touched. Repeat with a gated repository to prove the write-only `HF_TOKEN`
 reaches only the download worker.
 
+Use an empty unified search and identify results with the DS4 support badge.
+Confirm nine current single-node choices appear: five DeepSeek V4 and four GLM
+5.2. DSpark support weights and
+distributed-only Pro halves must not appear as standalone models. Select the
+Unsloth GLM Q4 choice and confirm its displayed size covers eleven shards; its
+durable install record must retain all eleven exact paths and one immutable
+revision.
+
+For a DeepSeek Flash profile with enough memory headroom, set **Resident request
+sessions** to `2`, restart/reload the profile, and issue two overlapping
+requests. Confirm the DS4 argv contains exactly `--batched-session 2`, status
+reports capacity two, neither request is rejected by manager admission, and
+both leases drain before unload. Repeat with the setting unset and confirm
+authoritative capacity returns to one.
+
 Afterward, `GET /manager/model-library/install-evidence` must show the
 candidate-observed state transitions, including hidden/deleted rows, without
 credentials or arbitrary worker output. The ordinary installs endpoint remains
@@ -282,6 +347,23 @@ oMLX reports exactly one loaded pool model, and a second request reuses it.
 Exercise non-streaming and streaming chat, Responses, embeddings, or rerank as
 allowed by that profile. Explicit unload must converge without an admin-auth
 error.
+
+Set oMLX `scheduler.max_concurrent_requests` above one, leave Unified
+Inference's concurrency ceiling blank, and issue that many overlapping warm
+requests. `GET /manager/status` and the fleet snapshot must report the oMLX
+admin setting as the authoritative capacity while all leases remain on the
+same resident epoch. Then set a lower global ceiling and verify it caps, but
+never raises, the engine limit.
+
+After several requests, inspect `GET /manager/performance` and the menu-bar
+popover. Confirm p50/p95, cold-start count, and streamed tokens/second are
+present and that no prompt or response content appears. Compare the same alias
+against a direct compatible endpoint with `macos/scripts/benchmark_native.py`.
+
+Inspect the oMLX Runtime Updates card's SSD-cache metrics. Exercise **Reset SSD
+Cache…** only with disposable cache state: admission must close, active work
+must drain, all engines must unload, the official oMLX cache-clear API must
+complete, and model weights must remain untouched.
 
 If oMLX rejects unload, do not weaken strict residency. Keep it loopback-only
 and correct its admin authentication/session configuration.
@@ -318,6 +400,71 @@ curl -X POST http://127.0.0.1:17321/manager/reconcile | jq
 
 Mnemosyne must detect the drift, unload it, and never load another target while
 any enabled adapter has uncertain state.
+
+### Per-model engine alternatives, pinning, and automatic selection
+
+Install or import the same logical generation model for two engines. In
+**Models → Engine selection**, attach the second installed profile to the
+first, save, choose **Best fresh benchmark**, and explicitly allow Preview
+engines only when this is intentional. Then choose **Benchmark compatible
+engines** and confirm:
+
+- each exact target becomes resident sequentially and never overlaps another
+  engine;
+- the results contain only fixed metric fields and hashed identities—not the
+  prompt, generated text, credentials, local paths, or upstream log output;
+- fewer than the configured successful samples, any failure rate above 5%, or
+  an improvement below the configured threshold retains the original engine;
+- a selected alternative that fails during model load transparently serves
+  the untouched request through the fallback and clears the stale evidence;
+  a failure after upstream work may have started is not replayed, but the next
+  request uses the fallback;
+- restarting with a changed engine binary, changing the model/load config, or
+  aging the record beyond its limit makes the original engine win until a new
+  benchmark passes;
+- an alternative resident is not advertised to Fleet as the warm primary
+  deployment merely because it shares the public alias; and
+- switching the policy back to **Fixed fallback engine** immediately restores
+  the original routing behavior without deleting weights or benchmark rows.
+
+After benchmarking, choose **Pinned engine**, select the non-winning candidate,
+save, and send both streaming and non-streaming requests. Confirm every new
+request uses the pin regardless of the stored recommendation. Disable that
+engine and confirm an untouched request uses the original fallback. Re-enable
+it and confirm the saved pin resumes. Pinning a non-primary engine must make
+the alias ineligible in the Fleet snapshot so its primary deployment identity
+cannot route to different weights or an engine-specific implementation.
+
+The same content-free evidence is available from
+`GET /manager/benchmarks?alias=<alias>`. Re-run this matrix once with a failed
+alternative load and once while cancelling the benchmark client.
+
+### Per-model context contract
+
+For a generation model with detected native context, open **Models → Context
+window** and verify the detected-native, current-engine, verified, and
+guaranteed values are distinct and clearly labeled. Exercise all three
+policies:
+
+- **Automatic** retains the prior safe value before evidence exists. Choose
+  **Profile usable context** and confirm candidates run sequentially, no model
+  overlap occurs, and a fresh result becomes the advertised guarantee.
+- **Model native maximum** requests the detected value without presenting it as
+  a locally profiled result. If the allocation cannot load, the failure occurs
+  before inference and no smaller ambiguous replay is attempted.
+- **Explicit limit** survives save, service restart, unload/load, and oMLX
+  restart. For oMLX, confirm its official model status reports that exact value
+  after Mnemosyne loads the model; the global 32K fallback must not replace it.
+
+Confirm `GET :1240/v1/models` returns the selected guarantee in
+`max_model_len` and the structured `context_window`, and compare it with
+`GET :17321/manager/contexts?alias=<alias>`. Upgrade one engine runtime (or
+expire the evidence), reconcile, and verify Automatic returns to the persisted
+safe fallback until it is profiled again. Attach an alternative with a smaller
+context guarantee and confirm it cannot win the speed benchmark. Inspect the
+SQLite context row and verify it contains only fingerprints, fixed token
+counts, suite/runtime/system identities, and timestamps—never probe text,
+generated output, paths, credentials, or diagnostics.
 
 ## 8. MFLUX image lifecycle
 
@@ -378,14 +525,16 @@ section.
 - **Storage → Add Model Folder…** opens the native directory chooser; selecting
   an exact nested folder such as `/Volumes/Athena/models` displays that path,
   its containing mount and free space, and never reduces it to `/Volumes/Athena`;
-  the menu transfers its Finder bookmark to the service, the service creates a
-  receiver-owned durable bookmark, only the resulting SHA-256 `scope_id`
-  appears in YAML, and selecting the folder again repairs a missing or stale
-  private bookmark;
+  the menu transfers its Finder bookmark to the service, but an ordinary
+  read/write-accessible folder persists without a `scope_id` and remains usable
+  after restart/login without reselection; only a folder that fails the
+  unscoped capability probe creates a receiver-owned durable bookmark, only its
+  resulting SHA-256 `scope_id` appears in YAML, and selecting that protected
+  folder again repairs a missing or stale private bookmark;
   unmount the drive and confirm the location becomes unavailable, then mount a
   different volume at the same path and confirm the UUID mismatch fails closed;
-- **Model Library** exposes engine and model choices through pickers/lists,
-  never a raw repository or storage-path field; start a small compatible test
+- **Model Library** exposes one cross-engine list with engine-support badges,
+  never engine tabs or a raw repository/storage-path field; start a small compatible test
   download, confirm bytes/total, percentage, progress, and speed update live,
   then close/reopen Settings and confirm progress persists and cancel/retry
   work without making any model resident;
@@ -444,6 +593,14 @@ MFLUX matches the official PyPI version, and DS4 shows the current official
 `antirez/ds4` commit. No dependency metadata should be requested from the
 Unified Inference GitHub repository.
 
+For a stable Homebrew-owned oMLX installation with an update available,
+confirm the UI displays the exact stop/update/upgrade/start sequence. Begin a
+long request and approve the update: it must wait for the lease, invoke only
+those fixed owner commands, restart oMLX, validate an authoritative empty
+inventory, and then reopen admission. A Homebrew HEAD build must refuse this
+path and present stable migration guidance; an official app must continue to
+delegate updates to its own updater.
+
 Start a long request, then install an available official update. The download
 and validation phase must not disturb the resident model. For llama.cpp,
 confirm the asset name/URL, GitHub-published size and SHA-256, safe archive
@@ -500,7 +657,7 @@ This gate applies only to a machine with an older LM Studio-backed
 configuration or model library.
 
 1. Stop LM Studio before starting Unified Inference.
-2. Open the upgraded schema-version-2 configuration and confirm there is no
+2. Open the upgraded schema-version-5 configuration and confirm there is no
    `engines.lmstudio` block. Old LM Studio profiles should appear only under
    `migration.legacy_lmstudio_profiles` and must not appear in `/v1/models`.
 3. Confirm **Detected model folders** offers the configured

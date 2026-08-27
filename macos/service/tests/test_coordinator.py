@@ -8,6 +8,7 @@ from mnemosyne_macos.config import MacConfig
 from mnemosyne_macos.coordinator import (
     CoordinatorError,
     CoordinatorState,
+    QueueFull,
     QueueTimeout,
     ResidencyCoordinator,
 )
@@ -113,7 +114,12 @@ def _targets() -> tuple[ResolvedTarget, ResolvedTarget]:
                 "omlx": {"enabled": True},
             },
             "models": [
-                {"alias": "studio", "engine": "llama.cpp", "model": "org/studio"},
+                {
+                    "alias": "studio",
+                    "engine": "llama.cpp",
+                    "model": "org/studio",
+                    "load": {"parallel": 4},
+                },
                 {"alias": "glm", "engine": "omlx", "model": "org/glm"},
             ]
         }
@@ -153,6 +159,78 @@ async def test_concurrent_same_target_coalesces_one_load() -> None:
 
     await first.release()
     await second.release()
+
+
+@pytest.mark.asyncio
+async def test_warm_fast_path_uses_free_permits_before_bounding_waiters() -> None:
+    events: list[str] = []
+    adapters = {
+        engine: FakeAdapter(engine, events)
+        for engine in (EngineName.LLAMA_CPP, EngineName.OMLX, EngineName.DS4)
+    }
+    coordinator = ResidencyCoordinator(
+        adapters,
+        queue_timeout_seconds=2,
+        transition_timeout_seconds=2,
+        cleanup_timeout_seconds=2,
+        configured_max_concurrency=2,
+        max_queue_depth=1,
+    )
+    studio, _glm = _targets()
+    await coordinator.initialize()
+
+    first = await coordinator.acquire(studio)
+    # Both warm requests fit the effective limit. Neither consumes the sole
+    # waiter slot, even when they arrive without yielding to the driver.
+    second = await coordinator.acquire(studio)
+    queued_task = asyncio.create_task(coordinator.acquire(studio))
+    await asyncio.sleep(0)
+
+    status = await coordinator.status()
+    assert status.inflight == 2
+    assert status.queued == 1
+    assert status.capacity is not None
+    assert status.capacity.effective_limit == 2
+    assert status.capacity.available == 0
+
+    with pytest.raises(QueueFull, match="1 waiters"):
+        await coordinator.acquire(studio)
+
+    await first.release()
+    third = await asyncio.wait_for(queued_task, timeout=1)
+    assert (await coordinator.status()).inflight == 2
+    await second.release()
+    await third.release()
+
+
+@pytest.mark.asyncio
+async def test_abort_fences_queued_successor_before_unloading_resident() -> None:
+    events: list[str] = []
+    coordinator, adapters = _coordinator(events)
+    studio, glm = _targets()
+    await coordinator.initialize()
+    lease = await coordinator.acquire(studio)
+
+    successor = asyncio.create_task(coordinator.acquire(glm))
+    for _ in range(50):
+        if (await coordinator.status()).queued == 1:
+            break
+        await asyncio.sleep(0)
+
+    await lease.abort()
+
+    with pytest.raises(CoordinatorError, match="abort in progress"):
+        await successor
+    status = await coordinator.status()
+    assert status.state == CoordinatorState.IDLE
+    assert status.inflight == 0
+    assert status.queued == 0
+    assert status.resident_alias is None
+    assert adapters[EngineName.LLAMA_CPP].residents == []
+    assert "load:omlx:glm" not in events
+
+    recovered = await coordinator.acquire(glm)
+    await recovered.release()
 
 
 @pytest.mark.asyncio
@@ -525,6 +603,80 @@ async def test_same_alias_with_changed_load_digest_reloads() -> None:
     second_lease = await coordinator.acquire(second)
     await second_lease.release()
     assert adapters[EngineName.LLAMA_CPP].load_count == 2
+
+
+@pytest.mark.asyncio
+async def test_same_model_with_changed_served_name_reloads() -> None:
+    events: list[str] = []
+    coordinator, adapters = _coordinator(events)
+    await coordinator.initialize()
+    profiles = MacConfig.model_validate(
+        {
+            "models": [
+                {
+                    "alias": "first",
+                    "engine": "llama.cpp",
+                    "model": "org/studio",
+                    "served_model_name": "served-first",
+                },
+                {
+                    "alias": "second",
+                    "engine": "llama.cpp",
+                    "model": "org/studio",
+                    "served_model_name": "served-second",
+                },
+            ]
+        }
+    ).profiles()
+    assert profiles["first"].key == profiles["second"].key
+
+    first = await coordinator.acquire(profiles["first"])
+    await first.release()
+    second = await coordinator.acquire(profiles["second"])
+
+    assert adapters[EngineName.LLAMA_CPP].load_count == 2
+    assert second.handle.wire_model == "served-second"
+    await second.release()
+
+
+@pytest.mark.asyncio
+async def test_llama_capability_launch_modes_do_not_share_a_resident() -> None:
+    events: list[str] = []
+    coordinator, adapters = _coordinator(events)
+    await coordinator.initialize()
+    profiles = MacConfig.model_validate(
+        {
+            "models": [
+                {
+                    "alias": "generation",
+                    "engine": "llama.cpp",
+                    "model": "org/shared",
+                    "served_model_name": "shared-wire",
+                },
+                {
+                    "alias": "embeddings",
+                    "engine": "llama.cpp",
+                    "model": "org/shared",
+                    "served_model_name": "shared-wire",
+                    "capabilities": ["embeddings"],
+                },
+                {
+                    "alias": "rerank",
+                    "engine": "llama.cpp",
+                    "model": "org/shared",
+                    "served_model_name": "shared-wire",
+                    "capabilities": ["rerank"],
+                },
+            ]
+        }
+    ).profiles()
+    assert len({target.key for target in profiles.values()}) == 1
+
+    for alias in ("generation", "embeddings", "rerank"):
+        lease = await coordinator.acquire(profiles[alias])
+        await lease.release()
+
+    assert adapters[EngineName.LLAMA_CPP].load_count == 3
 
 
 @pytest.mark.asyncio

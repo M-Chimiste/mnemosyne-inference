@@ -58,6 +58,17 @@ def suggested_model_alias(
     return alias if alias and _ALIAS_RE.fullmatch(alias) else fallback
 
 
+def ds4_wire_model_name(model: str) -> str:
+    """Return the canonical model id accepted by the upstream DS4 server."""
+
+    basename = Path(model).name.casefold()
+    if "glm-5.2" in basename:
+        return "glm-5.2"
+    if "deepseek-v4-pro" in basename:
+        return "deepseek-v4-pro"
+    return "deepseek-v4-flash"
+
+
 class ServerConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -65,15 +76,21 @@ class ServerConfig(BaseModel):
     inference_port: int = Field(default=1240, ge=1024, le=65535)
     control_bind: str = "127.0.0.1"
     control_port: int = Field(default=17321, ge=1024, le=65535)
-    idle_unload_seconds: int | None = Field(default=900, ge=1)
+    # Interactive Macs benefit far more from retaining one verified resident
+    # than from repeatedly reloading weights and rebuilding/scanning KV caches.
+    # Memory-conscious installations can opt into a positive idle timeout.
+    idle_unload_seconds: int | None = Field(default=None, ge=1)
     startup_timeout_seconds: float = Field(default=900, gt=0)
     swap_queue_timeout_seconds: float = Field(default=300, gt=0)
+    max_concurrency: int | None = Field(default=None, ge=1)
+    max_queue_depth: int = Field(default=128, ge=1, le=100_000)
     shutdown_grace_seconds: float = Field(default=30, gt=0)
     reconcile_interval_seconds: float = Field(default=30, ge=5)
     image_request_timeout_seconds: float = Field(default=1800, gt=0)
     image_max_pixels: int = Field(default=4_194_304, ge=4096)
     startup_policy: str = "unload_all"
     inference_api_key_env: str = "INFERENCE_API_KEY"
+    fleet_api_key_env: str = "FLEET_API_KEY"
     control_password_env: str = "ADMIN_PASSWORD"
 
     @model_validator(mode="after")
@@ -165,6 +182,53 @@ class DS4Config(BaseModel):
         return value
 
 
+class MLXcelConfig(BaseModel):
+    """Manager-owned native MLX server (Preview).
+
+    The conventional Homebrew path is only a discovery-friendly default.
+    Mnemosyne never installs, upgrades, or replaces that external binary as a
+    side effect of enabling the adapter.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    host: str = "127.0.0.1"
+    port: int = Field(default=17326, ge=1024, le=65535)
+    binary: str = "/opt/homebrew/bin/mlxcel-server"
+    working_directory: str = str(_APP_SUPPORT)
+    process_state_path: str = str(_APP_SUPPORT / "state" / "mlxcel-process.json")
+    request_timeout_seconds: float = Field(default=30, gt=0)
+    shutdown_grace_seconds: float = Field(default=30, gt=0)
+
+    @field_validator("host")
+    @classmethod
+    def _loopback_only(cls, value: str) -> str:
+        return _validate_loopback_host(value, engine="mlxcel")
+
+
+class MistralRSConfig(BaseModel):
+    """Manager-owned mistral.rs server (Preview)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    host: str = "127.0.0.1"
+    port: int = Field(default=17327, ge=1024, le=65535)
+    binary: str = str(Path.home() / ".local" / "bin" / "mistralrs")
+    working_directory: str = str(_APP_SUPPORT)
+    process_state_path: str = str(
+        _APP_SUPPORT / "state" / "mistral-rs-process.json"
+    )
+    request_timeout_seconds: float = Field(default=30, gt=0)
+    shutdown_grace_seconds: float = Field(default=30, gt=0)
+
+    @field_validator("host")
+    @classmethod
+    def _loopback_only(cls, value: str) -> str:
+        return _validate_loopback_host(value, engine="mistral.rs")
+
+
 class MFluxConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -196,6 +260,8 @@ class EnginesConfig(BaseModel):
     omlx: OMLXConfig = Field(default_factory=OMLXConfig)
     ds4: DS4Config = Field(default_factory=DS4Config)
     mflux: MFluxConfig = Field(default_factory=MFluxConfig)
+    mlxcel: MLXcelConfig = Field(default_factory=MLXcelConfig)
+    mistral_rs: MistralRSConfig = Field(default_factory=MistralRSConfig)
 
 
 class ModelLoadConfig(BaseModel):
@@ -261,18 +327,304 @@ class ImageProfileConfig(BaseModel):
         return value
 
 
+class ModelSelectionConfig(BaseModel):
+    """Policy for choosing among exact, explicitly configured candidates."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    mode: Literal["fixed", "benchmark", "pinned"] = "fixed"
+    pinned_engine: EngineName | None = None
+    objective: Literal["balanced", "latency", "throughput"] = "balanced"
+    max_benchmark_age_hours: int = Field(default=168, ge=1, le=24 * 365)
+    minimum_samples: int = Field(default=3, ge=1, le=20)
+    minimum_improvement_percent: float = Field(default=5.0, ge=0, le=100)
+    allow_preview: bool = False
+
+
+class ModelContextConfig(BaseModel):
+    """User policy and immutable metadata for one engine candidate."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    mode: Literal["automatic", "native", "fixed"] = "automatic"
+    native_tokens: int | None = Field(default=None, gt=0, le=10_000_000)
+    fixed_tokens: int | None = Field(default=None, gt=0, le=10_000_000)
+    max_verified_age_hours: int = Field(default=720, ge=1, le=24 * 365)
+
+    @model_validator(mode="after")
+    def _validate_mode(self) -> "ModelContextConfig":
+        if self.mode == "fixed" and self.fixed_tokens is None:
+            raise ValueError("fixed context policy requires fixed_tokens")
+        if self.mode != "fixed" and self.fixed_tokens is not None:
+            raise ValueError("fixed_tokens requires mode='fixed'")
+        if self.mode == "native" and self.native_tokens is None:
+            raise ValueError("native context policy requires detected native_tokens")
+        if (
+            self.fixed_tokens is not None
+            and self.native_tokens is not None
+            and self.fixed_tokens > self.native_tokens
+        ):
+            raise ValueError("fixed context cannot exceed the detected native limit")
+        return self
+
+
+def _validate_language_engine_options(
+    *,
+    engine: EngineName,
+    load: ModelLoadConfig,
+    capabilities: set[Endpoint] | None,
+) -> None:
+    if capabilities is not None and not capabilities:
+        raise ValueError("capabilities must contain at least one endpoint")
+    if capabilities is not None and Endpoint.IMAGES_GENERATIONS in capabilities:
+        raise ValueError("images/generations capability requires engine='mflux'")
+    if engine == EngineName.MFLUX:
+        raise ValueError("MFLUX cannot be used as a language-engine candidate")
+    if engine != EngineName.DS4 and (
+        load.kv_disk_directory is not None or load.kv_disk_space_mb is not None
+    ):
+        raise ValueError("KV disk settings require engine='ds4'")
+    if engine not in {
+        EngineName.DS4,
+        EngineName.LLAMA_CPP,
+        EngineName.MLXCEL,
+        EngineName.MISTRAL_RS,
+    } and load.extra_args:
+        raise ValueError(
+            "extra_args settings require a manager-owned language engine"
+        )
+    if engine == EngineName.OMLX and any(
+        value is not None
+        for value in (
+            load.context_length,
+            load.eval_batch_size,
+            load.flash_attention,
+            load.offload_kv_cache_to_gpu,
+            load.projector_path,
+            load.gpu_layers,
+            load.ubatch_size,
+            load.threads,
+            load.parallel,
+            load.pooling,
+        )
+    ):
+        raise ValueError("oMLX load settings belong in oMLX per-model settings")
+    if engine in {EngineName.DS4, EngineName.MLXCEL, EngineName.MISTRAL_RS}:
+        unsupported = (
+            load.eval_batch_size,
+            load.flash_attention,
+            load.offload_kv_cache_to_gpu,
+            load.projector_path,
+            load.gpu_layers,
+            load.ubatch_size,
+            load.threads,
+            load.pooling,
+        )
+        if any(value is not None for value in unsupported):
+            raise ValueError(
+                "llama.cpp-specific load settings are not supported by "
+                f"{'DS4' if engine == EngineName.DS4 else engine.value}"
+            )
+    if engine == EngineName.MISTRAL_RS and (
+        load.context_length is not None or load.parallel is not None
+    ):
+        raise ValueError(
+            "mistral.rs context and scheduler tuning must use reviewed extra_args"
+        )
+    if engine == EngineName.LLAMA_CPP:
+        effective = capabilities or set(DEFAULT_CAPABILITIES[EngineName.LLAMA_CPP])
+        generation = effective & {
+            Endpoint.CHAT_COMPLETIONS,
+            Endpoint.COMPLETIONS,
+            Endpoint.RESPONSES,
+            Endpoint.MESSAGES,
+        }
+        specialized = effective & {Endpoint.EMBEDDINGS, Endpoint.RERANK}
+        if generation and specialized:
+            raise ValueError(
+                "llama.cpp generation profiles cannot also advertise embeddings or rerank"
+            )
+        if Endpoint.RERANK in effective and effective != {Endpoint.RERANK}:
+            raise ValueError("llama.cpp rerank profiles must use only the rerank capability")
+        if load.projector_path is not None and not generation:
+            raise ValueError("llama.cpp projectors require a generation-capable profile")
+
+
+def _validate_context_engine_options(
+    *, engine: EngineName, context: ModelContextConfig
+) -> None:
+    if engine == EngineName.MISTRAL_RS and context.mode != "automatic":
+        raise ValueError(
+            "mistral.rs explicit/native context policy requires a reviewed runtime flag contract"
+        )
+
+
+def _resolve_language_target(
+    *,
+    alias: str,
+    engine: EngineName,
+    model: str,
+    served_model_name: str | None,
+    capabilities: set[Endpoint] | None,
+    load: ModelLoadConfig,
+    context: ModelContextConfig,
+    storage_path: str | None,
+    scope_id: str | None,
+    storage_volume_uuid: str | None,
+) -> ResolvedTarget:
+    load_options = load.model_dump(exclude_none=True, exclude_defaults=True)
+    requested_context = (
+        context.fixed_tokens
+        if context.mode == "fixed"
+        else context.native_tokens
+        if context.mode == "native"
+        else load.context_length
+    )
+    if engine in {EngineName.LLAMA_CPP, EngineName.DS4, EngineName.MLXCEL}:
+        if requested_context is None:
+            load_options.pop("context_length", None)
+        else:
+            load_options["context_length"] = requested_context
+    canonical = (
+        os.path.abspath(os.path.expanduser(model))
+        if engine
+        in {
+            EngineName.DS4,
+            EngineName.LLAMA_CPP,
+            EngineName.MLXCEL,
+            EngineName.MISTRAL_RS,
+        }
+        else model
+    )
+    payload = json.dumps(
+        {
+            "load": load_options,
+            "context_mode": context.mode,
+            "requested_context": requested_context,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+    wire_model = (
+        ds4_wire_model_name(model)
+        if engine == EngineName.DS4
+        else "default"
+        if engine == EngineName.MISTRAL_RS and served_model_name is None
+        else served_model_name
+        or (alias if engine in {EngineName.LLAMA_CPP, EngineName.MLXCEL} else model)
+    )
+    return ResolvedTarget(
+        alias=alias,
+        key=TargetKey(
+            engine=engine,
+            canonical_model_id=canonical,
+            load_config_digest=digest,
+        ),
+        wire_model=wire_model,
+        capabilities=(
+            frozenset(capabilities)
+            if capabilities is not None
+            else DEFAULT_CAPABILITIES[engine]
+        ),
+        load_options=load_options,
+        storage_path=storage_path,
+        scope_id=scope_id,
+        storage_volume_uuid=storage_volume_uuid,
+        context_mode=context.mode,
+        native_context_length=context.native_tokens,
+        requested_context_length=requested_context,
+        context_max_verified_age_hours=context.max_verified_age_hours,
+    )
+
+
+class ModelEngineAlternative(BaseModel):
+    """An exact alternative implementation for the same public model alias."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    engine: EngineName
+    model: str
+    # UI-created alternatives retain the disabled source alias so detach can
+    # restore exactly the original profile after a save/restart.
+    source_alias: str | None = None
+    storage: str | None = None
+    served_model_name: str | None = None
+    capabilities: set[Endpoint] | None = None
+    load: ModelLoadConfig = Field(default_factory=ModelLoadConfig)
+    context: ModelContextConfig = Field(default_factory=ModelContextConfig)
+    enabled: bool = True
+
+    @field_validator("model")
+    @classmethod
+    def _model_required(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("model must not be empty")
+        return value
+
+    @field_validator("source_alias")
+    @classmethod
+    def _valid_source_alias(cls, value: str | None) -> str | None:
+        if value is not None and not _ALIAS_RE.fullmatch(value):
+            raise ValueError(
+                "source_alias must use the same syntax as a model alias"
+            )
+        return value
+
+    @field_validator("served_model_name")
+    @classmethod
+    def _served_name_not_empty(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError("served_model_name must not be empty")
+        return value
+
+    @model_validator(mode="after")
+    def _validate_engine_options(self) -> "ModelEngineAlternative":
+        _validate_language_engine_options(
+            engine=self.engine,
+            load=self.load,
+            capabilities=self.capabilities,
+        )
+        _validate_context_engine_options(engine=self.engine, context=self.context)
+        return self
+
+    def resolve(
+        self,
+        *,
+        alias: str,
+        storage_path: str | None = None,
+        scope_id: str | None = None,
+        storage_volume_uuid: str | None = None,
+    ) -> ResolvedTarget:
+        return _resolve_language_target(
+            alias=alias,
+            engine=self.engine,
+            model=self.model,
+            served_model_name=self.served_model_name,
+            capabilities=self.capabilities,
+            load=self.load,
+            context=self.context,
+            storage_path=storage_path,
+            scope_id=scope_id,
+            storage_volume_uuid=storage_volume_uuid,
+        )
+
+
 class ModelProfile(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    alias: str
+    alias: str = Field(max_length=128)
     engine: EngineName
     model: str
     storage: str | None = None
     served_model_name: str | None = None
     capabilities: set[Endpoint] | None = None
     load: ModelLoadConfig = Field(default_factory=ModelLoadConfig)
+    context: ModelContextConfig = Field(default_factory=ModelContextConfig)
     kind: ModelKind = ModelKind.LANGUAGE
     image: ImageProfileConfig | None = None
+    alternatives: list[ModelEngineAlternative] = Field(default_factory=list)
+    selection: ModelSelectionConfig = Field(default_factory=ModelSelectionConfig)
     enabled: bool = True
 
     @field_validator("alias")
@@ -305,75 +657,86 @@ class ModelProfile(BaseModel):
                 raise ValueError("MFLUX profiles require kind='image' and image settings")
             if self.load != ModelLoadConfig():
                 raise ValueError("MFLUX profiles use image settings, not language load settings")
+            if self.context != ModelContextConfig():
+                raise ValueError("MFLUX profiles do not use language context settings")
             if self.capabilities is not None and self.capabilities != {
                 Endpoint.IMAGES_GENERATIONS
             }:
                 raise ValueError("MFLUX profiles only support images/generations")
+            if self.alternatives:
+                raise ValueError("image profiles do not support engine alternatives")
+            if self.selection.mode != "fixed":
+                raise ValueError("image profiles use fixed engine selection")
+            if self.selection.pinned_engine is not None:
+                raise ValueError("image profiles cannot retain a pinned language engine")
         elif self.kind == ModelKind.IMAGE or self.image is not None:
             raise ValueError("image profiles require engine='mflux'")
-        elif self.capabilities is not None and Endpoint.IMAGES_GENERATIONS in self.capabilities:
-            raise ValueError("images/generations capability requires engine='mflux'")
-        if self.engine != EngineName.DS4 and (
-            self.load.kv_disk_directory is not None
-            or self.load.kv_disk_space_mb is not None
-        ):
-            raise ValueError("KV disk settings require engine='ds4'")
-        if self.engine not in {EngineName.DS4, EngineName.LLAMA_CPP} and self.load.extra_args:
-            raise ValueError(
-                "extra_args settings require engine='ds4' or 'llama.cpp'"
+        else:
+            _validate_language_engine_options(
+                engine=self.engine,
+                load=self.load,
+                capabilities=self.capabilities,
             )
-        if self.engine == EngineName.OMLX and any(
-            value is not None
-            for value in (
-                self.load.context_length,
-                self.load.eval_batch_size,
-                self.load.flash_attention,
-                self.load.offload_kv_cache_to_gpu,
-                self.load.projector_path,
-                self.load.gpu_layers,
-                self.load.ubatch_size,
-                self.load.threads,
-                self.load.parallel,
-                self.load.pooling,
-            )
-        ):
-            raise ValueError("oMLX load settings belong in oMLX per-model settings")
-        if self.engine == EngineName.DS4 and any(
-            value is not None
-            for value in (
-                self.load.eval_batch_size,
-                self.load.flash_attention,
-                self.load.offload_kv_cache_to_gpu,
-                self.load.projector_path,
-                self.load.gpu_layers,
-                self.load.ubatch_size,
-                self.load.threads,
-                self.load.parallel,
-                self.load.pooling,
-            )
-        ):
-            raise ValueError("llama.cpp load settings are not supported by DS4")
-        if self.engine == EngineName.LLAMA_CPP:
-            capabilities = self.capabilities or set(DEFAULT_CAPABILITIES[EngineName.LLAMA_CPP])
-            generation = capabilities & {
-                Endpoint.CHAT_COMPLETIONS,
-                Endpoint.COMPLETIONS,
-                Endpoint.RESPONSES,
-                Endpoint.MESSAGES,
+            _validate_context_engine_options(engine=self.engine, context=self.context)
+        if self.selection.mode == "benchmark" and not self.alternatives:
+            raise ValueError("benchmark selection requires at least one engine alternative")
+        if self.selection.mode == "pinned":
+            if self.selection.pinned_engine is None:
+                raise ValueError("pinned engine selection requires pinned_engine")
+            declared_engines = {
+                self.engine,
+                *(alternative.engine for alternative in self.alternatives),
             }
-            specialized = capabilities & {Endpoint.EMBEDDINGS, Endpoint.RERANK}
-            if generation and specialized:
+            if self.selection.pinned_engine not in declared_engines:
                 raise ValueError(
-                    "llama.cpp generation profiles cannot also advertise embeddings or rerank"
+                    "pinned_engine must name the primary engine or a declared alternative"
                 )
-            if Endpoint.RERANK in capabilities and capabilities != {Endpoint.RERANK}:
-                raise ValueError("llama.cpp rerank profiles must use only the rerank capability")
-            if self.load.projector_path is not None and not generation:
+        if self.selection.mode == "benchmark":
+            primary_capabilities = self.capabilities or set(
+                DEFAULT_CAPABILITIES[self.engine]
+            )
+            chat_candidates = int(Endpoint.CHAT_COMPLETIONS in primary_capabilities)
+            chat_candidates += sum(
+                Endpoint.CHAT_COMPLETIONS
+                in (
+                    alternative.capabilities
+                    or set(DEFAULT_CAPABILITIES[alternative.engine])
+                )
+                for alternative in self.alternatives
+                if alternative.enabled
+            )
+            if chat_candidates < 2:
                 raise ValueError(
-                    "llama.cpp projectors require a generation-capable profile"
+                    "benchmark selection requires at least two enabled "
+                    "chat-capable engine candidates"
                 )
-        if self.capabilities is not None and not self.capabilities:
-            raise ValueError("capabilities must contain at least one endpoint")
+        candidate_identities = [
+            (
+                alternative.engine,
+                alternative.model,
+                json.dumps(
+                    {
+                        "load": alternative.load.model_dump(mode="json"),
+                        "context": alternative.context.model_dump(mode="json"),
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            )
+            for alternative in self.alternatives
+            if alternative.enabled
+        ]
+        if len(candidate_identities) != len(set(candidate_identities)):
+            raise ValueError("model engine alternatives must be unique")
+        candidate_engines = [self.engine] + [
+            alternative.engine
+            for alternative in self.alternatives
+            if alternative.enabled
+        ]
+        if len(candidate_engines) != len(set(candidate_engines)):
+            raise ValueError(
+                "a model profile may declare at most one candidate per engine"
+            )
         return self
 
     def resolve(
@@ -395,38 +758,36 @@ class ModelProfile(BaseModel):
                 "num_inference_steps": self.image.num_inference_steps,
                 "guidance_scale": self.image.guidance_scale,
             }
-        else:
-            load_options = self.load.model_dump(exclude_none=True, exclude_defaults=True)
-            image_defaults = {}
-        canonical = (
-            os.path.abspath(os.path.expanduser(self.model))
-            if self.engine in {EngineName.DS4, EngineName.LLAMA_CPP}
-            else self.model
-        )
-        payload = json.dumps(load_options, sort_keys=True, separators=(",", ":"))
-        digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
-        wire_model = self.served_model_name or (
-            self.alias
-            if self.engine in {EngineName.DS4, EngineName.LLAMA_CPP, EngineName.MFLUX}
-            else self.model
-        )
-        capabilities = (
-            frozenset(self.capabilities)
-            if self.capabilities is not None
-            else DEFAULT_CAPABILITIES[self.engine]
-        )
-        return ResolvedTarget(
+            payload = json.dumps(load_options, sort_keys=True, separators=(",", ":"))
+            digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+            return ResolvedTarget(
+                alias=self.alias,
+                key=TargetKey(
+                    engine=self.engine,
+                    canonical_model_id=self.model,
+                    load_config_digest=digest,
+                ),
+                wire_model=self.served_model_name or self.alias,
+                capabilities=(
+                    frozenset(self.capabilities)
+                    if self.capabilities is not None
+                    else DEFAULT_CAPABILITIES[self.engine]
+                ),
+                load_options=load_options,
+                kind=self.kind,
+                image_defaults=image_defaults,
+                storage_path=storage_path,
+                scope_id=scope_id,
+                storage_volume_uuid=storage_volume_uuid,
+            )
+        return _resolve_language_target(
             alias=self.alias,
-            key=TargetKey(
-                engine=self.engine,
-                canonical_model_id=canonical,
-                load_config_digest=digest,
-            ),
-            wire_model=wire_model,
-            capabilities=capabilities,
-            load_options=load_options,
-            kind=self.kind,
-            image_defaults=image_defaults,
+            engine=self.engine,
+            model=self.model,
+            served_model_name=self.served_model_name,
+            capabilities=self.capabilities,
+            load=self.load,
+            context=self.context,
             storage_path=storage_path,
             scope_id=scope_id,
             storage_volume_uuid=storage_volume_uuid,
@@ -504,6 +865,28 @@ class StorageLocationConfig(BaseModel):
             raise ValueError("storage scope_id must be a SHA-256 identifier")
         return normalized
 
+    @model_validator(mode="after")
+    def _internal_storage_does_not_need_a_bookmark(self) -> "StorageLocationConfig":
+        """Drop obsolete Finder grants for the app-owned internal model root.
+
+        Older builds allowed the internal Application Support folder to be
+        selected through Finder and persisted a security-scoped bookmark for
+        it. A signing-identity change can invalidate that bookmark even though
+        the unsandboxed per-user service already owns this private folder.
+        Keeping the stale scope would unnecessarily degrade startup and every
+        model-storage probe.
+        """
+
+        configured = os.path.normcase(
+            os.path.normpath(os.path.abspath(os.path.expanduser(self.path)))
+        )
+        internal = os.path.normcase(
+            os.path.normpath(os.path.abspath(str(_APP_SUPPORT / "models")))
+        )
+        if configured == internal:
+            self.scope_id = None
+        return self
+
 
 def _default_storage_locations() -> list[StorageLocationConfig]:
     return [
@@ -540,7 +923,7 @@ class StorageConfig(BaseModel):
 class MacConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    schema_version: Literal[2] = 2
+    schema_version: Literal[6] = 6
     server: ServerConfig = Field(default_factory=ServerConfig)
     engines: EnginesConfig = Field(default_factory=EnginesConfig)
     paths: PathsConfig = Field(default_factory=PathsConfig)
@@ -556,6 +939,36 @@ class MacConfig(BaseModel):
             return value
         raw = copy.deepcopy(value)
         version = raw.get("schema_version", 1)
+
+        def add_context_policy(candidate: Any) -> None:
+            if not isinstance(candidate, dict) or candidate.get("engine") == "mflux":
+                return
+            if "context" not in candidate:
+                load = candidate.get("load")
+                configured = (
+                    load.get("context_length")
+                    if isinstance(load, dict)
+                    else None
+                )
+                candidate["context"] = (
+                    {"mode": "fixed", "fixed_tokens": configured}
+                    if isinstance(configured, int) and configured > 0
+                    else {"mode": "automatic"}
+                )
+            alternatives = candidate.get("alternatives")
+            if isinstance(alternatives, list):
+                for alternative in alternatives:
+                    add_context_policy(alternative)
+
+        if version in {2, 3, 4, 5}:
+            models = raw.get("models")
+            if isinstance(models, list):
+                for profile in models:
+                    add_context_policy(profile)
+            raw["schema_version"] = 6
+            return raw
+        if version == 6:
+            return raw
         if version != 1:
             return raw
 
@@ -606,7 +1019,11 @@ class MacConfig(BaseModel):
             migrated_profiles = [*previous, *migrated_profiles]
         migration["legacy_lmstudio_profiles"] = migrated_profiles
         raw["migration"] = migration
-        raw["schema_version"] = 2
+        models = raw.get("models")
+        if isinstance(models, list):
+            for profile in models:
+                add_context_policy(profile)
+        raw["schema_version"] = 6
         return raw
 
     @model_validator(mode="after")
@@ -617,11 +1034,17 @@ class MacConfig(BaseModel):
             raise ValueError(f"duplicate model aliases: {duplicates}")
 
         storage_names = {location.name for location in self.storage.locations}
-        invalid_storage = sorted(
-            profile.alias
-            for profile in self.models
-            if profile.storage is not None and profile.storage not in storage_names
-        )
+        invalid_storage: list[str] = []
+        for profile in self.models:
+            if profile.storage is not None and profile.storage not in storage_names:
+                invalid_storage.append(profile.alias)
+            invalid_storage.extend(
+                f"{profile.alias}:{alternative.engine.value}"
+                for alternative in profile.alternatives
+                if alternative.storage is not None
+                and alternative.storage not in storage_names
+            )
+        invalid_storage.sort()
         if invalid_storage:
             raise ValueError(
                 "model profiles reference unknown storage locations: "
@@ -651,6 +1074,10 @@ class MacConfig(BaseModel):
             ports["ds4"] = self.engines.ds4.port
         if self.engines.mflux.enabled:
             ports["mflux"] = self.engines.mflux.port
+        if self.engines.mlxcel.enabled:
+            ports["mlxcel"] = self.engines.mlxcel.port
+        if self.engines.mistral_rs.enabled:
+            ports["mistral.rs"] = self.engines.mistral_rs.port
         by_port: dict[int, list[str]] = {}
         for name, port in ports.items():
             by_port.setdefault(port, []).append(name)
@@ -665,7 +1092,21 @@ class MacConfig(BaseModel):
             EngineName.OMLX: self.engines.omlx.enabled,
             EngineName.DS4: self.engines.ds4.enabled,
             EngineName.MFLUX: self.engines.mflux.enabled,
+            EngineName.MLXCEL: self.engines.mlxcel.enabled,
+            EngineName.MISTRAL_RS: self.engines.mistral_rs.enabled,
         }[engine]
+
+    @staticmethod
+    def _resolve_storage(
+        storage: str | None,
+        locations: dict[str, StorageLocationConfig],
+    ) -> tuple[str | None, str | None, str | None]:
+        location = locations.get(storage) if storage else None
+        return (
+            location.path if location is not None else None,
+            location.scope_id if location is not None else None,
+            location.volume_uuid if location is not None else None,
+        )
 
     def profiles(self) -> dict[str, ResolvedTarget]:
         locations = {location.name: location for location in self.storage.locations}
@@ -673,15 +1114,53 @@ class MacConfig(BaseModel):
         for profile in self.models:
             if not profile.enabled or not self.engine_enabled(profile.engine):
                 continue
-            location = locations.get(profile.storage) if profile.storage else None
+            storage_path, scope_id, volume_uuid = self._resolve_storage(
+                profile.storage, locations
+            )
             profiles[profile.alias] = profile.resolve(
-                storage_path=location.path if location is not None else None,
-                scope_id=location.scope_id if location is not None else None,
-                storage_volume_uuid=(
-                    location.volume_uuid if location is not None else None
-                ),
+                storage_path=storage_path,
+                scope_id=scope_id,
+                storage_volume_uuid=volume_uuid,
             )
         return profiles
+
+    def profile_candidates(self) -> dict[str, tuple[ResolvedTarget, ...]]:
+        """Return enabled primary/fallback targets without selecting among them."""
+
+        locations = {location.name: location for location in self.storage.locations}
+        result: dict[str, tuple[ResolvedTarget, ...]] = {}
+        for profile in self.models:
+            if (
+                not profile.enabled
+                or not self.engine_enabled(profile.engine)
+            ):
+                continue
+            storage_path, scope_id, volume_uuid = self._resolve_storage(
+                profile.storage, locations
+            )
+            candidates = [
+                profile.resolve(
+                    storage_path=storage_path,
+                    scope_id=scope_id,
+                    storage_volume_uuid=volume_uuid,
+                )
+            ]
+            for alternative in profile.alternatives:
+                if not alternative.enabled or not self.engine_enabled(alternative.engine):
+                    continue
+                alt_path, alt_scope, alt_volume = self._resolve_storage(
+                    alternative.storage, locations
+                )
+                candidates.append(
+                    alternative.resolve(
+                        alias=profile.alias,
+                        storage_path=alt_path,
+                        scope_id=alt_scope,
+                        storage_volume_uuid=alt_volume,
+                    )
+                )
+            result[profile.alias] = tuple(candidates)
+        return result
 
 
 def _url_port(url: str) -> int:
@@ -706,6 +1185,16 @@ def _validate_loopback_url(value: str, *, engine: str) -> str:
     if parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
         raise ValueError(f"{engine} base_url may not include a path, query, or fragment")
     return value.rstrip("/")
+
+
+def _validate_loopback_host(value: str, *, engine: str) -> str:
+    try:
+        if not ipaddress.ip_address(value).is_loopback:
+            raise ValueError(f"{engine} must bind to a loopback address")
+    except ValueError as exc:
+        if value != "localhost":
+            raise ValueError(f"{engine} host must be a loopback address") from exc
+    return value
 
 
 def load_env(path: str | Path) -> None:

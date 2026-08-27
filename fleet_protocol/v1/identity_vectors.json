@@ -1,0 +1,120 @@
+{
+  "schema_version": 1,
+  "vectors": [
+    {
+      "name": "vllm-huggingface-language",
+      "input": {
+        "engine": "vllm",
+        "upstream_model": "Qwen/Qwen2.5-Coder-7B-Instruct",
+        "resolved_revision": "0123456789abcdef0123456789abcdef01234567",
+        "artifact": {
+          "format": "safetensors",
+          "selected_files": [],
+          "quantization": null,
+          "content_digest": null
+        },
+        "kind": "language",
+        "capabilities": [
+          "responses",
+          "chat.completions",
+          "completions"
+        ],
+        "load_config": {
+          "context_length": 32768,
+          "trust_remote_code": false,
+          "semantic_extra_args": []
+        }
+      },
+      "expected_deployment_id": "sha256:8b1e1458735256f9486127144acd0b54480f39d8ee9f6c4e450703229dd68c02",
+      "expected_load_config_digest": "sha256:25b6cc7a188f4bf7fd60477e49664bf414cea8bcf8641bc153098975ca6f4640"
+    },
+    {
+      "name": "llamacpp-exact-gguf-selection",
+      "input": {
+        "engine": "llama.cpp",
+        "upstream_model": "bartowski/Qwen2.5-Coder-7B-Instruct-GGUF",
+        "resolved_revision": "89abcdef0123456789abcdef0123456789abcdef",
+        "artifact": {
+          "format": "gguf",
+          "selected_files": [
+            "Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf"
+          ],
+          "quantization": "Q4_K_M",
+          "content_digest": null
+        },
+        "kind": "language",
+        "capabilities": [
+          "chat/completions",
+          "responses"
+        ],
+        "load_config": {
+          "context_length": 16384,
+          "pooling": null,
+          "semantic_extra_args": []
+        }
+      },
+      "expected_deployment_id": "sha256:a1d2fe1287d4933d5d7be79a60fabcbad3e44c8e25c2a0e2f02d7d4aa7e891be",
+      "expected_load_config_digest": "sha256:ce7769cde1a560d65e5ce85b8a9183e399fed9d806f1f36251de92729ef09df3"
+    },
+    {
+      "name": "llamacpp-generation-with-projector",
+      "input": {
+        "engine": "llama.cpp",
+        "upstream_model": "publisher/coder-GGUF",
+        "resolved_revision": "0123456789ABCDEF0123456789ABCDEF01234567",
+        "artifact": {
+          "format": "gguf",
+          "selected_files": [
+            "mmproj-F16.gguf",
+            "model-Q4_K_M.gguf"
+          ],
+          "quantization": "Q4_K_M",
+          "content_digest": null
+        },
+        "kind": "language",
+        "capabilities": [
+          "chat/completions",
+          "completions",
+          "responses"
+        ],
+        "load_config": {
+          "context_length": 16384,
+          "pooling": null,
+          "semantic_extra_args": []
+        }
+      },
+      "expected_deployment_id": "sha256:b961f783bbad7fccf9acedfe2d3f97dd8348721161a5e14843f3e7798cd12579",
+      "expected_load_config_digest": "sha256:ce7769cde1a560d65e5ce85b8a9183e399fed9d806f1f36251de92729ef09df3"
+    },
+    {
+      "name": "content-addressed-local-image-artifact",
+      "input": {
+        "engine": "mflux",
+        "upstream_model": "black-forest-labs/FLUX.1-schnell",
+        "resolved_revision": null,
+        "artifact": {
+          "format": "safetensors",
+          "selected_files": [],
+          "quantization": null,
+          "content_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "kind": "image",
+        "capabilities": [
+          "images/generations"
+        ],
+        "load_config": {
+          "family": "flux-schnell",
+          "quantize": 8,
+          "image_defaults": {
+            "width": 1024,
+            "height": 1024,
+            "num_inference_steps": 4,
+            "guidance_scale": 3.5
+          }
+        }
+      },
+      "expected_deployment_id": "sha256:0ffbac7fc9748ae72fbef9bc1b474d6c95caee03b3b29113cb6d449834c703b5",
+      "expected_load_config_digest": "sha256:4bcd55c500d94b4eb77d1a75dbef41bd925af02cfa31cbd197f870978f9a4ab3"
+    }
+  ]
+}

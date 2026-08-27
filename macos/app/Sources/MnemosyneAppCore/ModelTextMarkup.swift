@@ -1,5 +1,15 @@
 import Foundation
 
+public enum ModelTextBlock: Equatable, Sendable {
+    case heading(level: Int, text: String)
+    case paragraph(String)
+    case unorderedItem(String)
+    case orderedItem(number: Int, text: String)
+    case quote(String)
+    case code(String)
+    case rule
+}
+
 public enum ModelTextMarkup {
     public static func attributedString(from source: String) -> AttributedString {
         let normalized = markdown(from: source)
@@ -13,6 +23,8 @@ public enum ModelTextMarkup {
     public static func markdown(from source: String) -> String {
         var output = source.replacingOccurrences(of: "\r\n", with: "\n")
             .replacingOccurrences(of: "\r", with: "\n")
+
+        output = removingFrontMatter(from: output)
 
         output = replacing(
             #"(?is)<!--.*?-->"#,
@@ -145,6 +157,158 @@ public enum ModelTextMarkup {
         output = replacing(#"\n[ \t]+"#, in: output, with: "\n")
         output = replacing(#"\n{3,}"#, in: output, with: "\n\n")
         return output.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    public static func blocks(from source: String) -> [ModelTextBlock] {
+        let normalized = markdown(from: source)
+        guard !normalized.isEmpty else { return [] }
+
+        let lines = normalized.split(
+            separator: "\n",
+            omittingEmptySubsequences: false
+        ).map(String.init)
+        var blocks: [ModelTextBlock] = []
+        var paragraph: [String] = []
+        var code: [String] = []
+        var codeFence: String?
+
+        func flushParagraph() {
+            guard !paragraph.isEmpty else { return }
+            blocks.append(.paragraph(paragraph.joined(separator: " ")))
+            paragraph.removeAll(keepingCapacity: true)
+        }
+
+        for line in lines {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+
+            if let fence = codeFence {
+                if trimmed.hasPrefix(fence) {
+                    blocks.append(.code(code.joined(separator: "\n")))
+                    code.removeAll(keepingCapacity: true)
+                    codeFence = nil
+                } else {
+                    code.append(line)
+                }
+                continue
+            }
+
+            if trimmed.hasPrefix("```") || trimmed.hasPrefix("~~~") {
+                flushParagraph()
+                codeFence = String(trimmed.prefix(3))
+                continue
+            }
+            if trimmed.isEmpty {
+                flushParagraph()
+                continue
+            }
+            if let heading = heading(in: trimmed) {
+                flushParagraph()
+                blocks.append(.heading(level: heading.level, text: heading.text))
+                continue
+            }
+            if isHorizontalRule(trimmed) {
+                flushParagraph()
+                blocks.append(.rule)
+                continue
+            }
+            if let item = unorderedItem(in: trimmed) {
+                flushParagraph()
+                blocks.append(.unorderedItem(item))
+                continue
+            }
+            if let item = orderedItem(in: trimmed) {
+                flushParagraph()
+                blocks.append(.orderedItem(number: item.number, text: item.text))
+                continue
+            }
+            if trimmed.hasPrefix(">") {
+                flushParagraph()
+                let text = trimmed.dropFirst()
+                    .trimmingCharacters(in: .whitespaces)
+                blocks.append(.quote(text))
+                continue
+            }
+            paragraph.append(trimmed)
+        }
+
+        flushParagraph()
+        if !code.isEmpty {
+            blocks.append(.code(code.joined(separator: "\n")))
+        }
+        return blocks
+    }
+
+    private static func removingFrontMatter(from source: String) -> String {
+        let lines = source.split(
+            separator: "\n",
+            omittingEmptySubsequences: false
+        ).map(String.init)
+        guard lines.first?.trimmingCharacters(in: .whitespaces) == "---" else {
+            return source
+        }
+
+        let searchLimit = min(lines.count, 200)
+        guard let closingIndex = (1 ..< searchLimit).first(where: { index in
+            let line = lines[index].trimmingCharacters(in: .whitespaces)
+            return line == "---" || line == "..."
+        }) else {
+            return source
+        }
+        let yamlKey = try? NSRegularExpression(
+            pattern: #"^[A-Za-z0-9_.-]+\s*:"#
+        )
+        let hasMetadata = lines[1 ..< closingIndex].contains { line in
+            guard let yamlKey else { return false }
+            return yamlKey.firstMatch(
+                in: line,
+                range: NSRange(line.startIndex..., in: line)
+            ) != nil
+        }
+        guard hasMetadata else { return source }
+        return lines.dropFirst(closingIndex + 1).joined(separator: "\n")
+    }
+
+    private static func heading(in line: String) -> (level: Int, text: String)? {
+        let hashes = line.prefix(while: { $0 == "#" })
+        guard (1 ... 6).contains(hashes.count) else { return nil }
+        let remainder = line.dropFirst(hashes.count)
+        guard remainder.first?.isWhitespace == true else { return nil }
+        let text = remainder.trimmingCharacters(in: .whitespaces)
+        return text.isEmpty ? nil : (hashes.count, text)
+    }
+
+    private static func unorderedItem(in line: String) -> String? {
+        guard line.count >= 3 else { return nil }
+        let marker = line.first
+        guard marker == "-" || marker == "*" || marker == "+" else { return nil }
+        let remainder = line.dropFirst()
+        guard remainder.first?.isWhitespace == true else { return nil }
+        let text = remainder.trimmingCharacters(in: .whitespaces)
+        return text.isEmpty ? nil : text
+    }
+
+    private static func orderedItem(in line: String) -> (number: Int, text: String)? {
+        let digits = line.prefix(while: { $0.isNumber })
+        guard let number = Int(digits), !digits.isEmpty else { return nil }
+        let markerIndex = line.index(line.startIndex, offsetBy: digits.count)
+        guard markerIndex < line.endIndex,
+              line[markerIndex] == "." || line[markerIndex] == ")"
+        else { return nil }
+        let remainderIndex = line.index(after: markerIndex)
+        guard remainderIndex < line.endIndex,
+              line[remainderIndex].isWhitespace
+        else { return nil }
+        let text = line[line.index(after: remainderIndex)...]
+            .trimmingCharacters(in: .whitespaces)
+        return text.isEmpty ? nil : (number, text)
+    }
+
+    private static func isHorizontalRule(_ line: String) -> Bool {
+        let compact = line.replacingOccurrences(of: " ", with: "")
+        guard compact.count >= 3, let marker = compact.first,
+              marker == "-" || marker == "_" || marker == "*"
+        else { return false }
+        return compact.allSatisfy { $0 == marker }
     }
 
     private static func replacing(

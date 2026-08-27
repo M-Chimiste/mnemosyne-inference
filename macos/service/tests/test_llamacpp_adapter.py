@@ -207,7 +207,10 @@ async def test_llama_cpp_file_validation_does_not_block_event_loop(
             return {"model": str(model), "projector": None}
 
     adapter = LlamaCppAdapter(
-        LlamaCppConfig(request_timeout_seconds=1),
+        LlamaCppConfig(
+            request_timeout_seconds=1,
+            process_state_path=str(tmp_path / "llama-process.json"),
+        ),
         runtime_root=tmp_path / "managed-runtimes",
         filesystem_probe=Probe(),  # type: ignore[arg-type]
     )
@@ -248,7 +251,10 @@ async def test_llama_cpp_file_validation_timeout_is_actionable(
             )
 
     adapter = LlamaCppAdapter(
-        LlamaCppConfig(request_timeout_seconds=0.05),
+        LlamaCppConfig(
+            request_timeout_seconds=0.05,
+            process_state_path=str(tmp_path / "llama-process.json"),
+        ),
         runtime_root=tmp_path / "managed-runtimes",
         filesystem_probe=Probe(),  # type: ignore[arg-type]
     )
@@ -344,6 +350,7 @@ async def test_llama_cpp_owned_metadata_retains_scope_for_restart_validation(
     config = LlamaCppConfig(
         binary=str(binary),
         working_directory=str(binary.parent),
+        process_state_path=str(tmp_path / "llama-process.json"),
     )
     argv = build_llama_cpp_argv(config, target)
     identity = ProcessIdentity(
@@ -425,7 +432,16 @@ async def test_llama_cpp_inherits_owned_process_lifecycle_and_routing(
         process_state_path=str(state_path),
         shutdown_grace_seconds=1,
     )
-    target = _target(model, alias="chat-local")
+    target = _target(
+        model,
+        alias="chat-local",
+        capabilities=[
+            "chat/completions",
+            "completions",
+            "responses",
+            "messages",
+        ],
+    )
     process = _FakeProcess()
     identity: ProcessIdentity | None = None
     spawn_kwargs: dict[str, object] = {}

@@ -1,0 +1,24 @@
+[Unit]
+Description=Mnemosyne Fleet Gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mnemosyne-fleet
+Group=mnemosyne-fleet
+EnvironmentFile=/etc/mnemosyne-fleet/secrets.env
+Environment=MNEMOSYNE_FLEET_CONFIG=/etc/mnemosyne-fleet/config.toml
+ExecStart=/opt/mnemosyne-fleet/.venv/bin/mnemosyne-fleet
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/mnemosyne-fleet
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
+

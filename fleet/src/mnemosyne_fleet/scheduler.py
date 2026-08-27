@@ -1,0 +1,510 @@
+from __future__ import annotations
+
+import asyncio
+import time
+import uuid
+from collections import defaultdict, deque
+from dataclasses import dataclass, field
+
+from .config import ModelConfig, NodeConfig
+from .protocol import Deployment
+from .registry import NodeRecord, NodeRegistry
+
+
+class UnknownModelError(LookupError):
+    pass
+
+
+class CapabilityError(LookupError):
+    pass
+
+
+class FleetBusyError(RuntimeError):
+    def __init__(self, code: str, retry_after: int = 1) -> None:
+        super().__init__(code)
+        self.code = code
+        self.retry_after = retry_after
+
+
+@dataclass(frozen=True, slots=True)
+class Candidate:
+    record: NodeRecord
+    deployment: Deployment
+    tier: int
+    load_score: float
+
+
+@dataclass(slots=True)
+class Reservation:
+    route_id: str
+    public_model: str
+    capability: str
+    node_id: str
+    instance_id: str
+    deployment_id: str
+    local_alias: str
+    reserved_at: float
+    queue_ms: float
+    _scheduler: "Scheduler"
+    admitted_at: float | None = None
+    _released: bool = False
+    _release_task: asyncio.Task[None] | None = field(
+        default=None,
+        init=False,
+        repr=False,
+    )
+
+    async def release(self) -> None:
+        if self._released:
+            return
+        task = self._release_task
+        if task is None:
+            # A caller can be cancelled while returning capacity. Keep the
+            # actual release in a separately owned task so cancellation (even
+            # repeated cancellation) cannot strand a local reservation.
+            task = asyncio.create_task(
+                self._scheduler.release(self),
+                name=f"fleet-release-{self.route_id}",
+            )
+            self._release_task = task
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            # The shielded task remains responsible for returning capacity.
+            raise
+        except BaseException:
+            # Scheduler release is expected to be infallible, but allow a
+            # genuine failure to be retried instead of marking it complete.
+            if self._release_task is task:
+                self._release_task = None
+            raise
+        else:
+            self._released = True
+
+    def mark_admitted(self, admitted_at: float | None = None) -> None:
+        """Record the first upstream headers that prove node admission.
+
+        Until this happens, no subsequent poll can safely be assumed to have
+        observed the reservation. Once admitted, a poll that started later may
+        account for it in node-local active/queue state.
+        """
+
+        if self.admitted_at is None:
+            self.admitted_at = (
+                time.monotonic() if admitted_at is None else admitted_at
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class _Ticket:
+    ticket_id: str
+    capability: str
+    enqueued_at: float
+    excluded_nodes: frozenset[str]
+
+
+class Scheduler:
+    """Warm-first scheduler with bounded FIFO queues and local reservations."""
+
+    def __init__(
+        self,
+        *,
+        registry: NodeRegistry,
+        models: tuple[ModelConfig, ...],
+        nodes: tuple[NodeConfig, ...],
+    ) -> None:
+        self._registry = registry
+        self._models = {model.name: model for model in models}
+        self._nodes = {node.node_id: node for node in nodes}
+        self._condition = asyncio.Condition()
+        self._queues: dict[str, deque[_Ticket]] = defaultdict(deque)
+        self._reservations: dict[str, Reservation] = {}
+        self._selection_counter = 0
+        self._last_selected: dict[str, int] = defaultdict(int)
+
+    def model(self, name: str) -> ModelConfig:
+        try:
+            return self._models[name]
+        except KeyError as exc:
+            raise UnknownModelError(name) from exc
+
+    async def wake(self) -> None:
+        async with self._condition:
+            self._condition.notify_all()
+
+    def _unaccounted_reservations(self, record: NodeRecord) -> int:
+        return sum(
+            1
+            for reservation in self._reservations.values()
+            if reservation.node_id == record.enrollment.node_id
+            and reservation.instance_id == record.snapshot.node.instance_id
+            and (
+                reservation.admitted_at is None
+                or reservation.admitted_at >= record.poll_started_monotonic
+            )
+        )
+
+    def _candidate_deployment(
+        self,
+        record: NodeRecord,
+        *,
+        model: ModelConfig,
+        capability: str,
+    ) -> Deployment | None:
+        for deployment in self._strict_deployments(record, model=model):
+            if (
+                deployment.identity_confidence == "authoritative"
+                and deployment.fleet_eligible
+                and capability in deployment.identity.capabilities
+                and deployment.loadable
+            ):
+                return deployment
+        return None
+
+    @staticmethod
+    def _id_deployments(
+        record: NodeRecord,
+        *,
+        model: ModelConfig,
+    ) -> tuple[Deployment, ...]:
+        return tuple(
+            deployment
+            for deployment in record.snapshot.deployments
+            if deployment.deployment_id == model.deployment_id
+        )
+
+    @classmethod
+    def _strict_deployments(
+        cls,
+        record: NodeRecord,
+        *,
+        model: ModelConfig,
+    ) -> tuple[Deployment, ...]:
+        return tuple(
+            deployment
+            for deployment in cls._id_deployments(record, model=model)
+            if set(deployment.identity.capabilities) == set(model.capabilities)
+        )
+
+    def _select(
+        self,
+        *,
+        model: ModelConfig,
+        capability: str,
+        excluded_nodes: frozenset[str],
+    ) -> Candidate | None:
+        candidates: list[Candidate] = []
+        for record in self._registry.live_records():
+            node_id = record.enrollment.node_id
+            snapshot = record.snapshot
+            if (
+                node_id in excluded_nodes
+                or not snapshot.health.accepting
+                or not snapshot.health.authoritative
+                or snapshot.health.state in {"degraded", "stopping"}
+            ):
+                continue
+            deployment = self._candidate_deployment(
+                record,
+                model=model,
+                capability=capability,
+            )
+            if deployment is None:
+                continue
+
+            local = self._unaccounted_reservations(record)
+            resident = snapshot.residency.deployment_id == model.deployment_id
+            advertised_available = (
+                snapshot.capacity.available
+                if resident
+                else deployment.capacity.available
+            )
+            available = max(0, advertised_available - local)
+            node_queue_room = max(
+                0, snapshot.admission.queue_limit - snapshot.admission.queue_depth - local
+            )
+            if resident and available > 0:
+                tier = 1
+            elif resident and node_queue_room > 0:
+                tier = 2
+            elif (
+                snapshot.residency.deployment_id is None
+                and node_queue_room > 0
+                and deployment.capacity.effective_limit > 0
+            ):
+                tier = 3
+            elif node_queue_room > 0 and deployment.capacity.effective_limit > 0:
+                tier = 4
+            else:
+                continue
+
+            configured_weight = self._nodes[node_id].routing_weight
+            weight = float(deployment.capacity.effective_limit)
+            if configured_weight is not None:
+                weight = min(weight, configured_weight)
+            outstanding = snapshot.capacity.active + snapshot.admission.queue_depth + local
+            candidates.append(
+                Candidate(
+                    record=record,
+                    deployment=deployment,
+                    tier=tier,
+                    load_score=outstanding / max(weight, 1e-9),
+                )
+            )
+        if not candidates:
+            return None
+        return min(
+            candidates,
+            key=lambda candidate: (
+                candidate.tier,
+                candidate.load_score,
+                self._last_selected[candidate.record.enrollment.node_id],
+                candidate.record.enrollment.node_id,
+            ),
+        )
+
+    async def acquire(
+        self,
+        *,
+        public_model: str,
+        capability: str,
+        excluded_nodes: frozenset[str] = frozenset(),
+    ) -> Reservation:
+        model = self.model(public_model)
+        if capability not in model.capabilities:
+            raise CapabilityError(capability)
+        started = time.monotonic()
+        ticket: _Ticket | None = None
+        deadline = started + model.queue_timeout_seconds
+
+        async with self._condition:
+            queue = self._queues[public_model]
+            if not queue:
+                candidate = self._select(
+                    model=model,
+                    capability=capability,
+                    excluded_nodes=excluded_nodes,
+                )
+                if candidate is not None:
+                    return self._reserve(candidate, model, capability, started, started)
+            if len(queue) >= model.queue_depth:
+                raise FleetBusyError("fleet_queue_full")
+            ticket = _Ticket(
+                ticket_id=uuid.uuid4().hex,
+                capability=capability,
+                enqueued_at=started,
+                excluded_nodes=excluded_nodes,
+            )
+            queue.append(ticket)
+            try:
+                while True:
+                    if queue and queue[0].ticket_id == ticket.ticket_id:
+                        candidate = self._select(
+                            model=model,
+                            capability=capability,
+                            excluded_nodes=excluded_nodes,
+                        )
+                        if candidate is not None:
+                            queue.popleft()
+                            reservation = self._reserve(
+                                candidate,
+                                model,
+                                capability,
+                                started,
+                                time.monotonic(),
+                            )
+                            self._condition.notify_all()
+                            return reservation
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise FleetBusyError("fleet_queue_timeout")
+                    try:
+                        await asyncio.wait_for(self._condition.wait(), timeout=remaining)
+                    except TimeoutError as exc:
+                        raise FleetBusyError("fleet_queue_timeout") from exc
+            finally:
+                if ticket in queue:
+                    queue.remove(ticket)
+                    self._condition.notify_all()
+
+    def _reserve(
+        self,
+        candidate: Candidate,
+        model: ModelConfig,
+        capability: str,
+        queued_at: float,
+        reserved_at: float,
+    ) -> Reservation:
+        route_id = str(uuid.uuid4())
+        record = candidate.record
+        reservation = Reservation(
+            route_id=route_id,
+            public_model=model.name,
+            capability=capability,
+            node_id=record.enrollment.node_id,
+            instance_id=record.snapshot.node.instance_id,
+            deployment_id=model.deployment_id,
+            local_alias=candidate.deployment.alias,
+            reserved_at=reserved_at,
+            queue_ms=max(0.0, (reserved_at - queued_at) * 1000.0),
+            _scheduler=self,
+        )
+        self._reservations[route_id] = reservation
+        self._selection_counter += 1
+        self._last_selected[reservation.node_id] = self._selection_counter
+        return reservation
+
+    async def release(self, reservation: Reservation) -> None:
+        async with self._condition:
+            self._reservations.pop(reservation.route_id, None)
+            self._condition.notify_all()
+
+    def enrollment(self, node_id: str) -> NodeConfig:
+        return self._nodes[node_id]
+
+    @property
+    def node_count(self) -> int:
+        return len(self._nodes)
+
+    def status(self) -> dict[str, object]:
+        active_by_node: dict[str, int] = defaultdict(int)
+        active_by_model: dict[str, int] = defaultdict(int)
+        for reservation in self._reservations.values():
+            active_by_node[reservation.node_id] += 1
+            active_by_model[reservation.public_model] += 1
+        return {
+            "active_total": len(self._reservations),
+            "active_by_node": dict(active_by_node),
+            "active_by_model": dict(active_by_model),
+            "queues": {
+                model: {
+                    "depth": len(self._queues[model]),
+                    "limit": config.queue_depth,
+                    "timeout_seconds": config.queue_timeout_seconds,
+                }
+                for model, config in self._models.items()
+            },
+        }
+
+    def model_matrix(self) -> list[dict[str, object]]:
+        rows: list[dict[str, object]] = []
+        for model in self._models.values():
+            nodes: list[dict[str, object]] = []
+            for node_id in self._nodes:
+                record = self._registry.record(node_id)
+                snapshot_error_code = self._registry.error_code(node_id)
+                if record is None:
+                    nodes.append(
+                        {
+                            "node_id": node_id,
+                            "online": False,
+                            "eligible": False,
+                            "strict_match": False,
+                            "warm": False,
+                            "alias": None,
+                            "aliases": [],
+                            "capacity": None,
+                            "reason_codes": ["snapshot_unavailable"],
+                            "snapshot_error_code": snapshot_error_code,
+                        }
+                    )
+                    continue
+
+                online = self._registry.is_live(record)
+                id_deployments = self._id_deployments(record, model=model)
+                strict_deployments = self._strict_deployments(record, model=model)
+                authoritative = tuple(
+                    deployment
+                    for deployment in strict_deployments
+                    if deployment.identity_confidence == "authoritative"
+                )
+                fleet_eligible = tuple(
+                    deployment
+                    for deployment in authoritative
+                    if deployment.fleet_eligible
+                )
+                routable = tuple(
+                    deployment
+                    for deployment in fleet_eligible
+                    if deployment.loadable
+                )
+                health = record.snapshot.health
+                schedulable_health = (
+                    health.accepting
+                    and health.authoritative
+                    and health.state not in {"degraded", "stopping"}
+                )
+                reason_codes: list[str] = []
+                if not online:
+                    reason_codes.append("snapshot_stale")
+                if not id_deployments:
+                    reason_codes.append("deployment_not_advertised")
+                elif not strict_deployments:
+                    reason_codes.append("capabilities_mismatch")
+                else:
+                    if not authoritative:
+                        reason_codes.append("identity_unverified")
+                    elif not fleet_eligible:
+                        reason_codes.append("fleet_ineligible")
+                    elif not routable:
+                        reason_codes.append("not_loadable")
+                if not health.authoritative:
+                    reason_codes.append("node_not_authoritative")
+                if health.state == "degraded":
+                    reason_codes.append("node_degraded")
+                elif health.state == "stopping":
+                    reason_codes.append("node_stopping")
+                if not health.accepting:
+                    reason_codes.append("node_not_accepting")
+
+                display_deployment = (
+                    routable[0]
+                    if routable
+                    else strict_deployments[0] if strict_deployments else None
+                )
+                nodes.append(
+                    {
+                        "node_id": node_id,
+                        "online": online,
+                        "eligible": bool(routable) and online and schedulable_health,
+                        "strict_match": bool(strict_deployments),
+                        "warm": any(
+                            deployment.warm for deployment in strict_deployments
+                        ),
+                        "alias": (
+                            display_deployment.alias
+                            if display_deployment is not None
+                            else None
+                        ),
+                        "aliases": sorted(
+                            deployment.alias for deployment in strict_deployments
+                        ),
+                        "capacity": (
+                            display_deployment.capacity.model_dump(mode="json")
+                            if display_deployment is not None
+                            else None
+                        ),
+                        "reason_codes": reason_codes,
+                        "snapshot_error_code": snapshot_error_code,
+                    }
+                )
+            rows.append(
+                {
+                    "name": model.name,
+                    "deployment_id": model.deployment_id,
+                    "capabilities": sorted(model.capabilities),
+                    "strict_replica_count": sum(
+                        1 for node in nodes if node["strict_match"]
+                    ),
+                    "online_strict_replica_count": sum(
+                        1
+                        for node in nodes
+                        if node["strict_match"] and node["online"]
+                    ),
+                    "eligible_replica_count": sum(
+                        1 for node in nodes if node["eligible"]
+                    ),
+                    "nodes": nodes,
+                }
+            )
+        return rows

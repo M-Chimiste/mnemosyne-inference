@@ -57,8 +57,10 @@ service plus on-demand manager-owned engine processes:
   loopback `17325` only while a GGUF profile is resident. Its binary is
   installed from the official upstream release below Application Support,
   not embedded in the signed app or stored beside model weights.
-- DS4 and the private MFLUX worker are also manager-owned, on-demand process
-  groups. MFLUX uses loopback port `17324` and the independent
+- DS4, mlxcel, mistral.rs, and the private MFLUX worker are also
+  manager-owned, on-demand process groups. mlxcel and mistral.rs retain
+  externally installed official binaries while the service owns only their
+  exact child server processes on `17326` and `17327`. MFLUX uses loopback port `17324` and the independent
   `framework-mnemosyne-image` Python export layer.
 
 The LaunchAgent owns the service lifetime, so **Quit Menu App** does not stop

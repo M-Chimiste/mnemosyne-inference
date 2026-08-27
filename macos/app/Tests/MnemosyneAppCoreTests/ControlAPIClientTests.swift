@@ -12,7 +12,13 @@ func defaultControlPort() {
     #expect(!NativeSettings().engines.omlx.enabled)
     #expect(!NativeSettings().engines.ds4.enabled)
     #expect(!NativeSettings().engines.mflux.enabled)
-    #expect(NativeSettings().schemaVersion == 2)
+    #expect(!NativeSettings().engines.mlxcel.enabled)
+    #expect(!NativeSettings().engines.mistralRs.enabled)
+    #expect(NativeSettings().schemaVersion == 6)
+    #expect(NativeSettings().server.maxConcurrency == nil)
+    #expect(NativeSettings().server.maxQueueDepth == 128)
+    #expect(NativeSettings().server.idleUnloadSeconds == nil)
+    #expect(NativeSettings().server.fleetApiKeyEnv == "FLEET_API_KEY")
     #expect(NativeSettings().tokenSidecar.enabled)
 }
 
@@ -21,6 +27,34 @@ func endpointResolution() {
     let client = ControlAPIClient(baseURL: URL(string: "http://localhost:17321")!)
     #expect(client.endpointURL("/manager/status").absoluteString == "http://localhost:17321/manager/status")
     #expect(client.endpointURL("/manager/models").absoluteString == "http://localhost:17321/manager/models")
+}
+
+@Test("oMLX cache health remains metadata-only and decodes large byte counts")
+func omlxCacheHealthDecoding() throws {
+    let payload = #"""
+    {
+      "available":true,
+      "total_requests":42,
+      "total_cached_tokens":12000,
+      "cache_efficiency":0.42,
+      "ssd_file_count":80,
+      "ssd_size_bytes":153545080832,
+      "ssd_limit_bytes":274877906944,
+      "hot_size_bytes":1073741824,
+      "hot_limit_bytes":8589934592,
+      "reset_recommended":false,
+      "diagnostic":null
+    }
+    """#.data(using: .utf8)!
+
+    let health = try JSONDecoder.nativeSettingsDecoder().decode(
+        OMLXCacheHealth.self,
+        from: payload
+    )
+    #expect(health.totalRequests == 42)
+    #expect(health.ssdSizeBytes == 153_545_080_832)
+    #expect(health.cacheEfficiency == 0.42)
+    #expect(!health.resetRecommended)
 }
 
 @Test("Load requests use the control endpoint and exact JSON body")
@@ -38,6 +72,54 @@ func loadRequestEncoding() throws {
     let body = try #require(request.httpBody)
     let payload = try JSONDecoder().decode(LoadModelRequest.self, from: body)
     #expect(payload == LoadModelRequest(model: "glm-5-2"))
+}
+
+@Test("Engine benchmarks use a bounded fixed suite request")
+func benchmarkRequestEncoding() throws {
+    let client = ControlAPIClient(
+        baseURL: URL(string: "http://localhost:17321")!,
+        adminPassword: "secret"
+    )
+    let request = try client.benchmarkRequest(alias: "qwen-3.5", sampleRuns: 7)
+
+    #expect(
+        request.url?.absoluteString
+            == "http://localhost:17321/manager/benchmarks/qwen-3.5"
+    )
+    #expect(request.httpMethod == "POST")
+    #expect(request.timeoutInterval == 3_600)
+    #expect(request.value(forHTTPHeaderField: "Authorization") == "Basic YWRtaW46c2VjcmV0")
+    let body = try #require(request.httpBody)
+    let object = try #require(
+        JSONSerialization.jsonObject(with: body) as? [String: Any]
+    )
+    #expect(object["warmup_runs"] as? Int == 1)
+    #expect(object["sample_runs"] as? Int == 7)
+    #expect(object["max_tokens"] as? Int == 128)
+}
+
+@Test("Context profiling uses the explicit long-running manager route")
+func contextProfileRequestEncoding() throws {
+    let client = ControlAPIClient(
+        baseURL: URL(string: "http://localhost:17321")!,
+        adminPassword: "secret"
+    )
+    let request = try client.contextProfileRequest(
+        alias: "qwen-3.5",
+        targetTokens: 262_144
+    )
+
+    #expect(
+        request.url?.absoluteString
+            == "http://localhost:17321/manager/contexts/qwen-3.5/profile"
+    )
+    #expect(request.httpMethod == "POST")
+    #expect(request.timeoutInterval == 3_600)
+    let body = try #require(request.httpBody)
+    let object = try #require(
+        JSONSerialization.jsonObject(with: body) as? [String: Any]
+    )
+    #expect(object["target_tokens"] as? Int == 262_144)
 }
 
 @Test("Model self-test requests use the public-path verifier with bounded options")
@@ -73,6 +155,7 @@ func configurationSaveRequestEncoding() throws {
     )
     var settings = NativeSettings()
     settings.server.inferencePort = 17_330
+    settings.server.maxConcurrency = 3
     settings.storage = ModelStorageSettings(
         default: "athena-models",
         locations: [
@@ -94,6 +177,11 @@ func configurationSaveRequestEncoding() throws {
                 projectorPath: "/Volumes/Athena/models/mmproj.gguf",
                 gpuLayers: 99,
                 ubatchSize: 512
+            ),
+            context: ModelContextSettings(
+                mode: "fixed",
+                nativeTokens: 131_072,
+                fixedTokens: 65_536
             )
         )
     ]
@@ -116,12 +204,19 @@ func configurationSaveRequestEncoding() throws {
     let storage = try #require(config["storage"] as? [String: Any])
     let locations = try #require(storage["locations"] as? [[String: Any]])
     let load = try #require(models.first?["load"] as? [String: Any])
+    let context = try #require(models.first?["context"] as? [String: Any])
     #expect(server["inference_port"] as? Int == 17_330)
-    #expect(config["schema_version"] as? Int == 2)
+    #expect(config["schema_version"] as? Int == 6)
+    #expect(server["max_concurrency"] as? Int == 3)
+    #expect(server["max_queue_depth"] as? Int == 128)
+    #expect(server["fleet_api_key_env"] as? String == "FLEET_API_KEY")
     #expect(load["context_length"] as? Int == 32_768)
     #expect(load["projector_path"] as? String == "/Volumes/Athena/models/mmproj.gguf")
     #expect(load["gpu_layers"] as? Int == 99)
     #expect(load["ubatch_size"] as? Int == 512)
+    #expect(context["mode"] as? String == "fixed")
+    #expect(context["native_tokens"] as? Int == 131_072)
+    #expect(context["fixed_tokens"] as? Int == 65_536)
     #expect(models.first?["engine"] as? String == "llama.cpp")
     #expect(locations.first?["path"] as? String == "/Volumes/Athena/models")
     #expect(locations.first?["volume_uuid"] as? String == "ATHENA-UUID")
@@ -201,9 +296,9 @@ func futureConfigurationSchemaSaveRefused() throws {
     let client = ControlAPIClient(
         baseURL: URL(string: "http://localhost:17321")!
     )
-    let settings = NativeSettings(schemaVersion: 3)
+    let settings = NativeSettings(schemaVersion: 7)
 
-    #expect(throws: ControlAPIError.unsupportedConfigurationSchema(3)) {
+    #expect(throws: ControlAPIError.unsupportedConfigurationSchema(7)) {
         _ = try client.configurationSaveRequest(
             settings: settings,
             revision: String(repeating: "f", count: 64)
@@ -211,12 +306,47 @@ func futureConfigurationSchemaSaveRefused() throws {
     }
 }
 
+@Test("Pinned engine selection round-trips through schema six")
+func pinnedEngineSelectionRoundTrip() throws {
+    let value = ModelSelectionSettings(
+        mode: "pinned",
+        pinnedEngine: .mlxcel,
+        objective: "latency",
+        minimumImprovementPercent: 12
+    )
+
+    let data = try JSONEncoder.nativeSettingsEncoder().encode(value)
+    let object = try #require(
+        JSONSerialization.jsonObject(with: data) as? [String: Any]
+    )
+    #expect(object["mode"] as? String == "pinned")
+    #expect(object["pinned_engine"] as? String == "mlxcel")
+    #expect(object["minimum_improvement_percent"] as? Double == 12)
+    #expect(
+        try JSONDecoder.nativeSettingsDecoder().decode(
+            ModelSelectionSettings.self,
+            from: data
+        ) == value
+    )
+}
+
+@Test("Product version and build have a compact sidebar label")
+func productBuildIdentityFormatting() {
+    let release = ProductBuildIdentity(version: " 0.9.0 ", build: "50")
+    #expect(release.compactLabel == "0.9.0 (50)")
+    #expect(release.accessibilityLabel == "Version 0.9.0, build 50")
+    #expect(
+        ProductBuildIdentity(version: nil, build: nil).compactLabel
+            == "development"
+    )
+}
+
 @Test("Structured configuration decodes every engine and image setting")
 func configurationDecoding() throws {
     let payload = #"""
     {
-      "schema_version": 2,
-      "server": {"inference_bind":"127.0.0.1","inference_port":1240,"control_bind":"127.0.0.1","control_port":17321,"idle_unload_seconds":900,"startup_timeout_seconds":900,"swap_queue_timeout_seconds":300,"shutdown_grace_seconds":30,"reconcile_interval_seconds":30,"image_request_timeout_seconds":1800,"image_max_pixels":4194304,"startup_policy":"unload_all","inference_api_key_env":"INFERENCE_API_KEY","control_password_env":"ADMIN_PASSWORD"},
+      "schema_version": 3,
+      "server": {"inference_bind":"127.0.0.1","inference_port":1240,"control_bind":"127.0.0.1","control_port":17321,"idle_unload_seconds":900,"startup_timeout_seconds":900,"swap_queue_timeout_seconds":300,"max_concurrency":null,"max_queue_depth":128,"shutdown_grace_seconds":30,"reconcile_interval_seconds":30,"image_request_timeout_seconds":1800,"image_max_pixels":4194304,"startup_policy":"unload_all","inference_api_key_env":"INFERENCE_API_KEY","fleet_api_key_env":"FLEET_API_KEY","control_password_env":"ADMIN_PASSWORD"},
       "engines": {
         "llama_cpp":{"enabled":true,"host":"127.0.0.1","port":17325,"binary":"/runtime/llama-server","working_directory":"/runtime","process_state_path":"/state/llama.json","request_timeout_seconds":30,"shutdown_grace_seconds":30},
         "omlx":{"enabled":true,"base_url":"http://127.0.0.1:17322","api_key_env":"OMLX_API_KEY","admin_session_env":"OMLX_ADMIN_SESSION","request_timeout_seconds":30,"model_directories":["/Volumes/Athena/models"]},
@@ -240,6 +370,30 @@ func configurationDecoding() throws {
     #expect(settings.models.first?.image?.family == .qwenImage)
     #expect(settings.models.first?.image?.numInferenceSteps == 30)
     #expect(settings.tokenSidecar.maxOutboxRows == 100_000)
+    #expect(settings.server.maxConcurrency == nil)
+    #expect(settings.server.maxQueueDepth == 128)
+    #expect(settings.server.fleetApiKeyEnv == "FLEET_API_KEY")
+}
+
+@Test("DS4 resident session capacity reuses the typed parallel setting")
+func ds4ParallelSessionsRoundTrip() throws {
+    let load = ModelLoadSettings(
+        contextLength: 32_768,
+        parallel: 3,
+        kvDiskSpaceMb: 8_192
+    )
+    let encoded = try JSONEncoder.nativeSettingsEncoder().encode(load)
+    let object = try #require(
+        JSONSerialization.jsonObject(with: encoded) as? [String: Any]
+    )
+
+    #expect(object["parallel"] as? Int == 3)
+    let decoded = try JSONDecoder.nativeSettingsDecoder().decode(
+        ModelLoadSettings.self,
+        from: encoded
+    )
+    #expect(decoded.parallel == 3)
+    #expect(decoded.kvDiskSpaceMb == 8_192)
 }
 
 @Test("Local model scans preserve explicit projector and migration metadata")
@@ -423,7 +577,10 @@ func llamaCppFileSelectionDecoding() throws {
     #expect(install.projectorFilename == "mmproj-F16.gguf")
     #expect(install.includeProjector)
     #expect(install.revision == "abc123")
-    #expect(install.capabilities == ModelRole.generation.capabilities)
+    #expect(
+        install.capabilities
+            == ModelRole.generation.capabilities(for: .llamaCpp)
+    )
 }
 
 @Test("GGUF file discovery preserves the llama.cpp engine value in the query")
@@ -447,6 +604,28 @@ func llamaCppFileSelectionRequest() throws {
     #expect(query["engine"] == "llama.cpp")
     #expect(query["repo_id"] == "org/model-GGUF")
     #expect(query["revision"] == "abc123")
+}
+
+@Test("Model library search requests one unified catalog without an engine filter")
+func unifiedModelLibrarySearchRequest() throws {
+    let client = ControlAPIClient(
+        baseURL: URL(string: "http://localhost:17321")!,
+        adminPassword: "secret"
+    )
+    let request = client.librarySearchRequest(query: "qwen vision")
+    let url = try #require(request.url)
+    let components = try #require(
+        URLComponents(url: url, resolvingAgainstBaseURL: false)
+    )
+    let query = Dictionary(
+        uniqueKeysWithValues: (components.queryItems ?? []).map { ($0.name, $0.value) }
+    )
+
+    #expect(url.path == "/manager/model-library/search")
+    #expect(query["q"] == "qwen vision")
+    #expect(query["engine"] == nil)
+    #expect(request.httpMethod == "GET")
+    #expect(request.value(forHTTPHeaderField: "Authorization") == "Basic YWRtaW46c2VjcmV0")
 }
 
 @Test("Model library records preserve engine compatibility and nested destinations")
@@ -735,6 +914,27 @@ func statusDecodeIsForwardCompatible() throws {
         "last_error": "Postgres is unavailable",
         "future_field": "ignored"
       },
+      "performance": {
+        "window_limit": 512,
+        "sample_count": 3,
+        "oldest_observed_at": 1,
+        "newest_observed_at": 2,
+        "by_model": [{
+          "alias": "glm-5-2",
+          "engine": "omlx",
+          "requests": 3,
+          "errors": 0,
+          "cold_starts": 1,
+          "average_admission_ms": 12.5,
+          "average_upstream_headers_ms": 15.0,
+          "average_first_byte_ms": 42.0,
+          "average_total_ms": 950.0,
+          "average_output_tokens_per_second": 25.5,
+          "p50_total_ms": 900.0,
+          "p95_total_ms": 1200.0
+        }],
+        "recent": []
+      },
       "another_future_field": true
     }
     """#.data(using: .utf8)!
@@ -751,6 +951,10 @@ func statusDecodeIsForwardCompatible() throws {
     #expect(snapshot.tokenSidecar?.lastFlushAt == 1_784_462_400.5)
     #expect(snapshot.tokenSidecar?.writerReady == false)
     #expect(snapshot.tokenSidecar?.lastError == "Postgres is unavailable")
+    #expect(snapshot.performance?.sampleCount == 3)
+    #expect(snapshot.performance?.byModel.first?.p50TotalMs == 900)
+    #expect(snapshot.performance?.byModel.first?.coldStarts == 1)
+    #expect(snapshot.performance?.byModel.first?.averageOutputTokensPerSecond == 25.5)
     #expect(snapshot.diagnostic == "engine state needs attention")
     #expect(snapshot.startupError == "oMLX authentication failed")
 }

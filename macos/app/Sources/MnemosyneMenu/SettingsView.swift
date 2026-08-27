@@ -2,6 +2,15 @@ import Foundation
 import MnemosyneAppCore
 import SwiftUI
 
+private enum ResidencyPreset: String, CaseIterable, Identifiable {
+    case performance = "Performance"
+    case balanced = "Balanced"
+    case memorySaver = "Memory Saver"
+    case custom = "Custom"
+
+    var id: String { rawValue }
+}
+
 struct SettingsView: View {
     @ObservedObject var viewModel: SettingsViewModel
     @ObservedObject var registration: LaunchAgentRegistration
@@ -9,6 +18,8 @@ struct SettingsView: View {
     let restartService: () -> Void
     @State private var previewedCredentialDrafts: Set<ManagedCredential> = []
     @State private var selfTestAlias = ""
+    @State private var alternativeSourceIndex: Int?
+    private let productBuildIdentity = ProductBuildIdentity.current
 
     var body: some View {
         HStack(spacing: 0) {
@@ -60,6 +71,36 @@ struct SettingsView: View {
                 "Unified Inference will run these exact commands after approval:\n\nbrew tap jundot/omlx https://github.com/jundot/omlx\nbrew install omlx\n\nHomebrew will own the installation. This never uses --HEAD or replaces an existing oMLX installation. The stable formula omits optional custom kernels; use the recommended official app when you need them."
             )
         }
+        .alert(
+            "Update oMLX with Homebrew?",
+            isPresented: $viewModel.confirmHomebrewOMLXUpgrade
+        ) {
+            Button("Cancel", role: .cancel) {
+                viewModel.pendingOMLXUpgrade = nil
+            }
+            Button("Drain and Update") {
+                guard let update = viewModel.pendingOMLXUpgrade else { return }
+                viewModel.pendingOMLXUpgrade = nil
+                Task { await viewModel.installRuntimeUpdate(update) }
+            }
+        } message: {
+            Text(
+                "Unified Inference will stop new oMLX requests, drain active work, unload the resident model, and delegate these fixed operations to Homebrew:\n\nomlx stop\nbrew update\nbrew upgrade omlx\nomlx start\n\nAdmission reopens only after the updated oMLX control plane is healthy and empty."
+            )
+        }
+        .alert(
+            "Reset oMLX SSD cache?",
+            isPresented: $viewModel.confirmOMLXCacheReset
+        ) {
+            Button("Cancel", role: .cancel) {}
+            Button("Drain and Reset", role: .destructive) {
+                Task { await viewModel.resetOMLXCache() }
+            }
+        } message: {
+            Text(
+                "Unified Inference will drain active requests and unload the resident model, then ask oMLX to delete its reusable SSD KV-cache blocks. Model weights and configuration are not changed. The next matching prompt will need a fresh prefill."
+            )
+        }
         .sheet(isPresented: $viewModel.showLocalModelImporter) {
             ExistingModelImporterView(viewModel: viewModel)
         }
@@ -92,10 +133,21 @@ struct SettingsView: View {
                 .buttonStyle(.plain)
             }
             Spacer()
-            Text("Unified Inference")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .padding(12)
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                Text("Unified Inference")
+                    .font(.caption)
+                    .lineLimit(1)
+                Spacer(minLength: 2)
+                Text(productBuildIdentity.compactLabel)
+                    .font(.caption2)
+                    .monospacedDigit()
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.75)
+                    .accessibilityLabel(productBuildIdentity.accessibilityLabel)
+            }
+            .foregroundStyle(.secondary)
+            .help(productBuildIdentity.accessibilityLabel)
+            .padding(12)
         }
         .frame(width: 180)
         .background(Color(nsColor: .controlBackgroundColor).opacity(0.55))
@@ -569,6 +621,10 @@ struct SettingsView: View {
             viewModel.settings.engines.ds4.enabled
         case .mflux:
             viewModel.settings.engines.mflux.enabled
+        case .mlxcel:
+            viewModel.settings.engines.mlxcel.enabled
+        case .mistralRs:
+            viewModel.settings.engines.mistralRs.enabled
         }
     }
 
@@ -711,6 +767,12 @@ struct SettingsView: View {
             }
 
             Section("Model residency") {
+                Picker("Preset", selection: residencyPreset) {
+                    ForEach(ResidencyPreset.allCases) { preset in
+                        Text(preset.rawValue).tag(preset)
+                    }
+                }
+                .pickerStyle(.segmented)
                 Toggle("Unload the current model when it has been idle", isOn: idleUnloadEnabled)
                 if viewModel.settings.server.idleUnloadSeconds != nil {
                     LabeledContent("Idle time") {
@@ -723,9 +785,29 @@ struct SettingsView: View {
                 LabeledContent("Queued request timeout") {
                     secondsField($viewModel.settings.server.swapQueueTimeoutSeconds)
                 }
+                optionalIntegerField(
+                    "Concurrency ceiling",
+                    value: $viewModel.settings.server.maxConcurrency
+                )
+                LabeledContent("Maximum queued requests") {
+                    integerField(
+                        $viewModel.settings.server.maxQueueDepth,
+                        unit: "requests"
+                    )
+                }
                 LabeledContent("Shutdown grace period") {
                     secondsField($viewModel.settings.server.shutdownGraceSeconds)
                 }
+                Text(
+                    viewModel.settings.server.idleUnloadSeconds == nil
+                        ? "Performance mode keeps one verified model warm, avoiding repeated weight loads and cache scans."
+                        : "Memory-saver mode releases the resident model after the configured idle interval."
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                Text("Leave the concurrency ceiling blank to use the engine's authoritative scheduler limit. A ceiling can reduce memory pressure; it cannot exceed what the engine reports.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
 
             Section("Image generation") {
@@ -817,7 +899,7 @@ struct SettingsView: View {
                     secondsField($viewModel.settings.engines.ds4.requestTimeoutSeconds)
                 }
             } header: {
-                engineHeader("DS4", detail: "DeepSeek GGUF models")
+                engineHeader("DS4", detail: "DeepSeek V4 and GLM 5.2 GGUF models")
             }
 
             Section {
@@ -841,6 +923,74 @@ struct SettingsView: View {
                     .foregroundStyle(.secondary)
             } header: {
                 engineHeader("MFLUX", detail: "Qwen Image and Krea 2")
+            }
+
+            Section {
+                Toggle(
+                    "Enable mlxcel (Preview)",
+                    isOn: $viewModel.settings.engines.mlxcel.enabled
+                )
+                LabeledContent("Local port") {
+                    TextField(
+                        "Port",
+                        value: $viewModel.settings.engines.mlxcel.port,
+                        format: .number.grouping(.never)
+                    )
+                    .labelsHidden()
+                    .textFieldStyle(.roundedBorder)
+                    .multilineTextAlignment(.trailing)
+                    .frame(width: 80)
+                }
+                TextField(
+                    "mlxcel-server executable",
+                    text: $viewModel.settings.engines.mlxcel.binary
+                )
+                TextField(
+                    "Working folder",
+                    text: $viewModel.settings.engines.mlxcel.workingDirectory
+                )
+                LabeledContent("Request timeout") {
+                    secondsField($viewModel.settings.engines.mlxcel.requestTimeoutSeconds)
+                }
+                Text("Install and upgrade the official Homebrew formula with `brew tap lablup/tap` and `brew install mlxcel`. Unified Inference owns only the model server process.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } header: {
+                engineHeader("mlxcel", detail: "Native MLX text and vision serving")
+            }
+
+            Section {
+                Toggle(
+                    "Enable mistral.rs (Preview)",
+                    isOn: $viewModel.settings.engines.mistralRs.enabled
+                )
+                LabeledContent("Local port") {
+                    TextField(
+                        "Port",
+                        value: $viewModel.settings.engines.mistralRs.port,
+                        format: .number.grouping(.never)
+                    )
+                    .labelsHidden()
+                    .textFieldStyle(.roundedBorder)
+                    .multilineTextAlignment(.trailing)
+                    .frame(width: 80)
+                }
+                TextField(
+                    "mistralrs executable",
+                    text: $viewModel.settings.engines.mistralRs.binary
+                )
+                TextField(
+                    "Working folder",
+                    text: $viewModel.settings.engines.mistralRs.workingDirectory
+                )
+                LabeledContent("Request timeout") {
+                    secondsField($viewModel.settings.engines.mistralRs.requestTimeoutSeconds)
+                }
+                Text("The official mistral.rs installer owns the binary and its `mistralrs update` path. Unified Inference launches it offline against a pinned local snapshot.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } header: {
+                engineHeader("mistral.rs", detail: "Safetensors language and multimodal models")
             }
 
         }
@@ -898,12 +1048,12 @@ struct SettingsView: View {
                     ContentUnavailableView(
                         "No Update Information",
                         systemImage: "arrow.triangle.2.circlepath",
-                            description: Text("Choose Check Now to inspect llama.cpp, oMLX, MFLUX, and DS4.")
+                            description: Text("Choose Check Now to inspect llama.cpp, oMLX, MFLUX, DS4, mlxcel, and mistral.rs.")
                     )
                     .frame(maxWidth: .infinity, minHeight: 260)
                 }
 
-                Text("Official downloads are staged and import/build-validated while inference remains available. Activation waits for active requests, unloads the current model through the residency coordinator, and atomically switches runtimes. The previous managed runtime is retained for rollback.")
+                Text("Managed runtime downloads are staged and validated while inference remains available; activation drains through the residency coordinator and retains the previous runtime for rollback. Externally owned engines show their detected binary and official install or update path without Unified Inference replacing vendor files.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -953,6 +1103,10 @@ struct SettingsView: View {
                             ).opacity(0.12),
                             in: Capsule()
                         )
+                } else if update.diagnostic != nil {
+                    Text("CHECK FAILED")
+                        .font(.caption2.weight(.bold))
+                        .foregroundStyle(.orange)
                 } else if update.installed {
                     Text("CURRENT")
                         .font(.caption2.weight(.bold))
@@ -989,6 +1143,12 @@ struct SettingsView: View {
                             .textSelection(.enabled)
                     }
                 }
+                if let kind = update.installationKindLabel {
+                    GridRow {
+                        Text("Installation").foregroundStyle(.secondary)
+                        Text(kind)
+                    }
+                }
             }
 
             Text(update.managementNote)
@@ -1000,6 +1160,31 @@ struct SettingsView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+            if update.engine == .omlx,
+               update.upgradeStrategy == "migrate_to_stable" {
+                Text("This is an unreproducible Homebrew HEAD build. Migrate once to the official stable app for precompiled kernels and one-click updates; Unified Inference will not rebuild an arbitrary moving commit.")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            }
+            if update.engine == .omlx,
+               let cache = viewModel.omlxCacheHealth {
+                VStack(alignment: .leading, spacing: 5) {
+                    HStack {
+                        Label("SSD prompt cache", systemImage: "externaldrive")
+                        Spacer()
+                        Text(ByteCountFormatter.string(fromByteCount: Int64(cache.ssdSizeBytes), countStyle: .file))
+                            .font(.system(.caption, design: .monospaced))
+                    }
+                    Text("\(cache.ssdFileCount) files · \(cache.totalCachedTokens.formatted()) cached tokens across \(cache.totalRequests.formatted()) requests")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    if let diagnostic = cache.diagnostic {
+                        Label(diagnostic, systemImage: "gauge.with.dots.needle.67percent")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                    }
+                }
+            }
 
             if let diagnostic = update.diagnostic {
                 Label(diagnostic, systemImage: "exclamationmark.triangle")
@@ -1008,6 +1193,15 @@ struct SettingsView: View {
             }
 
             HStack {
+                if (update.engine == .mlxcel || update.engine == .mistralRs),
+                   let target = update.officialInstallerUrl,
+                   let url = URL(string: target) {
+                    Link(
+                        update.installed ? "Update Instructions" : "Install Instructions",
+                        destination: url
+                    )
+                    .buttonStyle(.borderedProminent)
+                }
                 if update.engine == .omlx,
                    !update.installed,
                    let target = update.officialInstallerUrl,
@@ -1027,8 +1221,17 @@ struct SettingsView: View {
                             || viewModel.isCheckingRuntimeUpdates
                     )
                 } else if update.canInstall {
-                    Button("Install \(update.availableVersion ?? "Update")") {
-                        Task { await viewModel.installRuntimeUpdate(update) }
+                    Button(
+                        update.engine == .omlx
+                            ? "Update to \(update.availableLabel ?? "Stable")"
+                            : "Install \(update.availableVersion ?? "Update")"
+                    ) {
+                        if update.engine == .omlx {
+                            viewModel.pendingOMLXUpgrade = update
+                            viewModel.confirmHomebrewOMLXUpgrade = true
+                        } else {
+                            Task { await viewModel.installRuntimeUpdate(update) }
+                        }
                     }
                     .buttonStyle(.borderedProminent)
                     .disabled(viewModel.updatingRuntimeEngine != nil)
@@ -1050,6 +1253,13 @@ struct SettingsView: View {
                         viewModel.openOMLXApplication(update)
                     }
                 }
+                if update.engine == .omlx,
+                   update.upgradeStrategy == "migrate_to_stable",
+                   let target = update.officialInstallerUrl,
+                   let url = URL(string: target) {
+                    Link("Download Stable oMLX", destination: url)
+                        .buttonStyle(.borderedProminent)
+                }
                 if update.engine == .omlx {
                     Button("Check Again") {
                         Task { await viewModel.refreshRuntimeUpdates(force: true) }
@@ -1058,6 +1268,15 @@ struct SettingsView: View {
                         viewModel.isCheckingRuntimeUpdates
                             || viewModel.updatingRuntimeEngine != nil
                     )
+                    if viewModel.omlxCacheHealth != nil {
+                        Button("Reset SSD Cache…") {
+                            viewModel.confirmOMLXCacheReset = true
+                        }
+                        .disabled(
+                            viewModel.isResettingOMLXCache
+                                || viewModel.updatingRuntimeEngine != nil
+                        )
+                    }
                 }
                 Spacer()
                 if let target = update.releaseNotesUrl ?? update.latestUpstreamUrl,
@@ -1181,26 +1400,22 @@ struct SettingsView: View {
 
     private var libraryPage: some View {
         VStack(spacing: 0) {
-            HStack(spacing: 10) {
-                Picker("Engine", selection: Binding(
-                    get: { viewModel.libraryEngine },
-                    set: { viewModel.selectLibraryEngine($0) }
-                )) {
-                    Text("llama.cpp").tag(InferenceEngine.llamaCpp)
-                    Text("oMLX").tag(InferenceEngine.omlx)
-                    Text("DS4").tag(InferenceEngine.ds4)
-                    Text("MFLUX").tag(InferenceEngine.mflux)
+            VStack(alignment: .leading, spacing: 7) {
+                HStack(spacing: 10) {
+                    Image(systemName: "magnifyingglass")
+                        .foregroundStyle(.secondary)
+                    TextField("Search Hugging Face", text: $viewModel.libraryQuery)
+                        .textFieldStyle(.roundedBorder)
+                        .onSubmit { Task { await viewModel.refreshModelLibrary() } }
+                    Button("Search") { Task { await viewModel.refreshModelLibrary() } }
+                        .disabled(viewModel.isSearchingLibrary)
+                    if viewModel.isSearchingLibrary {
+                        ProgressView().controlSize(.small)
+                    }
                 }
-                .frame(width: 170)
-
-                TextField("Search Hugging Face", text: $viewModel.libraryQuery)
-                    .textFieldStyle(.roundedBorder)
-                    .onSubmit { Task { await viewModel.refreshModelLibrary() } }
-                Button("Search") { Task { await viewModel.refreshModelLibrary() } }
-                    .disabled(viewModel.isSearchingLibrary)
-                if viewModel.isSearchingLibrary {
-                    ProgressView().controlSize(.small)
-                }
+                Text("One catalog searches every supported model format. Engine badges show where each result can run; Preview engines remain limited to their verified upstream catalogs.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
             .padding(14)
             Divider()
@@ -1215,13 +1430,14 @@ struct SettingsView: View {
                             HStack {
                                 Text(model.displayName).fontWeight(.medium)
                                 Spacer()
-                                compatibilityBadge(model.compatibility)
+                                engineBadge(model.engine)
                             }
                             Text(model.repoId)
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                                 .lineLimit(1)
                             HStack(spacing: 9) {
+                                compatibilityBadge(model.compatibility)
                                 if let quantization = model.quantization {
                                     Text(quantization)
                                 }
@@ -1241,17 +1457,34 @@ struct SettingsView: View {
                 }
                 .frame(minWidth: 330)
 
-                VStack(alignment: .leading, spacing: 14) {
-                    if let searchResult = viewModel.selectedLibrarySearchResult {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 14) {
+                        if let searchResult = viewModel.selectedLibrarySearchResult {
                         VStack(alignment: .leading, spacing: 6) {
-                            Text(searchResult.displayName)
-                                .font(.title3.weight(.semibold))
+                            HStack(alignment: .firstTextBaseline) {
+                                Text(searchResult.displayName)
+                                    .font(.title3.weight(.semibold))
+                                    .fixedSize(horizontal: false, vertical: true)
+                                Spacer(minLength: 10)
+                                engineBadge(searchResult.engine)
+                                compatibilityBadge(searchResult.compatibility)
+                            }
                             Text(searchResult.repoId)
                                 .font(.system(.caption, design: .monospaced))
                                 .foregroundStyle(.secondary)
                                 .textSelection(.enabled)
                             Text(searchResult.compatibilityReason)
                                 .font(.callout)
+                                .fixedSize(horizontal: false, vertical: true)
+                            if searchResult.engine == .ds4 {
+                                Label(
+                                    "DS4 support is limited to exact GGUF layouts declared by the installed upstream runtime.",
+                                    systemImage: "checkmark.shield"
+                                )
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                            }
                             if viewModel.isLoadingLibraryDetails {
                                 HStack(spacing: 7) {
                                     ProgressView().controlSize(.small)
@@ -1265,43 +1498,68 @@ struct SettingsView: View {
                                         .font(.callout)
                                         .foregroundStyle(.secondary)
                                         .textSelection(.enabled)
+                                        .fixedSize(horizontal: false, vertical: true)
                                 }
-                                HStack(spacing: 8) {
+                                LazyVGrid(
+                                    columns: [
+                                        GridItem(
+                                            .adaptive(minimum: 145),
+                                            spacing: 8,
+                                            alignment: .leading
+                                        )
+                                    ],
+                                    alignment: .leading,
+                                    spacing: 7
+                                ) {
                                     if let context = details.contextLength {
                                         modelBadge(
                                             "\(context.formatted()) token context",
                                             color: .blue
                                         )
+                                        .frame(maxWidth: .infinity, alignment: .leading)
                                     }
                                     if let architecture = details.architecture {
                                         modelBadge(architecture, color: .purple)
+                                            .frame(maxWidth: .infinity, alignment: .leading)
                                     }
                                     if let parameters = details.parameterCount {
                                         modelBadge(
                                             parameterCount(parameters),
                                             color: .secondary
                                         )
+                                        .frame(maxWidth: .infinity, alignment: .leading)
                                     }
                                     if let license = details.license {
                                         modelBadge(license, color: .secondary)
+                                            .frame(maxWidth: .infinity, alignment: .leading)
                                     }
                                 }
                                 if let markdown = details.modelCardMarkdown {
-                                    DisclosureGroup("Model card") {
-                                        ScrollView {
-                                            Text(
-                                                ModelTextMarkup.attributedString(
-                                                    from: markdown
-                                                )
+                                    DisclosureGroup {
+                                        if let url = URL(
+                                            string: "https://huggingface.co/\(details.repoId)"
+                                        ) {
+                                            Link(
+                                                "Open full card on Hugging Face",
+                                                destination: url
                                             )
-                                                .frame(
-                                                    maxWidth: .infinity,
-                                                    alignment: .leading
-                                                )
-                                                .textSelection(.enabled)
-                                                .padding(.vertical, 8)
+                                            .font(.caption)
                                         }
-                                        .frame(maxHeight: 260)
+                                        ScrollView {
+                                            ModelCardView(markdown: markdown)
+                                                .padding(12)
+                                        }
+                                        .frame(height: 340)
+                                        .background(
+                                            Color(nsColor: .textBackgroundColor).opacity(0.7),
+                                            in: RoundedRectangle(cornerRadius: 8)
+                                        )
+                                        .overlay {
+                                            RoundedRectangle(cornerRadius: 8)
+                                                .stroke(.separator.opacity(0.45), lineWidth: 1)
+                                        }
+                                    } label: {
+                                        Label("Model card", systemImage: "doc.richtext")
                                     }
                                 }
                             }
@@ -1439,16 +1697,17 @@ struct SettingsView: View {
                         Text("Downloading never loads the model. The normal residency coordinator will load it only when an API request selects its new alias.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
-                    } else {
-                        ContentUnavailableView(
-                            "Choose a Model",
-                            systemImage: "shippingbox",
-                            description: Text("Search results are filtered for the selected inference engine.")
-                        )
+                        } else {
+                            ContentUnavailableView(
+                                "Choose a Model",
+                                systemImage: "shippingbox",
+                                description: Text("Search Hugging Face, then choose a result with the engine support you want.")
+                            )
+                        }
                     }
-                    Spacer()
+                    .padding(18)
+                    .frame(maxWidth: .infinity, alignment: .topLeading)
                 }
-                .padding(18)
                 .frame(minWidth: 350, maxWidth: .infinity, alignment: .topLeading)
             }
 
@@ -1627,6 +1886,7 @@ struct SettingsView: View {
                     }
                 }
 
+                engineSelectionOptions(index)
                 modelRoleOptions(index)
                 if viewModel.settings.models[index].engine == .mflux {
                     imageModelOptions(index)
@@ -1665,14 +1925,183 @@ struct SettingsView: View {
     }
 
     @ViewBuilder
+    private func engineSelectionOptions(_ index: Int) -> some View {
+        let profile = viewModel.settings.models[index]
+        let alternatives = viewModel.settings.models[index].alternatives
+        let pinnableEngines = [profile.engine] + alternatives
+            .filter(\.enabled)
+            .map(\.engine)
+        let sources = viewModel.compatibleAlternativeSources(for: index)
+        if !alternatives.isEmpty || !sources.isEmpty {
+            Section("Engine selection") {
+                if !sources.isEmpty {
+                    Picker("Attach installed profile", selection: $alternativeSourceIndex) {
+                        Text("Choose a compatible model…").tag(nil as Int?)
+                        ForEach(sources, id: \.self) { sourceIndex in
+                            let source = viewModel.settings.models[sourceIndex]
+                            Text("\(source.alias) — \(source.engine.displayName)")
+                                .tag(sourceIndex as Int?)
+                        }
+                    }
+                    Button("Use as engine alternative") {
+                        guard let sourceIndex = alternativeSourceIndex else { return }
+                        viewModel.attachAlternative(sourceIndex: sourceIndex, to: index)
+                        alternativeSourceIndex = nil
+                    }
+                    .disabled(alternativeSourceIndex == nil)
+                    Text("Download or import the same logical model as a separate profile, then attach it here. Its exact engine, path, role, and load settings are preserved; no weights are copied.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                if !alternatives.isEmpty {
+                Picker(
+                    "Policy",
+                    selection: engineSelectionModeBinding(for: index)
+                ) {
+                    Text("Fixed fallback engine").tag("fixed")
+                    Text("Best fresh benchmark").tag("benchmark")
+                    Text("Pinned engine").tag("pinned")
+                }
+                if profile.selection.mode == "pinned" {
+                    Picker(
+                        "Pinned engine",
+                        selection: pinnedEngineBinding(for: index)
+                    ) {
+                        ForEach(pinnableEngines) { engine in
+                            Text(
+                                engine == profile.engine
+                                    ? "\(engine.displayName) — original fallback"
+                                    : engine.displayName
+                            )
+                            .tag(engine)
+                        }
+                    }
+                    Text(
+                        "Pinned selection bypasses benchmark recommendations. The original fallback is still used if the pinned engine cannot load before inference starts."
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                } else if profile.selection.mode == "benchmark" {
+                    Picker(
+                        "Optimize for",
+                        selection: $viewModel.settings.models[index].selection.objective
+                    ) {
+                        Text("Balanced").tag("balanced")
+                        Text("First-token latency").tag("latency")
+                        Text("Output throughput").tag("throughput")
+                    }
+                    Toggle(
+                        "Allow Preview engines to win",
+                        isOn: $viewModel.settings.models[index].selection.allowPreview
+                    )
+                    LabeledContent("Minimum samples") {
+                        integerField(
+                            $viewModel.settings.models[index].selection.minimumSamples,
+                            unit: "runs"
+                        )
+                    }
+                    LabeledContent("Evidence lifetime") {
+                        integerField(
+                            $viewModel.settings.models[index].selection.maxBenchmarkAgeHours,
+                            unit: "hours"
+                        )
+                    }
+                    LabeledContent("Minimum improvement") {
+                        doubleField(
+                            $viewModel.settings.models[index].selection.minimumImprovementPercent,
+                            unit: "%"
+                        )
+                    }
+                }
+                ForEach(alternatives) { alternative in
+                    LabeledContent(alternative.engine.displayName) {
+                        HStack {
+                            Text(alternative.model)
+                                .font(.system(.caption, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                            Button("Detach") {
+                                viewModel.detachAlternative(
+                                    id: alternative.id,
+                                    from: index
+                                )
+                            }
+                            .buttonStyle(.borderless)
+                        }
+                    }
+                }
+                if let decision = viewModel.benchmarkSnapshot?.decisions.first(
+                    where: { $0.alias == viewModel.settings.models[index].alias }
+                ) {
+                    LabeledContent("Current decision") {
+                        Text(decision.selectedEngine.displayName)
+                            .foregroundStyle(.secondary)
+                    }
+                    Text(decision.reason)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                HStack {
+                    Button("Benchmark compatible engines") {
+                        let alias = viewModel.settings.models[index].alias
+                        Task { await viewModel.runEngineBenchmark(alias: alias) }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(
+                        viewModel.hasUnsavedChanges
+                            || viewModel.benchmarkingAlias != nil
+                            || !viewModel.canBenchmarkModel(at: index)
+                    )
+                    if viewModel.benchmarkingAlias
+                        == viewModel.settings.models[index].alias {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text("This can take several minutes.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                Text("The original engine remains the fallback. Benchmark mode uses only fresh results for this exact model, load configuration, runtime version, and Mac.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                }
+            }
+        }
+    }
+
+    private func engineSelectionModeBinding(for index: Int) -> Binding<String> {
+        Binding(
+            get: { viewModel.settings.models[index].selection.mode },
+            set: { mode in
+                viewModel.settings.models[index].selection.mode = mode
+                if mode == "pinned",
+                   viewModel.settings.models[index].selection.pinnedEngine == nil {
+                    viewModel.settings.models[index].selection.pinnedEngine =
+                        viewModel.settings.models[index].engine
+                }
+            }
+        )
+    }
+
+    private func pinnedEngineBinding(for index: Int) -> Binding<InferenceEngine> {
+        Binding(
+            get: {
+                viewModel.settings.models[index].selection.pinnedEngine
+                    ?? viewModel.settings.models[index].engine
+            },
+            set: {
+                viewModel.settings.models[index].selection.pinnedEngine = $0
+            }
+        )
+    }
+
+    @ViewBuilder
     private func languageModelOptions(_ index: Int) -> some View {
         let engine = viewModel.settings.models[index].engine
+        contextWindowOptions(index)
         if engine != .omlx {
             Section("Loading") {
-                optionalIntegerField(
-                    "Context length",
-                    value: $viewModel.settings.models[index].load.contextLength
-                )
                 if engine == .llamaCpp {
                     optionalIntegerField(
                         "Evaluation batch size",
@@ -1729,6 +2158,13 @@ struct SettingsView: View {
                     }
                 }
                 if engine == .ds4 {
+                    optionalIntegerField(
+                        "Resident request sessions",
+                        value: $viewModel.settings.models[index].load.parallel
+                    )
+                    Text("Two or more sessions enable DS4 request concurrency and Flash decode batching, but allocate a complete KV state per session. Leave unset for the safest single-session memory use; GLM currently gains fairness rather than native batch speed.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                     TextField(
                         "KV cache folder (optional)",
                         text: optionalStringBinding(
@@ -1740,6 +2176,20 @@ struct SettingsView: View {
                         value: $viewModel.settings.models[index].load.kvDiskSpaceMb
                     )
                 }
+                if engine == .mlxcel {
+                    optionalIntegerField(
+                        "Parallel request slots",
+                        value: $viewModel.settings.models[index].load.parallel
+                    )
+                    Text("mlxcel defaults to four continuously batched slots. Set an explicit value when memory pressure or benchmark results favor a different scheduler width.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                if engine == .mistralRs {
+                    Text("mistral.rs starts with a conservative single manager admission slot on Metal. Advanced runtime arguments remain configuration-only until upstream exposes an authoritative scheduler-capacity contract.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
         } else {
             Section("Loading") {
@@ -1747,6 +2197,118 @@ struct SettingsView: View {
                     .foregroundStyle(.secondary)
             }
         }
+    }
+
+    @ViewBuilder
+    private func contextWindowOptions(_ index: Int) -> some View {
+        let profile = viewModel.settings.models[index]
+        let observed = viewModel.contextSnapshot?.models
+            .first(where: { $0.alias == profile.alias })?.candidates
+            .first(where: { $0.engine == profile.engine })
+        Section("Context window") {
+            if profile.engine == .mistralRs {
+                LabeledContent("Policy") {
+                    Text("Engine automatic")
+                        .foregroundStyle(.secondary)
+                }
+                Text("mistral.rs remains on its reviewed engine default until its Metal runtime exposes an authoritative context-setting contract.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                Picker(
+                    "Policy",
+                    selection: contextModeBinding(for: index, observed: observed)
+                ) {
+                    Text("Automatic — verified when profiled").tag("automatic")
+                    if profile.context.nativeTokens != nil {
+                        Text("Model native maximum").tag("native")
+                    }
+                    Text("Explicit limit").tag("fixed")
+                }
+                if profile.context.mode == "fixed" {
+                    optionalIntegerField(
+                        "Explicit token limit",
+                        value: $viewModel.settings.models[index].context.fixedTokens
+                    )
+                }
+                LabeledContent("Detected native limit") {
+                    Text(
+                        profile.context.nativeTokens?.formatted()
+                            ?? observed?.nativeTokens?.formatted()
+                            ?? "Unknown"
+                    )
+                    .foregroundStyle(.secondary)
+                }
+                LabeledContent("Guaranteed API limit") {
+                    Text(observed?.guaranteedTokens?.formatted() ?? "Not yet observed")
+                        .foregroundStyle(.secondary)
+                }
+                if let verified = observed?.verifiedTokens {
+                    LabeledContent("Verified on this Mac") {
+                        Text("\(verified.formatted()) tokens")
+                            .foregroundStyle(.green)
+                    }
+                } else if let effective = observed?.effectiveTokens {
+                    LabeledContent("Current engine setting") {
+                        Text("\(effective.formatted()) tokens")
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                if !profile.alternatives.isEmpty,
+                   let candidates = viewModel.contextSnapshot?.models
+                    .first(where: { $0.alias == profile.alias })?.candidates {
+                    ForEach(candidates.filter { $0.engine != profile.engine }) { candidate in
+                        LabeledContent("\(candidate.engine.displayName) guarantee") {
+                            Text(candidate.guaranteedTokens?.formatted() ?? "Unknown")
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+            }
+            HStack {
+                Button("Profile usable context") {
+                    Task { await viewModel.runContextProfile(alias: profile.alias) }
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(
+                    viewModel.hasUnsavedChanges
+                        || viewModel.profilingContextAlias != nil
+                        || profile.configuredRole != .generation
+                )
+                if viewModel.profilingContextAlias == profile.alias {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text("Large prefills can take several minutes.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            Text("Automatic mode uses fresh long-prefill evidence for this exact model, engine runtime, and Mac. Without valid evidence it keeps the configured safe fallback. Native mode requests the model's advertised maximum without proving it fits; an explicit limit is always honored.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private func contextModeBinding(
+        for index: Int,
+        observed: ContextWindowCandidate?
+    ) -> Binding<String> {
+        Binding(
+            get: { viewModel.settings.models[index].context.mode },
+            set: { mode in
+                viewModel.settings.models[index].context.mode = mode
+                if mode == "fixed" {
+                    viewModel.settings.models[index].context.fixedTokens =
+                        viewModel.settings.models[index].context.fixedTokens
+                        ?? observed?.guaranteedTokens
+                        ?? viewModel.settings.models[index].context.nativeTokens
+                        ?? viewModel.settings.models[index].load.contextLength
+                        ?? 32_768
+                } else {
+                    viewModel.settings.models[index].context.fixedTokens = nil
+                }
+            }
+        )
     }
 
     private func imageModelOptions(_ index: Int) -> some View {
@@ -2075,6 +2637,34 @@ struct SettingsView: View {
         )
     }
 
+    private var residencyPreset: Binding<ResidencyPreset> {
+        Binding(
+            get: {
+                switch viewModel.settings.server.idleUnloadSeconds {
+                case nil: .performance
+                case 900: .balanced
+                case 300: .memorySaver
+                default: .custom
+                }
+            },
+            set: { preset in
+                switch preset {
+                case .performance:
+                    viewModel.settings.server.idleUnloadSeconds = nil
+                    viewModel.settings.server.maxConcurrency = nil
+                case .balanced:
+                    viewModel.settings.server.idleUnloadSeconds = 900
+                    viewModel.settings.server.maxConcurrency = nil
+                case .memorySaver:
+                    viewModel.settings.server.idleUnloadSeconds = 300
+                    viewModel.settings.server.maxConcurrency = 1
+                case .custom:
+                    break
+                }
+            }
+        )
+    }
+
     private var idleUnloadSeconds: Binding<Int> {
         Binding(
             get: { viewModel.settings.server.idleUnloadSeconds ?? 900 },
@@ -2209,6 +2799,24 @@ struct SettingsView: View {
             .background(color.opacity(0.12), in: Capsule())
     }
 
+    private func engineBadge(_ engine: InferenceEngine) -> some View {
+        let color: Color = switch engine {
+        case .llamaCpp: .blue
+        case .omlx: .purple
+        case .ds4: .orange
+        case .mflux: .pink
+        case .mlxcel: .indigo
+        case .mistralRs: .teal
+        }
+        return Label(engine.displayName, systemImage: "checkmark.circle.fill")
+            .font(.caption2.weight(.semibold))
+            .foregroundStyle(color)
+            .padding(.horizontal, 7)
+            .padding(.vertical, 3)
+            .background(color.opacity(0.12), in: Capsule())
+            .fixedSize()
+    }
+
     private func storageDisplayName(_ name: String) -> String {
         name.split(separator: "-").map { $0.capitalized }.joined(separator: " ")
     }
@@ -2274,6 +2882,24 @@ struct SettingsView: View {
         .frame(minWidth: fieldWidth + 70, alignment: .trailing)
     }
 
+    private func doubleField(
+        _ value: Binding<Double>,
+        unit: String,
+        fieldWidth: CGFloat = 104
+    ) -> some View {
+        HStack(spacing: 8) {
+            TextField("Value", value: value, format: .number)
+                .labelsHidden()
+                .textFieldStyle(.roundedBorder)
+                .multilineTextAlignment(.trailing)
+                .frame(width: fieldWidth)
+            Text(unit)
+                .foregroundStyle(.secondary)
+                .frame(width: 58, alignment: .leading)
+        }
+        .frame(minWidth: fieldWidth + 70, alignment: .trailing)
+    }
+
     private func modelRoleBinding(for index: Int) -> Binding<ModelRole?> {
         Binding(
             get: { viewModel.settings.models[index].configuredRole },
@@ -2320,6 +2946,87 @@ struct SettingsView: View {
         }
     }
 
+}
+
+private struct ModelCardView: View {
+    private let blocks: [ModelTextBlock]
+
+    init(markdown: String) {
+        blocks = ModelTextMarkup.blocks(from: markdown)
+    }
+
+    var body: some View {
+        LazyVStack(alignment: .leading, spacing: 10) {
+            ForEach(Array(blocks.enumerated()), id: \.offset) { _, block in
+                blockView(block)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .textSelection(.enabled)
+    }
+
+    @ViewBuilder
+    private func blockView(_ block: ModelTextBlock) -> some View {
+        switch block {
+        case let .heading(level, text):
+            Text(ModelTextMarkup.attributedString(from: text))
+                .font(headingFont(level))
+                .fontWeight(level <= 2 ? .bold : .semibold)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(.top, level <= 2 ? 5 : 2)
+        case let .paragraph(text):
+            Text(ModelTextMarkup.attributedString(from: text))
+                .lineSpacing(3)
+                .fixedSize(horizontal: false, vertical: true)
+        case let .unorderedItem(text):
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text("•")
+                    .fontWeight(.semibold)
+                Text(ModelTextMarkup.attributedString(from: text))
+                    .lineSpacing(2)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        case let .orderedItem(number, text):
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text("\(number).")
+                    .fontWeight(.semibold)
+                    .monospacedDigit()
+                Text(ModelTextMarkup.attributedString(from: text))
+                    .lineSpacing(2)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        case let .quote(text):
+            HStack(alignment: .top, spacing: 9) {
+                RoundedRectangle(cornerRadius: 2)
+                    .fill(Color.accentColor.opacity(0.55))
+                    .frame(width: 3)
+                Text(ModelTextMarkup.attributedString(from: text))
+                    .italic()
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        case let .code(text):
+            ScrollView(.horizontal) {
+                Text(text)
+                    .font(.system(.caption, design: .monospaced))
+                    .fixedSize(horizontal: true, vertical: true)
+                    .padding(10)
+            }
+            .background(.quaternary.opacity(0.55), in: RoundedRectangle(cornerRadius: 6))
+        case .rule:
+            Divider()
+                .padding(.vertical, 3)
+        }
+    }
+
+    private func headingFont(_ level: Int) -> Font {
+        switch level {
+        case 1: .title2
+        case 2: .title3
+        case 3: .headline
+        default: .subheadline
+        }
+    }
 }
 
 private struct ExistingModelImporterView: View {

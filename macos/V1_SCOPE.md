@@ -34,6 +34,13 @@ existing weights can be adopted without copying them.
 
 - DS4 language inference.
 - MFLUX image generation.
+- mlxcel native MLX generation and vision-language inference.
+- mistral.rs Safetensors language and multimodal inference.
+- Exact-model cross-engine benchmarking and opt-in automatic selection. The
+  Stable profile remains the fallback whenever evidence is missing or stale.
+- Explicit per-model engine pinning when answer quality or compatibility
+  should override the benchmark winner; the original profile remains the
+  pre-work fallback.
 
 Preview engines remain installable and usable, but the UI and control API label
 them as Preview and fresh configurations leave them disabled. A missing

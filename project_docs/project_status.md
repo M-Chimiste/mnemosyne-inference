@@ -1,6 +1,6 @@
 # Mnemosyne Inference — Project Status
 
-**Last updated:** 2026-07-31
+**Last updated:** 2026-08-27
 
 ## Current state
 
@@ -20,10 +20,23 @@ the engine-pin update. The remaining release work is workstation/CUDA smoke
 validation of the current pins and end-to-end backend swaps; see
 [smoke_checks.md](smoke_checks.md).
 
+The optional Nyx-hosted Fleet gateway is implemented as a separately locked
+service under `fleet/`. Enrolled CUDA and native nodes expose a versioned,
+secret-free snapshot through a dedicated credential. Nyx performs strict
+deployment and capability matching, warm-first capacity-aware scheduling,
+bounded FIFO queuing, and cancellation-safe full-response reservations behind
+one public endpoint. Its realtime dashboard joins live node state and
+metadata-only route history with bounded read-only aggregates from the
+existing token ledger; nodes remain the only token-event writers. Isolated
+fault-injection coverage and a content-redacted multi-node acceptance runner
+are present. LAN/Tailscale deployment on Nyx and representative simultaneous
+Mac/CUDA hardware evidence remain release gates; see
+[fleet acceptance](fleet_acceptance.md).
+
 An isolated native macOS track is implemented, with frontier text-engine,
 protected-storage, and migration-soak acceptance still pending. It lives
 entirely below `macos/`, replaces the previous sidecar on `1240`, uses
-`17321-17325` for control and inner engines, and does not alter
+`17321-17327` for control and inner engines, and does not alter
 the CUDA image or its `8000-8002` topology. The first implementation includes:
 
 - a separately locked FastAPI service with inference and control planes;
@@ -67,19 +80,48 @@ the CUDA image or its `8000-8002` topology. The first implementation includes:
   history, a compact persistent transition journal for target-Mac lifecycle
   evidence, residency-neutral profile creation, and exact manager-owned
   directory deletion behind the global empty-residency barrier;
+- current DS4 discovery for its five DeepSeek V4 and four GLM 5.2 single-node
+  targets, with exact Hub-file/revision validation and atomic eleven-shard GLM
+  installation rather than broad unsupported GGUF claims, plus typed
+  resident-session capacity for upstream scheduling/batching;
 - a bounded private managed-runtime lifecycle journal that distinguishes
   service instances and proves activation, post-restart inference, rollback,
   post-rollback inference, and fixed-code corrupt-runtime rejection without
   retaining exception text; and
 - independent setup, architecture, and Apple Silicon smoke documentation.
 
+The native track now also has additive Preview adapters for mlxcel and
+mistral.rs. Both reuse strict manager-owned process identity and keep their
+upstream installation external. Schema-v5 model profiles retain their original
+engine as the fixed fallback, may attach one exact candidate per additional
+engine, can pin a user-selected engine when quality should override speed, and
+can opt into durable content-free benchmark selection. Automatic routing
+requires fresh successful evidence for the exact ordered candidate set,
+runtime, system, and suite; Preview winners require explicit consent. Fleet
+excludes aliases whose local policy can select a non-primary engine, preserving
+immutable deployment identity. The Settings sidebar exposes the packaged app
+version and build beside the product name.
+
+- Schema-v6 language candidates now carry detected-native, configured,
+  effective, and locally verified context-window contracts. Settings can apply
+  fresh exact-Mac profiling automatically, request the model-native maximum, or
+  pin an explicit token limit. oMLX is inspected and configured through its
+  official APIs, `/v1/models` advertises `max_model_len`, and an otherwise faster
+  engine cannot win automatic selection by silently reducing usable context.
+- Qwen3.8 request-level thinking controls are portable across stable native
+  language engines. Unified Inference retains the model-native `low`, `medium`,
+  and `xhigh` reasoning effort, normalizes thinking/preservation template
+  controls, and translates one token-budget surface to the selected oMLX or
+  llama.cpp dialect without persisting prompts or reasoning content.
+
 The native product is now a 0.9.0 release candidate with one enforced version,
 a guided Setup & Health flow, bounded secret-redacted readiness, real public
 listener self-tests with durable usage verification, Stable/Preview engine
 tiers, Sparkle integration, and separate CI/signed-release workflows. The
 Python schema, packaged YAML, and Swift defaults now agree: llama.cpp is
-enabled, external oMLX remains off until configured, and Preview DS4/MFLUX are
-opt-in. The build-47 private DMG was rejected after installation because dyld
+enabled, external oMLX remains off until configured, and Preview DS4, MFLUX,
+mlxcel, and mistral.rs are opt-in. The build-47 private DMG was rejected after
+installation because dyld
 could not resolve its packaged Sparkle framework. Corrected build 50 adds the
 `Contents/Frameworks` rpath and is independently verified against the
 dependency, embedded framework, and load command
@@ -140,11 +182,13 @@ gate until the candidate actually produces the required state transitions.
 Managed runtime acceptance now has the same durable treatment: the strict
 collector requires an ordered update/restart/rollback/restart/rejection chain
 and confirms the original managed version remains active.
-The current native service suite passes all 280 tests on the development Mac,
-including the two real-bookmark tests that skip in restricted runners. The
-isolated MFLUX worker passes 23 tests with
-real Metal access, the packaging suite passes 33 tests, and all 60 current
-Swift tests pass. The full relocatable build reports version 0.9.0 and its
+The current CUDA/manager suite passes 478 tests, and the independently locked
+Fleet suite passes 79 tests. The native service suite passes 402 tests on the
+development Mac; two real-bookmark tests skip in restricted runners.
+The isolated MFLUX worker passes 23 tests with real Metal access, the packaging
+suite passes 33 tests, and all 73 current Swift tests pass. The Fleet wheel
+contains its protocol schema and passed a clean build. The full relocatable
+build reports version 0.9.0 and its
 embedded service passes configuration validation without adding bytecode to or
 invalidating the signed app. GitHub Actions macOS CI run
 [30265133377](https://github.com/M-Chimiste/mnemosyne-inference/actions/runs/30265133377)
@@ -175,8 +219,41 @@ see
 | 9 — llama.cpp backend for GGUF | Auto-detected llama-server dispatch alongside vLLM | ⚠️ Code landed; CUDA workstation smoke pending |
 | 10 — Local image generation | Unified Images API via CUDA SGLang Diffusion and macOS MFLUX | ⚠️ Mac Krea 2 smoke passed; CUDA model smoke pending |
 | 11 — Native GGUF migration | Replace the Mac LM Studio dependency with managed llama.cpp and adopt existing libraries in place | ⚠️ LM Studio runtime dependency removed; service/runtime, direct GGUF, historical signed-package, and live LaunchAgent smokes passed; current 0.9 candidate migration/durability/signing gates remain |
+| 12 — Nyx Fleet gateway | Strict multi-node discovery, capacity routing, concurrency, usage view, and realtime dashboard | ⚠️ Implementation and isolated coverage landed; Nyx + Mac + CUDA target-host acceptance pending |
 
 ## What has landed
+
+**Phase 12**
+
+- CUDA and native managers expose separately authenticated protocol-v1
+  snapshots containing strict immutable deployment identity, residency epoch,
+  bounded admission, derived/configured/effective concurrency, and redacted
+  usage-delivery health.
+- Both nodes use FIFO epoch leases through complete response streams. Different
+  targets drain before unload, while unload, eviction, reconciliation,
+  maintenance, and shutdown share fail-closed barriers.
+- The Nyx service explicitly enrolls nodes, expires stale instances from its
+  own monotonic receipt clock, and routes exact public model/deployment and
+  capability mappings with warm-first weighted least-outstanding selection.
+- Gateway retries are limited to proven pre-work failures. Cancellation-safe
+  reservations, fixed metadata-only route history, separate client/admin/node
+  credentials, ambient-proxy isolation, and a read-only ledger role preserve
+  the data-plane trust boundary.
+- `/fleet/` presents realtime node, resident, queue, capacity, route, and
+  usage state without exposing node URLs or secrets. The serving node remains
+  the sole durable token-accounting authority.
+- CUDA catalog schema v5 gives local analytics the same event UUID as the
+  delivery outbox and commits both atomically before response completion;
+  ambiguous commits and restart retries cannot double-count model totals.
+- The canonical schema, cross-platform identity vectors, security review,
+  automated suites, and `scripts/fleet_acceptance.py` define the remaining
+  target-host evidence rather than treating simulated engines as hardware
+  acceptance. A bounded wire-level rehearsal now runs that real CLI against
+  the real Fleet HTTP service and two separately authenticated macOS- and
+  CUDA-labelled protocol nodes, proving deterministic fan-out, exact simulated
+  per-node usage increments, and metadata-only persistence; it remains
+  explicitly distinct from Nyx, engine, outbox/Postgres, and transport
+  acceptance.
 
 **Phase 10**
 
@@ -188,7 +265,7 @@ see
   Qwen/Qwen-Image and krea/Krea-2-Turbo share the existing inner `:8002`
   lifecycle, so loading an image model unloads vLLM/llama.cpp and vice versa.
 - SGLang Diffusion 0.5.13 is installed under `/opt/sglang`, isolated from the
-  vLLM environment. Catalog schema v4 persists model kind, capabilities, and
+  vLLM environment. Catalog schema v4 introduced model kind, capabilities, and
   image defaults; the CLI, UI, and HF `text-to-image` search path can create
   image installs.
 - Apple Silicon image profiles use a separately locked MFLUX 0.18.0 worker on
@@ -202,16 +279,29 @@ see
 - The native app bundle contains separate `framework-mnemosyne-base` and
   `framework-mnemosyne-image` export layers plus separate service/worker
   source trees. No MLX runtime is added to Docker.
-- The native Runtime Updates page detects llama.cpp, oMLX, MFLUX, and DS4
-  versions. For oMLX it selects the official DMG matching the host macOS
+- The native Runtime Updates page detects llama.cpp, oMLX, MFLUX, DS4, mlxcel,
+  and mistral.rs versions. For oMLX it selects the official DMG matching the host macOS
   version, detects the app, CLI shim, conventional Homebrew paths, or running
   server, and delegates updates to oMLX. A missing oMLX runtime can instead be
   installed through an approval-gated, argument-bounded stable Homebrew
   action. llama.cpp comes from its official
   GitHub arm64 artifact, MFLUX installs from its official PyPI project, and DS4
-  builds from an exact official GitHub commit. Managed updates stage
+  builds from an exact official GitHub commit. mlxcel and mistral.rs retain
+  externally owned official upgrade paths. Managed updates stage
   independently, activate through the global-empty maintenance barrier, and
   retain the previous version for rollback without a repository-owned feed.
+- The native coordinator now reads oMLX's authoritative concurrent-request
+  limit from its admin settings, applies only an optional global ceiling, and
+  keeps a bounded metadata-only performance window with cold-start, admission,
+  first-byte, total-latency, and streamed token-rate aggregates. Fresh configs
+  retain one verified warm model and new GGUF profiles use bounded interactive
+  context defaults.
+- oMLX runtime ownership is classified as official app, stable Homebrew,
+  Homebrew HEAD, or other external service. Stable Homebrew updates use an
+  explicit globally drained fixed-command workflow; HEAD builds migrate rather
+  than rebuild. Vendor cache metrics and a confirmed, drain-safe official SSD
+  cache reset are available without exposing paths or credentials. A
+  content-redacted benchmark supports direct compatible-endpoint comparisons.
 - Unified Inference is now the native token sidecar: central reporting defaults
   on for every language engine. Existing machines can migrate the previous
   sidecar's canonical `node.id` and ledger DSN from its LaunchAgent; Settings
@@ -270,7 +360,11 @@ see
   facts are read-only, and API routing is selected through typed,
   engine-constrained Generation, Embeddings, Rerank, or Image roles rather
   than raw paths and arbitrary endpoint checkboxes.
-- Hugging Face discovery now shows bounded model-card prose and architecture,
+- Hugging Face discovery now uses one cross-engine catalog with explicit
+  engine-support badges while retaining exact per-engine install validation.
+  Model cards strip Hub YAML front matter and render safe Markdown blocks in a
+  scrollable detail pane rather than compressing or truncating the install UI.
+  Discovery also shows bounded model-card prose and architecture,
   context length, parameter count, and license when Hub/config/GGUF metadata
   provides them. GGUF search requires an exact quant/shard selection and
   automatically selects the highest-fidelity same-directory vision projector,
@@ -340,8 +434,9 @@ see
   `org/repo` or absolute-path fallback.
 - Swap queueing replaces 409-on-race behavior with deadline-bounded waiting,
   same-target piggybacking, 504 on timeout, and 503 on vLLM load failure.
-- Idle eviction and buffered usage writes update `last_used_at` and
-  `request_count` without hot-path SQLite writes.
+- Idle eviction retains buffered request-count updates. Token events now use
+  an immediate idempotent SQLite transaction so local analytics and the
+  optional delivery outbox become durable together before response completion.
 - `/manager/status` is additive: legacy keys remain, with alias, GPU plan,
   quantization, idle countdown, in-flight count, and swap target added.
 - `vllm-ctl status` prints the new fields when present.

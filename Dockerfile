@@ -138,6 +138,8 @@ RUN pip install --no-cache-dir \
 # ── App ────────────────────────────────────────────────────────────
 WORKDIR /app
 COPY vllm_manager.py config.py catalog.py profiles.py runtime.py image_api.py \
+     usage_normalization.py \
+     cuda_residency.py fleet_protocol.py \
      downloader.py download_worker.py hf_search.py logsetup.py \
      pg_writer.py repo_probe.py vllm_supported_architectures.json ./
 COPY scripts/ ./scripts/

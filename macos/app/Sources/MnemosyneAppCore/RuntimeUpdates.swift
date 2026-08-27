@@ -31,6 +31,8 @@ public struct EngineRuntimeUpdate: Codable, Equatable, Identifiable, Sendable {
     public let installedVersion: String?
     public let installedRevision: String?
     public let installedPath: String?
+    public let installationKind: String?
+    public let upgradeStrategy: String?
     public let latestUpstreamVersion: String?
     public let latestUpstreamRevision: String?
     public let latestUpstreamUrl: String?
@@ -57,6 +59,17 @@ public struct EngineRuntimeUpdate: Codable, Equatable, Identifiable, Sendable {
     public var availableLabel: String? {
         availableVersion ?? latestUpstreamVersion
     }
+
+    public var installationKindLabel: String? {
+        switch installationKind {
+        case "official_app", "official_app_cli": "Official app"
+        case "homebrew_stable": "Homebrew stable"
+        case "homebrew_head": "Homebrew HEAD"
+        case "running_external": "External server"
+        case "external_cli": "External CLI"
+        default: nil
+        }
+    }
 }
 
 public struct InstallRuntimeUpdateRequest: Codable, Equatable, Sendable {
@@ -65,4 +78,24 @@ public struct InstallRuntimeUpdateRequest: Codable, Equatable, Sendable {
     public init(version: String?) {
         self.version = version
     }
+}
+
+public struct OMLXCacheHealth: Codable, Equatable, Sendable {
+    public let available: Bool
+    public let totalRequests: Int
+    public let totalCachedTokens: Int
+    public let cacheEfficiency: Double?
+    public let ssdFileCount: Int
+    public let ssdSizeBytes: Int
+    public let ssdLimitBytes: Int
+    public let hotSizeBytes: Int
+    public let hotLimitBytes: Int
+    public let resetRecommended: Bool
+    public let diagnostic: String?
+}
+
+public struct OMLXCacheResetResult: Codable, Equatable, Sendable {
+    public let status: String
+    public let deletedFiles: Int
+    public let cache: OMLXCacheHealth?
 }

@@ -605,7 +605,7 @@ class AcceptanceEvidenceTests(unittest.TestCase):
         }
         config = {
             "config": {
-                "schema_version": 2,
+                "schema_version": 3,
                 "engines": {"llama_cpp": {"enabled": True}},
                 "storage": {
                     "locations": [

@@ -1,7 +1,7 @@
 import Foundation
 
 public struct NativeSettings: Codable, Equatable, Sendable {
-    public static let supportedSchemaVersion = 2
+    public static let supportedSchemaVersion = 6
 
     public var schemaVersion: Int
     public var server: ServerSettings
@@ -65,15 +65,18 @@ public struct ServerSettings: Codable, Equatable, Sendable {
     public var inferencePort = 1_240
     public var controlBind = "127.0.0.1"
     public var controlPort = 17_321
-    public var idleUnloadSeconds: Int? = 900
+    public var idleUnloadSeconds: Int?
     public var startupTimeoutSeconds = 900.0
     public var swapQueueTimeoutSeconds = 300.0
+    public var maxConcurrency: Int?
+    public var maxQueueDepth = 128
     public var shutdownGraceSeconds = 30.0
     public var reconcileIntervalSeconds = 30.0
     public var imageRequestTimeoutSeconds = 1_800.0
     public var imageMaxPixels = 4_194_304
     public var startupPolicy = "unload_all"
     public var inferenceApiKeyEnv = "INFERENCE_API_KEY"
+    public var fleetApiKeyEnv = "FLEET_API_KEY"
     public var controlPasswordEnv = "ADMIN_PASSWORD"
 
     public init() {}
@@ -89,8 +92,28 @@ public struct EngineSettings: Codable, Equatable, Sendable {
     public var omlx = OMLXSettings()
     public var ds4 = DS4Settings()
     public var mflux = MFluxSettings()
+    public var mlxcel = MLXcelSettings()
+    public var mistralRs = MistralRSSettings()
 
     public init() {}
+
+    enum CodingKeys: String, CodingKey {
+        case llamaCpp, omlx, ds4, mflux, mlxcel, mistralRs
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        llamaCpp = try container.decode(LlamaCppSettings.self, forKey: .llamaCpp)
+        omlx = try container.decode(OMLXSettings.self, forKey: .omlx)
+        ds4 = try container.decode(DS4Settings.self, forKey: .ds4)
+        mflux = try container.decode(MFluxSettings.self, forKey: .mflux)
+        mlxcel = try container.decodeIfPresent(MLXcelSettings.self, forKey: .mlxcel)
+            ?? .init()
+        mistralRs = try container.decodeIfPresent(
+            MistralRSSettings.self,
+            forKey: .mistralRs
+        ) ?? .init()
+    }
 }
 
 public struct LlamaCppSettings: Codable, Equatable, Sendable {
@@ -139,6 +162,34 @@ public struct MFluxSettings: Codable, Equatable, Sendable {
     public var python: String?
     public var pythonEnv = "MNEMOSYNE_MFLUX_PYTHON"
     public var sourcePathEnv = "MNEMOSYNE_MFLUX_PYTHONPATH"
+    public var requestTimeoutSeconds = 30.0
+    public var shutdownGraceSeconds = 30.0
+
+    public init() {}
+}
+
+public struct MLXcelSettings: Codable, Equatable, Sendable {
+    public var enabled = false
+    public var host = "127.0.0.1"
+    public var port = 17_326
+    public var binary = "/opt/homebrew/bin/mlxcel-server"
+    public var workingDirectory = "~/Library/Application Support/Mnemosyne"
+    public var processStatePath =
+        "~/Library/Application Support/Mnemosyne/state/mlxcel-process.json"
+    public var requestTimeoutSeconds = 30.0
+    public var shutdownGraceSeconds = 30.0
+
+    public init() {}
+}
+
+public struct MistralRSSettings: Codable, Equatable, Sendable {
+    public var enabled = false
+    public var host = "127.0.0.1"
+    public var port = 17_327
+    public var binary = "~/.local/bin/mistralrs"
+    public var workingDirectory = "~/Library/Application Support/Mnemosyne"
+    public var processStatePath =
+        "~/Library/Application Support/Mnemosyne/state/mistral-rs-process.json"
     public var requestTimeoutSeconds = 30.0
     public var shutdownGraceSeconds = 30.0
 
@@ -196,6 +247,8 @@ public enum InferenceEngine: String, Codable, CaseIterable, Identifiable, Sendab
     case omlx
     case ds4
     case mflux
+    case mlxcel
+    case mistralRs = "mistral.rs"
 
     public var id: String { rawValue }
 
@@ -205,6 +258,8 @@ public enum InferenceEngine: String, Codable, CaseIterable, Identifiable, Sendab
         case .omlx: "oMLX"
         case .ds4: "DS4"
         case .mflux: "MFLUX"
+        case .mlxcel: "mlxcel"
+        case .mistralRs: "mistral.rs"
         }
     }
 }
@@ -212,6 +267,25 @@ public enum InferenceEngine: String, Codable, CaseIterable, Identifiable, Sendab
 public enum ModelKindSetting: String, Codable, Sendable {
     case language
     case image
+}
+
+public struct ModelContextSettings: Codable, Equatable, Sendable {
+    public var mode: String
+    public var nativeTokens: Int?
+    public var fixedTokens: Int?
+    public var maxVerifiedAgeHours: Int
+
+    public init(
+        mode: String = "automatic",
+        nativeTokens: Int? = nil,
+        fixedTokens: Int? = nil,
+        maxVerifiedAgeHours: Int = 720
+    ) {
+        self.mode = mode
+        self.nativeTokens = nativeTokens
+        self.fixedTokens = fixedTokens
+        self.maxVerifiedAgeHours = maxVerifiedAgeHours
+    }
 }
 
 public struct ModelProfileSettings: Codable, Equatable, Sendable {
@@ -222,8 +296,11 @@ public struct ModelProfileSettings: Codable, Equatable, Sendable {
     public var servedModelName: String?
     public var capabilities: [String]?
     public var load: ModelLoadSettings
+    public var context: ModelContextSettings
     public var kind: ModelKindSetting
     public var image: ImageProfileSettings?
+    public var alternatives: [ModelEngineAlternativeSettings]
+    public var selection: ModelSelectionSettings
     public var enabled: Bool
 
     public init(
@@ -234,8 +311,11 @@ public struct ModelProfileSettings: Codable, Equatable, Sendable {
         servedModelName: String? = nil,
         capabilities: [String]? = nil,
         load: ModelLoadSettings = .init(),
+        context: ModelContextSettings = .init(),
         kind: ModelKindSetting = .language,
         image: ImageProfileSettings? = nil,
+        alternatives: [ModelEngineAlternativeSettings] = [],
+        selection: ModelSelectionSettings = .init(),
         enabled: Bool = true
     ) {
         self.alias = alias
@@ -245,9 +325,156 @@ public struct ModelProfileSettings: Codable, Equatable, Sendable {
         self.servedModelName = servedModelName
         self.capabilities = capabilities
         self.load = load
+        self.context = context
         self.kind = kind
         self.image = image
+        self.alternatives = alternatives
+        self.selection = selection
         self.enabled = enabled
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case alias, engine, model, storage, servedModelName, capabilities
+        case load, context, kind, image, alternatives, selection, enabled
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        alias = try container.decode(String.self, forKey: .alias)
+        engine = try container.decode(InferenceEngine.self, forKey: .engine)
+        model = try container.decode(String.self, forKey: .model)
+        storage = try container.decodeIfPresent(String.self, forKey: .storage)
+        servedModelName = try container.decodeIfPresent(
+            String.self,
+            forKey: .servedModelName
+        )
+        capabilities = try container.decodeIfPresent(
+            [String].self,
+            forKey: .capabilities
+        )
+        load = try container.decodeIfPresent(ModelLoadSettings.self, forKey: .load)
+            ?? .init()
+        context = try container.decodeIfPresent(ModelContextSettings.self, forKey: .context)
+            ?? .init()
+        kind = try container.decodeIfPresent(ModelKindSetting.self, forKey: .kind)
+            ?? .language
+        image = try container.decodeIfPresent(ImageProfileSettings.self, forKey: .image)
+        alternatives = try container.decodeIfPresent(
+            [ModelEngineAlternativeSettings].self,
+            forKey: .alternatives
+        ) ?? []
+        selection = try container.decodeIfPresent(
+            ModelSelectionSettings.self,
+            forKey: .selection
+        ) ?? .init()
+        enabled = try container.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(alias, forKey: .alias)
+        try container.encode(engine, forKey: .engine)
+        try container.encode(model, forKey: .model)
+        try container.encodeIfPresent(storage, forKey: .storage)
+        try container.encodeIfPresent(servedModelName, forKey: .servedModelName)
+        try container.encodeIfPresent(capabilities, forKey: .capabilities)
+        try container.encode(load, forKey: .load)
+        try container.encode(context, forKey: .context)
+        try container.encode(kind, forKey: .kind)
+        try container.encodeIfPresent(image, forKey: .image)
+        try container.encode(alternatives, forKey: .alternatives)
+        try container.encode(selection, forKey: .selection)
+        try container.encode(enabled, forKey: .enabled)
+    }
+}
+
+public struct ModelEngineAlternativeSettings: Codable, Equatable, Sendable, Identifiable {
+    public var engine: InferenceEngine
+    public var model: String
+    public var sourceAlias: String?
+    public var storage: String?
+    public var servedModelName: String?
+    public var capabilities: [String]?
+    public var load: ModelLoadSettings
+    public var context: ModelContextSettings
+    public var enabled: Bool
+
+    public var id: String { "\(engine.rawValue):\(model)" }
+
+    public init(
+        engine: InferenceEngine,
+        model: String,
+        sourceAlias: String? = nil,
+        storage: String? = nil,
+        servedModelName: String? = nil,
+        capabilities: [String]? = nil,
+        load: ModelLoadSettings = .init(),
+        context: ModelContextSettings = .init(),
+        enabled: Bool = true
+    ) {
+        self.engine = engine
+        self.model = model
+        self.sourceAlias = sourceAlias
+        self.storage = storage
+        self.servedModelName = servedModelName
+        self.capabilities = capabilities
+        self.load = load
+        self.context = context
+        self.enabled = enabled
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case engine, model, sourceAlias, storage, servedModelName, capabilities
+        case load, context, enabled
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        engine = try container.decode(InferenceEngine.self, forKey: .engine)
+        model = try container.decode(String.self, forKey: .model)
+        sourceAlias = try container.decodeIfPresent(String.self, forKey: .sourceAlias)
+        storage = try container.decodeIfPresent(String.self, forKey: .storage)
+        servedModelName = try container.decodeIfPresent(
+            String.self,
+            forKey: .servedModelName
+        )
+        capabilities = try container.decodeIfPresent(
+            [String].self,
+            forKey: .capabilities
+        )
+        load = try container.decodeIfPresent(ModelLoadSettings.self, forKey: .load)
+            ?? .init()
+        context = try container.decodeIfPresent(ModelContextSettings.self, forKey: .context)
+            ?? .init()
+        enabled = try container.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
+    }
+}
+
+public struct ModelSelectionSettings: Codable, Equatable, Sendable {
+    public var mode = "fixed"
+    public var pinnedEngine: InferenceEngine?
+    public var objective = "balanced"
+    public var maxBenchmarkAgeHours = 168
+    public var minimumSamples = 3
+    public var minimumImprovementPercent = 5.0
+    public var allowPreview = false
+
+    public init(
+        mode: String = "fixed",
+        pinnedEngine: InferenceEngine? = nil,
+        objective: String = "balanced",
+        maxBenchmarkAgeHours: Int = 168,
+        minimumSamples: Int = 3,
+        minimumImprovementPercent: Double = 5.0,
+        allowPreview: Bool = false
+    ) {
+        self.mode = mode
+        self.pinnedEngine = pinnedEngine
+        self.objective = objective
+        self.maxBenchmarkAgeHours = maxBenchmarkAgeHours
+        self.minimumSamples = minimumSamples
+        self.minimumImprovementPercent = minimumImprovementPercent
+        self.allowPreview = allowPreview
     }
 }
 

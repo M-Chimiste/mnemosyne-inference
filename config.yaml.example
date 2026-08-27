@@ -15,6 +15,8 @@ server:
   idle_unload_seconds: 900          # 15 min default; null disables idle eviction
   startup_timeout_seconds: 600
   swap_queue_timeout_seconds: 300   # how long /v1 waits during a model swap before 504
+  max_concurrency: null             # optional ceiling; never raises engine-derived capacity
+  max_queue_depth: 128              # bounded FIFO waiters; must be at least 1
   image_request_timeout_seconds: 1800
   image_max_pixels: 4194304         # 2048x2048; width/height must be multiples of 16
 
@@ -31,11 +33,16 @@ defaults:
   trust_remote_code: true
   max_model_len: null               # null → vLLM derives from model config
 
+# Stable, non-secret identity advertised to an explicitly enrolled Nyx fleet
+# gateway. When token_sidecar is enabled, use the same node_id in both blocks.
+fleet:
+  node_id: ""                       # e.g. "cuda-east"
+
 # Optional: forward per-request token usage to a central Postgres ledger
-# (DSN comes from TOKEN_SIDECAR_POSTGRES_DSN in .env). Rows are batched
-# locally in the SQLite catalog so a Postgres outage doesn't drop data
-# and a container restart doesn't lose anything past the last in-memory
-# flush. Disabled by default.
+# (DSN comes from TOKEN_SIDECAR_POSTGRES_DSN in .env). Each completed usage
+# event commits local analytics and the SQLite delivery outbox atomically
+# before response completion; Postgres delivery is then batched and retry-safe.
+# Disabled by default.
 token_sidecar:
   enabled: false
   node_id: ""                       # e.g. "Mnemosyne" — unique per host

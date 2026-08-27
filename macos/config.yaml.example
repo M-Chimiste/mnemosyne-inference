@@ -1,7 +1,7 @@
 # Mnemosyne native macOS configuration.
 # Copy to ~/Library/Application Support/Mnemosyne/config.yaml.
 
-schema_version: 2
+schema_version: 6
 
 server:
   # Settings > General switches this between 127.0.0.1 (This Mac only) and
@@ -10,9 +10,17 @@ server:
   inference_port: 1240
   control_bind: 127.0.0.1
   control_port: 17321
-  idle_unload_seconds: 900
+  # Keep the verified resident warm for responsive interactive use. Set a
+  # positive number (for example 900) on a memory-constrained shared Mac.
+  idle_unload_seconds: null
   startup_timeout_seconds: 900
   swap_queue_timeout_seconds: 300
+  # null derives a conservative limit from each engine/profile. Set a positive
+  # integer to cap that derived limit for every resident model.
+  max_concurrency: null
+  # Waiting requests only; warm requests with a free concurrency permit bypass
+  # the queue without violating FIFO model-switch ordering.
+  max_queue_depth: 128
   shutdown_grace_seconds: 30
   reconcile_interval_seconds: 30
   image_request_timeout_seconds: 1800
@@ -21,6 +29,7 @@ server:
   # Authentication is optional on either bind. When this variable is set,
   # every /v1/* request must send Authorization: Bearer <key>.
   inference_api_key_env: INFERENCE_API_KEY
+  fleet_api_key_env: FLEET_API_KEY
   control_password_env: ADMIN_PASSWORD
 
 engines:
@@ -74,6 +83,32 @@ engines:
     request_timeout_seconds: 30
     shutdown_grace_seconds: 30
 
+  # Preview: native Rust/MLX server. Install and upgrade the official Homebrew
+  # formula separately (`brew tap lablup/tap && brew install mlxcel`). Unified
+  # Inference owns only an exact model server process and never its formula.
+  mlxcel:
+    enabled: false
+    host: 127.0.0.1
+    port: 17326
+    binary: /opt/homebrew/bin/mlxcel-server
+    working_directory: ~/Library/Application Support/Mnemosyne
+    process_state_path: ~/Library/Application Support/Mnemosyne/state/mlxcel-process.json
+    request_timeout_seconds: 30
+    shutdown_grace_seconds: 30
+
+  # Preview: broad Safetensors runtime. The official mistral.rs installer owns
+  # ~/.local/bin/mistralrs and its `mistralrs update` flow. Model Library still
+  # pins and downloads every served snapshot before this process is launched.
+  mistral_rs:
+    enabled: false
+    host: 127.0.0.1
+    port: 17327
+    binary: ~/.local/bin/mistralrs
+    working_directory: ~/Library/Application Support/Mnemosyne
+    process_state_path: ~/Library/Application Support/Mnemosyne/state/mistral-rs-process.json
+    request_timeout_seconds: 30
+    shutdown_grace_seconds: 30
+
 paths:
   state_database: ~/Library/Application Support/Mnemosyne/state/mnemosyne.db
   log_directory: ~/Library/Application Support/Mnemosyne/logs
@@ -96,6 +131,43 @@ storage:
 # volumes, or assumed cache locations; the exact user-selected destinations
 # are preserved when a model is installed or imported.
 models: []
+
+# One public alias can retain its current engine as an unconditional fallback
+# while explicitly listing compatible local snapshots. `fixed` preserves the
+# historical behavior. `benchmark` selects a different candidate only when
+# fresh exact evidence clears the requested improvement threshold. `pinned`
+# always prefers one explicitly named engine, independent of benchmark rank.
+# models:
+#   - alias: qwen
+#     engine: omlx
+#     model: Qwen-4bit
+#     storage: internal
+#     context:
+#       # automatic applies a fresh long-prefill result for this exact runtime
+#       # and Mac, otherwise it retains the safe load/engine fallback.
+#       mode: automatic
+#       native_tokens: 262144
+#       max_verified_age_hours: 720
+#       # Use mode: native to request the advertised maximum without profiling,
+#       # or mode: fixed plus fixed_tokens for an explicit user-owned limit.
+#     alternatives:
+#       - engine: mlxcel
+#         model: ~/Library/Application Support/Mnemosyne/models/mlxcel/mlx-community/Qwen-4bit
+#         storage: internal
+#         context:
+#           mode: automatic
+#           native_tokens: 262144
+#         load:
+#           parallel: 4
+#     selection:
+#       mode: pinned
+#       pinned_engine: mlxcel
+#       # Change mode to benchmark to use the ranking controls below instead.
+#       objective: balanced
+#       allow_preview: true
+#       minimum_samples: 3
+#       max_benchmark_age_hours: 168
+#       minimum_improvement_percent: 5
 
 # Version-1 LM Studio profiles are moved here automatically as inert alias and
 # tuning records. Add Existing Models consumes matching records when the

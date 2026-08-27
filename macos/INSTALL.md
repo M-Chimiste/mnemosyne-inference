@@ -8,9 +8,10 @@ clients with one OpenAI-compatible endpoint:
 http://127.0.0.1:1240/v1
 ```
 
-Docker and LM Studio are not required. Only oMLX is installed separately,
-through its official app or Homebrew.
-llama.cpp, DS4, and MFLUX are installed or updated from Unified Inference.
+Docker and LM Studio are not required. oMLX is installed separately through
+its official app or Homebrew. The optional Preview mlxcel and mistral.rs
+binaries also use their official external installers. llama.cpp, DS4, and
+MFLUX are installed or updated from Unified Inference.
 
 The current 0.9 line is a release candidate. Use the private DMG for local
 testing, but do not treat it as the V1 distribution until the
@@ -26,6 +27,8 @@ artifact is published. The exact Stable/Preview contract is in
 | oMLX | Stable | MLX generation, embedding, and rerank models | Official oMLX app (recommended) | `17322` |
 | DS4 | Preview | Supported DeepSeek V4 and GLM 5.2 layouts | **Settings → Runtime Updates** | `17323` |
 | MFLUX | Preview | Apple Silicon image generation | Bundled; updates in **Runtime Updates** | `17324` |
+| mlxcel | Preview | MLX language and vision-language models | Official Homebrew tap | `17326` |
+| mistral.rs | Preview | Safetensors language and multimodal models | Official installer | `17327` |
 
 Clients never call those private ports. Unified Inference owns model selection,
 global residency, proxying, and language-token accounting on port `1240`.
@@ -37,7 +40,8 @@ You need:
 - An Apple Silicon Mac running macOS 15 or newer.
 - Apple Command Line Tools for DS4. The recommended official oMLX app includes
   its custom Metal kernels and does not require a local kernel build.
-- Optional: [Homebrew](https://brew.sh/) for a headless oMLX installation.
+- Optional: [Homebrew](https://brew.sh/) for a headless oMLX installation or
+  the Preview mlxcel runtime.
   Full Xcode is needed only for the advanced Homebrew HEAD custom-kernel build.
 - Enough internal or external storage for model weights.
 
@@ -128,9 +132,10 @@ No Homebrew llama.cpp installation is needed.
 2. Choose **Check Now**.
 3. Install the available llama.cpp runtime.
 4. In **Settings → Engines**, leave llama.cpp enabled.
-5. Use **Model Library → llama.cpp** to choose a GGUF repository and exact
-   quant/shard set. A detected vision projector is selected automatically; you
-   can choose another or opt out for text-only use.
+5. Search the unified **Model Library**, choose a result carrying the
+   **llama.cpp** support badge, and select its exact quant/shard set. A detected
+   vision projector is selected automatically; you can choose another or opt
+   out for text-only use.
 
 Unified Inference downloads the official
 [ggml-org/llama.cpp release](https://github.com/ggml-org/llama.cpp/releases/latest),
@@ -247,15 +252,61 @@ Official references:
 - [oMLX CLI configuration](https://github.com/jundot/omlx#cli-configuration)
 - [Official oMLX releases](https://github.com/jundot/omlx/releases)
 
-## 6. Install DS4
+## 6. Install mlxcel (Preview)
+
+mlxcel is the lower-overhead native MLX alternative. Unified Inference owns
+the exact per-model `mlxcel-server` child, but it never replaces Homebrew's
+binary or lets the server download weights while handling an inference
+request.
+
+1. Install the official stable formula:
+
+   ```bash
+   brew tap lablup/tap
+   brew install mlxcel
+   ```
+
+2. Open **Settings → Engines**, enable **mlxcel**, and confirm its binary is
+   `/opt/homebrew/bin/mlxcel-server`.
+3. In **Model Library**, install a result carrying the **mlxcel** support badge.
+   Compatibility is metadata-derived until the exact pinned snapshot passes a
+   real load; `mlxcel arch` is the upstream architecture authority.
+
+Do not start a separate persistent server on `17326`. See the
+[official mlxcel repository](https://github.com/lablup/mlxcel) for its current
+architecture table and release notes.
+
+## 7. Install mistral.rs (Preview)
+
+mistral.rs provides a second native execution path for pinned Hugging Face
+Safetensors snapshots. Use the upstream stable installer:
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf \
+  https://raw.githubusercontent.com/EricLBuehler/mistral.rs/master/install.sh | sh
+```
+
+The installer exposes `~/.local/bin/mistralrs`. Enable **mistral.rs** under
+**Settings → Engines**, then install a Model Library result carrying its
+support badge. Unified Inference starts it with a local model path, loopback
+binding, no built-in UI, and no runtime token source; the inference path does
+not fetch or authenticate to Hugging Face.
+
+Do not start another server on `17327`. The
+[official mistral.rs quickstart](https://ericlbuehler.github.io/mistral.rs/quickstart/)
+documents its installer and supported model families.
+
+## 8. Install DS4
 
 DS4 is specialized; it is not a second general-purpose GGUF engine.
 
 1. Confirm `xcode-select --print-path` succeeds.
 2. Open **Settings → Runtime Updates** and choose **Check Now**.
 3. Install DS4, then leave it enabled under **Settings → Engines**.
-4. Use **Model Library → DS4** to install one of the exact supported model
-   layouts.
+4. In the unified **Model Library**, choose a result carrying the **DS4**
+   support badge. An empty search shows the complete current catalog: four
+   DeepSeek V4 Flash choices, one DeepSeek V4 Pro choice, and four GLM 5.2
+   choices.
 
 Unified Inference downloads an exact commit from the official
 [antirez/ds4 repository](https://github.com/antirez/ds4), builds
@@ -265,9 +316,20 @@ on port `17323`. Do not manually clone DS4 or place a second server in
 
 Large DS4 targets have substantial unified-memory and SSD-streaming
 requirements. Check the selected model's size and the upstream DS4 notes
-before downloading it.
+before downloading it. The Unsloth GLM Q4 choice downloads all eleven required
+shards as one pinned install. Unified Inference checks that every exact file is
+present at the resolved Hugging Face revision before starting and asks you to
+update an older managed DS4 runtime before installing a target it does not
+declare. Arbitrary GGUF repositories remain llama.cpp candidates, not DS4
+candidates.
 
-## 7. Prepare MFLUX
+For concurrent DS4 clients, set **Models → Loading → Resident request
+sessions** to `2` or more. This enables upstream session scheduling and Flash
+decode batching, but each slot owns a complete KV state. Leave it unset on a
+memory-tight machine; GLM currently gains request fairness rather than native
+Metal batch speed.
+
+## 9. Prepare MFLUX
 
 Do not install MFLUX globally with `pip` or `uv tool` for the packaged app.
 Unified Inference includes an isolated MFLUX worker and can update its upstream
@@ -276,8 +338,8 @@ package independently:
 1. Open **Settings → Runtime Updates**, choose **Check Now**, and install an
    available MFLUX update.
 2. Leave MFLUX enabled under **Settings → Engines**.
-3. Choose a verified image checkpoint and storage location under
-   **Settings → Model Library → MFLUX**.
+3. In **Settings → Model Library**, choose a verified image checkpoint carrying
+   the **MFLUX** support badge, then choose its storage location.
 
 Supported image profiles are exposed through
 `POST /v1/images/generations`. Image requests deliberately do not create
@@ -287,7 +349,7 @@ The standalone upstream project is
 [filipstrand/mflux](https://github.com/filipstrand/mflux), but its global CLI
 environment is not used by Unified Inference.
 
-## 8. Import an existing LM Studio library
+## 10. Import an existing LM Studio library
 
 LM Studio is not required and is never used as an inference engine. To reuse
 weights from an older installation:
@@ -304,7 +366,7 @@ The source hint reads only LM Studio's on-disk settings and conventional model
 directory. The scan does not contact LM Studio, load a model, copy weights, or
 treat a multimodal projector as a primary model.
 
-## 9. Verify the complete installation
+## 11. Verify the complete installation
 
 The catalog should list only models whose engines are enabled and whose
 profiles are usable:
@@ -402,8 +464,17 @@ outbox remain in Application Support. Follow the exact recovery sequence in
   drains active requests and unloads the resident model first.
 - Official oMLX app: use its in-app updater. Unified Inference's oMLX card
   opens the matching official release and detects the new version afterward.
-- oMLX stable installations: `brew update` followed by
-  `brew upgrade omlx`.
+- oMLX stable Homebrew installations: choose the confirmed update action in
+  **Runtime Updates**. Unified Inference drains inference, runs only `omlx
+  stop`, `brew update`, `brew upgrade omlx`, and `omlx start`, then verifies
+  that the upgraded control plane is healthy and empty before reopening
+  admission.
+- mlxcel: use `brew update` followed by `brew upgrade mlxcel`. Disable the
+  engine or unload its resident model first; the next runtime fingerprint
+  automatically invalidates older benchmark evidence.
+- mistral.rs installer-managed binaries: run `mistralrs update`. As with
+  mlxcel, unload first and rerun the affected model benchmark after the binary
+  changes.
 - Advanced oMLX custom-kernel HEAD installations:
 
   ```bash
@@ -414,6 +485,10 @@ outbox remain in Application Support. Follow the exact recovery sequence in
 
 Re-run the native-kernel verification after every advanced Homebrew
 custom-kernel replacement.
+
+Homebrew HEAD builds intentionally do not get the supervised update action.
+They follow a moving commit and toolchain, so the Runtime Updates card directs
+them to the official app or stable formula instead.
 
 ## Troubleshooting
 
@@ -442,6 +517,19 @@ curl --fail http://127.0.0.1:17322/v1/models
 If oMLX is listening on its default port `8000`, rerun the one-time
 `omlx serve --host 127.0.0.1 --port 17322 --model-dir ...` command, stop it
 with Control-C, and run `omlx restart`.
+
+### Warm oMLX requests are still unexpectedly slow
+
+Open **Settings → Runtime Updates** and inspect the oMLX SSD prompt-cache size,
+request history, and cached-token count. A large cache with meaningful traffic
+but no observed reuse is flagged as a recommendation, not an automatic error.
+Use **Reset SSD Cache…** only after reading its confirmation: Unified Inference
+drains active work and asks oMLX to clear reusable KV blocks. It does not remove
+models. The next request will perform a fresh prefill.
+
+For a comparable measurement, run `macos/scripts/benchmark_native.py` as shown
+in the macOS README. It can send the same fixed, content-redacted workload to
+Unified Inference and an LM Studio-compatible endpoint.
 
 ### An engine is not installed yet
 

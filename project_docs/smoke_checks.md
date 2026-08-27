@@ -194,6 +194,55 @@ when authenticated.
 
 ---
 
+## 7a. Fleet snapshot and lease-safe switching
+
+Set `fleet.node_id` in `config.yaml` and `FLEET_API_KEY` in `.env`, restart,
+then query the read-only inference-plane snapshot:
+
+```bash
+FLEET_API_KEY="$(grep -E '^FLEET_API_KEY=' ~/vllm-manager/.env | head -1 | cut -d= -f2-)"
+
+curl -s "$INF/fleet/v1/snapshot" \
+  -H "Authorization: Bearer $FLEET_API_KEY" \
+  | tee /tmp/mnemosyne-fleet-snapshot.json \
+  | jq '{
+      schema_version,
+      node,
+      health,
+      residency,
+      admission,
+      capacity,
+      usage_delivery
+    }'
+
+curl -s -o /dev/null -w '%{http_code}\n' \
+  "$ADMIN/fleet/v1/snapshot" \
+  -u admin:"$ADMIN_PASSWORD"
+# -> 404
+```
+
+**Expect:** schema version `1`, the configured stable node ID, platform
+`cuda`, an authoritative idle/ready state, a queue limit of at least one, and
+no credential, DSN, storage path, engine argv, inner endpoint, prompt, or
+output anywhere in the JSON. With `FLEET_API_KEY` removed and the container
+restarted, the inference route itself returns `404`.
+
+To prove a model switch cannot unload beneath a stream, start a long streaming
+request for `$MODEL_A`, then request `$MODEL_B` from a second terminal while
+the first stream remains open. Poll the snapshot.
+
+**Expect:** the snapshot reports the A lease in `capacity.active`, then
+`health.state: draining` with B's deployment ID as `transition_target`.
+Residency stays on A until the stream closes. Only then does B load and receive
+its request. New A requests arriving behind B do not bypass it. Repeat with
+enough same-model requests to reach `capacity.effective_limit`; the next
+`max_queue_depth` requests wait and the following arrival receives
+pre-inference `429` with `detail.code: node_busy` and `Retry-After`.
+It must also carry `X-Mnemosyne-Error: node_busy`; the manager must strip this
+reserved proof header from any engine-originated response.
+
+---
+
 ## 8. Unload
 
 ```bash
@@ -201,7 +250,8 @@ curl -sX POST "$ADMIN/manager/unload" -u admin:"$ADMIN_PASSWORD"
 curl -s "$ADMIN/manager/status" -u admin:"$ADMIN_PASSWORD" | jq
 ```
 
-**Expect:** `loaded_model: null`, `vllm_pid: null`, `loaded_at: null`.
+**Expect:** unload waits for any complete response streams to close, then
+reports `loaded_model: null`, `vllm_pid: null`, `loaded_at: null`.
 ([vllm_manager.py:173-185](../vllm_manager.py).)
 
 ---

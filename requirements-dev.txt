@@ -16,4 +16,5 @@ huggingface_hub
 uvicorn
 pyyaml
 pydantic>=2
+jsonschema>=4
 psycopg[binary]>=3.2,<4

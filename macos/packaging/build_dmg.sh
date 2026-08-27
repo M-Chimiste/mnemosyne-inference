@@ -10,6 +10,7 @@ OUTPUT_PATH=""
 VOLUME_NAME="Unified Inference"
 CODESIGN_IDENTITY="${CODESIGN_IDENTITY:-}"
 NOTARYTOOL_PROFILE="${NOTARYTOOL_PROFILE:-}"
+NOTARYTOOL_NO_S3_ACCELERATION="${NOTARYTOOL_NO_S3_ACCELERATION:-0}"
 
 usage() {
     cat <<'EOF'
@@ -147,6 +148,14 @@ if [[ -n "$NOTARYTOOL_PROFILE" ]]; then
     fi
 fi
 
+NOTARYTOOL_ARGS=(
+    --keychain-profile "$NOTARYTOOL_PROFILE"
+    --wait
+)
+if [[ "$NOTARYTOOL_NO_S3_ACCELERATION" == "1" ]]; then
+    NOTARYTOOL_ARGS+=(--no-s3-acceleration)
+fi
+
 WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/unified-inference-dmg.XXXXXX")"
 SOURCE_DIR="$WORK_DIR/source"
 MOUNT_DIR="$WORK_DIR/mount"
@@ -168,8 +177,7 @@ if [[ -n "$NOTARYTOOL_PROFILE" ]]; then
     ditto -c -k --keepParent "$APP_PATH" "$APP_ZIP"
     xcrun notarytool submit \
         "$APP_ZIP" \
-        --keychain-profile "$NOTARYTOOL_PROFILE" \
-        --wait
+        "${NOTARYTOOL_ARGS[@]}"
     xcrun stapler staple "$APP_PATH"
     xcrun stapler validate "$APP_PATH"
     spctl \
@@ -204,8 +212,7 @@ fi
 if [[ -n "$NOTARYTOOL_PROFILE" ]]; then
     xcrun notarytool submit \
         "$TEMP_DMG" \
-        --keychain-profile "$NOTARYTOOL_PROFILE" \
-        --wait
+        "${NOTARYTOOL_ARGS[@]}"
     xcrun stapler staple "$TEMP_DMG"
     xcrun stapler validate "$TEMP_DMG"
     spctl \

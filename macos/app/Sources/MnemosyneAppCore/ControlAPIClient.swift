@@ -10,11 +10,15 @@ public protocol ControlAPI: Sendable {
         unloadAfter: Bool
     ) async throws -> ModelSelfTestResult
     func models() async throws -> ModelCatalogSnapshot
+    func benchmarks(alias: String?) async throws -> EngineBenchmarkSnapshot
+    func runBenchmark(alias: String, sampleRuns: Int) async throws -> EngineBenchmarkRun
+    func contexts(alias: String?) async throws -> ContextWindowSnapshot
+    func profileContext(alias: String, targetTokens: Int?) async throws -> ContextProfileRun
     func load(model: String) async throws -> ServiceSnapshot
     func unload() async throws
     func storageLocations() async throws -> StorageSnapshot
     func inspectStorage(path: String, bookmarkData: Data?) async throws -> StorageStatus
-    func searchLibrary(query: String, engine: InferenceEngine) async throws -> [LibraryModel]
+    func searchLibrary(query: String) async throws -> [LibraryModel]
     func libraryFiles(
         repoId: String, engine: InferenceEngine, revision: String?
     ) async throws -> [LibraryModel]
@@ -43,6 +47,8 @@ public protocol ControlAPI: Sendable {
         engine: InferenceEngine, version: String?
     ) async throws -> RuntimeUpdateSnapshot
     func rollbackRuntimeUpdate(engine: InferenceEngine) async throws -> RuntimeUpdateSnapshot
+    func omlxCacheHealth() async throws -> OMLXCacheHealth
+    func resetOMLXCache() async throws -> OMLXCacheResetResult
     func configuration() async throws -> ConfigurationSnapshot
     func saveConfiguration(
         _ settings: NativeSettings, revision: String
@@ -177,6 +183,102 @@ public struct ControlAPIClient: ControlAPI, Sendable {
         return try JSONDecoder().decode(ServiceSnapshot.self, from: data)
     }
 
+    public func benchmarks(alias: String? = nil) async throws -> EngineBenchmarkSnapshot {
+        var components = URLComponents(
+            url: endpointURL("/manager/benchmarks"),
+            resolvingAgainstBaseURL: false
+        )!
+        if let alias {
+            components.queryItems = [URLQueryItem(name: "alias", value: alias)]
+        }
+        var request = URLRequest(url: components.url!)
+        request.httpMethod = "GET"
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        addAuthorization(to: &request)
+        let (data, response) = try await session.data(for: request)
+        try validate(response, data: data)
+        return try JSONDecoder.nativeSettingsDecoder().decode(
+            EngineBenchmarkSnapshot.self,
+            from: data
+        )
+    }
+
+    public func runBenchmark(
+        alias: String,
+        sampleRuns: Int
+    ) async throws -> EngineBenchmarkRun {
+        let request = try benchmarkRequest(alias: alias, sampleRuns: sampleRuns)
+        let (data, response) = try await session.data(for: request)
+        try validate(response, data: data)
+        return try JSONDecoder.nativeSettingsDecoder().decode(
+            EngineBenchmarkRun.self,
+            from: data
+        )
+    }
+
+    func benchmarkRequest(alias: String, sampleRuns: Int) throws -> URLRequest {
+        var request = makeRequest(
+            path: "/manager/benchmarks/\(alias)",
+            method: "POST"
+        )
+        request.timeoutInterval = 60 * 60
+        request.httpBody = try JSONEncoder.nativeSettingsEncoder().encode(
+            RunEngineBenchmarkRequest(
+                warmupRuns: 1,
+                sampleRuns: min(max(sampleRuns, 1), 20),
+                maxTokens: 128
+            )
+        )
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        return request
+    }
+
+    public func contexts(alias: String? = nil) async throws -> ContextWindowSnapshot {
+        var components = URLComponents(
+            url: endpointURL("/manager/contexts"),
+            resolvingAgainstBaseURL: false
+        )!
+        if let alias {
+            components.queryItems = [URLQueryItem(name: "alias", value: alias)]
+        }
+        var request = URLRequest(url: components.url!)
+        request.httpMethod = "GET"
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        addAuthorization(to: &request)
+        let (data, response) = try await session.data(for: request)
+        try validate(response, data: data)
+        return try JSONDecoder.nativeSettingsDecoder().decode(
+            ContextWindowSnapshot.self,
+            from: data
+        )
+    }
+
+    public func profileContext(
+        alias: String,
+        targetTokens: Int? = nil
+    ) async throws -> ContextProfileRun {
+        let request = try contextProfileRequest(alias: alias, targetTokens: targetTokens)
+        let (data, response) = try await session.data(for: request)
+        try validate(response, data: data)
+        return try JSONDecoder.nativeSettingsDecoder().decode(
+            ContextProfileRun.self,
+            from: data
+        )
+    }
+
+    func contextProfileRequest(alias: String, targetTokens: Int?) throws -> URLRequest {
+        var request = makeRequest(
+            path: "/manager/contexts/\(alias)/profile",
+            method: "POST"
+        )
+        request.timeoutInterval = 60 * 60
+        request.httpBody = try JSONEncoder.nativeSettingsEncoder().encode(
+            RunContextProfileRequest(targetTokens: targetTokens)
+        )
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        return request
+    }
+
     public func readiness() async throws -> ReadinessSnapshot {
         let request = makeRequest(path: "/manager/readiness")
         let (data, response) = try await session.data(for: request)
@@ -271,21 +373,9 @@ public struct ControlAPIClient: ControlAPI, Sendable {
     }
 
     public func searchLibrary(
-        query: String,
-        engine: InferenceEngine
+        query: String
     ) async throws -> [LibraryModel] {
-        var components = URLComponents(
-            url: endpointURL("/manager/model-library/search"),
-            resolvingAgainstBaseURL: false
-        )!
-        components.queryItems = [
-            URLQueryItem(name: "engine", value: engine.rawValue),
-            URLQueryItem(name: "q", value: query),
-        ]
-        var request = URLRequest(url: components.url!)
-        request.httpMethod = "GET"
-        request.setValue("application/json", forHTTPHeaderField: "Accept")
-        addAuthorization(to: &request)
+        let request = librarySearchRequest(query: query)
         let (data, response) = try await session.data(for: request)
         try validate(response, data: data)
         return try JSONDecoder.nativeSettingsDecoder()
@@ -458,6 +548,30 @@ public struct ControlAPIClient: ControlAPI, Sendable {
         return try await sendRuntimeUpdateRequest(request)
     }
 
+    public func omlxCacheHealth() async throws -> OMLXCacheHealth {
+        let request = makeRequest(path: "/manager/engines/omlx/cache")
+        let (data, response) = try await session.data(for: request)
+        try validate(response, data: data)
+        return try JSONDecoder.nativeSettingsDecoder().decode(
+            OMLXCacheHealth.self,
+            from: data
+        )
+    }
+
+    public func resetOMLXCache() async throws -> OMLXCacheResetResult {
+        var request = makeRequest(
+            path: "/manager/engines/omlx/cache/reset",
+            method: "POST"
+        )
+        request.timeoutInterval = 15 * 60
+        let (data, response) = try await session.data(for: request)
+        try validate(response, data: data)
+        return try JSONDecoder.nativeSettingsDecoder().decode(
+            OMLXCacheResetResult.self,
+            from: data
+        )
+    }
+
     public func configuration() async throws -> ConfigurationSnapshot {
         let request = makeRequest(path: "/manager/config")
         let (data, response) = try await session.data(for: request)
@@ -507,6 +621,19 @@ public struct ControlAPIClient: ControlAPI, Sendable {
 
     func localModelSourcesRequest() -> URLRequest {
         makeRequest(path: "/manager/model-library/local-sources")
+    }
+
+    func librarySearchRequest(query: String) -> URLRequest {
+        var components = URLComponents(
+            url: endpointURL("/manager/model-library/search"),
+            resolvingAgainstBaseURL: false
+        )!
+        components.queryItems = [URLQueryItem(name: "q", value: query)]
+        var request = URLRequest(url: components.url!)
+        request.httpMethod = "GET"
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        addAuthorization(to: &request)
+        return request
     }
 
     func libraryFilesRequest(

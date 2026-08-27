@@ -20,9 +20,204 @@ from mnemosyne_macos.models import EngineName
 
 def test_ds4_and_mflux_only_offer_curated_artifacts() -> None:
     ds4 = recommended_models(EngineName.DS4)
-    assert len(ds4) == 4
-    assert all(item.repo_id == "antirez/deepseek-v4-gguf" for item in ds4)
-    assert all(item.filename and item.compatibility == "verified" for item in ds4)
+    assert len(ds4) == 9
+    assert {item.repo_id for item in ds4} == {
+        "antirez/deepseek-v4-gguf",
+        "antirez/GLM-5.2-GGUF",
+        "unsloth/GLM-5.2-GGUF",
+    }
+    assert all(
+        item.filename
+        and item.download_files
+        and item.compatibility == "verified"
+        and item.suggested_role == "generation"
+        for item in ds4
+    )
+    assert sum("GLM 5.2" in item.display_name for item in ds4) == 4
+    assert sum("0731" in item.display_name for item in ds4) == 4
+    assert all("DSpark" not in item.display_name for item in ds4)
+    assert {item.family for item in ds4} == {
+        "deepseek-v4-flash",
+        "deepseek-v4-pro",
+        "glm-5.2",
+    }
+
+
+def test_ds4_search_verifies_exact_hub_files_sizes_and_revision(monkeypatch) -> None:
+    catalog = recommended_models(EngineName.DS4)
+    by_repo: dict[str, set[str]] = {}
+    for model in catalog:
+        by_repo.setdefault(model.repo_id, set()).update(model.download_files)
+    seen: list[str] = []
+
+    class FakeAPI:
+        def __init__(self, token=None):
+            assert token == "secret"
+
+        def model_info(self, repo_id, **kwargs):
+            seen.append(repo_id)
+            assert kwargs == {"files_metadata": True}
+            return SimpleNamespace(
+                sha=f"resolved-{len(seen)}",
+                downloads=123,
+                likes=7,
+                siblings=[
+                    SimpleNamespace(rfilename=filename, size=100 + index)
+                    for index, filename in enumerate(sorted(by_repo[repo_id]))
+                ],
+            )
+
+    monkeypatch.setattr("mnemosyne_macos.model_library.HfApi", FakeAPI)
+    results = search_models("", engine=EngineName.DS4, token="secret")
+
+    assert len(results) == 9
+    assert seen == [
+        "antirez/deepseek-v4-gguf",
+        "unsloth/GLM-5.2-GGUF",
+        "antirez/GLM-5.2-GGUF",
+    ]
+    assert all(item.installable and item.resolved_revision for item in results)
+    assert all(item.downloads == 123 and item.likes == 7 for item in results)
+    sharded = next(item for item in results if "11 shards" in item.display_name)
+    assert len(sharded.download_files) == 11
+    assert sharded.size_bytes == sum(range(100, 111))
+    assert "verified 11 exact files" in sharded.compatibility_reason
+
+
+def test_ds4_search_marks_a_stale_declared_file_unavailable(monkeypatch) -> None:
+    class FakeAPI:
+        def __init__(self, token=None):
+            self.token = token
+
+        def model_info(self, repo_id, **kwargs):
+            assert repo_id == "antirez/GLM-5.2-GGUF"
+            return SimpleNamespace(
+                sha="resolved",
+                siblings=[],
+                downloads=0,
+                likes=0,
+            )
+
+    monkeypatch.setattr("mnemosyne_macos.model_library.HfApi", FakeAPI)
+    results = search_models("routed q4", engine=EngineName.DS4)
+
+    assert len(results) == 1
+    assert results[0].installable is False
+    assert results[0].compatibility == "unavailable"
+    assert "Update DS4" in results[0].compatibility_reason
+
+
+def test_ds4_search_requires_a_managed_runtime_that_declares_the_target(
+    monkeypatch, tmp_path
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "download_model.sh").write_text(
+        'REPO="antirez/deepseek-v4-gguf"\n'
+        'OLD_FILE="DeepSeek-V4-Flash-old.gguf"\n',
+        encoding="utf-8",
+    )
+    candidate = next(
+        item
+        for item in recommended_models(EngineName.DS4)
+        if item.quantization == "MXFP4"
+    )
+
+    class FakeRuntime:
+        def path(self, key):
+            assert key == "working_directory"
+            return source
+
+    class FakeAPI:
+        def __init__(self, token=None):
+            self.token = token
+
+        def model_info(self, repo_id, **kwargs):
+            return SimpleNamespace(
+                sha="resolved",
+                siblings=[
+                    SimpleNamespace(rfilename=candidate.filename, size=123)
+                ],
+            )
+
+    monkeypatch.setattr(
+        "mnemosyne_macos.model_library.resolve_active_runtime",
+        lambda engine: FakeRuntime() if engine == "ds4" else None,
+    )
+    monkeypatch.setattr("mnemosyne_macos.model_library.HfApi", FakeAPI)
+
+    results = search_models("native mxfp4", engine=EngineName.DS4)
+
+    assert len(results) == 1
+    assert results[0].installable is False
+    assert "installed managed DS4 runtime" in results[0].compatibility_reason
+    with pytest.raises(ValueError, match="update DS4 before downloading"):
+        validate_install_candidate(
+            engine=EngineName.DS4,
+            repo_id=candidate.repo_id,
+            filename=candidate.filename,
+        )
+
+
+def test_ds4_sharded_install_pins_all_exact_files(monkeypatch) -> None:
+    sharded = next(
+        item
+        for item in recommended_models(EngineName.DS4)
+        if item.repo_id == "unsloth/GLM-5.2-GGUF"
+    )
+
+    class FakeAPI:
+        def __init__(self, token=None):
+            self.token = token
+
+        def model_info(self, repo_id, **kwargs):
+            assert repo_id == sharded.repo_id
+            assert kwargs == {"revision": "main", "files_metadata": True}
+            return SimpleNamespace(
+                sha="c" * 40,
+                siblings=[
+                    SimpleNamespace(rfilename=filename, size=100)
+                    for filename in sharded.download_files
+                ],
+            )
+
+    monkeypatch.setattr("mnemosyne_macos.model_library.HfApi", FakeAPI)
+    candidate = validate_install_candidate(
+        engine=EngineName.DS4,
+        repo_id=sharded.repo_id,
+        filename=sharded.filename,
+        revision="main",
+    )
+
+    assert candidate.resolved_revision == "c" * 40
+    assert candidate.download_files == sharded.download_files
+    assert candidate.size_bytes == 1_100
+
+
+def test_verified_install_candidate_pins_resolved_hub_revision(monkeypatch) -> None:
+    seen: dict = {}
+
+    class FakeAPI:
+        def __init__(self, token=None):
+            seen["token"] = token
+
+        def model_info(self, repo_id, **kwargs):
+            seen["repo_id"] = repo_id
+            seen.update(kwargs)
+            return SimpleNamespace(sha="a" * 40)
+
+    monkeypatch.setattr("mnemosyne_macos.model_library.HfApi", FakeAPI)
+    candidate = validate_install_candidate(
+        engine=EngineName.MFLUX,
+        repo_id="black-forest-labs/FLUX.1-schnell",
+        filename=None,
+        revision="main",
+    )
+
+    assert candidate.resolved_revision == "a" * 40
+    assert seen["repo_id"] == "black-forest-labs/FLUX.1-schnell"
+    assert seen["revision"] == "main"
+    assert seen["files_metadata"] is True
 
 
 def test_active_mflux_pack_can_extend_curated_catalog(monkeypatch, tmp_path) -> None:
@@ -166,6 +361,107 @@ def test_omlx_search_filters_adapters_and_reports_compatibility(monkeypatch) -> 
         "limit": 20,
         "full": True,
     }
+
+
+def test_omlx_install_candidate_retains_resolved_hub_revision(monkeypatch) -> None:
+    class FakeAPI:
+        def __init__(self, token=None):
+            self.token = token
+
+        def model_info(self, *_args, **_kwargs):
+            return SimpleNamespace(
+                sha="b" * 40,
+                tags=["mlx", "text-generation"],
+                pipeline_tag="text-generation",
+            )
+
+    monkeypatch.setattr("mnemosyne_macos.model_library.HfApi", FakeAPI)
+    candidate = validate_install_candidate(
+        engine=EngineName.OMLX,
+        repo_id="mlx-community/Model-4bit",
+        filename=None,
+        revision="main",
+    )
+
+    assert candidate.resolved_revision == "b" * 40
+
+
+def test_mlxcel_search_keeps_mlx_candidates_engine_scoped(monkeypatch) -> None:
+    class FakeAPI:
+        def __init__(self, token=None):
+            self.token = token
+
+        def list_models(self, **kwargs):
+            assert kwargs["filter"] == "mlx"
+            return [
+                SimpleNamespace(
+                    id="mlx-community/Qwen-4bit",
+                    tags=["mlx", "4bit"],
+                    pipeline_tag="text-generation",
+                    downloads=10,
+                    likes=2,
+                    usedStorage=123,
+                )
+            ]
+
+    monkeypatch.setattr("mnemosyne_macos.model_library.HfApi", FakeAPI)
+    results = search_models("qwen", engine=EngineName.MLXCEL)
+
+    assert len(results) == 1
+    assert results[0].engine == "mlxcel"
+    assert results[0].suggested_role == "generation"
+    assert "Final architecture compatibility" in results[0].compatibility_reason
+
+
+def test_mistral_rs_install_requires_pinned_safetensors_snapshot(monkeypatch) -> None:
+    class FakeAPI:
+        def __init__(self, token=None):
+            self.token = token
+
+        def model_info(self, repo_id, **kwargs):
+            assert repo_id == "owner/model"
+            assert kwargs == {"revision": "main", "files_metadata": True}
+            return SimpleNamespace(
+                sha="c" * 40,
+                tags=["text-generation"],
+                siblings=[
+                    SimpleNamespace(rfilename="config.json", size=100),
+                    SimpleNamespace(rfilename="model.safetensors", size=1_000),
+                ],
+            )
+
+    monkeypatch.setattr("mnemosyne_macos.model_library.HfApi", FakeAPI)
+    candidate = validate_install_candidate(
+        engine=EngineName.MISTRAL_RS,
+        repo_id="owner/model",
+        filename=None,
+        revision="main",
+    )
+
+    assert candidate.resolved_revision == "c" * 40
+    assert candidate.engine == "mistral.rs"
+    assert candidate.suggested_role == "generation"
+
+
+def test_mistral_rs_rejects_repositories_without_safetensors(monkeypatch) -> None:
+    class FakeAPI:
+        def __init__(self, token=None):
+            self.token = token
+
+        def model_info(self, *_args, **_kwargs):
+            return SimpleNamespace(
+                sha="d" * 40,
+                tags=["text-generation"],
+                siblings=[SimpleNamespace(rfilename="config.json", size=100)],
+            )
+
+    monkeypatch.setattr("mnemosyne_macos.model_library.HfApi", FakeAPI)
+    with pytest.raises(ValueError, match="Safetensors weights"):
+        validate_install_candidate(
+            engine=EngineName.MISTRAL_RS,
+            repo_id="owner/model",
+            filename=None,
+        )
 
 
 def test_download_size_uses_exact_file_or_complete_snapshot(monkeypatch) -> None:

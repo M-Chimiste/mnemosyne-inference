@@ -14,6 +14,7 @@ from collections import deque
 import contextlib
 import ctypes
 from dataclasses import dataclass
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -30,7 +31,7 @@ from typing import Any, Awaitable, Callable, Mapping, Protocol
 
 import httpx
 
-from .base import AdapterError, Deadline, EngineAdapter
+from .base import AdapterError, CapacityHint, Deadline, EngineAdapter
 from ..config import DS4Config
 from ..runtime_updates import resolve_active_runtime
 from ..scoped_process import wrap_scoped_argv
@@ -44,6 +45,7 @@ from ..models import (
     ResolvedTarget,
     ServiceState,
     TargetKey,
+    effective_load_identity,
 )
 
 
@@ -295,6 +297,7 @@ _RESERVED_EXTRA_ARGS = {
     "--ctx",
     "--kv-disk-dir",
     "--kv-disk-space-mb",
+    "--batched-session",
 }
 
 
@@ -330,6 +333,8 @@ def build_ds4_argv(config: DS4Config, target: ResolvedTarget) -> list[str]:
         )
     if options.get("kv_disk_space_mb") is not None:
         argv.extend(["--kv-disk-space-mb", str(options["kv_disk_space_mb"])])
+    if options.get("parallel") is not None:
+        argv.extend(["--batched-session", str(options["parallel"])])
     argv.extend(str(arg) for arg in extra_args)
     return argv
 
@@ -455,7 +460,7 @@ class DS4Adapter(EngineAdapter):
     ) -> None:
         self.config = config
         self.base_url = f"http://{config.host}:{config.port}"
-        self._client = client or httpx.AsyncClient()
+        self._client = client or httpx.AsyncClient(trust_env=False)
         self._owns_client = client is None
         self._spawn_process = spawn_process or self._default_spawn
         self._identity_probe = identity_probe or self._default_identity_probe
@@ -472,6 +477,38 @@ class DS4Adapter(EngineAdapter):
         self._target: ResolvedTarget | None = None
         self._log_task: asyncio.Task[None] | None = None
         self._log_tail: deque[str] = deque(maxlen=80)
+
+    def capacity_hint(self, target: ResolvedTarget) -> CapacityHint:
+        configured = target.load_options.get("parallel")
+        if (
+            isinstance(configured, int)
+            and not isinstance(configured, bool)
+            and configured > 0
+        ):
+            return CapacityHint(
+                limit=configured,
+                source="ds4-batched-sessions",
+                confidence="configured",
+            )
+        return CapacityHint(
+            limit=1,
+            source="ds4-single-session",
+            confidence="authoritative",
+        )
+
+    async def runtime_fingerprint(self, *, deadline: Deadline) -> str | None:
+        del deadline
+        config = self._effective_config()
+        binary = Path(config.binary).expanduser()
+        try:
+            stat = await asyncio.to_thread(binary.stat)
+        except OSError:
+            return None
+        material = (
+            f"{self.engine.value}\0{binary.resolve(strict=False)}\0"
+            f"{stat.st_size}\0{stat.st_mtime_ns}"
+        )
+        return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
     def _effective_config(self) -> DS4Config:
         managed = resolve_active_runtime("ds4", root=self._runtime_root)
@@ -886,7 +923,8 @@ class DS4Adapter(EngineAdapter):
                 and before.residents[0].managed
                 and before.residents[0].ready
                 and self._target is not None
-                and self._target.key == target.key
+                and effective_load_identity(self._target)
+                == effective_load_identity(target)
             ):
                 return self._handle(target, before.residents[0])
             raise AdapterError(

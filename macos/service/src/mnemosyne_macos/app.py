@@ -20,7 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from . import __version__
 from .config import MacConfig, suggested_model_alias
-from .coordinator import CoordinatorError, QueueTimeout
+from .coordinator import CoordinatorError, CoordinatorState, QueueFull, QueueTimeout
 from .engines.base import AdapterError
 from .filesystem import FilesystemProbeError
 from .image_api import ImageRequestError, normalize_image_request
@@ -36,6 +36,7 @@ from .model_library import (
     validate_install_candidate,
 )
 from .models import DEFAULT_CAPABILITIES, Endpoint, EngineName
+from .performance import RequestPerformanceTimer
 from .proxy import (
     InvalidProxyRequest,
     StreamingEventFilter,
@@ -65,6 +66,27 @@ def _lexical_path(value: str) -> str:
     )
 
 
+async def _await_task_to_known_outcome(task: asyncio.Task):
+    """Defer repeated caller cancellation until an owned task is complete."""
+
+    cancellation: asyncio.CancelledError | None = None
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as exc:
+            if cancellation is None:
+                cancellation = exc
+        except Exception:
+            break
+
+    if task.cancelled():
+        return task.result()
+    result = task.result()
+    if cancellation is not None:
+        raise cancellation
+    return result
+
+
 class LoadRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     model: str
@@ -89,6 +111,22 @@ class DeleteManagedModelRequest(BaseModel):
     revision: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
 
 
+class BenchmarkModelRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    warmup_runs: int = Field(default=1, ge=0, le=5)
+    sample_runs: int = Field(default=3, ge=1, le=20)
+    # Output length is part of the benchmark suite contract. Keeping it fixed
+    # prevents incomparable throughput runs from sharing one evidence key.
+    max_tokens: int = Field(default=128, ge=128, le=128)
+
+
+class ContextProfileRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    target_tokens: int | None = Field(default=None, ge=4_096, le=1_048_576)
+
+
 class InstallModelRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -103,11 +141,43 @@ class InstallModelRequest(BaseModel):
     capabilities: set[Endpoint] | None = None
 
 
-_INSTALL_ROLE_CAPABILITIES: dict[str, frozenset[Endpoint]] = {
-    "generation": DEFAULT_CAPABILITIES[EngineName.LLAMA_CPP],
-    "embeddings": frozenset({Endpoint.EMBEDDINGS}),
-    "rerank": frozenset({Endpoint.RERANK}),
-    "image": frozenset({Endpoint.IMAGES_GENERATIONS}),
+_GENERATION_WITH_MESSAGES = frozenset(
+    {
+        Endpoint.CHAT_COMPLETIONS,
+        Endpoint.COMPLETIONS,
+        Endpoint.RESPONSES,
+        Endpoint.MESSAGES,
+    }
+)
+_INSTALL_ROLE_CAPABILITY_SETS: dict[
+    EngineName,
+    dict[str, tuple[frozenset[Endpoint], ...]],
+] = {
+    EngineName.LLAMA_CPP: {
+        "generation": (
+            DEFAULT_CAPABILITIES[EngineName.LLAMA_CPP],
+            _GENERATION_WITH_MESSAGES,
+        ),
+        "embeddings": (frozenset({Endpoint.EMBEDDINGS}),),
+        "rerank": (frozenset({Endpoint.RERANK}),),
+    },
+    EngineName.OMLX: {
+        "generation": (_GENERATION_WITH_MESSAGES,),
+        "embeddings": (frozenset({Endpoint.EMBEDDINGS}),),
+        "rerank": (frozenset({Endpoint.RERANK}),),
+    },
+    EngineName.DS4: {
+        "generation": (_GENERATION_WITH_MESSAGES,),
+    },
+    EngineName.MFLUX: {
+        "image": (frozenset({Endpoint.IMAGES_GENERATIONS}),),
+    },
+    EngineName.MLXCEL: {
+        "generation": (DEFAULT_CAPABILITIES[EngineName.MLXCEL],),
+    },
+    EngineName.MISTRAL_RS: {
+        "generation": (_GENERATION_WITH_MESSAGES,),
+    },
 }
 
 
@@ -118,6 +188,7 @@ def _validated_install_capabilities(
     suggested_role: str | None,
     has_projector: bool,
 ) -> frozenset[Endpoint]:
+    role_capabilities = _INSTALL_ROLE_CAPABILITY_SETS.get(engine, {})
     if requested is None:
         role = (
             "image"
@@ -126,28 +197,23 @@ def _validated_install_capabilities(
             if engine == EngineName.DS4
             else suggested_role or "generation"
         )
-        capabilities = _INSTALL_ROLE_CAPABILITIES.get(role)
-        if capabilities is None:
+        accepted = role_capabilities.get(role)
+        if accepted is None:
             raise ValueError("model metadata suggested an unsupported role")
+        capabilities = accepted[0]
     else:
         capabilities = frozenset(requested)
 
-    allowed_roles: dict[EngineName, set[str]] = {
-        EngineName.LLAMA_CPP: {"generation", "embeddings", "rerank"},
-        EngineName.OMLX: {"generation", "embeddings", "rerank"},
-        EngineName.DS4: {"generation"},
-        EngineName.MFLUX: {"image"},
-    }
     matching_role = next(
         (
             role
-            for role, role_capabilities in _INSTALL_ROLE_CAPABILITIES.items()
-            if capabilities == role_capabilities
+            for role, accepted in role_capabilities.items()
+            if capabilities in accepted
         ),
         None,
     )
-    if matching_role is None or matching_role not in allowed_roles.get(engine, set()):
-        allowed = ", ".join(sorted(allowed_roles.get(engine, set()))) or "none"
+    if matching_role is None:
+        allowed = ", ".join(sorted(role_capabilities)) or "none"
         raise ValueError(
             f"{engine.value} installs require one supported model role: {allowed}"
         )
@@ -204,25 +270,32 @@ async def _close_proxy_resources(
     this helper preserves cancellation after both cleanup attempts run.
     """
 
-    cancellation: asyncio.CancelledError | None = None
-    try:
-        if upstream is not None:
-            try:
-                await upstream.aclose()
-            except asyncio.CancelledError as exc:
-                cancellation = exc
-            except Exception:
-                logger.warning("failed to close upstream response", exc_info=True)
-    finally:
-        if lease is not None:
-            try:
-                await lease.release()
-            except asyncio.CancelledError as exc:
-                cancellation = cancellation or exc
-            except Exception:
-                logger.exception("failed to release model lease")
-    if cancellation is not None:
-        raise cancellation
+    async def drain() -> None:
+        cancellation: asyncio.CancelledError | None = None
+        try:
+            if upstream is not None:
+                try:
+                    await upstream.aclose()
+                except asyncio.CancelledError as exc:
+                    cancellation = exc
+                except Exception:
+                    logger.warning("failed to close upstream response", exc_info=True)
+        finally:
+            if lease is not None:
+                try:
+                    await lease.release()
+                except asyncio.CancelledError as exc:
+                    cancellation = cancellation or exc
+                except Exception:
+                    logger.exception("failed to release model lease")
+        if cancellation is not None:
+            raise cancellation
+
+    cleanup = asyncio.create_task(
+        drain(),
+        name="mnemosyne-close-proxy-resources",
+    )
+    await _await_task_to_known_outcome(cleanup)
 
 
 async def _audit_after_upstream_failure(runtime: NativeRuntime) -> None:
@@ -237,12 +310,48 @@ async def _abort_image_request(
     upstream: Any | None,
     lease: Any | None,
 ) -> None:
-    """Release the lease and terminate MFLUX so cancelled work frees memory."""
-    await _close_proxy_resources(upstream, lease)
+    """Fence admission before terminating MFLUX after an interrupted request."""
+
+    cancellation: asyncio.CancelledError | None = None
+    if lease is not None:
+        try:
+            await lease.abort()
+        except asyncio.CancelledError as exc:
+            cancellation = exc
+        except Exception:
+            logger.exception("failed to abort and unload image resident")
+    if upstream is not None:
+        try:
+            await upstream.aclose()
+        except asyncio.CancelledError as exc:
+            cancellation = cancellation or exc
+        except Exception:
+            logger.warning("failed to close aborted image response", exc_info=True)
+    if cancellation is not None:
+        raise cancellation
+
+
+async def _abort_image_request_shielded(
+    runtime: NativeRuntime,
+    upstream: Any | None,
+    lease: Any | None,
+) -> None:
+    """Let the MFLUX epoch fence/unload finish if its caller is cancelled."""
+
+    cleanup = asyncio.create_task(
+        _abort_image_request(runtime, upstream, lease),
+        name="mnemosyne-abort-image-request",
+    )
     try:
-        await runtime.coordinator.unload()
-    except Exception:
-        logger.exception("failed to unload image worker after request abort")
+        await asyncio.shield(cleanup)
+    except asyncio.CancelledError as cancellation:
+        # The independently owned cleanup task keeps running. Usually the
+        # cancellation that reached this wrapper has already been delivered,
+        # so this second shield waits for the fence/unload before cancellation
+        # is re-raised. A repeated cancellation still cannot cancel cleanup.
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.shield(cleanup)
+        raise cancellation
 
 
 def _json_model(body: bytes) -> str:
@@ -259,6 +368,8 @@ def _json_model(body: bytes) -> str:
 
 
 def _error_status(exc: Exception) -> int:
+    if isinstance(exc, QueueFull):
+        return 429
     if isinstance(exc, QueueTimeout):
         return 504
     if isinstance(exc, KeyError):
@@ -291,9 +402,9 @@ async def _record_usage(
     streamed: bool,
     started_at: float,
     status_code: int,
-) -> None:
+) -> Any:
     if usage is None or not (200 <= status_code < 300):
-        return
+        return None
     event: UsageEvent | None
     if isinstance(usage, Mapping):
         event = usage_event_from_payload(
@@ -322,6 +433,139 @@ async def _record_usage(
             await runtime.record_usage(event)
         except Exception:
             logger.exception("failed to persist token usage event")
+        return event.usage
+    return None
+
+
+class _StreamingProxyOwnership:
+    """Idempotent full-ASGI ownership of native upstream and model lease."""
+
+    def __init__(
+        self,
+        *,
+        runtime: NativeRuntime,
+        upstream: httpx.Response,
+        lease: Any,
+        target: Any,
+        endpoint: Endpoint,
+        requested_model: str,
+        started_at: float,
+        usage_parser: StreamingUsageParser,
+        performance_timer: RequestPerformanceTimer,
+    ) -> None:
+        self.runtime = runtime
+        self.upstream = upstream
+        self.lease = lease
+        self.target = target
+        self.endpoint = endpoint
+        self.requested_model = requested_model
+        self.started_at = started_at
+        self.usage_parser = usage_parser
+        self.performance_timer = performance_timer
+        self.body_failed = False
+        self.upstream_failed = False
+        self._completion_task: asyncio.Task[None] | None = None
+
+    def note_failure(self, *, upstream_failed: bool) -> None:
+        self.body_failed = True
+        self.upstream_failed = self.upstream_failed or upstream_failed
+
+    async def _finish(self) -> None:
+        usage = None
+        try:
+            usage = self.usage_parser.finish()
+            await _record_usage(
+                self.runtime,
+                usage,
+                endpoint=self.endpoint,
+                engine=str(self.target.key.engine),
+                requested_model=self.requested_model,
+                alias=self.target.alias,
+                streamed=True,
+                started_at=self.started_at,
+                status_code=self.upstream.status_code,
+            )
+        finally:
+            try:
+                if (
+                    self.target.key.engine == EngineName.MFLUX
+                    and self.body_failed
+                ):
+                    await _abort_image_request_shielded(
+                        self.runtime,
+                        self.upstream,
+                        self.lease,
+                    )
+                else:
+                    await _close_proxy_resources(self.upstream, self.lease)
+            finally:
+                if (
+                    self.upstream_failed
+                    and self.target.key.engine != EngineName.MFLUX
+                ):
+                    await _audit_after_upstream_failure(self.runtime)
+                if (
+                    self.runtime.is_engine_alternative(self.target)
+                    and (
+                        self.upstream_failed
+                        or self.upstream.status_code >= 500
+                    )
+                ):
+                    self.runtime.invalidate_automatic_selection(self.target.alias)
+                self.performance_timer.finish(
+                    status_code=self.upstream.status_code,
+                    error_code=(
+                        "upstream_stream_failure"
+                        if self.upstream_failed
+                        else "stream_interrupted"
+                        if self.body_failed
+                        else "upstream_status"
+                        if self.upstream.status_code >= 400
+                        else None
+                    ),
+                    completion_tokens=(
+                        usage.completion_tokens if usage is not None else None
+                    ),
+                )
+
+    async def complete(self) -> None:
+        if self._completion_task is None:
+            self._completion_task = asyncio.create_task(
+                self._finish(),
+                name="mnemosyne-streaming-proxy-finish",
+            )
+        await _await_task_to_known_outcome(self._completion_task)
+
+
+class _OwnedStreamingResponse(StreamingResponse):
+    """Ensure cleanup even if cancellation precedes body iteration."""
+
+    def __init__(
+        self,
+        content,
+        *,
+        owner: _StreamingProxyOwnership,
+        status_code: int,
+        headers: Mapping[str, str],
+    ) -> None:
+        super().__init__(
+            content,
+            status_code=status_code,
+            headers=dict(headers),
+        )
+        self._owner = owner
+
+    async def __call__(self, scope, receive, send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        except asyncio.CancelledError:
+            self._owner.note_failure(upstream_failed=False)
+            raise
+        except BaseException:
+            self._owner.note_failure(upstream_failed=False)
+            raise
+        finally:
+            await self._owner.complete()
 
 
 def _inference_authorized(runtime: NativeRuntime, request: Request) -> bool:
@@ -330,6 +574,17 @@ def _inference_authorized(runtime: NativeRuntime, request: Request) -> bool:
     ).strip()
     if not expected:
         return True
+    prefix = "Bearer "
+    supplied = request.headers.get("authorization", "")
+    return supplied.startswith(prefix) and hmac.compare_digest(
+        supplied[len(prefix) :], expected
+    )
+
+
+def _fleet_authorized(runtime: NativeRuntime, request: Request) -> bool:
+    expected = os.environ.get(runtime.config.server.fleet_api_key_env, "").strip()
+    if not expected:
+        return False
     prefix = "Bearer "
     supplied = request.headers.get("authorization", "")
     return supplied.startswith(prefix) and hmac.compare_digest(
@@ -352,11 +607,15 @@ def _control_authorized(runtime: NativeRuntime, request: Request) -> bool:
     return username == "admin" and hmac.compare_digest(password, expected)
 
 
-async def _resolve_target(runtime: NativeRuntime, model: str) -> Any:
+async def _resolve_target(
+    runtime: NativeRuntime,
+    model: str,
+    endpoint: Endpoint | None = None,
+) -> Any:
     """Resolve storage-backed profiles without blocking either HTTP plane."""
 
     try:
-        return await runtime.resolve_target(model)
+        return await runtime.resolve_target(model, endpoint=endpoint)
     except FilesystemProbeError as exc:
         raise HTTPException(
             503,
@@ -398,11 +657,41 @@ def create_inference_app(runtime: NativeRuntime) -> FastAPI:
     async def models() -> dict:
         return {"object": "list", "data": runtime.model_list()}
 
+    @app.get("/fleet/v1/snapshot")
+    async def fleet_snapshot(request: Request) -> dict:
+        configured = os.environ.get(
+            runtime.config.server.fleet_api_key_env,
+            "",
+        ).strip()
+        if not configured:
+            raise HTTPException(503, "fleet snapshot authentication is not configured")
+        if not _fleet_authorized(runtime, request):
+            raise HTTPException(
+                status_code=401,
+                detail="invalid or missing fleet bearer token",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        if not os.environ.get(
+            runtime.config.server.inference_api_key_env,
+            "",
+        ).strip():
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "fleet_inference_auth_unconfigured",
+                    "message": (
+                        "configure a node-specific inference API key before "
+                        "enabling fleet discovery"
+                    ),
+                },
+            )
+        return await runtime.fleet_snapshot()
+
     async def proxy(request: Request, endpoint: Endpoint) -> Response:
         body = await request.body()
         requested_model = _json_model(body)
         try:
-            target = await _resolve_target(runtime, requested_model)
+            target = await _resolve_target(runtime, requested_model, endpoint)
         except KeyError as exc:
             raise HTTPException(404, str(exc)) from exc
         if endpoint not in target.capabilities:
@@ -422,6 +711,18 @@ def create_inference_app(runtime: NativeRuntime) -> FastAPI:
                 raise HTTPException(400, str(exc)) from exc
 
         started_at = time.monotonic()
+        performance_timer = runtime.performance.start(
+            alias=target.alias,
+            engine=target.key.engine.value,
+            endpoint=f"/v1/{endpoint.value}",
+            streamed=False,
+        )
+        before_admission = await runtime.coordinator.status()
+        cold_start = not (
+            before_admission.resident_alias == target.alias
+            and before_admission.resident_engine == target.key.engine
+            and before_admission.state == CoordinatorState.READY
+        )
         lease = None
         upstream: httpx.Response | None = None
         try:
@@ -433,16 +734,53 @@ def create_inference_app(runtime: NativeRuntime) -> FastAPI:
                 if endpoint == Endpoint.IMAGES_GENERATIONS
                 else None
             )
-            lease = await runtime.coordinator.acquire(
-                target,
-                timeout_seconds=lease_timeout,
-            )
+            try:
+                lease = await runtime.coordinator.acquire(
+                    target,
+                    timeout_seconds=lease_timeout,
+                )
+            except (QueueFull, QueueTimeout):
+                raise
+            except (AdapterError, CoordinatorError):
+                primary = runtime.resolve(target.alias)
+                status = await runtime.coordinator.status()
+                can_fallback = bool(
+                    target.key.engine != primary.key.engine
+                    and status.initialized
+                    and status.accepting
+                    and status.resident_alias is None
+                )
+                if not can_fallback:
+                    raise
+                # The selected candidate failed before an upstream request
+                # existed. Automatic choices lose their stale evidence; an
+                # explicit user pin remains saved. Recover this untouched
+                # request through the original fixed target.
+                runtime.invalidate_automatic_selection(target.alias)
+                target = await runtime.resolve_fixed_target(
+                    target.alias,
+                    endpoint=endpoint,
+                )
+                performance_timer.engine = target.key.engine.value
+                retry_status = await runtime.coordinator.status()
+                cold_start = not (
+                    retry_status.resident_alias == target.alias
+                    and retry_status.resident_engine == target.key.engine
+                    and retry_status.state == CoordinatorState.READY
+                )
+                lease = await runtime.coordinator.acquire(
+                    target,
+                    timeout_seconds=lease_timeout,
+                )
+            performance_timer.mark_admitted(cold_start=cold_start)
             route = lease.route(endpoint)
             prepared, requested_model, streamed, client_asked_usage = prepare_request_body(
                 body,
                 route=route,
                 endpoint=endpoint,
+                engine=target.key.engine,
             )
+            performance_timer.streamed = streamed
             upstream_request = runtime.proxy_client.build_request(
                 method=request.method,
                 url=f"{route.base_url}{route.path}",
@@ -457,29 +795,63 @@ def create_inference_app(runtime: NativeRuntime) -> FastAPI:
                     upstream = await runtime.proxy_client.send(upstream_request, stream=True)
             else:
                 upstream = await runtime.proxy_client.send(upstream_request, stream=True)
+            performance_timer.mark_upstream_headers()
+            if (
+                upstream.status_code >= 500
+                and runtime.is_engine_alternative(target)
+            ):
+                # Work may already have begun, so never replay this request.
+                # The evidence is removed only for subsequent requests.
+                runtime.invalidate_automatic_selection(target.alias)
         except asyncio.CancelledError:
+            performance_timer.finish(status_code=499, error_code="cancelled")
             if target.key.engine == EngineName.MFLUX:
-                cleanup = asyncio.create_task(
-                    _abort_image_request(runtime, upstream, lease),
-                    name="mnemosyne-abort-image-request",
-                )
-                with contextlib.suppress(asyncio.CancelledError):
-                    await asyncio.shield(cleanup)
+                await _abort_image_request_shielded(runtime, upstream, lease)
             else:
                 await _close_proxy_resources(upstream, lease)
             raise
         except TimeoutError as exc:
+            performance_timer.finish(status_code=504, error_code="request_timeout")
             if target.key.engine == EngineName.MFLUX:
-                await _abort_image_request(runtime, upstream, lease)
+                await _abort_image_request_shielded(runtime, upstream, lease)
             else:
                 await _close_proxy_resources(upstream, lease)
             raise HTTPException(504, "image generation timed out") from exc
-        except HTTPException:
+        except QueueFull as exc:
+            performance_timer.finish(status_code=429, error_code="queue_full")
+            await _close_proxy_resources(upstream, lease)
+            raise HTTPException(
+                status_code=429,
+                detail={
+                    "code": "node_busy",
+                    "message": str(exc),
+                },
+                headers={
+                    "Retry-After": "1",
+                    "X-Mnemosyne-Error": "node_busy",
+                },
+            ) from exc
+        except HTTPException as exc:
+            performance_timer.finish(
+                status_code=exc.status_code,
+                error_code="request_rejected",
+            )
             await _close_proxy_resources(upstream, lease)
             raise
         except Exception as exc:
+            status_code = _error_status(exc)
+            performance_timer.finish(
+                status_code=status_code,
+                error_code=(
+                    "upstream_transport"
+                    if isinstance(exc, httpx.HTTPError)
+                    else "inference_failure"
+                ),
+            )
             await _close_proxy_resources(upstream, lease)
             if isinstance(exc, httpx.HTTPError):
+                if runtime.is_engine_alternative(target):
+                    runtime.invalidate_automatic_selection(target.alias)
                 await _audit_after_upstream_failure(runtime)
             raise HTTPException(_error_status(exc), str(exc)) from exc
 
@@ -488,6 +860,7 @@ def create_inference_app(runtime: NativeRuntime) -> FastAPI:
         is_event_stream = "text/event-stream" in upstream.headers.get(
             "content-type", ""
         )
+        performance_timer.streamed = streamed or is_event_stream
         if streamed or is_event_stream:
             usage_parser = StreamingUsageParser(endpoint=f"/v1/{endpoint.value}")
             event_filter = StreamingEventFilter(
@@ -496,48 +869,49 @@ def create_inference_app(runtime: NativeRuntime) -> FastAPI:
                     and endpoint in {Endpoint.CHAT_COMPLETIONS, Endpoint.COMPLETIONS}
                 )
             )
+            owner = _StreamingProxyOwnership(
+                runtime=runtime,
+                upstream=upstream,
+                lease=lease,
+                target=target,
+                endpoint=endpoint,
+                requested_model=requested_model,
+                started_at=started_at,
+                usage_parser=usage_parser,
+                performance_timer=performance_timer,
+            )
 
             async def stream_body():
-                upstream_failed = False
                 try:
                     async for chunk in upstream.aiter_bytes():
+                        performance_timer.mark_first_byte()
                         usage_parser.feed(chunk)
                         for forwarded in event_filter.feed(chunk):
                             yield forwarded
                     tail = event_filter.finish()
                     if tail:
                         yield tail
-                except httpx.HTTPError:
-                    upstream_failed = True
+                except asyncio.CancelledError:
+                    owner.note_failure(upstream_failed=False)
+                    raise
+                except BaseException:
+                    owner.note_failure(upstream_failed=True)
                     raise
                 finally:
-                    try:
-                        usage = usage_parser.finish()
-                        await _record_usage(
-                            runtime,
-                            usage,
-                            endpoint=endpoint,
-                            engine=str(target.key.engine),
-                            requested_model=requested_model,
-                            alias=target.alias,
-                            streamed=True,
-                            started_at=started_at,
-                            status_code=upstream.status_code,
-                        )
-                    finally:
-                        await _close_proxy_resources(upstream, lease)
-                        if upstream_failed:
-                            await _audit_after_upstream_failure(runtime)
+                    await owner.complete()
 
-            return StreamingResponse(
+            return _OwnedStreamingResponse(
                 stream_body(),
+                owner=owner,
                 status_code=upstream.status_code,
                 headers=response_headers,
             )
 
         upstream_failed = False
+        body_failed = False
         try:
             content = await upstream.aread()
+            performance_timer.mark_first_byte()
             decoded: Mapping[str, Any] | None = None
             try:
                 candidate = json.loads(content)
@@ -546,7 +920,7 @@ def create_inference_app(runtime: NativeRuntime) -> FastAPI:
             except (TypeError, ValueError):
                 pass
             if endpoint != Endpoint.IMAGES_GENERATIONS:
-                await _record_usage(
+                normalized_usage = await _record_usage(
                     runtime,
                     decoded,
                     endpoint=endpoint,
@@ -557,18 +931,49 @@ def create_inference_app(runtime: NativeRuntime) -> FastAPI:
                     started_at=started_at,
                     status_code=upstream.status_code,
                 )
+            else:
+                normalized_usage = None
+            performance_timer.finish(
+                status_code=upstream.status_code,
+                error_code=(
+                    "upstream_status" if upstream.status_code >= 400 else None
+                ),
+                completion_tokens=(
+                    normalized_usage.completion_tokens
+                    if normalized_usage is not None
+                    else None
+                ),
+            )
             return Response(
                 content=content,
                 status_code=upstream.status_code,
                 headers=response_headers,
             )
+        except asyncio.CancelledError:
+            body_failed = True
+            performance_timer.finish(status_code=499, error_code="cancelled")
+            raise
         except httpx.HTTPError as exc:
+            body_failed = True
             upstream_failed = True
+            performance_timer.finish(
+                status_code=502,
+                error_code="upstream_response",
+            )
             raise HTTPException(502, f"upstream response failed: {exc}") from exc
+        except Exception:
+            body_failed = True
+            performance_timer.finish(status_code=500, error_code="response_failure")
+            raise
         finally:
-            await _close_proxy_resources(upstream, lease)
-            if upstream_failed:
+            if target.key.engine == EngineName.MFLUX and body_failed:
+                await _abort_image_request_shielded(runtime, upstream, lease)
+            else:
+                await _close_proxy_resources(upstream, lease)
+            if upstream_failed and target.key.engine != EngineName.MFLUX:
                 await _audit_after_upstream_failure(runtime)
+            if upstream_failed and runtime.is_engine_alternative(target):
+                runtime.invalidate_automatic_selection(target.alias)
 
     @app.post("/v1/chat/completions")
     async def chat_completions(request: Request) -> Response:
@@ -618,6 +1023,54 @@ def create_control_app(runtime: NativeRuntime) -> FastAPI:
     async def status() -> dict:
         return await runtime.status()
 
+    @app.get("/manager/performance")
+    async def performance() -> dict:
+        return runtime.performance.snapshot()
+
+    @app.get("/manager/benchmarks")
+    async def benchmarks(alias: str | None = Query(default=None)) -> dict:
+        return runtime.benchmark_snapshot(alias)
+
+    @app.post("/manager/benchmarks/{alias}")
+    async def benchmark_model(alias: str, payload: BenchmarkModelRequest) -> dict:
+        try:
+            return await runtime.benchmark_model(
+                alias,
+                warmup_runs=payload.warmup_runs,
+                sample_runs=payload.sample_runs,
+                max_tokens=payload.max_tokens,
+            )
+        except Exception as exc:
+            raise HTTPException(_error_status(exc), str(exc)) from exc
+
+    @app.delete("/manager/benchmarks/{alias}")
+    async def clear_benchmarks(alias: str) -> dict:
+        return {
+            "alias": alias,
+            "deleted": runtime.reject_benchmark_evidence(alias),
+        }
+
+    @app.get("/manager/contexts")
+    async def contexts(alias: str | None = Query(default=None)) -> dict:
+        return runtime.context_snapshot(alias)
+
+    @app.post("/manager/contexts/{alias}/profile")
+    async def profile_context(alias: str, payload: ContextProfileRequest) -> dict:
+        try:
+            return await runtime.profile_model_context(
+                alias,
+                target_tokens=payload.target_tokens,
+            )
+        except Exception as exc:
+            raise HTTPException(_error_status(exc), str(exc)) from exc
+
+    @app.delete("/manager/contexts/{alias}")
+    async def clear_contexts(alias: str) -> dict:
+        return {
+            "alias": alias,
+            "deleted": runtime.reject_context_evidence(alias),
+        }
+
     @app.get("/manager/readiness")
     async def readiness() -> dict:
         return await runtime.readiness()
@@ -660,20 +1113,41 @@ def create_control_app(runtime: NativeRuntime) -> FastAPI:
 
     @app.get("/manager/storage")
     async def storage_locations() -> dict:
-        statuses = await asyncio.gather(
-            *(
-                runtime.filesystem.inspect(
+        async def inspect_location(location) -> dict:
+            try:
+                status = await runtime.filesystem.inspect(
                     location.path,
                     name=location.name,
                     expected_volume_uuid=location.volume_uuid,
                     scope_id=location.scope_id,
                 )
-                for location in runtime.config.storage.locations
-            )
+                return status.to_dict()
+            except FilesystemProbeError as exc:
+                # One stale or temporarily unavailable Finder grant must not
+                # turn the complete Settings storage card into an HTTP 500.
+                # Retain the exact configured path and return a typed,
+                # unavailable row so the user can repair that location.
+                return {
+                    "name": location.name,
+                    "path": str(Path(location.path).expanduser().absolute()),
+                    "exists": False,
+                    "is_directory": False,
+                    "writable": False,
+                    "mount_path": None,
+                    "volume_uuid": None,
+                    "expected_volume_uuid": location.volume_uuid,
+                    "volume_matches": False,
+                    "total_bytes": None,
+                    "free_bytes": None,
+                    "diagnostic": str(exc),
+                }
+
+        statuses = await asyncio.gather(
+            *(inspect_location(location) for location in runtime.config.storage.locations)
         )
         return {
             "default": runtime.config.storage.default,
-            "locations": [status.to_dict() for status in statuses],
+            "locations": statuses,
         }
 
     @app.get("/manager/storage/inspect")
@@ -688,23 +1162,58 @@ def create_control_app(runtime: NativeRuntime) -> FastAPI:
 
     @app.post("/manager/storage/inspect")
     async def inspect_selected_storage(payload: StorageInspectRequest) -> dict:
+        scope_id: str | None = None
         try:
-            scope_id = (
-                await runtime.register_security_scope(
-                    payload.path,
-                    payload.bookmark_data,
+            # A selected folder that the unsandboxed service can already use
+            # needs no persistent security scope. Persisting one anyway makes
+            # ordinary folders depend on a bookmark contract intended for
+            # protected/sandboxed access and can force needless reselection.
+            unscoped = None
+            try:
+                unscoped = await runtime.filesystem.inspect(payload.path)
+            except FilesystemProbeError:
+                pass
+            if (
+                unscoped is not None
+                and unscoped.exists
+                and unscoped.is_directory
+                and unscoped.writable
+                and unscoped.volume_matches
+            ):
+                value = unscoped.to_dict()
+                value["scope_id"] = None
+                return value
+
+            if payload.bookmark_data is None:
+                if unscoped is not None:
+                    return unscoped.to_dict()
+                raise FilesystemProbeError(
+                    "the selected model folder could not be inspected"
                 )
-                if payload.bookmark_data is not None
-                else None
+
+            scope_id = await runtime.register_security_scope(
+                payload.path,
+                payload.bookmark_data,
             )
             status = await runtime.filesystem.inspect(
                 payload.path,
                 scope_id=scope_id,
             )
+            if not (
+                status.exists
+                and status.is_directory
+                and status.writable
+                and status.volume_matches
+            ):
+                raise FilesystemProbeError(
+                    status.diagnostic or "the selected model folder is unavailable"
+                )
             value = status.to_dict()
             value["scope_id"] = scope_id
             return value
         except (FilesystemProbeError, ValueError, SecurityScopeError) as exc:
+            if scope_id is not None:
+                await runtime.discard_security_scope(scope_id)
             raise HTTPException(400, str(exc)) from exc
 
     @app.get("/manager/model-library/recommendations")
@@ -810,17 +1319,38 @@ def create_control_app(runtime: NativeRuntime) -> FastAPI:
 
     @app.get("/manager/model-library/search")
     async def library_search(
-        engine: EngineName,
+        engine: EngineName | None = None,
         q: str = Query(default="", max_length=200),
         limit: int = Query(default=20, ge=1, le=50),
     ) -> dict:
         try:
-            models = await asyncio.to_thread(
-                search_models,
-                q,
-                engine=engine,
-                limit=limit,
-            )
+            if engine is not None:
+                models = await asyncio.to_thread(
+                    search_models,
+                    q,
+                    engine=engine,
+                    limit=limit,
+                )
+            else:
+                searches = [
+                    asyncio.to_thread(
+                        search_models,
+                        q,
+                        engine=candidate,
+                        limit=limit,
+                    )
+                    for candidate in EngineName
+                ]
+                grouped = await asyncio.gather(*searches)
+                models = [model for group in grouped for model in group]
+                models.sort(
+                    key=lambda model: (
+                        -(model.downloads or 0),
+                        model.display_name.casefold(),
+                        model.engine,
+                        model.filename or "",
+                    )
+                )
             return {"models": [model.to_dict() for model in models]}
         except Exception as exc:
             raise HTTPException(502, f"Hugging Face search failed: {exc}") from exc
@@ -966,7 +1496,7 @@ def create_control_app(runtime: NativeRuntime) -> FastAPI:
                     kind="image",
                     image=image_profile_defaults(candidate),
                 )
-            elif payload.engine == EngineName.LLAMA_CPP:
+            elif payload.engine in {EngineName.DS4, EngineName.LLAMA_CPP}:
                 if not candidate.filename:
                     raise ValueError("select an exact GGUF file")
                 load: dict[str, Any] = {}
@@ -981,7 +1511,11 @@ def create_control_app(runtime: NativeRuntime) -> FastAPI:
                     engine=payload.engine,
                     model=str(destination / candidate.filename),
                     storage=payload.storage or runtime.config.storage.default,
-                    served_model_name=alias,
+                    served_model_name=(
+                        candidate.family
+                        if payload.engine == EngineName.DS4
+                        else alias
+                    ),
                     capabilities=set(capabilities),
                     load=load,
                 )
@@ -989,7 +1523,18 @@ def create_control_app(runtime: NativeRuntime) -> FastAPI:
                 ModelProfile(
                     alias=alias,
                     engine=payload.engine,
-                    model=payload.repo_id,
+                    model=(
+                        str(destination)
+                        if payload.engine
+                        in {EngineName.MLXCEL, EngineName.MISTRAL_RS}
+                        else payload.repo_id
+                    ),
+                    storage=(
+                        storage_name
+                        if payload.engine
+                        in {EngineName.MLXCEL, EngineName.MISTRAL_RS}
+                        else None
+                    ),
                     capabilities=set(capabilities),
                 )
             record = await runtime.installer.create(
@@ -1123,6 +1668,20 @@ def create_control_app(runtime: NativeRuntime) -> FastAPI:
     async def runtime_update_evidence() -> dict:
         try:
             return await runtime.runtime_update_evidence()
+        except Exception as exc:
+            raise HTTPException(_error_status(exc), str(exc)) from exc
+
+    @app.get("/manager/engines/omlx/cache")
+    async def omlx_cache_health() -> dict:
+        try:
+            return await runtime.omlx_cache_health()
+        except Exception as exc:
+            raise HTTPException(_error_status(exc), str(exc)) from exc
+
+    @app.post("/manager/engines/omlx/cache/reset")
+    async def reset_omlx_cache() -> dict:
+        try:
+            return await runtime.reset_omlx_cache()
         except Exception as exc:
             raise HTTPException(_error_status(exc), str(exc)) from exc
 

@@ -10,6 +10,14 @@ func modelRoleCapabilitiesAreCanonical() {
     #expect(ModelRole.embeddings.capabilities == ["embeddings"])
     #expect(ModelRole.rerank.capabilities == ["rerank"])
     #expect(ModelRole.image.capabilities == ["images/generations"])
+    #expect(
+        ModelRole.generation.capabilities(for: .llamaCpp)
+            == ["chat/completions", "completions", "responses"]
+    )
+    #expect(
+        ModelRole.generation.capabilities(for: .omlx)
+            == ModelRole.generation.capabilities
+    )
 }
 
 @Test("Role choices are limited by engine and multimodal projector")
@@ -55,8 +63,25 @@ func applyingModelRoleIsAtomic() {
 
     profile.applyRole(.generation)
     #expect(profile.configuredRole == .generation)
-    #expect(profile.capabilities == ModelRole.generation.capabilities)
+    #expect(
+        profile.capabilities
+            == ModelRole.generation.capabilities(for: .llamaCpp)
+    )
     #expect(profile.load.pooling == nil)
+}
+
+@Test("Explicit llama.cpp Messages capability survives typed role editing")
+func explicitLlamaMessagesCapabilityIsPreserved() {
+    var profile = ModelProfileSettings(
+        alias: "anthropic",
+        engine: .llamaCpp,
+        model: "/models/anthropic.gguf",
+        capabilities: ModelRole.generation.capabilities
+    )
+
+    #expect(profile.configuredRole == .generation)
+    profile.applyRole(.generation)
+    #expect(profile.capabilities == ModelRole.generation.capabilities)
 }
 
 @Test("Legacy mixed endpoint combinations require a deliberate role choice")

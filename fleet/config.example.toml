@@ -1,0 +1,41 @@
+[server]
+# Keep Nyx on a private LAN/Tailscale address or put it behind a trusted TLS
+# reverse proxy. The dashboard is at /fleet/.
+host = "127.0.0.1"
+port = 17400
+api_key_env = "MNEMOSYNE_FLEET_CLIENT_KEY"
+admin_api_key_env = "MNEMOSYNE_FLEET_ADMIN_KEY"
+database_path = "/var/lib/mnemosyne-fleet/fleet.db"
+request_timeout_seconds = 300
+max_body_bytes = 16777216
+route_history_limit = 10000
+poll_interval_seconds = 2
+snapshot_ttl_seconds = 10
+
+[[nodes]]
+node_id = "metis"
+url = "http://metis:1240"
+# Fleet snapshot and inference credentials are separate trust channels.
+fleet_token_env = "MNEMOSYNE_METIS_FLEET_KEY"
+inference_token_env = "MNEMOSYNE_METIS_INFERENCE_KEY"
+# Optional. This may reduce, but cannot raise, the node's derived capacity.
+routing_weight = 2
+
+[[nodes]]
+node_id = "cuda-box"
+url = "http://cuda-box:8000"
+fleet_token_env = "MNEMOSYNE_CUDA_FLEET_KEY"
+inference_token_env = "MNEMOSYNE_CUDA_INFERENCE_KEY"
+
+[[models]]
+name = "qwen-coder"
+# Copy the exact authoritative deployment ID advertised by enrolled nodes.
+deployment_id = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+capabilities = ["chat/completions", "completions", "responses"]
+queue_depth = 128
+queue_timeout_seconds = 120
+
+[ledger]
+# Optional read-only Postgres role for dashboard aggregates.
+dsn_env = "MNEMOSYNE_FLEET_LEDGER_DSN"
+

@@ -31,7 +31,14 @@ from uuid import uuid4
 
 import httpx
 
-from .config import DS4Config, LlamaCppConfig, MFluxConfig, OMLXConfig
+from .config import (
+    DS4Config,
+    LlamaCppConfig,
+    MFluxConfig,
+    MLXcelConfig,
+    MistralRSConfig,
+    OMLXConfig,
+)
 from .models import ENGINE_RELEASE_TIER, EngineName
 
 
@@ -46,10 +53,21 @@ DS4_COMMIT_API_URL = "https://api.github.com/repos/antirez/ds4/commits/main"
 LLAMA_CPP_RELEASE_API_URL = (
     "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest"
 )
+LLAMA_CPP_RELEASE_TAG_API_URL = (
+    "https://api.github.com/repos/ggml-org/llama.cpp/releases/tags/"
+)
+LLAMA_CPP_RELEASE_DOWNLOAD_PREFIX = (
+    "https://github.com/ggml-org/llama.cpp/releases/download/"
+)
+LLAMA_CPP_STABLE_POINTER_NAME = "nightly-tag.txt"
+MAX_LLAMA_CPP_STABLE_POINTER_BYTES = 32
 MAX_SOURCE_ARCHIVE_BYTES = 2 * 1024**3
 _VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$")
 _ENGINES = ("llama.cpp", "omlx", "mflux", "ds4")
+_EXTERNAL_PREVIEW_ENGINES = ("mlxcel", "mistral.rs")
 _OMLX_RELEASES_URL = "https://github.com/jundot/omlx/releases"
+_MLXCEL_INSTALL_URL = "https://github.com/lablup/mlxcel#install-with-homebrew-macoslinux"
+_MISTRAL_RS_INSTALL_URL = "https://ericlbuehler.github.io/mistral.rs/quickstart/"
 _LIFECYCLE_LIMIT = 256
 _LIFECYCLE_ACTION_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _LIFECYCLE_EVENT_ID_RE = re.compile(
@@ -177,6 +195,37 @@ def _omlx_cli_candidates() -> tuple[Path, ...]:
         if candidate not in unique:
             unique.append(candidate)
     return tuple(unique)
+
+
+def _omlx_installation_kind(path: str | None) -> str:
+    """Classify ownership without trusting PATH aliases or arbitrary commands."""
+
+    if not path:
+        return "not_installed"
+    if path.startswith(("http://", "https://")):
+        return "running_external"
+    candidate = Path(path).expanduser()
+    if candidate.suffix.casefold() == ".app":
+        return "official_app"
+    try:
+        resolved = candidate.resolve(strict=False)
+    except OSError:
+        resolved = candidate
+    normalized = str(resolved).casefold()
+    if "/cellar/omlx/head-" in normalized:
+        return "homebrew_head"
+    if "/cellar/omlx/" in normalized or "/homebrew/opt/omlx/" in normalized:
+        return "homebrew_stable"
+    if "/.omlx/bin/omlx" in normalized:
+        return "official_app_cli"
+    return "external_cli"
+
+
+def _homebrew_executable() -> Path | None:
+    for candidate in (Path("/opt/homebrew/bin/brew"), Path("/usr/local/bin/brew")):
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return candidate
+    return None
 
 
 @dataclass(frozen=True)
@@ -617,6 +666,8 @@ class RuntimeUpdateManager:
         mflux: MFluxConfig,
         ds4: DS4Config,
         llama_cpp: LlamaCppConfig | None = None,
+        mlxcel: MLXcelConfig | None = None,
+        mistral_rs: MistralRSConfig | None = None,
         root: str | Path | None = None,
         client: httpx.AsyncClient | None = None,
     ) -> None:
@@ -624,6 +675,8 @@ class RuntimeUpdateManager:
         self.omlx = omlx
         self.mflux = mflux
         self.ds4 = ds4
+        self.mlxcel = mlxcel or MLXcelConfig()
+        self.mistral_rs = mistral_rs or MistralRSConfig()
         self.root = _runtime_root(root)
         self.channel = "official"
         self._client = client or httpx.AsyncClient(timeout=30, follow_redirects=True)
@@ -914,9 +967,14 @@ class RuntimeUpdateManager:
         payload = await self._fetch_json(LLAMA_CPP_RELEASE_API_URL)
         if not isinstance(payload, dict):
             raise RuntimeUpdateError("official llama.cpp release response was invalid")
-        tag = _validate_version(payload.get("tag_name"))
+        stable_tag = _validate_version(payload.get("tag_name"))
         if payload.get("draft") or payload.get("prerelease"):
             raise RuntimeUpdateError("official latest llama.cpp release was not stable")
+        release_url = str(
+            payload.get("html_url")
+            or f"https://github.com/ggml-org/llama.cpp/releases/tag/{stable_tag}"
+        )
+        tag = stable_tag
         expected_name = f"llama-{tag}-bin-macos-arm64.tar.gz"
         assets = payload.get("assets")
         if not isinstance(assets, list):
@@ -930,15 +988,44 @@ class RuntimeUpdateManager:
             None,
         )
         if asset is None:
-            raise RuntimeUpdateError(
-                f"official llama.cpp release omitted {expected_name}"
+            tag = await self._official_llama_cpp_stable_pointer(
+                payload,
+                stable_tag=stable_tag,
             )
+            payload = await self._fetch_json(f"{LLAMA_CPP_RELEASE_TAG_API_URL}{tag}")
+            if not isinstance(payload, dict):
+                raise RuntimeUpdateError(
+                    "official llama.cpp referenced release response was invalid"
+                )
+            if payload.get("draft") or payload.get("tag_name") != tag:
+                raise RuntimeUpdateError(
+                    "official llama.cpp stable pointer referenced an invalid release"
+                )
+            expected_name = f"llama-{tag}-bin-macos-arm64.tar.gz"
+            assets = payload.get("assets")
+            if not isinstance(assets, list):
+                raise RuntimeUpdateError(
+                    "official referenced llama.cpp release omitted assets"
+                )
+            asset = next(
+                (
+                    value
+                    for value in assets
+                    if isinstance(value, dict) and value.get("name") == expected_name
+                ),
+                None,
+            )
+            if asset is None:
+                raise RuntimeUpdateError(
+                    f"official referenced llama.cpp release omitted {expected_name}"
+                )
         source_url = asset.get("browser_download_url")
         digest = asset.get("digest")
         size = asset.get("size")
-        if not isinstance(source_url, str) or not source_url.startswith(
-            "https://github.com/ggml-org/llama.cpp/releases/download/"
-        ):
+        expected_source_url = (
+            f"{LLAMA_CPP_RELEASE_DOWNLOAD_PREFIX}{tag}/{expected_name}"
+        )
+        if source_url != expected_source_url:
             raise RuntimeUpdateError("official llama.cpp asset URL was invalid")
         if not isinstance(digest, str) or not re.fullmatch(
             r"sha256:[0-9a-fA-F]{64}", digest
@@ -948,10 +1035,6 @@ class RuntimeUpdateManager:
             )
         if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
             raise RuntimeUpdateError("official llama.cpp asset size was invalid")
-        release_url = str(
-            payload.get("html_url")
-            or f"https://github.com/ggml-org/llama.cpp/releases/tag/{tag}"
-        )
         revision = payload.get("target_commitish")
         return RuntimeRelease(
             engine="llama.cpp",
@@ -962,6 +1045,91 @@ class RuntimeUpdateManager:
             sha256=digest.split(":", 1)[1].casefold(),
             asset_size=size,
         )
+
+    async def _official_llama_cpp_stable_pointer(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        stable_tag: str,
+    ) -> str:
+        assets = payload.get("assets")
+        if not isinstance(assets, list):
+            raise RuntimeUpdateError("official llama.cpp release omitted assets")
+        pointer = next(
+            (
+                value
+                for value in assets
+                if isinstance(value, dict)
+                and value.get("name") == LLAMA_CPP_STABLE_POINTER_NAME
+            ),
+            None,
+        )
+        if pointer is None:
+            expected_name = f"llama-{stable_tag}-bin-macos-arm64.tar.gz"
+            raise RuntimeUpdateError(
+                "official llama.cpp release omitted "
+                f"{expected_name} and {LLAMA_CPP_STABLE_POINTER_NAME}"
+            )
+        expected_url = (
+            f"{LLAMA_CPP_RELEASE_DOWNLOAD_PREFIX}{stable_tag}/"
+            f"{LLAMA_CPP_STABLE_POINTER_NAME}"
+        )
+        source_url = pointer.get("browser_download_url")
+        digest = pointer.get("digest")
+        size = pointer.get("size")
+        if source_url != expected_url:
+            raise RuntimeUpdateError(
+                "official llama.cpp stable pointer URL was invalid"
+            )
+        if not isinstance(digest, str) or not re.fullmatch(
+            r"sha256:[0-9a-fA-F]{64}", digest
+        ):
+            raise RuntimeUpdateError(
+                "official llama.cpp stable pointer did not publish a SHA-256 digest"
+            )
+        if (
+            not isinstance(size, int)
+            or isinstance(size, bool)
+            or size <= 0
+            or size > MAX_LLAMA_CPP_STABLE_POINTER_BYTES
+        ):
+            raise RuntimeUpdateError(
+                "official llama.cpp stable pointer size was invalid"
+            )
+
+        body = bytearray()
+        async with self._client.stream(
+            "GET",
+            source_url,
+            headers={"Accept": "text/plain", "User-Agent": "Unified-Inference/1"},
+        ) as response:
+            response.raise_for_status()
+            async for chunk in response.aiter_bytes():
+                body.extend(chunk)
+                if len(body) > MAX_LLAMA_CPP_STABLE_POINTER_BYTES:
+                    raise RuntimeUpdateError(
+                        "official llama.cpp stable pointer exceeded its size limit"
+                    )
+        if len(body) != size:
+            raise RuntimeUpdateError(
+                "official llama.cpp stable pointer size did not match its metadata"
+            )
+        actual_digest = hashlib.sha256(body).hexdigest()
+        if not hmac.compare_digest(actual_digest, digest.split(":", 1)[1].casefold()):
+            raise RuntimeUpdateError(
+                "official llama.cpp stable pointer SHA-256 did not match its metadata"
+            )
+        try:
+            tag = bytes(body).decode("ascii").strip()
+        except UnicodeDecodeError as exc:
+            raise RuntimeUpdateError(
+                "official llama.cpp stable pointer was not ASCII"
+            ) from exc
+        if not re.fullmatch(r"b[1-9][0-9]*", tag):
+            raise RuntimeUpdateError(
+                "official llama.cpp stable pointer did not name a build release"
+            )
+        return tag
 
     async def _official_mflux(self) -> RuntimeRelease:
         payload = await self._fetch_json(MFLUX_PYPI_JSON_URL)
@@ -1017,16 +1185,18 @@ class RuntimeUpdateManager:
         self._last_checked_at = time.time()
 
     async def _installed_omlx(self) -> tuple[str | None, str | None, str | None]:
-        candidates = (
+        app_candidates = (
             Path("/Applications/oMLX.app/Contents/Info.plist"),
             Path.home() / "Applications" / "oMLX.app" / "Contents" / "Info.plist",
         )
-        for candidate in candidates:
+        app_install: tuple[str, None, str] | None = None
+        for candidate in app_candidates:
             try:
                 with candidate.open("rb") as stream:
                     value = plistlib.load(stream).get("CFBundleShortVersionString")
                 if isinstance(value, str) and value:
-                    return value, None, str(candidate.parents[2])
+                    app_install = (value, None, str(candidate.parents[1]))
+                    break
             except (OSError, ValueError, plistlib.InvalidFileException):
                 continue
         headers: dict[str, str] = {}
@@ -1037,6 +1207,7 @@ class RuntimeUpdateManager:
         # while the official pip/wheel server reports it from /api/status.
         # Both are read-only vendor endpoints and keep runtime discovery
         # external to Unified Inference's own release cadence.
+        running_version: str | None = None
         for endpoint in ("/health", "/api/status"):
             try:
                 response = await self._client.get(
@@ -1051,16 +1222,35 @@ class RuntimeUpdateManager:
                     for key in ("version", "app_version", "server_version"):
                         value = payload.get(key)
                         if isinstance(value, str) and value:
-                            return value.removeprefix("v"), None, self.omlx.base_url
+                            running_version = value.removeprefix("v")
+                            break
+                    if running_version is not None:
+                        break
             except (httpx.HTTPError, ValueError):
                 continue
+        cli_install: tuple[str, None, str] | None = None
         for executable in _omlx_cli_candidates():
             if not executable.is_file() or not os.access(executable, os.X_OK):
                 continue
             output = await _run_version_command(str(executable), "--version")
             match = re.search(r"\d+(?:\.\d+)+(?:[-+._A-Za-z0-9]*)?", output or "")
             if match:
-                return match.group(0), None, str(executable)
+                cli_install = (match.group(0), None, str(executable))
+                break
+        if running_version is not None:
+            if app_install is not None and _version_key(app_install[0]) == _version_key(
+                running_version
+            ):
+                return app_install
+            if cli_install is not None and _version_key(cli_install[0]) == _version_key(
+                running_version
+            ):
+                return running_version, None, cli_install[2]
+            return running_version, None, self.omlx.base_url
+        if app_install is not None:
+            return app_install
+        if cli_install is not None:
+            return cli_install
         return None, None, None
 
     async def _installed_llama_cpp(
@@ -1167,11 +1357,27 @@ class RuntimeUpdateManager:
     async def installed_status(self) -> dict[str, dict[str, Any]]:
         """Inspect local runtimes without contacting any upstream service."""
 
+        async def external_binary(config: MLXcelConfig | MistralRSConfig):
+            binary = Path(config.binary).expanduser()
+            if not binary.is_file() or not os.access(binary, os.X_OK):
+                return None, None, str(binary)
+            try:
+                output = await _run_version_command(str(binary), "--version")
+            except RuntimeUpdateError:
+                output = None
+            match = re.search(
+                r"\d+(?:\.\d+)+(?:[-+._A-Za-z0-9]*)?",
+                output or "",
+            )
+            return match.group(0) if match else "unknown", None, str(binary)
+
         installed_values = await asyncio.gather(
             self._installed_llama_cpp(),
             self._installed_omlx(),
             self._installed_mflux(),
             self._installed_ds4(),
+            external_binary(self.mlxcel),
+            external_binary(self.mistral_rs),
         )
         return {
             engine: {
@@ -1179,9 +1385,16 @@ class RuntimeUpdateManager:
                 "version": version,
                 "revision": revision,
                 "path": path,
+                "installation_kind": (
+                    _omlx_installation_kind(path)
+                    if engine == "omlx"
+                    else "external_cli"
+                    if engine in _EXTERNAL_PREVIEW_ENGINES
+                    else "managed_or_configured"
+                ),
             }
             for engine, (version, revision, path) in zip(
-                _ENGINES,
+                (*_ENGINES, *_EXTERNAL_PREVIEW_ENGINES),
                 installed_values,
                 strict=True,
             )
@@ -1193,11 +1406,24 @@ class RuntimeUpdateManager:
                 await self._refresh_releases()
             local_status = await self.installed_status()
             statuses: list[dict[str, Any]] = []
-            for engine in _ENGINES:
+            for engine in (*_ENGINES, *_EXTERNAL_PREVIEW_ENGINES):
                 installed_version = local_status[engine]["version"]
                 installed_revision = local_status[engine]["revision"]
                 installed_path = local_status[engine]["path"]
-                if engine == "omlx":
+                if engine in _EXTERNAL_PREVIEW_ENGINES:
+                    release = None
+                    upstream_version = None
+                    upstream_url = (
+                        _MLXCEL_INSTALL_URL
+                        if engine == "mlxcel"
+                        else _MISTRAL_RS_INSTALL_URL
+                    )
+                    official_installer_url = upstream_url
+                    # These binaries remain externally owned. Do not claim an
+                    # available version without querying and validating their
+                    # distinct upstream release contracts.
+                    update_available = False
+                elif engine == "omlx":
                     (
                         upstream_version,
                         upstream_url,
@@ -1234,12 +1460,22 @@ class RuntimeUpdateManager:
                             "omlx": "oMLX",
                             "mflux": "MFLUX",
                             "ds4": "DS4",
+                            "mlxcel": "mlxcel",
+                            "mistral.rs": "mistral.rs",
                         }[engine],
-                        "ownership": "external" if engine == "omlx" else "managed_or_external",
+                        "ownership": (
+                            "external"
+                            if engine == "omlx"
+                            or engine in _EXTERNAL_PREVIEW_ENGINES
+                            else "managed_or_external"
+                        ),
                         "installed": installed_version is not None,
                         "installed_version": installed_version,
                         "installed_revision": installed_revision,
                         "installed_path": installed_path,
+                        "installation_kind": local_status[engine].get(
+                            "installation_kind"
+                        ),
                         "latest_upstream_version": upstream_version,
                         "latest_upstream_revision": release.source_revision if release else None,
                         "latest_upstream_url": upstream_url,
@@ -1248,9 +1484,21 @@ class RuntimeUpdateManager:
                         "available_revision": release.source_revision if release else None,
                         "release_notes_url": upstream_url,
                         "update_available": update_available,
-                        "can_install": engine in {"llama.cpp", "mflux", "ds4"}
+                        "can_install": (
+                            engine in {"llama.cpp", "mflux", "ds4"}
+                            or (
+                                engine == "omlx"
+                                and local_status[engine].get("installation_kind")
+                                == "homebrew_stable"
+                                and self.omlx.enabled
+                            )
+                        )
                         and update_available,
-                        "can_rollback": self._rollback_version(engine) is not None,
+                        "can_rollback": (
+                            False
+                            if engine in _EXTERNAL_PREVIEW_ENGINES
+                            else self._rollback_version(engine) is not None
+                        ),
                         "management_note": (
                             "Version and Apple Silicon binaries come directly from official ggml-org/llama.cpp GitHub releases."
                             if engine == "llama.cpp"
@@ -1260,11 +1508,54 @@ class RuntimeUpdateManager:
                                 else (
                                     "Version and dependencies come directly from the official MFLUX package on PyPI."
                                     if engine == "mflux"
-                                    else "Version and source come directly from the official antirez/ds4 repository."
+                                    else (
+                                        "Version and source come directly from the official antirez/ds4 repository."
+                                        if engine == "ds4"
+                                        else (
+                                            "Install and update the official Homebrew formula with brew upgrade mlxcel. Unified Inference owns only its child server process."
+                                            if engine == "mlxcel"
+                                            else "Use the official installer and mistralrs update. Unified Inference owns only its child server process."
+                                        )
+                                    )
                                 )
                             )
                         ),
-                        "diagnostic": self._diagnostics.get(engine),
+                        "diagnostic": (
+                            "Enable oMLX before a supervised Homebrew update so Unified Inference can drain and validate its control plane."
+                            if engine == "omlx"
+                            and update_available
+                            and local_status[engine].get("installation_kind")
+                            == "homebrew_stable"
+                            and not self.omlx.enabled
+                            else (
+                                "Install the official external CLI, then check again."
+                                if engine in _EXTERNAL_PREVIEW_ENGINES
+                                and installed_version is None
+                                else self._diagnostics.get(engine)
+                            )
+                        ),
+                        "upgrade_strategy": (
+                            {
+                                "official_app": "vendor_app_updater",
+                                "official_app_cli": "vendor_app_updater",
+                                "homebrew_stable": "supervised_homebrew",
+                                "homebrew_head": "migrate_to_stable",
+                                "running_external": "external_manual",
+                                "external_cli": "external_manual",
+                                "not_installed": "official_installer",
+                            }.get(
+                                str(
+                                    local_status[engine].get(
+                                        "installation_kind", "not_installed"
+                                    )
+                                ),
+                                "managed",
+                            )
+                            if engine == "omlx"
+                            else "external_manual"
+                            if engine in _EXTERNAL_PREVIEW_ENGINES
+                            else "managed"
+                        ),
                     }
                 )
             return {
@@ -1275,6 +1566,87 @@ class RuntimeUpdateManager:
                 "core_protocol": CORE_RUNTIME_PROTOCOL,
                 "engines": statuses,
             }
+
+    async def upgrade_omlx_homebrew(
+        self,
+        version: str | None = None,
+    ) -> tuple[str | None, str | None]:
+        """Delegate one explicit stable update to the exact Homebrew owner."""
+
+        async with self._install_lock:
+            if self._last_checked_at is None:
+                await self._refresh_releases()
+            latest = self._upstream_omlx[0]
+            requested = version or latest
+            if not requested or not latest or requested != latest:
+                raise RuntimeUpdateError(
+                    "oMLX update must target the current official stable release"
+                )
+            installed = await self.installed_status()
+            state = installed["omlx"]
+            kind = state.get("installation_kind")
+            if kind == "homebrew_head":
+                raise RuntimeUpdateError(
+                    "Homebrew HEAD cannot be upgraded reproducibly; migrate to the official oMLX app or stable formula"
+                )
+            if kind != "homebrew_stable":
+                raise RuntimeUpdateError(
+                    "supervised oMLX upgrades require a stable Homebrew installation"
+                )
+            brew = _homebrew_executable()
+            if brew is None:
+                raise RuntimeUpdateError("the owning Homebrew executable is unavailable")
+            cli_path = state.get("path")
+            if not isinstance(cli_path, str):
+                raise RuntimeUpdateError("the installed oMLX CLI path is unavailable")
+            cli = Path(cli_path).expanduser()
+            if not cli.is_file() or not os.access(cli, os.X_OK):
+                raise RuntimeUpdateError("the installed oMLX CLI is not executable")
+
+            stop_attempted = False
+            failure: BaseException | None = None
+            try:
+                # A failed/timeout response has an ambiguous process outcome,
+                # so always attempt the bounded owner restart after invoking
+                # stop rather than assuming the service stayed up.
+                stop_attempted = True
+                await _run_checked(str(cli), "stop", timeout=120)
+                await _run_checked(str(brew), "update", timeout=900)
+                await _run_checked(str(brew), "upgrade", "omlx", timeout=1800)
+            except BaseException as exc:
+                failure = exc
+            finally:
+                if stop_attempted:
+                    refreshed_cli = next(
+                        (
+                            candidate
+                            for candidate in _omlx_cli_candidates()
+                            if candidate.is_file() and os.access(candidate, os.X_OK)
+                        ),
+                        cli,
+                    )
+                    try:
+                        await _run_checked(str(refreshed_cli), "start", timeout=120)
+                    except BaseException as restart_error:
+                        if failure is None:
+                            failure = restart_error
+            if failure is not None:
+                raise failure
+
+            deadline = time.monotonic() + 90
+            observed_version: str | None = None
+            observed_path: str | None = None
+            while time.monotonic() < deadline:
+                observed_version, _revision, observed_path = await self._installed_omlx()
+                if (
+                    observed_version is not None
+                    and _version_key(observed_version) >= _version_key(requested)
+                ):
+                    return observed_version, observed_path
+                await asyncio.sleep(1)
+            raise RuntimeUpdateError(
+                "updated oMLX did not return with the requested stable version"
+            )
 
     async def _download_source(self, url: str, destination: Path) -> None:
         downloaded = 0

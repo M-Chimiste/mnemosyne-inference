@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import httpx
@@ -65,6 +66,237 @@ async def test_omlx_load_unload_and_encoded_model_id() -> None:
     await adapter.unload(handle.instance, deadline=Deadline.after(5))
     assert b"mlx-community%2FGLM" in mutation_paths[0]
     assert b"mlx-community%2FGLM" in mutation_paths[1]
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_omlx_context_contract_reads_native_and_effective_limits() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/models/status":
+            return httpx.Response(
+                200,
+                json={
+                    "models": [
+                        {
+                            "id": "mlx-community/GLM",
+                            "max_context_window": 131_072,
+                        }
+                    ]
+                },
+            )
+        if request.url.path == "/admin/api/models":
+            return httpx.Response(
+                200,
+                json={
+                    "models": [
+                        {
+                            "id": "mlx-community/GLM",
+                            "model_context_length": 262_144,
+                        }
+                    ]
+                },
+            )
+        return httpx.Response(404)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    adapter = OMLXAdapter(OMLXConfig(), client=client)
+
+    hint = await adapter.context_window(_target(), deadline=Deadline.after(1))
+
+    assert hint.effective_tokens == 131_072
+    assert hint.native_tokens == 262_144
+    assert hint.confidence == "authoritative"
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_omlx_applies_the_profile_context_before_loading() -> None:
+    effective = 32_768
+    loaded = False
+    mutations: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal effective, loaded
+        if request.method == "GET" and request.url.path == "/v1/models/status":
+            return httpx.Response(
+                200,
+                json={
+                    "models": [
+                        {
+                            "id": "mlx-community/GLM",
+                            "max_context_window": effective,
+                        }
+                    ]
+                },
+            )
+        if request.method == "GET" and request.url.path == "/admin/api/models":
+            return httpx.Response(
+                200,
+                json={
+                    "models": [
+                        {
+                            "id": "mlx-community/GLM",
+                            "loaded": loaded,
+                            "is_loading": False,
+                            "model_context_length": 262_144,
+                        }
+                    ]
+                },
+            )
+        if request.method == "PUT" and request.url.path.endswith("/settings"):
+            mutations.append("settings")
+            assert request.read() == b'{"max_context_window":131072}'
+            effective = 131_072
+            return httpx.Response(200, json={"success": True})
+        if request.method == "POST" and request.url.path.endswith("/load"):
+            mutations.append("load")
+            loaded = True
+            return httpx.Response(
+                200,
+                json={"status": "ok", "model_id": "mlx-community/GLM"},
+            )
+        return httpx.Response(404)
+
+    target = MacConfig.model_validate(
+        {
+            "engines": {"omlx": {"enabled": True}},
+            "models": [
+                {
+                    "alias": "glm",
+                    "engine": "omlx",
+                    "model": "mlx-community/GLM",
+                    "context": {
+                        "mode": "fixed",
+                        "native_tokens": 262_144,
+                        "fixed_tokens": 131_072,
+                    },
+                }
+            ],
+        }
+    ).profiles()["glm"]
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    adapter = OMLXAdapter(OMLXConfig(), client=client)
+
+    await adapter.load(target, deadline=Deadline.after(1))
+
+    assert mutations == ["settings", "load"]
+    assert effective == 131_072
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_omlx_delegates_context_profiling_to_its_memory_guard_benchmark() -> None:
+    polls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal polls
+        if request.method == "POST" and request.url.path.endswith("/context/start"):
+            assert request.read() == (
+                b'{"model_id":"mlx-community/GLM","target_tokens":262144}'
+            )
+            return httpx.Response(
+                200,
+                json={"bench_id": "context-run", "status": "started"},
+            )
+        if request.method == "GET" and request.url.path.endswith("/results"):
+            polls += 1
+            if polls == 1:
+                return httpx.Response(
+                    200,
+                    json={"status": "running", "result": None},
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "status": "completed",
+                    "result": {
+                        "applied": True,
+                        "applied_tokens": 245_760,
+                        "verified_prompt_tokens": 247_808,
+                    },
+                },
+            )
+        return httpx.Response(404)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    adapter = OMLXAdapter(OMLXConfig(), client=client, poll_interval_seconds=0)
+
+    result = await adapter.profile_context_window(
+        _target(),
+        262_144,
+        deadline=Deadline.after(1),
+    )
+
+    assert result is not None
+    assert result.requested_tokens == 262_144
+    assert result.verified_tokens == 245_760
+    assert result.prompt_tokens == 247_808
+    assert result.source == "omlx-native-context-benchmark"
+    assert polls == 2
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_omlx_cache_health_is_sanitized_and_reset_uses_vendor_api() -> None:
+    requests: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append((request.method, request.url.path))
+        if request.method == "GET" and request.url.path == "/admin/api/stats":
+            assert request.url.params["scope"] == "alltime"
+            return httpx.Response(
+                200,
+                json={
+                    "total_requests": 40,
+                    "total_cached_tokens": 0,
+                    "cache_efficiency": 0.0,
+                    "api_key": "must-not-escape",
+                    "runtime_cache": {
+                        "ssd_cache_dir": "/Users/private/.omlx/cache",
+                        "total_num_files": 72,
+                        "total_size_bytes": 12 * 1024**3,
+                        "disk_max_bytes": 32 * 1024**3,
+                        "hot_cache_size_bytes": 512,
+                        "hot_cache_max_bytes": 1024,
+                    },
+                },
+            )
+        if (
+            request.method == "POST"
+            and request.url.path == "/admin/api/ssd-cache/clear"
+        ):
+            return httpx.Response(
+                200,
+                json={"status": "ok", "total_deleted": 72},
+            )
+        return httpx.Response(404)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    adapter = OMLXAdapter(OMLXConfig(), client=client)
+
+    health = await adapter.cache_health(deadline=Deadline.after(1))
+    assert health == {
+        "available": True,
+        "total_requests": 40,
+        "total_cached_tokens": 0,
+        "cache_efficiency": 0.0,
+        "ssd_file_count": 72,
+        "ssd_size_bytes": 12 * 1024**3,
+        "ssd_limit_bytes": 32 * 1024**3,
+        "hot_size_bytes": 512,
+        "hot_limit_bytes": 1024,
+        "reset_recommended": True,
+        "diagnostic": (
+            "The persistent oMLX cache is large but has recorded no prefix-cache reuse; reset it if warm requests remain slow."
+        ),
+    }
+    assert "api_key" not in health
+    assert "ssd_cache_dir" not in health
+    assert await adapter.clear_ssd_cache(deadline=Deadline.after(1)) == 72
+    assert requests == [
+        ("GET", "/admin/api/stats"),
+        ("POST", "/admin/api/ssd-cache/clear"),
+    ]
     await client.aclose()
 
 
@@ -281,6 +513,9 @@ async def test_failed_model_directory_sync_stays_pending_and_retries_after_recon
             self.events.append("audit")
             return True
 
+        async def status(self):
+            return SimpleNamespace(initialized=False)
+
     config = MacConfig.model_validate(
         {
             "engines": {
@@ -441,6 +676,59 @@ async def test_omlx_malformed_inventory_is_never_authoritative(
     assert snapshot.authoritative is False
     assert snapshot.service_state == ServiceState.INCOMPATIBLE
     assert diagnostic in (snapshot.diagnostic or "")
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_omlx_control_validation_observes_scheduler_capacity() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/admin/api/models":
+            return httpx.Response(200, json={"models": []})
+        if request.url.path == "/admin/api/global-settings":
+            return httpx.Response(
+                200,
+                json={"scheduler": {"max_concurrent_requests": 8}},
+            )
+        return httpx.Response(404)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    adapter = OMLXAdapter(OMLXConfig(), client=client)
+    snapshot = await adapter.validate_control(deadline=Deadline.after(1))
+
+    assert snapshot.authoritative is True
+    hint = adapter.capacity_hint(_target())
+    assert hint is not None
+    assert hint.limit == 8
+    assert hint.source == "omlx-admin-settings"
+    assert hint.confidence == "authoritative"
+
+    coordinator = ResidencyCoordinator(
+        {EngineName.OMLX: adapter},
+        configured_max_concurrency=6,
+    )
+    capacity = coordinator.capacity_for(_target())
+    assert capacity.derived_limit == 8
+    assert capacity.effective_limit == 6
+    assert capacity.source == "omlx-admin-settings"
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_omlx_missing_scheduler_capacity_remains_callable_and_conservative() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/admin/api/models":
+            return httpx.Response(200, json={"models": []})
+        if request.url.path == "/admin/api/global-settings":
+            return httpx.Response(200, json={"scheduler": {}})
+        return httpx.Response(404)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    adapter = OMLXAdapter(OMLXConfig(), client=client)
+    snapshot = await adapter.validate_control(deadline=Deadline.after(1))
+
+    assert snapshot.authoritative is True
+    assert adapter.capacity_hint(_target()) is None
+    assert "max_concurrent_requests" in (adapter.capacity_diagnostic or "")
     await client.aclose()
 
 
@@ -650,3 +938,12 @@ async def test_omlx_unload_404_is_safe_only_after_confirmed_absence() -> None:
     await adapter.unload(instance, deadline=Deadline.after(1))
     assert loaded is False
     await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_default_omlx_client_ignores_ambient_proxies() -> None:
+    adapter = OMLXAdapter(OMLXConfig())
+    try:
+        assert adapter._client._trust_env is False
+    finally:
+        await adapter.aclose()

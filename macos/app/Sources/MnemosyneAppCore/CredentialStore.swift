@@ -5,6 +5,7 @@ public enum ManagedCredential: String, CaseIterable, Identifiable, Sendable {
     case omlxAdminSession = "OMLX_ADMIN_SESSION"
     case huggingFaceToken = "HF_TOKEN"
     case inferenceAPIKey = "INFERENCE_API_KEY"
+    case fleetAPIKey = "FLEET_API_KEY"
     case adminPassword = "ADMIN_PASSWORD"
     case tokenSidecarPostgresDSN = "TOKEN_SIDECAR_POSTGRES_DSN"
 
@@ -16,6 +17,7 @@ public enum ManagedCredential: String, CaseIterable, Identifiable, Sendable {
         case .omlxAdminSession: "oMLX admin session"
         case .huggingFaceToken: "Hugging Face token"
         case .inferenceAPIKey: "Inference API key"
+        case .fleetAPIKey: "Fleet gateway API key"
         case .adminPassword: "Control service password"
         case .tokenSidecarPostgresDSN: "Postgres usage ledger URL"
         }
@@ -29,6 +31,8 @@ public enum ManagedCredential: String, CaseIterable, Identifiable, Sendable {
             "Optional token for authenticated Hugging Face downloads and required for gated or private models."
         case .inferenceAPIKey:
             "Optional. When configured, /v1/* requests require this bearer key. Leave it unset to allow unauthenticated inference, including from the local network."
+        case .fleetAPIKey:
+            "Dedicated bearer credential used by the Nyx gateway to read this Mac's fleet snapshot."
         case .adminPassword: "Required only when the control API is exposed beyond this Mac."
         case .tokenSidecarPostgresDSN: "Connection URL used by Unified Inference to deliver token usage to the central ledger."
         }

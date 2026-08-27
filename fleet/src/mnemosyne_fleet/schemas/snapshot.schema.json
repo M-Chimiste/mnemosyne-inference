@@ -1,0 +1,205 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mnemosyne.local/schemas/fleet/v1/snapshot.schema.json",
+  "title": "Mnemosyne Fleet Node Snapshot v1",
+  "description": "Secret-free, self-consistent node state consumed by the Nyx fleet gateway.",
+  "$comment": "Draft 2020-12 describes the bounded wire shape. Consumers must also enforce the semantic cross-field invariants documented in project_docs/fleet_architecture.md: canonical sorted arrays, capacity arithmetic, queue totals, advertised queue/transition references, health/admission consistency, and one distinct warm deployment identity.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "snapshot_sequence", "observed_at", "node", "health", "residency", "admission", "capacity", "deployments", "usage_delivery"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "snapshot_sequence": {"type": "integer", "minimum": 0},
+    "observed_at": {"type": "number", "minimum": 0},
+    "node": {"$ref": "#/$defs/node"},
+    "health": {"$ref": "#/$defs/health"},
+    "residency": {"$ref": "#/$defs/residency"},
+    "admission": {"$ref": "#/$defs/admission"},
+    "capacity": {"$ref": "#/$defs/capacity"},
+    "deployments": {"type": "array", "maxItems": 10000, "items": {"$ref": "#/$defs/deployment"}},
+    "usage_delivery": {"$ref": "#/$defs/usageDelivery"}
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "capability": {
+      "enum": ["chat/completions", "completions", "embeddings", "images/generations", "messages", "rerank", "responses"]
+    },
+    "diagnosticCode": {
+      "type": ["string", "null"],
+      "pattern": "^[a-z0-9_]{1,64}$"
+    },
+    "node": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["node_id", "instance_id", "platform", "version"],
+      "properties": {
+        "node_id": {"type": "string", "minLength": 1, "maxLength": 128},
+        "instance_id": {"type": "string", "minLength": 1, "maxLength": 128},
+        "platform": {"enum": ["cuda", "macos"]},
+        "version": {"type": "string", "minLength": 1, "maxLength": 64}
+      }
+    },
+    "health": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state", "accepting", "authoritative", "diagnostic_code"],
+      "properties": {
+        "state": {"enum": ["idle", "draining", "unloading", "loading", "verifying", "ready", "degraded", "stopping"]},
+        "accepting": {"type": "boolean"},
+        "authoritative": {"type": "boolean"},
+        "diagnostic_code": {"$ref": "#/$defs/diagnosticCode"}
+      }
+    },
+    "residency": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["alias", "deployment_id", "engine", "epoch", "transition_target"],
+      "properties": {
+        "alias": {"type": ["string", "null"], "minLength": 1, "maxLength": 128},
+        "deployment_id": {"anyOf": [{"$ref": "#/$defs/sha256"}, {"type": "null"}]},
+        "engine": {"type": ["string", "null"], "minLength": 1, "maxLength": 64},
+        "epoch": {"type": "integer", "minimum": 0},
+        "transition_target": {"anyOf": [{"$ref": "#/$defs/sha256"}, {"type": "null"}]}
+      }
+    },
+    "admission": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["queue_depth", "queue_limit", "queued_by_deployment"],
+      "properties": {
+        "queue_depth": {"type": "integer", "minimum": 0, "maximum": 1000000},
+        "queue_limit": {"type": "integer", "minimum": 1, "maximum": 1000000},
+        "queued_by_deployment": {
+          "type": "object",
+          "maxProperties": 10000,
+          "propertyNames": {"pattern": "^sha256:[0-9a-f]{64}$"},
+          "additionalProperties": {"type": "integer", "minimum": 1, "maximum": 1000000}
+        }
+      }
+    },
+    "capacity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["derived_limit", "configured_max_concurrency", "effective_limit", "active", "queued", "available", "source", "confidence", "saturation"],
+      "properties": {
+        "derived_limit": {"type": "integer", "minimum": 1, "maximum": 100000},
+        "configured_max_concurrency": {"type": ["integer", "null"], "minimum": 1, "maximum": 100000},
+        "effective_limit": {"type": "integer", "minimum": 1, "maximum": 100000},
+        "active": {"type": "integer", "minimum": 0, "maximum": 1000000},
+        "queued": {"type": "integer", "minimum": 0, "maximum": 1000000},
+        "available": {"type": "integer", "minimum": 0, "maximum": 100000},
+        "source": {"type": "string", "minLength": 1, "maxLength": 96},
+        "confidence": {"enum": ["authoritative", "configured", "derived", "conservative"]},
+        "saturation": {"type": "number", "minimum": 0}
+      }
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["format", "selected_files", "quantization", "content_digest"],
+      "properties": {
+        "format": {"type": "string", "minLength": 1, "maxLength": 64},
+        "selected_files": {
+          "type": "array",
+          "description": "Lexicographically sorted, unique, safe repository-relative primary/projector selections.",
+          "maxItems": 128,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512,
+            "pattern": "^(?!/)(?!.*\\\\)(?!.*//)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*\\/$).+"
+          }
+        },
+        "quantization": {"type": ["string", "null"], "maxLength": 128},
+        "content_digest": {"anyOf": [{"$ref": "#/$defs/sha256"}, {"type": "null"}]}
+      }
+    },
+    "deploymentIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocol", "engine", "upstream_model", "resolved_revision", "artifact", "kind", "capabilities", "load_config_digest"],
+      "properties": {
+        "protocol": {"const": 1},
+        "engine": {"type": "string", "minLength": 1, "maxLength": 64},
+        "upstream_model": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512,
+          "pattern": "^(?!/)(?![A-Za-z]:\\\\).+"
+        },
+        "resolved_revision": {"type": ["string", "null"], "maxLength": 256},
+        "artifact": {"$ref": "#/$defs/artifact"},
+        "kind": {"type": "string", "minLength": 1, "maxLength": 64},
+        "capabilities": {
+          "type": "array",
+          "description": "Lexicographically sorted and unique.",
+          "minItems": 1,
+          "maxItems": 7,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/capability"}
+        },
+        "load_config_digest": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "deployment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["alias", "deployment_id", "identity", "identity_confidence", "fleet_eligible", "loadable", "warm", "capacity"],
+      "properties": {
+        "alias": {"type": "string", "minLength": 1, "maxLength": 128},
+        "deployment_id": {"$ref": "#/$defs/sha256"},
+        "identity": {"$ref": "#/$defs/deploymentIdentity"},
+        "identity_confidence": {"enum": ["authoritative", "unverified"]},
+        "fleet_eligible": {"type": "boolean"},
+        "loadable": {"type": "boolean"},
+        "warm": {"type": "boolean"},
+        "capacity": {"$ref": "#/$defs/capacity"}
+      },
+      "allOf": [{
+        "if": {"properties": {"fleet_eligible": {"const": true}}, "required": ["fleet_eligible"]},
+        "then": {
+          "properties": {
+            "identity_confidence": {"const": "authoritative"},
+            "identity": {
+              "anyOf": [
+                {
+                  "properties": {
+                    "resolved_revision": {
+                      "type": "string",
+                      "pattern": "^[0-9a-f]{40,64}$"
+                    }
+                  },
+                  "required": ["resolved_revision"]
+                },
+                {
+                  "properties": {
+                    "artifact": {
+                      "properties": {
+                        "content_digest": {"$ref": "#/$defs/sha256"}
+                      },
+                      "required": ["content_digest"]
+                    }
+                  },
+                  "required": ["artifact"]
+                }
+              ]
+            }
+          }
+        }
+      }]
+    },
+    "usageDelivery": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "writer_ready", "outbox_pending", "last_flush_at", "last_error_code"],
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "writer_ready": {"type": "boolean"},
+        "outbox_pending": {"type": "integer", "minimum": 0, "maximum": 100000000},
+        "last_flush_at": {"type": ["number", "null"], "minimum": 0},
+        "last_error_code": {"$ref": "#/$defs/diagnosticCode"}
+      }
+    }
+  }
+}

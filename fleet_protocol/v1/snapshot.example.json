@@ -1,0 +1,87 @@
+{
+  "schema_version": 1,
+  "snapshot_sequence": 7,
+  "observed_at": 1785528000.0,
+  "node": {
+    "node_id": "athena-cuda",
+    "instance_id": "4ea23b26b02f45bcbe1dbe47e40c1e76",
+    "platform": "cuda",
+    "version": "0.9.0"
+  },
+  "health": {
+    "state": "idle",
+    "accepting": true,
+    "authoritative": true,
+    "diagnostic_code": null
+  },
+  "residency": {
+    "alias": null,
+    "deployment_id": null,
+    "engine": null,
+    "epoch": 4,
+    "transition_target": null
+  },
+  "admission": {
+    "queue_depth": 0,
+    "queue_limit": 128,
+    "queued_by_deployment": {}
+  },
+  "capacity": {
+    "derived_limit": 1,
+    "configured_max_concurrency": null,
+    "effective_limit": 1,
+    "active": 0,
+    "queued": 0,
+    "available": 0,
+    "source": "no-resident-conservative",
+    "confidence": "conservative",
+    "saturation": 0.0
+  },
+  "deployments": [
+    {
+      "alias": "qwen-coder",
+      "deployment_id": "sha256:8b1e1458735256f9486127144acd0b54480f39d8ee9f6c4e450703229dd68c02",
+      "identity": {
+        "protocol": 1,
+        "engine": "vllm",
+        "upstream_model": "Qwen/Qwen2.5-Coder-7B-Instruct",
+        "resolved_revision": "0123456789abcdef0123456789abcdef01234567",
+        "artifact": {
+          "format": "safetensors",
+          "selected_files": [],
+          "quantization": null,
+          "content_digest": null
+        },
+        "kind": "language",
+        "capabilities": [
+          "chat/completions",
+          "completions",
+          "responses"
+        ],
+        "load_config_digest": "sha256:25b6cc7a188f4bf7fd60477e49664bf414cea8bcf8641bc153098975ca6f4640"
+      },
+      "identity_confidence": "authoritative",
+      "fleet_eligible": true,
+      "loadable": true,
+      "warm": false,
+      "capacity": {
+        "derived_limit": 16,
+        "configured_max_concurrency": 6,
+        "effective_limit": 6,
+        "active": 0,
+        "queued": 0,
+        "available": 6,
+        "source": "vllm-max-num-seqs",
+        "confidence": "configured",
+        "saturation": 0.0
+      }
+    }
+  ],
+  "usage_delivery": {
+    "enabled": true,
+    "writer_ready": true,
+    "outbox_pending": 0,
+    "last_flush_at": 1785527990.0,
+    "last_error_code": null
+  }
+}

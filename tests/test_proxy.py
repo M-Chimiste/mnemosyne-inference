@@ -5,6 +5,7 @@ mocked at the _open_upstream boundary so no real subprocess is spawned.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from contextlib import asynccontextmanager
@@ -14,6 +15,30 @@ import httpx
 import pytest
 
 import vllm_manager
+
+
+def test_queue_full_marks_proven_pre_inference_node_busy() -> None:
+    from cuda_residency import QueueFull
+
+    exc = vllm_manager._admission_http_exception(
+        QueueFull("node admission queue is full")
+    )
+
+    assert exc.status_code == 429
+    assert exc.headers == {
+        "Retry-After": "1",
+        "X-Mnemosyne-Error": "node_busy",
+    }
+    assert exc.detail["code"] == "node_busy"
+
+
+def test_engine_cannot_spoof_manager_node_busy_proof() -> None:
+    assert vllm_manager._downstream_proxy_headers(
+        {
+            "Content-Type": "text/event-stream",
+            "X-Mnemosyne-Error": "node_busy",
+        }
+    ) == {"Content-Type": "text/event-stream"}
 
 
 # ── upstream mock helpers ─────────────────────────────────────────────
@@ -224,6 +249,32 @@ def test_v1_preserves_llamacpp_specific_request_options(rich_client, monkeypatch
     for key, value in request_body.items():
         if key != "model":
             assert captured["body"][key] == value
+
+
+def test_v1_enforces_configured_endpoint_contract(rich_client, monkeypatch):
+    from config import ModelProfile
+
+    client, stub = rich_client
+    vllm_manager._config.models[0] = ModelProfile(
+        alias="a-model",
+        model="org/a-model",
+        capabilities=["completions"],
+    )
+    _patch_upstream(monkeypatch, _FakeResponse())
+
+    rejected = client.post(
+        "/v1/chat/completions",
+        json={"model": "a-model", "messages": []},
+    )
+    assert rejected.status_code == 400
+    assert stub.calls == []
+
+    accepted = client.post(
+        "/v1/completions",
+        json={"model": "a-model", "prompt": "hello"},
+    )
+    assert accepted.status_code == 200
+    assert [profile.alias for profile in stub.calls] == ["a-model"]
 
 
 def test_v1_installed_hf_id_not_ready_returns_409(rich_client, monkeypatch):
@@ -476,6 +527,357 @@ def test_inflight_settles_to_zero_in_all_cases(rich_client, monkeypatch):
     assert vllm_manager._runtime.inflight == 0
 
 
+@pytest.mark.asyncio
+async def test_proxy_cleanup_attempts_all_closes_and_releases_for_switch():
+    from cuda_residency import CapacitySpec, CudaResidencyCoordinator
+
+    starts: list[str] = []
+    close_calls: list[str] = []
+
+    async def start(profile: str) -> None:
+        starts.append(profile)
+
+    coordinator = CudaResidencyCoordinator(
+        start_engine=start,
+        stop_engine=lambda: None,
+        derive_capacity=lambda _profile: CapacitySpec(
+            1,
+            "test",
+            "authoritative",
+        ),
+        configured_max_concurrency=None,
+        max_queue_depth=4,
+    )
+    lease = await coordinator.acquire(
+        "profile-a",
+        "deployment-a",
+        timeout_seconds=1,
+    )
+
+    class CancelledClose:
+        async def aclose(self) -> None:
+            close_calls.append("response")
+            raise asyncio.CancelledError()
+
+    class FailedClose:
+        async def aclose(self) -> None:
+            close_calls.append("client")
+            raise RuntimeError("close failed")
+
+    await vllm_manager._cleanup_proxy_resources(
+        response=CancelledClose(),
+        client=FailedClose(),
+        lease=lease,
+    )
+
+    assert sorted(close_calls) == ["client", "response"]
+    assert (await coordinator.status()).active == 0
+    next_lease = await coordinator.acquire(
+        "profile-b",
+        "deployment-b",
+        timeout_seconds=1,
+    )
+    assert starts == ["profile-a", "profile-b"]
+    await next_lease.release()
+    await coordinator.shutdown(timeout_seconds=1)
+
+
+@pytest.mark.asyncio
+async def test_proxy_cleanup_preserves_outer_cancellation_after_release():
+    from cuda_residency import CapacitySpec, CudaResidencyCoordinator
+
+    close_started = asyncio.Event()
+    allow_close = asyncio.Event()
+    close_finished = asyncio.Event()
+    coordinator = CudaResidencyCoordinator(
+        start_engine=lambda _profile: asyncio.sleep(0),
+        stop_engine=lambda: None,
+        derive_capacity=lambda _profile: CapacitySpec(
+            1,
+            "test",
+            "authoritative",
+        ),
+        configured_max_concurrency=None,
+        max_queue_depth=2,
+    )
+    lease = await coordinator.acquire(
+        "profile-a",
+        "deployment-a",
+        timeout_seconds=1,
+    )
+
+    class BlockingClose:
+        async def aclose(self) -> None:
+            close_started.set()
+            await allow_close.wait()
+            close_finished.set()
+
+    cleanup = asyncio.create_task(
+        vllm_manager._cleanup_proxy_resources(
+            response=BlockingClose(),
+            lease=lease,
+        )
+    )
+    await close_started.wait()
+    cleanup.cancel()
+    await asyncio.sleep(0)
+    cleanup.cancel()
+    await asyncio.sleep(0)
+    assert not cleanup.done()
+    allow_close.set()
+    with pytest.raises(asyncio.CancelledError):
+        await cleanup
+
+    assert close_finished.is_set()
+    assert (await coordinator.status()).active == 0
+    next_lease = await coordinator.acquire(
+        "profile-b",
+        "deployment-b",
+        timeout_seconds=1,
+    )
+    await next_lease.release()
+    await coordinator.shutdown(timeout_seconds=1)
+
+
+@pytest.mark.asyncio
+async def test_stream_owner_defers_repeated_cancellation_until_cleanup_finishes():
+    from cuda_residency import CapacitySpec, CudaResidencyCoordinator
+
+    close_started = asyncio.Event()
+    allow_close = asyncio.Event()
+    response_closed = asyncio.Event()
+    client_closed = asyncio.Event()
+    coordinator = CudaResidencyCoordinator(
+        start_engine=lambda _profile: asyncio.sleep(0),
+        stop_engine=lambda: None,
+        derive_capacity=lambda _profile: CapacitySpec(
+            1,
+            "test",
+            "authoritative",
+        ),
+        configured_max_concurrency=None,
+        max_queue_depth=2,
+    )
+    lease = await coordinator.acquire(
+        "profile-a",
+        "deployment-a",
+        timeout_seconds=1,
+    )
+
+    class BlockingResponse:
+        status_code = 200
+        headers = {"content-type": "text/event-stream"}
+
+        async def aclose(self) -> None:
+            close_started.set()
+            await allow_close.wait()
+            response_closed.set()
+
+    class ClosingClient:
+        async def aclose(self) -> None:
+            client_closed.set()
+
+    owner = vllm_manager._StreamingProxyOwnership(
+        client=ClosingClient(),
+        response=BlockingResponse(),
+        lease=lease,
+        requested_model="profile-a",
+        alias="profile-a",
+        backend="llama.cpp",
+        path="v1/chat/completions",
+        request_start_monotonic=time.monotonic(),
+    )
+    completion = asyncio.create_task(owner.complete())
+    await close_started.wait()
+    completion.cancel()
+    await asyncio.sleep(0)
+    completion.cancel()
+    await asyncio.sleep(0)
+    assert not completion.done()
+
+    allow_close.set()
+    with pytest.raises(asyncio.CancelledError):
+        await completion
+
+    assert response_closed.is_set()
+    assert client_closed.is_set()
+    assert (await coordinator.status()).active == 0
+    await coordinator.shutdown(timeout_seconds=1)
+
+
+@pytest.mark.asyncio
+async def test_all_cuda_loopback_http_clients_ignore_ambient_proxies(
+    monkeypatch,
+):
+    constructed: list[dict] = []
+
+    class Response:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return [{"slot": 1}]
+
+    class Client:
+        def __init__(self, **kwargs):
+            constructed.append(kwargs)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get(self, _url, **_kwargs):
+            return Response()
+
+        def build_request(self, **kwargs):
+            return kwargs
+
+        async def send(self, _request, *, stream):
+            assert stream is True
+            return Response()
+
+        async def aclose(self):
+            return None
+
+    class Profile:
+        backend = "llama.cpp"
+        extra_args = ()
+
+    class Request:
+        headers = {}
+        method = "POST"
+        query_params = {}
+
+    monkeypatch.setattr(vllm_manager.httpx, "AsyncClient", Client)
+    assert await vllm_manager._wait_for_health("http://127.0.0.1/health", 1)
+    capacity = await vllm_manager._probe_engine_capacity(Profile())
+    assert capacity.derived_limit == 1
+    client, _response = await vllm_manager._open_upstream(
+        Request(),
+        "v1/responses",
+        b"{}",
+    )
+    await client.aclose()
+
+    assert len(constructed) == 3
+    assert all(options["trust_env"] is False for options in constructed)
+
+
+@pytest.mark.asyncio
+async def test_outer_stream_response_releases_before_body_iterator_starts(
+    monkeypatch,
+):
+    from cuda_residency import CapacitySpec, CudaResidencyCoordinator
+
+    starts: list[str] = []
+    body_iterated = False
+
+    async def start(profile: str) -> None:
+        starts.append(profile)
+
+    coordinator = CudaResidencyCoordinator(
+        start_engine=start,
+        stop_engine=lambda: None,
+        derive_capacity=lambda _profile: CapacitySpec(
+            1,
+            "test",
+            "authoritative",
+        ),
+        configured_max_concurrency=None,
+        max_queue_depth=2,
+    )
+    lease = await coordinator.acquire(
+        "profile-a",
+        "deployment-a",
+        timeout_seconds=1,
+    )
+
+    class NeverStartedResponse:
+        status_code = 200
+        headers = {"content-type": "text/event-stream"}
+        closed = False
+
+        async def aiter_bytes(self):
+            nonlocal body_iterated
+            body_iterated = True
+            yield b"data: never\n\n"
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    class CloseClient:
+        closed = False
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    response = NeverStartedResponse()
+    client = CloseClient()
+    owner = vllm_manager._StreamingProxyOwnership(
+        client=client,
+        response=response,
+        lease=lease,
+        requested_model="profile-a",
+        alias="profile-a",
+        backend="llama.cpp",
+        path="v1/chat/completions",
+        request_start_monotonic=time.monotonic(),
+    )
+    owned = vllm_manager._OwnedStreamingResponse(
+        vllm_manager._wrap_stream(owner),
+        owner=owner,
+        status_code=200,
+        headers=response.headers,
+        media_type="text/event-stream",
+    )
+
+    async def cancel_before_first_iteration(
+        _response,
+        _scope,
+        _receive,
+        _send,
+    ) -> None:
+        await _send({
+            "type": "http.response.start",
+            "status": 200,
+            "headers": [],
+        })
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(
+        vllm_manager.StreamingResponse,
+        "__call__",
+        cancel_before_first_iteration,
+    )
+    sent: list[dict] = []
+
+    async def send(message: dict) -> None:
+        sent.append(message)
+
+    with pytest.raises(asyncio.CancelledError):
+        await owned({}, None, send)
+
+    assert sent == [{
+        "type": "http.response.start",
+        "status": 200,
+        "headers": [],
+    }]
+    assert body_iterated is False
+    assert response.closed is True
+    assert client.closed is True
+    assert (await coordinator.status()).active == 0
+    next_lease = await coordinator.acquire(
+        "profile-b",
+        "deployment-b",
+        timeout_seconds=1,
+    )
+    assert starts == ["profile-a", "profile-b"]
+    await next_lease.release()
+    await coordinator.shutdown(timeout_seconds=1)
+
+
 # ── unload ────────────────────────────────────────────────────────────
 
 
@@ -651,9 +1053,34 @@ def _usage_body(prompt=10, completion=5, total=15) -> bytes:
     }).encode()
 
 
+def _enable_all_language_capabilities() -> None:
+    """Let the shared rich fixture exercise opt-in Messages/Rerank routes."""
+
+    vllm_manager._config.models[0].capabilities = (
+        "chat.completions",
+        "completions",
+        "embeddings",
+        "messages",
+        "rerank",
+        "responses",
+    )
+
+
+def _durable_usage_rows():
+    return vllm_manager._catalog._conn.execute(
+        "SELECT event_id, requested_model, alias, backend, prompt_tokens, "
+        "completion_tokens, total_tokens, usage_json "
+        "FROM request_usage ORDER BY id"
+    ).fetchall()
+
+
+def _assert_no_durable_usage() -> None:
+    assert not vllm_manager._runtime.usage_rows
+    assert _durable_usage_rows() == []
+
+
 def test_usage_recorded_non_streaming(rich_client, monkeypatch):
-    """A 2xx non-streaming response on an allowlisted endpoint queues a row
-    and `_flush_usage` drains it into request_usage + models aggregates."""
+    """A 2xx response is durable before the client receives completion."""
     client, _stub = rich_client
     _patch_upstream(monkeypatch, _FakeResponse(body=_usage_body(11, 7, 18)))
     r = client.post(
@@ -661,33 +1088,26 @@ def test_usage_recorded_non_streaming(rich_client, monkeypatch):
         json={"model": "a-model", "messages": [{"role": "user", "content": "hi"}]},
     )
     assert r.status_code == 200
-    rows = list(vllm_manager._runtime.usage_rows)
+    assert not vllm_manager._runtime.usage_rows
+    rows = _durable_usage_rows()
     assert len(rows) == 1
     row = rows[0]
-    assert row.requested_model == "a-model"
-    assert row.alias == "a-model"
-    assert row.backend == "vllm"
-    assert (row.prompt_tokens, row.completion_tokens, row.total_tokens) == (11, 7, 18)
-    assert json.loads(row.usage_json)["prompt_tokens"] == 11
-    # Sidecar fields populated even when token_sidecar is disabled —
-    # the deque shape is uniform; the outbox mirror only kicks in on flush.
-    assert row.endpoint == "/v1/chat/completions"
-    assert row.streamed is False
-    assert row.status_code == 200
-    assert row.response_ms >= 0
-    assert len(row.event_id) == 32  # uuid4().hex
+    assert row["requested_model"] == "a-model"
+    assert row["alias"] == "a-model"
+    assert row["backend"] == "vllm"
+    assert (
+        row["prompt_tokens"],
+        row["completion_tokens"],
+        row["total_tokens"],
+    ) == (11, 7, 18)
+    assert json.loads(row["usage_json"])["prompt_tokens"] == 11
+    assert len(row["event_id"]) == 32
 
+    # The periodic flush is now retry-only and cannot duplicate a committed
+    # event or its model aggregates.
     vllm_manager._flush_usage()
     assert not vllm_manager._runtime.usage_rows
-    db_rows = vllm_manager._catalog._conn.execute(
-        "SELECT alias, prompt_tokens, completion_tokens, total_tokens "
-        "FROM request_usage ORDER BY id"
-    ).fetchall()
-    assert len(db_rows) == 1
-    assert (db_rows[0]["alias"], db_rows[0]["prompt_tokens"],
-            db_rows[0]["completion_tokens"], db_rows[0]["total_tokens"]) == (
-        "a-model", 11, 7, 18,
-    )
+    assert len(_durable_usage_rows()) == 1
     model_row = vllm_manager._catalog._conn.execute(
         "SELECT total_prompt_tokens, total_completion_tokens "
         "FROM models WHERE alias='a-model'"
@@ -696,13 +1116,78 @@ def test_usage_recorded_non_streaming(rich_client, monkeypatch):
             model_row["total_completion_tokens"]) == (11, 7)
 
 
+@pytest.mark.parametrize(
+    ("path", "response_body", "expected"),
+    [
+        (
+            "/v1/responses",
+            {
+                "type": "response",
+                "usage": {
+                    "input_tokens": 12,
+                    "output_tokens": 5,
+                    "total_tokens": 17,
+                },
+            },
+            (12, 5, 17),
+        ),
+        (
+            "/v1/messages",
+            {
+                "type": "message",
+                "usage": {
+                    "input_tokens": 4,
+                    "cache_creation_input_tokens": 6,
+                    "cache_read_input_tokens": 8,
+                    "output_tokens": 3,
+                },
+            },
+            (18, 3, 21),
+        ),
+        (
+            "/v1/rerank",
+            {
+                "results": [],
+                "usage": {"prompt_tokens": 9, "total_tokens": 9},
+            },
+            (9, 0, 9),
+        ),
+    ],
+)
+def test_fleet_language_routes_queue_normalized_usage(
+    rich_client,
+    monkeypatch,
+    path,
+    response_body,
+    expected,
+):
+    client, _stub = rich_client
+    _enable_all_language_capabilities()
+    _patch_upstream(
+        monkeypatch,
+        _FakeResponse(body=json.dumps(response_body).encode()),
+    )
+
+    response = client.post(path, json={"model": "a-model"})
+
+    assert response.status_code == 200
+    assert not vllm_manager._runtime.usage_rows
+    rows = _durable_usage_rows()
+    assert len(rows) == 1
+    assert (
+        rows[0]["prompt_tokens"],
+        rows[0]["completion_tokens"],
+        rows[0]["total_tokens"],
+    ) == expected
+
+
 def test_usage_skipped_on_non_2xx(rich_client, monkeypatch):
     """An upstream 500 (even with a usage block) must not queue a row."""
     client, _stub = rich_client
     _patch_upstream(monkeypatch, _FakeResponse(body=_usage_body(), status_code=500))
     r = client.post("/v1/chat/completions", json={"model": "a-model"})
     assert r.status_code == 500
-    assert not vllm_manager._runtime.usage_rows
+    _assert_no_durable_usage()
 
 
 def test_usage_skipped_when_usage_block_missing(rich_client, monkeypatch):
@@ -713,18 +1198,16 @@ def test_usage_skipped_when_usage_block_missing(rich_client, monkeypatch):
     ))
     r = client.post("/v1/chat/completions", json={"model": "a-model"})
     assert r.status_code == 200
-    assert not vllm_manager._runtime.usage_rows
+    _assert_no_durable_usage()
 
 
 def test_usage_skipped_for_non_allowlisted_path(rich_client, monkeypatch):
-    """Only chat/completions, completions, embeddings are inspected for
-    usage — a random /v1/models-style path with a usage-shaped body is
-    intentionally ignored."""
+    """A random language path with a usage-shaped body is ignored."""
     client, _stub = rich_client
     _patch_upstream(monkeypatch, _FakeResponse(body=_usage_body()))
     r = client.post("/v1/models", json={"model": "a-model"})
     assert r.status_code == 200
-    assert not vllm_manager._runtime.usage_rows
+    _assert_no_durable_usage()
 
 
 def test_usage_resident_profile_used_when_no_model_field(rich_client, monkeypatch):
@@ -736,13 +1219,18 @@ def test_usage_resident_profile_used_when_no_model_field(rich_client, monkeypatc
     _patch_upstream(monkeypatch, _FakeResponse(body=_usage_body(3, 2, 5)))
     r = client.post("/v1/chat/completions", json={"messages": []})
     assert r.status_code == 200
-    rows = list(vllm_manager._runtime.usage_rows)
+    assert not vllm_manager._runtime.usage_rows
+    rows = _durable_usage_rows()
     assert len(rows) == 1
     row = rows[0]
-    assert row.requested_model is None
-    assert row.alias == "a-model"
-    assert row.backend == "vllm"
-    assert (row.prompt_tokens, row.completion_tokens, row.total_tokens) == (3, 2, 5)
+    assert row["requested_model"] is None
+    assert row["alias"] == "a-model"
+    assert row["backend"] == "vllm"
+    assert (
+        row["prompt_tokens"],
+        row["completion_tokens"],
+        row["total_tokens"],
+    ) == (3, 2, 5)
 
 
 def test_streaming_usage_recorded_when_client_opted_in(rich_client, monkeypatch):
@@ -780,9 +1268,14 @@ def test_streaming_usage_recorded_when_client_opted_in(rich_client, monkeypatch)
     # All three events forwarded.
     assert text.count("data:") == 3
     assert "completion_tokens" in text
-    rows = list(vllm_manager._runtime.usage_rows)
+    assert not vllm_manager._runtime.usage_rows
+    rows = _durable_usage_rows()
     assert len(rows) == 1
-    assert rows[0][4:7] == (4, 2, 6)  # prompt, completion, total
+    assert (
+        rows[0]["prompt_tokens"],
+        rows[0]["completion_tokens"],
+        rows[0]["total_tokens"],
+    ) == (4, 2, 6)
 
 
 def test_streaming_usage_injected_and_stripped(rich_client, monkeypatch):
@@ -819,9 +1312,173 @@ def test_streaming_usage_injected_and_stripped(rich_client, monkeypatch):
     assert "[DONE]" in text
     assert "hi" in text
     # And the row was recorded.
-    rows = list(vllm_manager._runtime.usage_rows)
+    assert not vllm_manager._runtime.usage_rows
+    rows = _durable_usage_rows()
     assert len(rows) == 1
-    assert rows[0][4:7] == (4, 2, 6)
+    assert (
+        rows[0]["prompt_tokens"],
+        rows[0]["completion_tokens"],
+        rows[0]["total_tokens"],
+    ) == (4, 2, 6)
+
+
+@pytest.mark.asyncio
+async def test_stream_usage_commits_before_terminal_event_is_forwarded(
+    rich_client,
+):
+    _client, _stub = rich_client
+    response = _FakeResponse(
+        content_type="text/event-stream",
+        chunks=[
+            b'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n',
+            b'data: {"choices":[],"usage":{"prompt_tokens":4,'
+            b'"completion_tokens":2,"total_tokens":6}}\n\n',
+            b"data: [DONE]\n\n",
+        ],
+    )
+
+    class Lease:
+        resident_profile = None
+
+        async def release(self):
+            return None
+
+    owner = vllm_manager._StreamingProxyOwnership(
+        client=_FakeClient(),
+        response=response,
+        lease=Lease(),
+        requested_model="a-model",
+        alias="a-model",
+        backend="vllm",
+        path="v1/chat/completions",
+        request_start_monotonic=time.monotonic(),
+    )
+    iterator = vllm_manager._wrap_stream(
+        owner,
+        client_asked_for_usage=True,
+    ).__aiter__()
+
+    first = await iterator.__anext__()
+    assert b'"content":"hi"' in first
+    assert _durable_usage_rows() == []
+
+    terminal_usage = await iterator.__anext__()
+    assert b'"usage"' in terminal_usage
+    assert not vllm_manager._runtime.usage_rows
+    rows = _durable_usage_rows()
+    assert len(rows) == 1
+    assert (
+        rows[0]["prompt_tokens"],
+        rows[0]["completion_tokens"],
+        rows[0]["total_tokens"],
+    ) == (4, 2, 6)
+
+    await iterator.aclose()
+    await owner.complete()
+
+
+def test_streaming_responses_preserves_request_and_records_nested_tail_usage(
+    rich_client,
+    monkeypatch,
+):
+    client, _stub = rich_client
+    captured: dict = {}
+    completed = {
+        "type": "response.completed",
+        "response": {
+            "usage": {
+                "input_tokens": 31,
+                "output_tokens": 9,
+                "total_tokens": 40,
+            }
+        },
+    }
+    # Deliberately omit the final SSE blank line.
+    chunks = [
+        b'event: response.output_text.delta\ndata: {"delta":"hi"}\r\n\r\n',
+        f"event: response.completed\r\ndata: {json.dumps(completed)}".encode(),
+    ]
+
+    async def _open_upstream(_request, _path, body):
+        captured["body"] = body
+        return _FakeClient(), _FakeResponse(
+            content_type="text/event-stream",
+            chunks=chunks,
+        )
+
+    monkeypatch.setattr(vllm_manager, "_open_upstream", _open_upstream)
+    response = client.post(
+        "/v1/responses",
+        json={"model": "a-model", "input": "hi", "stream": True},
+    )
+
+    assert response.status_code == 200
+    forwarded = json.loads(captured["body"])
+    assert "stream_options" not in forwarded
+    assert b"response.completed" in response.content
+    assert not vllm_manager._runtime.usage_rows
+    rows = _durable_usage_rows()
+    assert len(rows) == 1
+    assert (
+        rows[0]["prompt_tokens"],
+        rows[0]["completion_tokens"],
+        rows[0]["total_tokens"],
+    ) == (31, 9, 40)
+
+
+def test_streaming_messages_preserves_request_and_merges_usage(
+    rich_client,
+    monkeypatch,
+):
+    client, _stub = rich_client
+    _enable_all_language_capabilities()
+    captured: dict = {}
+    start = {
+        "type": "message_start",
+        "message": {
+            "usage": {
+                "input_tokens": 3,
+                "cache_creation_input_tokens": 5,
+                "cache_read_input_tokens": 7,
+                "output_tokens": 0,
+            }
+        },
+    }
+    delta = {
+        "type": "message_delta",
+        "usage": {"output_tokens": 12},
+    }
+    chunks = [
+        f"event: message_start\ndata: {json.dumps(start)}\n\n".encode(),
+        f"event: message_delta\ndata: {json.dumps(delta)}".encode(),
+    ]
+
+    async def _open_upstream(_request, _path, body):
+        captured["body"] = body
+        return _FakeClient(), _FakeResponse(
+            content_type="text/event-stream",
+            chunks=chunks,
+        )
+
+    monkeypatch.setattr(vllm_manager, "_open_upstream", _open_upstream)
+    response = client.post(
+        "/v1/messages",
+        json={"model": "a-model", "messages": [], "stream": True},
+    )
+
+    assert response.status_code == 200
+    forwarded = json.loads(captured["body"])
+    assert "stream_options" not in forwarded
+    assert b"message_start" in response.content
+    assert b"message_delta" in response.content
+    assert not vllm_manager._runtime.usage_rows
+    rows = _durable_usage_rows()
+    assert len(rows) == 1
+    assert (
+        rows[0]["prompt_tokens"],
+        rows[0]["completion_tokens"],
+        rows[0]["total_tokens"],
+    ) == (15, 12, 27)
 
 
 def test_streaming_usage_skipped_on_non_2xx(rich_client, monkeypatch):
@@ -839,7 +1496,7 @@ def test_streaming_usage_skipped_on_non_2xx(rich_client, monkeypatch):
     )
     _ = r.content
     assert r.status_code == 500
-    assert not vllm_manager._runtime.usage_rows
+    _assert_no_durable_usage()
 
 
 def test_ensure_stream_usage_noop_when_not_streaming():
@@ -867,6 +1524,16 @@ def test_ensure_stream_usage_preserves_when_client_set():
     assert payload["stream_options"]["include_usage"] is True
     assert payload["stream_options"]["other"] == 1
     assert opted is True
+
+
+@pytest.mark.parametrize("path", ["v1/responses", "v1/messages", "v1/rerank"])
+def test_ensure_stream_usage_preserves_non_chat_request_bytes(path):
+    body = json.dumps({"model": "x", "stream": True}).encode()
+
+    new_body, opted = vllm_manager._ensure_stream_usage(body, path)
+
+    assert new_body == body
+    assert opted is False
 
 
 # ── GET /v1/models — local catalog listing ───────────────────────────

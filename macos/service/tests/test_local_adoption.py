@@ -294,6 +294,46 @@ async def test_install_completion_does_not_apply_a_pending_restart_configuration
     assert runtime.installer.storage == config.storage
 
 
+@pytest.mark.asyncio
+async def test_ds4_install_registration_uses_the_upstream_family_wire_model(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "Models"
+    destination = root / "ds4" / "antirez" / "GLM-5.2-GGUF"
+    filename = "GLM-5.2-UD-Q2_K_RoutedQ2K.gguf"
+    config_path = tmp_path / "settings" / "config.yaml"
+    config = MacConfig.model_validate(
+        {
+            "engines": {"ds4": {"enabled": True}},
+            "paths": {"state_database": str(tmp_path / "state.db")},
+            "storage": {
+                "default": "models",
+                "locations": [{"name": "models", "path": str(root)}],
+            },
+        }
+    )
+    save_config(config, config_path)
+    runtime = _runtime_for_adoption(config, config_path)
+    install = InstallRecord(
+        id="install-glm",
+        repo_id="antirez/GLM-5.2-GGUF",
+        engine=EngineName.DS4.value,
+        storage="models",
+        alias="my-glm",
+        destination=str(destination),
+        status="installed",
+        filename=filename,
+        family="glm-5.2",
+    )
+
+    await runtime._register_installed_model(install)  # noqa: SLF001
+
+    profile = load_config(config_path).models[0]
+    assert profile.alias == "my-glm"
+    assert profile.served_model_name == "glm-5.2"
+    assert profile.resolve().wire_model == "glm-5.2"
+
+
 @pytest.mark.parametrize(
     ("alias", "architecture", "expected"),
     [

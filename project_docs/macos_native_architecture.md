@@ -5,8 +5,8 @@ Status: implemented native architecture; target-Mac acceptance remains pending.
 ## Purpose
 
 The macOS deployment provides one OpenAI/Anthropic-compatible endpoint for a
-manager-owned llama.cpp runtime, oMLX, DwarfStar (DS4), and a managed MFLUX
-image worker. LM Studio is not an inference engine; its configured and
+manager-owned llama.cpp runtime, oMLX, DwarfStar (DS4), a managed MFLUX image
+worker, and optional Preview mlxcel or mistral.rs children. LM Studio is not an inference engine; its configured and
 conventional model directories are read only as Finder-confirmed migration
 hints. The deployment preserves the
 single-resident-model behavior of the CUDA deployment while running natively so
@@ -33,7 +33,9 @@ Default ports are deliberately outside common development defaults:
 | 17323 | DS4 | Managed native subprocess | `127.0.0.1` |
 | 17324 | MFLUX | Managed native image worker | `127.0.0.1` |
 | 17325 | llama.cpp | Managed native GGUF subprocess | `127.0.0.1` |
-| 17326-17329 | Reserved | Future local engines/diagnostics | unbound |
+| 17326 | mlxcel | Managed Preview MLX subprocess | `127.0.0.1` |
+| 17327 | mistral.rs | Managed Preview Safetensors subprocess | `127.0.0.1` |
+| 17328-17329 | Reserved | Future local engines/diagnostics | unbound |
 
 All ports remain configurable. Startup validates that inference and control
 ports differ, all managed inner ports differ, and no configured inner port is
@@ -44,7 +46,7 @@ The application bundle has two cooperating components:
 
 1. **Mnemosyne Core** is a per-user background service. It owns the catalog,
    global swap coordinator, proxy, usage outbox, and manager-owned
-   llama.cpp/DS4/MFLUX subprocesses.
+   llama.cpp/DS4/MFLUX/mlxcel/mistral.rs subprocesses.
 2. **Unified Inference.app** owns an explicit AppKit `NSStatusItem` and renders its
    controller as a SwiftUI popover. It reads status and sends commands through
    the control API. The UI may exit without interrupting an inference request.
@@ -78,6 +80,10 @@ There is exactly one lifecycle owner: Mnemosyne Core.
 - MFLUX is a dependency-isolated worker process owned by Mnemosyne. It exists
   only while an image profile is resident and is terminated on unload,
   timeout, or cancellation so Metal memory release follows process exit.
+- mlxcel and mistral.rs are model-specific Preview child processes owned by
+  Mnemosyne. Their official Homebrew/installer binaries remain externally
+  owned; persisted PID, process-group, start identity, executable, and complete
+  argv must match before recovery or signaling.
 - Routine llama.cpp, MFLUX, and DS4 engine updates come directly from their
   official upstreams below Application Support. Mnemosyne verifies the
   official llama.cpp asset name, URL, published size and SHA-256, safe archive
@@ -85,8 +91,8 @@ There is exactly one lifecycle owner: Mnemosyne Core.
   PyPI package; or builds an exact `antirez/ds4` commit while normal requests
   continue, then activates it only through the coordinator's all-engines-empty
   maintenance barrier. The signed app's MFLUX layer and configured DS4 paths
-  remain fallbacks. oMLX remains externally installed and uses its official
-  update mechanism.
+  remain fallbacks. oMLX, mlxcel, and mistral.rs remain externally installed
+  and use their official update mechanisms.
 - Clients use Mnemosyne on port 1240. Direct client traffic to an inner engine
   can violate the single-resident invariant and is unsupported.
 
@@ -97,13 +103,17 @@ engine cannot report authoritative state.
 
 ## Model Profiles
 
-Public aliases are globally unique and explicitly select an engine. Mnemosyne
-does not infer the engine from a model name or file extension.
+Public aliases are globally unique and explicitly declare a fallback engine.
+They may attach at most one exact candidate for each additional engine.
+Mnemosyne does not infer equivalence from a model name or file extension, and
+selection remains fixed unless the profile explicitly opts into fresh
+benchmark evidence or pins one declared engine. A pin bypasses benchmark
+ranking while preserving the original profile as the pre-work fallback.
 
 Conceptual configuration:
 
 ```yaml
-schema_version: 2
+schema_version: 6
 
 server:
   inference_bind: 127.0.0.1
@@ -132,6 +142,16 @@ engines:
     enabled: true
     host: 127.0.0.1
     port: 17324
+  mlxcel:
+    enabled: false
+    host: 127.0.0.1
+    port: 17326
+    binary: /opt/homebrew/bin/mlxcel-server
+  mistral_rs:
+    enabled: false
+    host: 127.0.0.1
+    port: 17327
+    binary: ~/.local/bin/mistralrs
 
 # Fresh installs have no model profiles. Model Library and Finder discovery
 # create profiles only after the user selects the exact model and destination;
@@ -177,9 +197,15 @@ nested paths are retained rather than collapsed to a volume root.
 The menu app creates ordinary bookmark data while the `NSOpenPanel` selection
 grant is live and sends it only to the control plane. The ordinary bookmark's
 implicit extension is Apple's supported single interprocess handoff.
-Mnemosyne resolves it without presenting UI, explicitly starts the transferred
-grant, rejects stale or path-mismatched access, and creates a new
-receiver-owned security-scoped bookmark. The durable bookmark's SHA-256 is the
+Mnemosyne first runs a bounded unscoped read/write probe. An ordinary folder
+that the unsandboxed service can already use persists only its exact path and
+volume identity. Startup repeats that proof for older configured locations,
+atomically removes unnecessary `scope_id` values, and prunes their bookmarks.
+
+Only a path that fails the unscoped proof consumes the transfer grant.
+Mnemosyne resolves it without presenting UI, explicitly starts it, rejects
+stale or path-mismatched access, and creates a new receiver-owned
+security-scoped bookmark. The durable bookmark's SHA-256 is the
 opaque `scope_id`. Only those receiver-owned bytes are stored as mode-`0600`
 files below the mode-`0700` `state/security-scopes` directory beside the
 active config; this root does not follow the configurable SQLite path. YAML
@@ -189,9 +215,10 @@ entitlements; this design must not be described as entitlement-backed.
 
 Before replacing YAML, the configuration endpoint freshly reactivates every
 referenced bookmark and rejects a missing, stale, path-mismatched, or
-non-reactivatable grant. At startup Mnemosyne revalidates every configured
-bookmark before coordinator initialization, then removes private bookmarks no
-longer referenced by the loaded configuration. Bookmark receipt and
+non-reactivatable grant. At startup Mnemosyne first retires a scope only after
+ordinary access succeeds, then revalidates every remaining configured bookmark
+before coordinator initialization and removes private bookmarks no longer
+referenced by the loaded configuration. Bookmark receipt and
 reactivation run in bounded, killable helper process groups. Scoped filesystem
 helpers and manager-owned engine/download children reactivate the durable
 bookmark in their own process, then `exec` the real upstream command without
@@ -231,9 +258,14 @@ trusting the coordinator's cache. `load` is idempotent for the exact target.
 engine name, operation, retryability, and actionable detail suitable for the
 control API and menu bar.
 
-Language inference is proxied without translating between wire protocols. The gateway
-only canonicalizes the `model` field, injects usage opt-in where supported, and
-removes outer authorization/cookie headers before forwarding.
+Language inference is proxied without translating between wire protocols. The
+gateway canonicalizes the `model` field, injects usage opt-in where supported,
+and removes outer authorization/cookie headers before forwarding. The one
+request-level compatibility shim runs after native engine selection: for oMLX
+and llama.cpp it maps a portable reasoning-token ceiling to the upstream field
+name and puts Qwen thinking/preservation controls into chat-template kwargs.
+All other request and response content stays opaque, and reasoning content is
+never persisted.
 Image generation uses a deliberately narrow OpenAI-compatible contract:
 `POST /v1/images/generations`, one base64 PNG, bounded dimensions, seed,
 steps, guidance, and negative prompt. It does not emit token-usage events.

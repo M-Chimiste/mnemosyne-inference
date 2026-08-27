@@ -1,0 +1,33 @@
+[project]
+name = "mnemosyne-fleet"
+version = "0.1.0"
+description = "Nyx-hosted routing and observability plane for Mnemosyne inference nodes"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.115,<1",
+  "httpx>=0.27,<1",
+  "jsonschema>=4.23,<5",
+  "pydantic>=2.8,<3",
+  "psycopg[binary]>=3.2,<4",
+  "uvicorn[standard]>=0.30,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.2,<9",
+  "pytest-asyncio>=0.24,<1",
+]
+
+[project.scripts]
+mnemosyne-fleet = "mnemosyne_fleet.main:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mnemosyne_fleet"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

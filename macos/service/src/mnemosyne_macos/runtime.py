@@ -8,18 +8,34 @@ from dataclasses import asdict
 import hashlib
 import ipaddress
 import json
+import logging
 import os
 from pathlib import Path
 import re
 import time
 from typing import Mapping
+from uuid import uuid4
 
 import httpx
 
 from . import __version__
+from .benchmarking import (
+    BENCHMARK_ENDPOINT,
+    CONTEXT_SUITE_VERSION,
+    BenchmarkStore,
+    BenchmarkSuite,
+    ContextBenchmarkRecord,
+    candidate_set_fingerprint,
+    choose_target,
+    context_target_fingerprint,
+    system_fingerprint,
+    target_fingerprint,
+    target_with_context_window,
+)
 from .config import (
     ImageProfileConfig,
     MacConfig,
+    ModelContextConfig,
     ModelLoadConfig,
     ModelProfile,
     StorageLocationConfig,
@@ -27,20 +43,31 @@ from .config import (
     save_config,
     suggested_model_alias,
 )
-from .coordinator import CoordinatorStatus, ResidencyCoordinator
+from .coordinator import CoordinatorState, CoordinatorStatus, ResidencyCoordinator
 from .engines.base import Deadline, EngineAdapter
 from .engines.ds4 import DS4Adapter
 from .engines.llamacpp import LlamaCppAdapter
+from .engines.managed_apple import MLXcelAdapter, MistralRSAdapter
 from .engines.mflux import MFluxAdapter
 from .engines.omlx import OMLXAdapter
 from .filesystem import FilesystemProbe, FilesystemProbeError
+from .fleet_protocol import (
+    FLEET_SCHEMA_VERSION,
+    deployment_identity,
+    effective_capacity,
+    gguf_quantization,
+    immutable_revision,
+    portable_load_config,
+)
 from .models import (
+    ContextWindowHint,
     ENGINE_RELEASE_TIER,
     Endpoint,
     EngineName,
     ResolvedTarget,
     ServiceState,
 )
+from .performance import PerformanceTracker
 from .install_store import InstallRecord
 from .installer import NativeInstaller
 from .local_models import (
@@ -53,6 +80,26 @@ from .usage_delivery import UsageService
 from .runtime_updates import RuntimeUpdateManager
 from .scope_process import SecurityScopeProcess
 from .security_scopes import SecurityScopeRegistry
+
+
+logger = logging.getLogger("mnemosyne-macos.runtime")
+
+DEFAULT_INTERACTIVE_CONTEXT_LENGTH = 32_768
+MAX_INTERACTIVE_CONTEXT_LENGTH = 65_536
+
+
+def recommended_interactive_context_length(detected: int | None) -> int:
+    """Choose a responsive default without discarding model capability metadata.
+
+    Model cards increasingly advertise 128K-to-1M token maxima. Passing those
+    maxima straight to llama-server eagerly allocates a correspondingly large
+    KV cache. New profiles therefore start at a bounded interactive size; an
+    operator can still opt into the full advertised context in Settings.
+    """
+
+    if detected is None:
+        return DEFAULT_INTERACTIVE_CONTEXT_LENGTH
+    return max(1, min(detected, MAX_INTERACTIVE_CONTEXT_LENGTH))
 
 
 class RuntimeConfigurationError(RuntimeError):
@@ -90,6 +137,7 @@ def _redact_diagnostic(
     redacted = value
     for key in (
         "INFERENCE_API_KEY",
+        "FLEET_API_KEY",
         "ADMIN_PASSWORD",
         "OMLX_API_KEY",
         "OMLX_ADMIN_SESSION",
@@ -189,15 +237,163 @@ def _profile_uses_install_destination(
 ) -> bool:
     destination = _lexical_path(install.destination)
     if profile.engine in {EngineName.LLAMA_CPP, EngineName.DS4}:
-        if not _path_is_within(destination, profile.model):
+        selected = [
+            value
+            for value in (install.filename, install.projector_filename)
+            if value is not None
+        ]
+        safe_selected = _safe_repository_files(selected)
+        if (
+            install.filename is None
+            or safe_selected is None
+            or safe_selected != sorted(selected)
+        ):
+            return False
+        expected_model = _lexical_path(
+            os.path.join(destination, install.filename)
+        )
+        if _lexical_path(profile.model) != expected_model:
             return False
         projector = profile.load.projector_path
-        return projector is None or _path_is_within(destination, projector)
+        if install.projector_filename is None:
+            return projector is None
+        if projector is None:
+            return False
+        expected_projector = _lexical_path(
+            os.path.join(destination, install.projector_filename)
+        )
+        return _lexical_path(projector) == expected_projector
     if profile.engine == EngineName.MFLUX:
         return _lexical_path(profile.model) == destination
     if profile.engine == EngineName.OMLX:
         return profile.model == Path(destination).name
+    if profile.engine in {EngineName.MLXCEL, EngineName.MISTRAL_RS}:
+        return _lexical_path(profile.model) == destination
     return False
+
+
+def _fleet_artifact_format(engine: EngineName) -> str:
+    return {
+        EngineName.LLAMA_CPP: "gguf",
+        EngineName.DS4: "gguf",
+        EngineName.OMLX: "mlx-snapshot",
+        EngineName.MFLUX: "mflux-snapshot",
+        EngineName.MLXCEL: "mlx-snapshot",
+        EngineName.MISTRAL_RS: "safetensors-snapshot",
+    }[engine]
+
+
+def _safe_repository_files(values: list[str]) -> list[str] | None:
+    if len(values) > 128:
+        return None
+    safe: list[str] = []
+    for value in values:
+        if (
+            not value
+            or len(value) > 512
+            or value.startswith(("/", "\\"))
+            or re.match(r"^[A-Za-z]:[\\/]", value)
+        ):
+            return None
+        normalized = value.replace("\\", "/")
+        if any(part in {"", ".", ".."} for part in normalized.split("/")):
+            return None
+        safe.append(normalized)
+    return sorted(set(safe))
+
+
+def _safe_huggingface_repo_id(value: str) -> bool:
+    return bool(
+        len(value) <= 512
+        and re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9._-]*"
+            r"(?:/[A-Za-z0-9][A-Za-z0-9._-]*)?",
+            value,
+        )
+    )
+
+
+def _fleet_deployment_identity(
+    *,
+    node_id: str,
+    profile: ModelProfile,
+    target: ResolvedTarget,
+    install: InstallRecord | None,
+) -> tuple[str, dict, bool]:
+    """Return deployment ID, canonical identity, and strict eligibility."""
+
+    managed = bool(
+        install is not None
+        and install.status == "installed"
+        and profile.engine.value == install.engine
+        and profile.storage == install.storage
+        and _profile_uses_install_destination(profile, install)
+    )
+    authoritative = bool(
+        managed and install is not None and immutable_revision(install.revision)
+    )
+    if managed and install is not None:
+        if target.key.engine in {EngineName.LLAMA_CPP, EngineName.DS4}:
+            # Auto-discovered shard companions are download provenance, not
+            # independently selected artifacts. Strict identity contains the
+            # exact primary file plus only an explicitly selected projector.
+            files = [
+                value
+                for value in (install.filename, install.projector_filename)
+                if value is not None
+            ]
+        else:
+            install_payload = install.to_dict()
+            files = [
+                str(value)
+                for value in install_payload.get("download_files", [])
+                if isinstance(value, str) and value
+            ]
+        selected_files = _safe_repository_files(files)
+        if selected_files is None:
+            selected_files = []
+            authoritative = False
+        artifact: dict[str, object] = {
+            "format": _fleet_artifact_format(target.key.engine),
+            "selected_files": selected_files,
+            "quantization": gguf_quantization(install.filename),
+            "content_digest": None,
+        }
+        if _safe_huggingface_repo_id(install.repo_id):
+            upstream_model = install.repo_id
+            revision = (
+                install.revision
+                if install.revision is None or len(install.revision) <= 256
+                else None
+            )
+            if immutable_revision(revision):
+                revision = revision.lower()
+        else:
+            upstream_model = f"node-local:{node_id}:{target.alias}"
+            revision = None
+            authoritative = False
+    else:
+        # Node-scoping prevents two path-only profiles from being mistaken for
+        # strict replicas while keeping local filesystem details private.
+        artifact = {
+            "format": _fleet_artifact_format(target.key.engine),
+            "selected_files": [],
+            "quantization": None,
+            "content_digest": None,
+        }
+        upstream_model = f"node-local:{node_id}:{target.alias}"
+        revision = None
+
+    deployment_id, _load_digest, identity = deployment_identity(
+        engine=target.key.engine.value,
+        upstream_model=upstream_model,
+        resolved_revision=revision,
+        artifact=artifact,
+        kind=target.kind.value,
+        capabilities=(endpoint.value for endpoint in target.capabilities),
+        load_config=portable_load_config(target),
+    )
+    return deployment_id, identity, authoritative
 
 
 def _profile_filesystem_references(profile: ModelProfile) -> tuple[str, ...]:
@@ -287,6 +483,16 @@ def build_adapters(
             runtime_root=runtime_root,
             security_scope_root=security_scope_root,
         )
+    if config.engines.mlxcel.enabled:
+        adapters[EngineName.MLXCEL] = MLXcelAdapter(
+            config.engines.mlxcel,
+            security_scope_root=security_scope_root,
+        )
+    if config.engines.mistral_rs.enabled:
+        adapters[EngineName.MISTRAL_RS] = MistralRSAdapter(
+            config.engines.mistral_rs,
+            security_scope_root=security_scope_root,
+        )
     return adapters
 
 
@@ -335,6 +541,9 @@ class NativeRuntime:
         self.config_path = Path(config_path).expanduser() if config_path else None
         self.env_path = Path(env_path).expanduser() if env_path else None
         self.profiles: dict[str, ResolvedTarget] = config.profiles()
+        self.profile_candidates: dict[str, tuple[ResolvedTarget, ...]] = (
+            config.profile_candidates()
+        )
         self.adapters = (
             dict(adapters)
             if adapters is not None
@@ -345,7 +554,12 @@ class NativeRuntime:
             )
         )
         missing = sorted(
-            {profile.key.engine for profile in self.profiles.values()} - self.adapters.keys()
+            {
+                target.key.engine
+                for candidates in self.profile_candidates.values()
+                for target in candidates
+            }
+            - self.adapters.keys()
         )
         if missing:
             raise RuntimeConfigurationError(
@@ -357,8 +571,13 @@ class NativeRuntime:
             transition_timeout_seconds=config.server.startup_timeout_seconds,
             cleanup_timeout_seconds=max(30, config.server.shutdown_grace_seconds),
             shutdown_grace_seconds=config.server.shutdown_grace_seconds,
+            configured_max_concurrency=config.server.max_concurrency,
+            max_queue_depth=config.server.max_queue_depth,
         )
-        self.proxy_client = proxy_client or httpx.AsyncClient(timeout=None)
+        self.proxy_client = proxy_client or httpx.AsyncClient(
+            timeout=None,
+            trust_env=False,
+        )
         self._owns_proxy_client = proxy_client is None
         self.self_test_client = self_test_client or httpx.AsyncClient(
             timeout=None,
@@ -369,6 +588,27 @@ class NativeRuntime:
             config.paths.state_database,
             config.token_sidecar,
         )
+        self.performance = PerformanceTracker()
+        self.benchmark_store = BenchmarkStore(config.paths.state_database)
+        # Routing must not touch SQLite. Durable evidence is loaded once per
+        # alias and refreshed only after a benchmark, explicit invalidation,
+        # or a profile addition.
+        self._benchmark_records = {
+            alias: tuple(self.benchmark_store.list(alias=alias))
+            for alias in self.profile_candidates
+        }
+        self._context_records = {
+            alias: tuple(self.benchmark_store.list_context(alias=alias))
+            for alias in self.profile_candidates
+        }
+        self._context_hints: dict[str, ContextWindowHint] = {}
+        self.benchmarks = BenchmarkSuite(
+            self.benchmark_store,
+            coordinator=self.coordinator,
+            client=self.proxy_client,
+        )
+        self._benchmark_lock = asyncio.Lock()
+        self._runtime_fingerprints: dict[EngineName, str | None] = {}
         self.installer = NativeInstaller(
             config.paths.state_database,
             on_installed=self._register_installed_model,
@@ -380,12 +620,17 @@ class NativeRuntime:
             omlx=config.engines.omlx,
             mflux=config.engines.mflux,
             ds4=config.engines.ds4,
+            mlxcel=config.engines.mlxcel,
+            mistral_rs=config.engines.mistral_rs,
             root=runtime_root,
         )
         self._started = False
         self._maintenance_task: asyncio.Task[None] | None = None
         self._reload_lock = asyncio.Lock()
         self._runtime_update_lock = asyncio.Lock()
+        self._fleet_snapshot_lock = asyncio.Lock()
+        self._fleet_instance_id = uuid4().hex
+        self._fleet_snapshot_sequence = 0
         self._omlx_directory_sync_pending = False
         self.startup_error: str | None = None
 
@@ -424,6 +669,7 @@ class NativeRuntime:
             await self._activate_configured_security_scopes()
             await self.coordinator.initialize()
             await self._sync_omlx_model_directories()
+            await self._refresh_runtime_fingerprints()
         except Exception as exc:
             self.startup_error = str(exc)
             if raise_on_degraded:
@@ -471,13 +717,58 @@ class NativeRuntime:
 
     async def _activate_configured_security_scopes(self) -> None:
         referenced: set[str] = set()
+        locations: list[StorageLocationConfig] = []
+        removed_unnecessary_scope = False
         for location in self.config.storage.locations:
-            if location.scope_id is not None:
-                await self.security_scope_process.activate(
-                    location.scope_id,
-                    location.path,
+            effective = location
+            if effective.scope_id is not None:
+                # Most user-selected model folders are already available to
+                # this deliberately unsandboxed per-user service. Prove that
+                # in the same bounded helper used by normal storage checks and
+                # remove an unnecessary bookmark instead of depending on a
+                # security-scope reactivation contract the process does not
+                # need. Protected paths still take the strict bookmark path.
+                unscoped = None
+                try:
+                    unscoped = await self.filesystem.inspect(
+                        effective.path,
+                        name=effective.name,
+                        expected_volume_uuid=effective.volume_uuid,
+                    )
+                except FilesystemProbeError:
+                    pass
+                if (
+                    unscoped is not None
+                    and unscoped.exists
+                    and unscoped.is_directory
+                    and unscoped.writable
+                    and unscoped.volume_matches
+                ):
+                    effective = effective.model_copy(update={"scope_id": None})
+                    removed_unnecessary_scope = True
+                else:
+                    await self.security_scope_process.activate(
+                        effective.scope_id,
+                        effective.path,
+                    )
+                    referenced.add(effective.scope_id)
+            locations.append(effective)
+
+        if removed_unnecessary_scope:
+            storage = self.config.storage.model_copy(update={"locations": locations})
+            migrated = MacConfig.model_validate(
+                self.config.model_copy(update={"storage": storage}).model_dump(
+                    mode="json"
                 )
-                referenced.add(location.scope_id)
+            )
+            if self.config_path is not None:
+                save_config(migrated, self.config_path)
+            self.config = migrated
+            self._apply_profiles(migrated)
+            self.installer.storage = migrated.storage
+            logger.info(
+                "removed unnecessary selected-folder grants from accessible model storage"
+            )
         self.security_scopes.prune(referenced)
 
     async def validate_security_scopes(self, config: MacConfig) -> None:
@@ -542,7 +833,7 @@ class NativeRuntime:
             revision = configuration_revision(config)
             if not restart_required:
                 self.config = config
-                self.profiles = config.profiles()
+                self._apply_profiles(config)
                 self.installer.storage = config.storage
             return restart_required, revision
 
@@ -745,7 +1036,7 @@ class NativeRuntime:
                     )
                 save_config(updated_config, self.config_path)
                 self.config = updated_config
-                self.profiles = updated_config.profiles()
+                self._apply_profiles(updated_config)
                 self.installer.storage = updated_config.storage
                 if managed_install is not None:
                     await asyncio.to_thread(
@@ -811,6 +1102,9 @@ class NativeRuntime:
     async def register_security_scope(self, path: str, bookmark_data: str) -> str:
         return (await self.security_scope_process.register(path, bookmark_data)).id
 
+    async def discard_security_scope(self, scope_id: str) -> None:
+        await asyncio.to_thread(self.security_scopes.discard, scope_id)
+
     async def require_security_scope(self, scope_id: str | None, path: str) -> None:
         if scope_id is None:
             return
@@ -839,21 +1133,28 @@ class NativeRuntime:
                 if idle_seconds is not None:
                     await self.coordinator.evict_if_idle(float(idle_seconds))
             except Exception:
-                # Status exposes coordinator diagnostics. A future logging
-                # integration records the traceback without killing upkeep.
+                logger.exception("native maintenance iteration failed")
                 continue
 
     async def _reconcile_maintenance(self) -> None:
         """Audit residency and retry a failed oMLX directory registration."""
 
-        if self._omlx_directory_sync_pending:
+        status = await self.coordinator.status()
+        if not status.initialized or self.startup_error is not None:
+            # Startup can race an externally launched oMLX service. Reconcile
+            # is the recovery path that both proves every adapter and restores
+            # admission; a read-only audit cannot initialize a failed start.
+            await self.coordinator.reconcile()
+        elif self._omlx_directory_sync_pending:
             # A failed maintenance barrier deliberately leaves the coordinator
             # degraded. Reconcile first so every adapter again proves its
             # observed state before retrying the residency-neutral rescan.
             await self.coordinator.reconcile()
-            await self._sync_omlx_model_directories()
         else:
             await self.coordinator.audit()
+        if self._omlx_directory_sync_pending:
+            await self._sync_omlx_model_directories()
+        await self._refresh_runtime_fingerprints()
         self.startup_error = None
 
     def resolve(self, alias: str) -> ResolvedTarget:
@@ -862,51 +1163,579 @@ class NativeRuntime:
         except KeyError as exc:
             raise KeyError(f"unknown model alias '{alias}'") from exc
 
-    async def resolve_target(self, alias: str) -> ResolvedTarget:
-        """Resolve a profile and validate its storage in a killable helper."""
-
-        target = self.resolve(alias)
+    def _profile(self, alias: str) -> ModelProfile:
         profile = next(
             (candidate for candidate in self.config.models if candidate.alias == alias),
             None,
         )
-        if profile is not None and profile.storage is not None:
-            location = next(
-                (
-                    candidate
-                    for candidate in self.config.storage.locations
-                    if candidate.name == profile.storage
-                ),
-                None,
-            )
-            if location is None:
-                raise RuntimeConfigurationError(
-                    f"model '{alias}' references missing storage '{profile.storage}'"
+        if profile is None:
+            raise KeyError(f"unknown model alias '{alias}'")
+        return profile
+
+    def _apply_profiles(self, config: MacConfig) -> None:
+        self.profile_candidates = config.profile_candidates()
+        self.profiles = {
+            alias: candidates[0]
+            for alias, candidates in self.profile_candidates.items()
+            if candidates
+        }
+        existing_records = getattr(self, "_benchmark_records", {})
+        benchmark_store = getattr(self, "benchmark_store", None)
+        self._benchmark_records = {
+            alias: (
+                existing_records[alias]
+                if alias in existing_records
+                else (
+                    tuple(benchmark_store.list(alias=alias))
+                    if benchmark_store is not None
+                    else ()
                 )
-            if target.key.engine in {EngineName.DS4, EngineName.LLAMA_CPP}:
-                await self.filesystem.validate_llama(
-                    root=location.path,
-                    model=target.key.canonical_model_id,
-                    projector=(
-                        str(target.load_options["projector_path"])
-                        if target.load_options.get("projector_path") is not None
-                        else None
+            )
+            for alias in self.profile_candidates
+        }
+        existing_context = getattr(self, "_context_records", {})
+        self._context_records = {
+            alias: (
+                existing_context[alias]
+                if alias in existing_context
+                else (
+                    tuple(benchmark_store.list_context(alias=alias))
+                    if benchmark_store is not None
+                    else ()
+                )
+            )
+            for alias in self.profile_candidates
+        }
+        self._apply_context_evidence()
+
+    def _reload_benchmark_records(self, alias: str) -> None:
+        self._benchmark_records[alias] = tuple(
+            self.benchmark_store.list(alias=alias)
+        )
+
+    def _reload_context_records(self, alias: str) -> None:
+        self._context_records[alias] = tuple(
+            self.benchmark_store.list_context(alias=alias)
+        )
+
+    def _fresh_context_record(self, target: ResolvedTarget):
+        runtime = getattr(self, "_runtime_fingerprints", {}).get(target.key.engine)
+        if runtime is None:
+            return None
+        cutoff = time.time() - target.context_max_verified_age_hours * 3600
+        fingerprint = context_target_fingerprint(target)
+        machine = system_fingerprint()
+        return next(
+            (
+                record
+                for record in self._context_records.get(target.alias, ())
+                if record.engine == target.key.engine.value
+                and record.target_fingerprint == fingerprint
+                and record.runtime_fingerprint == runtime
+                and record.system_fingerprint == machine
+                and record.suite_version == CONTEXT_SUITE_VERSION
+                and record.created_at >= cutoff
+            ),
+            None,
+        )
+
+    def _eligible_context_record(self, target: ResolvedTarget):
+        if target.context_mode != "automatic":
+            return None
+        return self._fresh_context_record(target)
+
+    def _apply_context_evidence(self) -> None:
+        if not hasattr(self, "profile_candidates"):
+            return
+        # Always start from persisted configuration. Otherwise an automatic
+        # value applied during a prior refresh could survive after its runtime
+        # fingerprint or age made the evidence stale.
+        baseline = (
+            self.config.profile_candidates()
+            if hasattr(self, "config")
+            else self.profile_candidates
+        )
+        updated: dict[str, tuple[ResolvedTarget, ...]] = {}
+        for alias, candidates in baseline.items():
+            resolved: list[ResolvedTarget] = []
+            for target in candidates:
+                record = self._eligible_context_record(target)
+                resolved.append(
+                    target_with_context_window(target, record.verified_tokens)
+                    if record is not None
+                    else target
+                )
+            updated[alias] = tuple(resolved)
+        self.profile_candidates = updated
+        self.profiles = {
+            alias: candidates[0]
+            for alias, candidates in updated.items()
+            if candidates
+        }
+
+    async def _refresh_context_hints(self) -> None:
+        if not hasattr(self, "profile_candidates"):
+            self._context_hints = {}
+            return
+
+        async def inspect(target: ResolvedTarget) -> tuple[str, ContextWindowHint]:
+            fingerprint = target_fingerprint(target)
+            adapter = self.adapters[target.key.engine]
+            try:
+                hint = await adapter.context_window(
+                    target,
+                    deadline=Deadline.after(5),
+                )
+            except Exception:
+                hint = ContextWindowHint(
+                    effective_tokens=target.requested_context_length,
+                    native_tokens=target.native_context_length,
+                    source=(
+                        "configured-load"
+                        if target.requested_context_length is not None
+                        else "unavailable"
                     ),
-                    expected_volume_uuid=location.volume_uuid,
-                    scope_id=location.scope_id,
+                    confidence=(
+                        "authoritative"
+                        if target.requested_context_length is not None
+                        else "unknown"
+                    ),
                 )
-                return target
-            status = await self.filesystem.inspect(
-                location.path,
-                name=location.name,
-                expected_volume_uuid=location.volume_uuid,
-                scope_id=location.scope_id,
+            return fingerprint, hint
+
+        unique = {
+            target_fingerprint(target): target
+            for candidates in self.profile_candidates.values()
+            for target in candidates
+        }
+        values = await asyncio.gather(*(inspect(target) for target in unique.values()))
+        self._context_hints = dict(values)
+
+    def context_contract(self, target: ResolvedTarget) -> dict:
+        hint = self._context_hints.get(target_fingerprint(target))
+        record = self._fresh_context_record(target)
+        effective = (
+            hint.effective_tokens
+            if hint is not None and hint.effective_tokens is not None
+            else target.requested_context_length
+        )
+        native = (
+            hint.native_tokens
+            if hint is not None and hint.native_tokens is not None
+            else target.native_context_length
+        )
+        verified = record.verified_tokens if record is not None else None
+        guaranteed = (
+            target.requested_context_length
+            if target.context_mode in {"fixed", "native"}
+            and target.requested_context_length is not None
+            else verified
+            if target.context_mode == "automatic" and verified is not None
+            else effective
+        )
+        return {
+            "mode": target.context_mode,
+            "native_tokens": native,
+            "configured_tokens": target.requested_context_length,
+            "effective_tokens": effective,
+            "verified_tokens": verified,
+            "guaranteed_tokens": guaranteed,
+            "source": hint.source if hint is not None else "configuration",
+            "confidence": hint.confidence if hint is not None else "unknown",
+        }
+
+    async def _refresh_runtime_fingerprints(self) -> None:
+        async def fingerprint(
+            engine: EngineName,
+            adapter: EngineAdapter,
+        ) -> tuple[EngineName, str | None]:
+            try:
+                value = await adapter.runtime_fingerprint(deadline=Deadline.after(5))
+            except Exception:
+                value = None
+            return engine, value
+
+        values = await asyncio.gather(
+            *(fingerprint(engine, adapter) for engine, adapter in self.adapters.items())
+        )
+        self._runtime_fingerprints = dict(values)
+        self._apply_context_evidence()
+        await self._refresh_context_hints()
+
+    def benchmark_decision(self, alias: str) -> tuple[ResolvedTarget, dict]:
+        profile = self._profile(alias)
+        candidates = self.profile_candidates.get(alias)
+        if not candidates:
+            raise KeyError(f"unknown model alias '{alias}'")
+        primary_contract = self.context_contract(candidates[0])
+        context_limits = {
+            target_fingerprint(candidate): self.context_contract(candidate).get(
+                "guaranteed_tokens"
             )
-            if not status.exists or not status.is_directory or not status.volume_matches:
-                raise RuntimeConfigurationError(
-                    status.diagnostic or f"storage for model '{alias}' is unavailable"
+            for candidate in candidates
+        }
+        selected, decision = choose_target(
+            alias=alias,
+            candidates=candidates,
+            policy=profile.selection,
+            records=self._benchmark_records.get(alias, ()),
+            runtime_fingerprints=self._runtime_fingerprints,
+            config_revision=candidate_set_fingerprint(candidates),
+            context_limits=context_limits,
+            required_context_tokens=primary_contract.get("guaranteed_tokens"),
+        )
+        return selected, decision.to_dict()
+
+    async def benchmark_model(
+        self,
+        alias: str,
+        *,
+        warmup_runs: int = 1,
+        sample_runs: int = 3,
+        max_tokens: int = 128,
+    ) -> dict:
+        """Benchmark every exact chat-capable candidate sequentially."""
+
+        profile = self._profile(alias)
+        all_candidates = self.profile_candidates.get(alias, ())
+        candidates = tuple(
+            target
+            for target in all_candidates
+            if BENCHMARK_ENDPOINT in target.capabilities
+        )
+        if len(candidates) < 2:
+            raise RuntimeConfigurationError(
+                "cross-engine benchmarking requires at least two enabled chat-capable candidates"
+            )
+        async with self._benchmark_lock:
+            await self._refresh_runtime_fingerprints()
+            revision = candidate_set_fingerprint(all_candidates)
+            results: list[dict] = []
+            failures: list[dict[str, str]] = []
+            for target in candidates:
+                try:
+                    await self._validate_target_storage(target)
+                    adapter = self.adapters[target.key.engine]
+                    record = await self.benchmarks.run_candidate(
+                        target,
+                        adapter=adapter,
+                        config_revision=revision,
+                        warmup_runs=warmup_runs,
+                        sample_runs=sample_runs,
+                        max_tokens=max_tokens,
+                    )
+                    results.append(record.to_dict())
+                    if record.successful_samples == 0:
+                        failures.append(
+                            {
+                                "engine": target.key.engine.value,
+                                "code": "benchmark_failed",
+                                "detail": "warmup or every measured sample failed",
+                            }
+                        )
+                except Exception:
+                    failures.append(
+                        {
+                            "engine": target.key.engine.value,
+                            "code": "benchmark_failed",
+                            "detail": (
+                                "candidate could not complete the fixed benchmark; "
+                                "inspect Setup & Health before retrying"
+                            ),
+                        }
+                    )
+            self._reload_benchmark_records(alias)
+            await self._refresh_runtime_fingerprints()
+            selected, decision = self.benchmark_decision(alias)
+            # End with the selected/fallback target warm. Loading occurs only
+            # after all samples, so it cannot bias any measured candidate.
+            try:
+                lease = await self.coordinator.acquire(selected)
+                await lease.release()
+            except Exception:
+                pass
+            return {
+                "schema_version": 1,
+                "alias": alias,
+                "policy": profile.selection.model_dump(mode="json"),
+                "results": results,
+                "failures": failures,
+                "decision": decision,
+            }
+
+    async def profile_model_context(
+        self,
+        alias: str,
+        *,
+        target_tokens: int | None = None,
+    ) -> dict:
+        """Measure usable context for every chat candidate, sequentially."""
+
+        profile = self._profile(alias)
+        candidates = tuple(
+            target
+            for target in self.profile_candidates.get(alias, ())
+            if BENCHMARK_ENDPOINT in target.capabilities
+        )
+        if not candidates:
+            raise RuntimeConfigurationError(
+                "context profiling requires a chat-capable language model"
+            )
+        async with self._benchmark_lock:
+            await self._refresh_runtime_fingerprints()
+            results: list[dict] = []
+            failures: list[dict[str, str]] = []
+            for target in candidates:
+                requested = target_tokens
+                if requested is None:
+                    requested = (
+                        target.native_context_length
+                        or target.requested_context_length
+                        or 262_144
+                    )
+                if target.native_context_length is not None:
+                    requested = min(requested, target.native_context_length)
+                try:
+                    await self._validate_target_storage(target)
+                    adapter = self.adapters[target.key.engine]
+                    runtime_fingerprint = await adapter.runtime_fingerprint(
+                        deadline=Deadline.after(5)
+                    )
+                    if runtime_fingerprint is None:
+                        raise RuntimeError(
+                            f"{target.key.engine.value} does not expose a stable runtime identity"
+                        )
+                    native_result = None
+                    native_error: Exception | None = None
+
+                    async def run_native(deadline: Deadline) -> None:
+                        nonlocal native_error, native_result
+                        try:
+                            native_result = await adapter.profile_context_window(
+                                target,
+                                requested,
+                                deadline=deadline,
+                            )
+                        except Exception as exc:
+                            # Let the barrier perform its post-operation empty
+                            # proof before surfacing a vendor precondition or
+                            # benchmark error. A rejected native benchmark is
+                            # not residency uncertainty by itself.
+                            native_error = exc
+
+                    if target.key.engine == EngineName.OMLX:
+                        await self.coordinator.run_empty_maintenance(
+                            run_native,
+                            name=f"{target.alias} oMLX context profile",
+                        )
+                    if native_error is not None:
+                        raise native_error
+                    if native_result is not None:
+                        record = ContextBenchmarkRecord(
+                            created_at=time.time(),
+                            alias=target.alias,
+                            engine=target.key.engine.value,
+                            target_fingerprint=context_target_fingerprint(target),
+                            runtime_fingerprint=runtime_fingerprint,
+                            system_fingerprint=system_fingerprint(),
+                            suite_version=CONTEXT_SUITE_VERSION,
+                            requested_tokens=native_result.requested_tokens,
+                            verified_tokens=native_result.verified_tokens,
+                            prompt_tokens=native_result.prompt_tokens,
+                        )
+                        self.benchmark_store.record_context(record)
+                    else:
+                        record = await self.benchmarks.profile_context_candidate(
+                            target,
+                            adapter=adapter,
+                            requested_tokens=requested,
+                        )
+                    results.append(record.to_dict())
+                except Exception:
+                    failures.append(
+                        {
+                            "engine": target.key.engine.value,
+                            "code": "context_profile_failed",
+                            "detail": (
+                                "candidate could not complete a verified long-context "
+                                "prefill; its prior context contract remains active"
+                            ),
+                        }
+                    )
+            self._reload_context_records(alias)
+            if results:
+                # A changed automatic context becomes part of the effective
+                # load identity, so short-prompt speed evidence must be rerun.
+                self.benchmark_store.clear_alias(alias)
+                self._reload_benchmark_records(alias)
+            self._apply_profiles(self.config)
+            await self._refresh_runtime_fingerprints()
+            return {
+                "schema_version": 1,
+                "alias": alias,
+                "policy": profile.context.model_dump(mode="json"),
+                "results": results,
+                "failures": failures,
+                "contexts": self.context_snapshot(alias)["models"],
+            }
+
+    def context_snapshot(self, alias: str | None = None) -> dict:
+        aliases = [alias] if alias is not None else sorted(self.profile_candidates)
+        models: list[dict] = []
+        for candidate_alias in aliases:
+            candidates = self.profile_candidates.get(candidate_alias, ())
+            if not candidates:
+                continue
+            models.append(
+                {
+                    "alias": candidate_alias,
+                    "candidates": [
+                        {
+                            "engine": target.key.engine.value,
+                            "target_fingerprint": target_fingerprint(target),
+                            **self.context_contract(target),
+                        }
+                        for target in candidates
+                    ],
+                }
+            )
+        records = self.benchmark_store.list_context(alias=alias)
+        return {
+            "schema_version": 1,
+            "models": models,
+            "records": [record.to_dict() for record in records],
+        }
+
+    def benchmark_snapshot(self, alias: str | None = None) -> dict:
+        records = self.benchmark_store.list(alias=alias)
+        decisions: list[dict] = []
+        aliases = [alias] if alias is not None else sorted(self.profile_candidates)
+        for candidate_alias in aliases:
+            try:
+                _target, decision = self.benchmark_decision(candidate_alias)
+                decisions.append(decision)
+            except KeyError:
+                continue
+        return {
+            "schema_version": 1,
+            "records": [record.to_dict() for record in records],
+            "decisions": decisions,
+        }
+
+    async def _validate_target_storage(self, target: ResolvedTarget) -> None:
+        if target.storage_path is None:
+            return
+        if target.key.engine in {EngineName.DS4, EngineName.LLAMA_CPP}:
+            await self.filesystem.validate_llama(
+                root=target.storage_path,
+                model=target.key.canonical_model_id,
+                projector=(
+                    str(target.load_options["projector_path"])
+                    if target.load_options.get("projector_path") is not None
+                    else None
+                ),
+                expected_volume_uuid=target.storage_volume_uuid,
+                scope_id=target.scope_id,
+            )
+            return
+        if target.key.engine in {EngineName.MLXCEL, EngineName.MISTRAL_RS}:
+            await self.filesystem.validate_directory(
+                root=target.storage_path,
+                path=target.key.canonical_model_id,
+                expected_volume_uuid=target.storage_volume_uuid,
+                scope_id=target.scope_id,
+            )
+            return
+        status = await self.filesystem.inspect(
+            target.storage_path,
+            expected_volume_uuid=target.storage_volume_uuid,
+            scope_id=target.scope_id,
+        )
+        if not status.exists or not status.is_directory or not status.volume_matches:
+            raise RuntimeConfigurationError(
+                status.diagnostic or f"storage for model '{target.alias}' is unavailable"
+            )
+
+    async def resolve_target(
+        self,
+        alias: str,
+        endpoint: Endpoint | None = None,
+    ) -> ResolvedTarget:
+        """Resolve a profile and validate its storage in a killable helper."""
+
+        target, _decision = self.benchmark_decision(alias)
+        primary = self.resolve(alias)
+        if endpoint is not None and endpoint not in target.capabilities:
+            target = primary
+        if (
+            self._profile(alias).selection.mode == "benchmark"
+            and self.is_engine_alternative(target)
+            and target.key.engine
+            in {EngineName.MLXCEL, EngineName.MISTRAL_RS}
+        ):
+            # These Preview binaries are vendor-owned and may be replaced
+            # outside Mnemosyne. A local stat-based identity check is cheap
+            # enough to protect every automatically selected request without
+            # adding SQLite or an upstream HTTP round-trip to the hot path.
+            adapter = self.adapters[target.key.engine]
+            try:
+                current_runtime = await adapter.runtime_fingerprint(
+                    deadline=Deadline.after(1)
                 )
+            except Exception:
+                current_runtime = None
+            if current_runtime != self._runtime_fingerprints.get(
+                target.key.engine
+            ):
+                self._runtime_fingerprints[target.key.engine] = current_runtime
+                target = primary
+        await self._validate_target_storage(target)
         return target
+
+    async def resolve_fixed_target(
+        self,
+        alias: str,
+        endpoint: Endpoint | None = None,
+    ) -> ResolvedTarget:
+        """Resolve and validate the original profile fallback."""
+
+        target = self.resolve(alias)
+        if endpoint is not None and endpoint not in target.capabilities:
+            raise RuntimeConfigurationError(
+                f"model '{alias}' does not support /v1/{endpoint.value}"
+            )
+        await self._validate_target_storage(target)
+        return target
+
+    def reject_benchmark_evidence(self, alias: str) -> int:
+        """Fail closed after a selected alternative cannot load pre-work."""
+
+        removed = self.benchmark_store.clear_alias(alias)
+        self._benchmark_records[alias] = ()
+        return removed
+
+    def reject_context_evidence(self, alias: str) -> int:
+        """Discard automatic context evidence and return to configured safety."""
+
+        self._profile(alias)
+        removed = self.benchmark_store.clear_context_alias(alias)
+        self._context_records[alias] = ()
+        self._apply_profiles(self.config)
+        return removed
+
+    def invalidate_automatic_selection(self, alias: str) -> int:
+        """Discard a failed automatic choice without overriding a user pin."""
+
+        if self._profile(alias).selection.mode != "benchmark":
+            return 0
+        return self.reject_benchmark_evidence(alias)
+
+    def is_engine_alternative(self, target: ResolvedTarget) -> bool:
+        primary = self.profiles.get(target.alias)
+        return bool(
+            primary is not None
+            and target.key.engine != primary.key.engine
+        )
 
     async def discover_local_models(
         self,
@@ -1168,9 +1997,12 @@ class NativeRuntime:
                     )
                     if (
                         compatible_load.get("context_length") is None
-                        and candidate.context_length is not None
                     ):
-                        compatible_load["context_length"] = candidate.context_length
+                        compatible_load["context_length"] = (
+                            recommended_interactive_context_length(
+                                candidate.context_length
+                            )
+                        )
                     load = ModelLoadConfig.model_validate(compatible_load)
                     preserved_capabilities = (
                         prior.capabilities
@@ -1201,6 +2033,14 @@ class NativeRuntime:
                         served_model_name=alias,
                         capabilities=capabilities,
                         load=load,
+                        context=(
+                            existing.context
+                            if existing is not None
+                            and existing.engine == EngineName.LLAMA_CPP
+                            else ModelContextConfig(
+                                native_tokens=candidate.context_length
+                            )
+                        ),
                         enabled=prior.enabled if prior is not None else True,
                     )
                 else:
@@ -1236,6 +2076,14 @@ class NativeRuntime:
                         capabilities={
                             Endpoint(value) for value in candidate.capabilities
                         },
+                        context=(
+                            existing.context
+                            if existing is not None
+                            and existing.engine == EngineName.OMLX
+                            else ModelContextConfig(
+                                native_tokens=candidate.context_length
+                            )
+                        ),
                         enabled=prior.enabled if prior is not None else True,
                     )
                 if existing_index is None:
@@ -1307,13 +2155,13 @@ class NativeRuntime:
             )
             if adapters_available and not restart_required:
                 self.config = new_config
-                self.profiles = new_config.profiles()
+                self._apply_profiles(new_config)
                 self.installer.storage = new_config.storage
 
         if needs_omlx and not restart_required:
             await self._sync_omlx_model_directories()
         return {
-            "schema_version": 2,
+            "schema_version": new_config.schema_version,
             "imported": imported,
             "restart_required": restart_required,
             "revision": configuration_revision(new_config),
@@ -1325,6 +2173,7 @@ class NativeRuntime:
         payload = asdict(value)
         secret_env_keys = (
             self.config.server.inference_api_key_env,
+            self.config.server.fleet_api_key_env,
             self.config.server.control_password_env,
             self.config.engines.omlx.api_key_env,
             self.config.engines.omlx.admin_session_env,
@@ -1350,7 +2199,223 @@ class NativeRuntime:
         usage_status = await self.usage.status()
         usage_status["last_error"] = redact(usage_status.get("last_error"))
         payload["token_sidecar"] = usage_status
+        payload["performance"] = self.performance.snapshot()
         return payload
+
+    async def fleet_snapshot(self) -> dict:
+        """Return one versioned, path-free snapshot for the enrolled gateway."""
+
+        async with self._fleet_snapshot_lock:
+            async with self._reload_lock:
+                targets = list(self.profiles.values())
+                profiles = {
+                    profile.alias: profile.model_copy(deep=True)
+                    for profile in self.config.models
+                    if profile.alias in self.profiles
+                }
+                configured_max = self.config.server.max_concurrency
+                queue_limit = self.config.server.max_queue_depth
+
+            installs = await asyncio.gather(
+                *(self.installer.latest_for_alias(target.alias) for target in targets),
+                return_exceptions=True,
+            )
+            usage = await self.usage.status()
+            coordinator = await self.coordinator.status()
+            node_id = self.usage.identity.node_id
+
+            identity_by_alias: dict[str, tuple[str, dict, bool]] = {}
+            for target, install_result in zip(targets, installs, strict=True):
+                profile = profiles[target.alias]
+                install = (
+                    install_result
+                    if isinstance(install_result, InstallRecord)
+                    else None
+                )
+                identity_by_alias[target.alias] = _fleet_deployment_identity(
+                    node_id=node_id,
+                    profile=profile,
+                    target=target,
+                    install=install,
+                )
+
+            deployment_id_by_alias = {
+                alias: identity[0]
+                for alias, identity in identity_by_alias.items()
+            }
+            queued_by_deployment: dict[str, int] = {}
+            for alias, count in coordinator.queued_by_deployment.items():
+                deployment_id = deployment_id_by_alias.get(alias)
+                if deployment_id is not None:
+                    queued_by_deployment[deployment_id] = (
+                        queued_by_deployment.get(deployment_id, 0) + count
+                    )
+
+            authoritative = bool(
+                coordinator.initialized
+                and coordinator.diagnostic is None
+                and coordinator.state
+                not in {CoordinatorState.DEGRADED, CoordinatorState.STOPPING}
+            )
+            accepting = bool(authoritative and coordinator.accepting)
+            deployments: list[dict] = []
+            for target in targets:
+                profile = profiles[target.alias]
+                deployment_id, identity, eligible = (
+                    identity_by_alias[target.alias]
+                )
+                selection_guarantees_primary = bool(
+                    profile.selection.mode == "fixed"
+                    or (
+                        profile.selection.mode == "pinned"
+                        and profile.selection.pinned_engine == profile.engine
+                    )
+                )
+                warm = bool(
+                    coordinator.resident_alias == target.alias
+                    and coordinator.resident_engine == target.key.engine
+                    and coordinator.resident_model
+                    == target.key.canonical_model_id
+                )
+                queued = queued_by_deployment.get(deployment_id, 0)
+                warm_accepting = bool(
+                    warm
+                    and coordinator.state == CoordinatorState.READY
+                    and coordinator.capacity is not None
+                    and coordinator.capacity.available > 0
+                )
+                capacity = self.coordinator.capacity_for(
+                    target,
+                    active=coordinator.inflight if warm else 0,
+                    queued=queued,
+                    # Deployment capacity is a cold scheduling estimate. It
+                    # remains discoverable while another model is resident;
+                    # a warm resident, however, cannot advertise admission
+                    # while it is draining, verifying, or fenced.
+                    accepting=(warm_accepting if warm else accepting),
+                )
+                deployments.append(
+                    {
+                        "alias": target.alias,
+                        "deployment_id": deployment_id,
+                        "identity": identity,
+                        "identity_confidence": (
+                            "authoritative" if eligible else "unverified"
+                        ),
+                        "fleet_eligible": bool(
+                            eligible and selection_guarantees_primary
+                        ),
+                        "loadable": bool(
+                            authoritative and selection_guarantees_primary
+                        ),
+                        "warm": warm,
+                        "capacity": capacity.to_dict(),
+                    }
+                )
+
+            resident_primary = (
+                self.profiles.get(coordinator.resident_alias)
+                if coordinator.resident_alias is not None
+                else None
+            )
+            resident_deployment = (
+                deployment_id_by_alias.get(resident_primary.alias)
+                if resident_primary is not None
+                and coordinator.resident_engine == resident_primary.key.engine
+                and coordinator.resident_model
+                == resident_primary.key.canonical_model_id
+                else None
+            )
+            transition_primary = (
+                self.profiles.get(coordinator.transition_target)
+                if coordinator.transition_target is not None
+                else None
+            )
+            transition_deployment = (
+                deployment_id_by_alias.get(transition_primary.alias)
+                if transition_primary is not None
+                and coordinator.transition_engine == transition_primary.key.engine
+                and coordinator.transition_model
+                == transition_primary.key.canonical_model_id
+                else None
+            )
+            root_capacity = (
+                coordinator.capacity.to_dict()
+                if coordinator.capacity is not None
+                else effective_capacity(
+                    derived_limit=1,
+                    configured_max_concurrency=configured_max,
+                    active=coordinator.inflight,
+                    queued=coordinator.queued,
+                    source="no-resident",
+                    confidence="conservative",
+                    accepting=False,
+                ).to_dict()
+            )
+
+            if self.startup_error is not None:
+                diagnostic_code = "startup_error"
+            elif coordinator.state == CoordinatorState.DEGRADED:
+                diagnostic_code = "coordinator_degraded"
+            elif not coordinator.initialized:
+                diagnostic_code = "not_initialized"
+            else:
+                diagnostic_code = None
+            health_state = (
+                "verifying"
+                if coordinator.state
+                in {
+                    CoordinatorState.VERIFYING_EMPTY,
+                    CoordinatorState.VERIFYING_TARGET,
+                }
+                else coordinator.state.value
+            )
+
+            self._fleet_snapshot_sequence += 1
+            return {
+                "schema_version": FLEET_SCHEMA_VERSION,
+                "snapshot_sequence": self._fleet_snapshot_sequence,
+                "observed_at": time.time(),
+                "node": {
+                    "node_id": node_id,
+                    "instance_id": self._fleet_instance_id,
+                    "platform": "macos",
+                    "version": __version__,
+                },
+                "health": {
+                    "state": health_state,
+                    "accepting": accepting,
+                    "authoritative": authoritative,
+                    "diagnostic_code": diagnostic_code,
+                },
+                "residency": {
+                    "alias": coordinator.resident_alias,
+                    "deployment_id": resident_deployment,
+                    "engine": (
+                        coordinator.resident_engine.value
+                        if coordinator.resident_engine is not None
+                        else None
+                    ),
+                    "epoch": coordinator.epoch,
+                    "transition_target": transition_deployment,
+                },
+                "admission": {
+                    "queue_depth": coordinator.queued,
+                    "queue_limit": queue_limit,
+                    "queued_by_deployment": queued_by_deployment,
+                },
+                "capacity": root_capacity,
+                "deployments": deployments,
+                "usage_delivery": {
+                    "enabled": bool(usage.get("enabled")),
+                    "writer_ready": bool(usage.get("writer_ready")),
+                    "outbox_pending": int(usage.get("outbox_depth") or 0),
+                    "last_flush_at": usage.get("last_flush_at"),
+                    "last_error_code": (
+                        "delivery_error" if usage.get("last_error") else None
+                    ),
+                },
+            }
 
     async def readiness(self) -> dict:
         """Return bounded, actionable setup and health state without upstream checks."""
@@ -1359,6 +2424,7 @@ class NativeRuntime:
         runtime_status = await self.runtime_updates.installed_status()
         secret_env_keys = (
             self.config.server.inference_api_key_env,
+            self.config.server.fleet_api_key_env,
             self.config.server.control_password_env,
             self.config.engines.omlx.api_key_env,
             self.config.engines.omlx.admin_session_env,
@@ -1702,17 +2768,18 @@ class NativeRuntime:
             "record_validation",
             None,
         )
-        if callable(record_validation):
+        externally_versioned = {
+            EngineName.OMLX,
+            EngineName.MLXCEL,
+            EngineName.MISTRAL_RS,
+        }
+        if callable(record_validation) and target.key.engine not in externally_versioned:
             try:
                 validation_event = await asyncio.to_thread(
                     record_validation,
                     target.key.engine.value,
                 )
-                runtime_validation_recorded = (
-                    validation_event is not None
-                    if target.key.engine != EngineName.OMLX
-                    else None
-                )
+                runtime_validation_recorded = validation_event is not None
             except Exception:
                 # Inference already succeeded. A damaged or unwritable
                 # evidence journal must be visible to strict acceptance
@@ -1748,6 +2815,13 @@ class NativeRuntime:
         await self.usage.record(event)
 
     async def _runtime_active_version(self, engine: str) -> str | None:
+        if engine.casefold() == "omlx":
+            try:
+                status = await self.runtime_updates.installed_status()
+            except Exception:
+                return None
+            value = status.get("omlx", {}).get("version")
+            return value if isinstance(value, str) else None
         active_version = getattr(self.runtime_updates, "active_version", None)
         if not callable(active_version):
             return None
@@ -1771,7 +2845,49 @@ class NativeRuntime:
         return True
 
     async def check_runtime_updates(self, *, refresh: bool = True) -> dict:
-        return await self.runtime_updates.check(refresh=refresh)
+        result = await self.runtime_updates.check(refresh=refresh)
+        # Runtime checks are also the observation point for externally owned
+        # mlxcel/mistral.rs binaries. Refresh the in-memory identities so a
+        # manual vendor upgrade makes old benchmark evidence ineligible before
+        # the next automatically selected request.
+        await self._refresh_runtime_fingerprints()
+        return result
+
+    async def omlx_cache_health(self) -> dict:
+        adapter = self.adapters.get(EngineName.OMLX)
+        if not isinstance(adapter, OMLXAdapter):
+            raise RuntimeConfigurationError("oMLX is not enabled")
+        deadline = Deadline.after(self.config.server.transition_timeout_seconds)
+        return await adapter.cache_health(deadline=deadline)
+
+    async def reset_omlx_cache(self) -> dict:
+        """Reset only oMLX's SSD KV cache after globally draining inference."""
+
+        adapter = self.adapters.get(EngineName.OMLX)
+        if not isinstance(adapter, OMLXAdapter):
+            raise RuntimeConfigurationError("oMLX is not enabled")
+        deleted = 0
+
+        async def reset(deadline: Deadline) -> None:
+            nonlocal deleted
+            deleted = await adapter.clear_ssd_cache(deadline=deadline)
+
+        await self.coordinator.run_empty_maintenance(
+            reset,
+            name="oMLX SSD cache reset",
+        )
+        try:
+            cache = await self.omlx_cache_health()
+        except Exception:
+            logger.exception(
+                "oMLX cache reset succeeded but refreshed cache metrics were unavailable"
+            )
+            cache = None
+        return {
+            "status": "ok",
+            "deleted_files": deleted,
+            "cache": cache,
+        }
 
     async def runtime_update_evidence(self) -> dict:
         evidence_reader = getattr(
@@ -1808,6 +2924,9 @@ class NativeRuntime:
         self, engine: str, *, version: str | None = None
     ) -> dict:
         """Stage without touching residency, then activate behind the barrier."""
+
+        if engine.casefold() == "omlx":
+            return await self._upgrade_external_omlx(version=version)
 
         async with self._runtime_update_lock:
             active_before = await self._runtime_active_version(engine)
@@ -1888,12 +3007,97 @@ class NativeRuntime:
                     source_revision=activated.source_revision,
                 )
             )
+            await self._refresh_runtime_fingerprints()
             result = await self.runtime_updates.check(refresh=False)
             result["activated"] = {
                 "engine": activated.engine,
                 "version": activated.version,
                 "source_revision": activated.source_revision,
                 "path": str(activated.root),
+            }
+            result["lifecycle_evidence_recorded"] = all(evidence_recorded)
+            return result
+
+    async def _upgrade_external_omlx(self, *, version: str | None) -> dict:
+        """Supervise a stable Homebrew update behind the global empty barrier."""
+
+        async with self._runtime_update_lock:
+            adapter = self.adapters.get(EngineName.OMLX)
+            if adapter is None:
+                raise RuntimeUpdateError(
+                    "enable oMLX before updating so its control plane can be drained and validated"
+                )
+            active_before = await self._runtime_active_version("omlx")
+            evidence_recorded = [
+                await self._record_runtime_lifecycle(
+                    engine="omlx",
+                    action="external_update_requested",
+                    outcome="started",
+                    requested_version=version,
+                    active_version_before=active_before,
+                    active_version_after=active_before,
+                )
+            ]
+            upgrader = getattr(self.runtime_updates, "upgrade_omlx_homebrew", None)
+            if not callable(upgrader):
+                raise RuntimeUpdateError(
+                    "this service build cannot supervise oMLX Homebrew updates"
+                )
+            updated_version: str | None = None
+            updated_path: str | None = None
+
+            async def upgrade(deadline: Deadline) -> None:
+                nonlocal updated_version, updated_path
+                updated_version, updated_path = await upgrader(version)
+                snapshot = await adapter.validate_control(deadline=deadline)
+                if (
+                    not snapshot.authoritative
+                    or snapshot.service_state != ServiceState.READY
+                    or snapshot.residents
+                ):
+                    raise RuntimeUpdateError(
+                        "updated oMLX did not return with an authoritative empty control plane: "
+                        f"{snapshot.diagnostic or snapshot.service_state}"
+                    )
+
+            try:
+                await self.coordinator.run_empty_maintenance(
+                    upgrade,
+                    name="oMLX supervised Homebrew update",
+                )
+            except Exception as exc:
+                evidence_recorded.append(
+                    await self._record_runtime_lifecycle(
+                        engine="omlx",
+                        action="external_update_rejected",
+                        outcome="failed",
+                        requested_version=version,
+                        active_version_before=active_before,
+                        active_version_after=await self._runtime_active_version("omlx"),
+                        error=exc,
+                    )
+                )
+                raise
+
+            evidence_recorded.append(
+                await self._record_runtime_lifecycle(
+                    engine="omlx",
+                    action="external_updated",
+                    outcome="succeeded",
+                    requested_version=version,
+                    prepared_version=updated_version,
+                    active_version_before=active_before,
+                    active_version_after=updated_version,
+                )
+            )
+            await self._refresh_runtime_fingerprints()
+            result = await self.runtime_updates.check(refresh=False)
+            result["activated"] = {
+                "engine": "omlx",
+                "version": updated_version,
+                "source_revision": None,
+                "path": updated_path,
+                "external_owner": "homebrew",
             }
             result["lifecycle_evidence_recorded"] = all(evidence_recorded)
             return result
@@ -1945,6 +3149,7 @@ class NativeRuntime:
                     source_revision=activated.source_revision,
                 )
             )
+            await self._refresh_runtime_fingerprints()
             result = await self.runtime_updates.check(refresh=False)
             result["activated"] = {
                 "engine": activated.engine,
@@ -1979,8 +3184,9 @@ class NativeRuntime:
                 )
             model = str(Path(install.destination) / install.filename)
             load = {}
-            if install.context_length is not None:
-                load["context_length"] = install.context_length
+            load["context_length"] = recommended_interactive_context_length(
+                install.context_length
+            )
             if install.projector_filename:
                 load["projector_path"] = str(
                     Path(install.destination) / install.projector_filename
@@ -1990,9 +3196,12 @@ class NativeRuntime:
                 engine=engine,
                 model=model,
                 storage=install.storage,
-                served_model_name=install.alias,
+                served_model_name=(
+                    install.family if engine == EngineName.DS4 else install.alias
+                ),
                 capabilities=requested_capabilities,
                 load=load,
+                context=ModelContextConfig(native_tokens=install.context_length),
             )
         elif engine == EngineName.MFLUX:
             from .model_library import image_profile_defaults, verified_model
@@ -2085,6 +3294,18 @@ class NativeRuntime:
                 model=Path(candidate.model_path).name,
                 storage=install.storage,
                 capabilities=detected_capabilities,
+                context=ModelContextConfig(
+                    native_tokens=candidate.context_length
+                ),
+            )
+        elif engine in {EngineName.MLXCEL, EngineName.MISTRAL_RS}:
+            profile = ModelProfile(
+                alias=install.alias,
+                engine=engine,
+                model=install.destination,
+                storage=install.storage,
+                capabilities=requested_capabilities,
+                context=ModelContextConfig(native_tokens=install.context_length),
             )
         else:
             raise RuntimeConfigurationError("unsupported native download engine")
@@ -2114,7 +3335,7 @@ class NativeRuntime:
             save_config(new_config, self.config_path)
             if not _restart_sensitive_configuration_changed(fresh, self.config):
                 self.config = new_config
-                self.profiles = new_config.profiles()
+                self._apply_profiles(new_config)
                 self.installer.storage = new_config.storage
                 applied = True
         if engine == EngineName.OMLX and applied:
@@ -2154,19 +3375,45 @@ class NativeRuntime:
         self._omlx_directory_sync_pending = False
 
     def model_list(self) -> list[dict]:
-        return [
-            {
-                "id": target.alias,
-                "object": "model",
-                "owned_by": "mnemosyne",
-                "engine": target.key.engine,
-                "upstream_model": target.key.canonical_model_id,
-                "capabilities": sorted(endpoint.value for endpoint in target.capabilities),
-                "model_kind": target.kind,
-                "load_config_digest": target.key.load_config_digest,
-            }
-            for target in self.profiles.values()
-        ]
+        rows: list[dict] = []
+        for primary in self.profiles.values():
+            selected, decision = self.benchmark_decision(primary.alias)
+            context = self.context_contract(selected)
+            rows.append(
+                {
+                    "id": primary.alias,
+                    "object": "model",
+                    "owned_by": "mnemosyne",
+                    "engine": selected.key.engine,
+                    "fallback_engine": primary.key.engine,
+                    "upstream_model": selected.key.canonical_model_id,
+                    # Alternatives optimize a subset of the established
+                    # profile contract; they never expand or remove it.
+                    "capabilities": sorted(
+                        endpoint.value for endpoint in primary.capabilities
+                    ),
+                    "model_kind": primary.kind,
+                    "load_config_digest": selected.key.load_config_digest,
+                    # OpenAI-compatible clients commonly recognize
+                    # max_model_len. The structured companion preserves how
+                    # that guaranteed value was obtained.
+                    "max_model_len": context["guaranteed_tokens"],
+                    "context_window": context,
+                    "selection": decision,
+                    "candidate_engines": [
+                        item.key.engine.value
+                        for item in self.profile_candidates.get(primary.alias, (primary,))
+                    ],
+                    "candidate_contexts": [
+                        {
+                            "engine": item.key.engine.value,
+                            **self.context_contract(item),
+                        }
+                        for item in self.profile_candidates.get(primary.alias, (primary,))
+                    ],
+                }
+            )
+        return rows
 
     async def reload_profiles(self) -> None:
         if self.config_path is None:
@@ -2185,7 +3432,7 @@ class NativeRuntime:
             if new_config.token_sidecar != self.config.token_sidecar:
                 raise RestartRequired("token sidecar settings changed; restart the LaunchAgent")
             self.config = new_config
-            self.profiles = new_config.profiles()
+            self._apply_profiles(new_config)
 
 
 __all__ = [

@@ -42,6 +42,7 @@ def boot(rich_config, stub_vllm):
         {l.name: l.path for l in vllm_manager._config.storage.locations},
     )
     vllm_manager._runtime = RuntimeState()
+    vllm_manager._coordinator = None
     vllm_manager._loading_target = None
     vllm_manager._load_event = None
     vllm_manager._load_error = None
@@ -227,28 +228,21 @@ def test_kill_vllm_resets_state_even_when_usage_flush_fails(rich_config, monkeyp
 
 
 @pytest.mark.asyncio
-async def test_new_request_during_eviction_lock_waits_then_loads(boot):
-    """Plan §5.6: new requests bumping inflight must observe the lock that
-    eviction holds during _kill_vllm. Verify by holding the swap lock,
-    starting a request task, releasing the lock, and asserting the task
-    completes a load against the now-empty resident state."""
+async def test_new_target_waits_for_active_resident_lease(boot):
+    """A queued target cannot unload the engine beneath an active request."""
     vllm_manager._config.server.idle_unload_seconds = 1
     await vllm_manager.ensure_loaded(_profile("a-model"), time.monotonic() + 5)
+    lease = await vllm_manager._acquire_profile_lease(
+        _profile("a-model"), time.monotonic() + 5
+    )
+    request_task = asyncio.create_task(
+        vllm_manager.ensure_loaded(_profile("b-model"), time.monotonic() + 5)
+    )
+    await asyncio.sleep(0.02)
+    assert not request_task.done()
+    assert vllm_manager._runtime.resident_alias == "a-model"
 
-    # Simulate: eviction holds the lock and kills.
-    await vllm_manager._swap_lock.acquire()
-    try:
-        # Start a request for b-model — it must wait on the lock.
-        request_task = asyncio.create_task(
-            vllm_manager.ensure_loaded(_profile("b-model"), time.monotonic() + 5)
-        )
-        await asyncio.sleep(0.02)
-        assert not request_task.done(), "request must wait while eviction holds the lock"
-        # Eviction work: kill the resident.
-        vllm_manager._kill_vllm()
-    finally:
-        vllm_manager._swap_lock.release()
-
+    await lease.release()
     await asyncio.wait_for(request_task, timeout=2.0)
     assert vllm_manager._runtime.resident_alias == "b-model"
 

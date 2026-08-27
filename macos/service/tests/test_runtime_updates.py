@@ -24,6 +24,7 @@ from mnemosyne_macos.runtime_updates import (
     RuntimeUpdateManager,
     _official_omlx_installer_url,
     _omlx_cli_candidates,
+    _omlx_installation_kind,
     _python_subprocess_environment,
     _safe_extract,
     resolve_active_runtime,
@@ -286,16 +287,59 @@ def _llama_release_payload(
     }
 
 
+def _llama_stable_release_payload(
+    nightly_version: str,
+    *,
+    stable_version: str = "v0.2.0",
+    digest: str | None = None,
+) -> tuple[dict, bytes]:
+    pointer = f"{nightly_version}\n".encode("ascii")
+    return (
+        {
+            "tag_name": stable_version,
+            "draft": False,
+            "prerelease": False,
+            "html_url": (
+                "https://github.com/ggml-org/llama.cpp/releases/tag/"
+                f"{stable_version}"
+            ),
+            "target_commitish": "main",
+            "assets": [
+                {
+                    "name": "nightly-tag.txt",
+                    "browser_download_url": (
+                        "https://github.com/ggml-org/llama.cpp/releases/download/"
+                        f"{stable_version}/nightly-tag.txt"
+                    ),
+                    "digest": (
+                        f"sha256:{digest}"
+                        if digest is not None
+                        else f"sha256:{hashlib.sha256(pointer).hexdigest()}"
+                    ),
+                    "size": len(pointer),
+                }
+            ],
+        },
+        pointer,
+    )
+
+
 def _official_handler(
     *,
     mflux_version: str = "0.19.0",
     ds4_revision: str = "a" * 40,
     llama_version: str = "b7777",
     llama_digest: str | None = None,
+    llama_stable_pointer: bool = False,
+    llama_pointer_digest: str | None = None,
 ) -> tuple[httpx.MockTransport, list[str]]:
     requests: list[str] = []
     archives = {ds4_revision: _ds4_source_archive(ds4_revision)}
     llama_archive = _llama_binary_archive(llama_version)
+    stable_payload, stable_pointer = _llama_stable_release_payload(
+        llama_version,
+        digest=llama_pointer_digest,
+    )
 
     def handler(request: httpx.Request) -> httpx.Response:
         url = str(request.url)
@@ -303,12 +347,26 @@ def _official_handler(
         if request.url.path.endswith("/ggml-org/llama.cpp/releases/latest"):
             return httpx.Response(
                 200,
-                json=_llama_release_payload(
-                    llama_archive,
-                    version=llama_version,
-                    digest=llama_digest,
+                json=(
+                    stable_payload
+                    if llama_stable_pointer
+                    else _llama_release_payload(
+                        llama_archive,
+                        version=llama_version,
+                        digest=llama_digest,
+                    )
                 ),
             )
+        if request.url.path.endswith(
+            f"/ggml-org/llama.cpp/releases/tags/{llama_version}"
+        ):
+            release = _llama_release_payload(
+                llama_archive,
+                version=llama_version,
+                digest=llama_digest,
+            )
+            release["prerelease"] = True
+            return httpx.Response(200, json=release)
         if request.url.path.endswith("/jundot/omlx/releases"):
             return httpx.Response(
                 200,
@@ -357,6 +415,11 @@ def _official_handler(
             return httpx.Response(200, content=body) if body else httpx.Response(404)
         if (
             request.url.host == "github.com"
+            and request.url.path.endswith("/v0.2.0/nightly-tag.txt")
+        ):
+            return httpx.Response(200, content=stable_pointer)
+        if (
+            request.url.host == "github.com"
             and request.url.path.endswith(
                 f"/llama-{llama_version}-bin-macos-arm64.tar.gz"
             )
@@ -365,6 +428,70 @@ def _official_handler(
         return httpx.Response(404)
 
     return httpx.MockTransport(handler), requests
+
+
+@pytest.mark.asyncio
+async def test_llama_cpp_update_follows_official_stable_pointer(
+    tmp_path: Path,
+) -> None:
+    transport, requests = _official_handler(
+        llama_version="b10566",
+        llama_stable_pointer=True,
+    )
+    client = httpx.AsyncClient(transport=transport)
+    manager = RuntimeUpdateManager(
+        llama_cpp=LlamaCppConfig(binary=str(tmp_path / "missing-llama-server")),
+        omlx=OMLXConfig(),
+        mflux=MFluxConfig(),
+        ds4=DS4Config(),
+        root=tmp_path / "runtimes",
+        client=client,
+    )
+    try:
+        snapshot = await manager.check()
+        status = next(
+            item for item in snapshot["engines"] if item["engine"] == "llama.cpp"
+        )
+        assert status["available_version"] == "b10566"
+        assert status["latest_upstream_url"].endswith("/releases/tag/v0.2.0")
+        assert status["update_available"] is True
+        assert status["can_install"] is True
+        assert any(url.endswith("/v0.2.0/nightly-tag.txt") for url in requests)
+        assert any(url.endswith("/releases/tags/b10566") for url in requests)
+    finally:
+        await manager.aclose()
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_llama_cpp_update_rejects_tampered_stable_pointer(
+    tmp_path: Path,
+) -> None:
+    transport, _requests = _official_handler(
+        llama_version="b10566",
+        llama_stable_pointer=True,
+        llama_pointer_digest="0" * 64,
+    )
+    client = httpx.AsyncClient(transport=transport)
+    manager = RuntimeUpdateManager(
+        llama_cpp=LlamaCppConfig(binary=str(tmp_path / "missing-llama-server")),
+        omlx=OMLXConfig(),
+        mflux=MFluxConfig(),
+        ds4=DS4Config(),
+        root=tmp_path / "runtimes",
+        client=client,
+    )
+    try:
+        snapshot = await manager.check()
+        status = next(
+            item for item in snapshot["engines"] if item["engine"] == "llama.cpp"
+        )
+        assert status["available_version"] is None
+        assert status["update_available"] is False
+        assert "stable pointer SHA-256" in status["diagnostic"]
+    finally:
+        await manager.aclose()
+        await client.aclose()
 
 
 @pytest.mark.asyncio
@@ -396,6 +523,17 @@ async def test_update_check_uses_only_official_upstreams(
         assert by_engine["omlx"]["release_tier"] == "stable"
         assert by_engine["mflux"]["release_tier"] == "preview"
         assert by_engine["ds4"]["release_tier"] == "preview"
+        assert by_engine["mlxcel"]["release_tier"] == "preview"
+        assert by_engine["mlxcel"]["ownership"] == "external"
+        assert by_engine["mlxcel"]["upgrade_strategy"] == "external_manual"
+        assert by_engine["mlxcel"]["official_installer_url"].startswith(
+            "https://github.com/lablup/mlxcel"
+        )
+        assert by_engine["mistral.rs"]["release_tier"] == "preview"
+        assert by_engine["mistral.rs"]["ownership"] == "external"
+        assert by_engine["mistral.rs"]["official_installer_url"].startswith(
+            "https://ericlbuehler.github.io/mistral.rs"
+        )
         assert by_engine["llama.cpp"]["available_version"] == "b7777"
         assert by_engine["llama.cpp"]["can_install"] is True
         assert "ggml-org/llama.cpp" in by_engine["llama.cpp"]["release_notes_url"]
@@ -438,9 +576,18 @@ async def test_installed_status_never_contacts_upstream(
     try:
         status = await manager.installed_status()
 
-        assert set(status) == {"llama.cpp", "omlx", "mflux", "ds4"}
+        assert set(status) == {
+            "llama.cpp",
+            "omlx",
+            "mflux",
+            "ds4",
+            "mlxcel",
+            "mistral.rs",
+        }
         assert status["llama.cpp"]["installed"] is False
         assert status["ds4"]["installed"] is False
+        assert status["mlxcel"]["installation_kind"] == "external_cli"
+        assert status["mistral.rs"]["installation_kind"] == "external_cli"
         # A bounded loopback oMLX probe is local runtime discovery, not an
         # upstream release query. Nothing may contact GitHub or PyPI.
         assert all(
@@ -492,6 +639,130 @@ def test_omlx_cli_candidates_include_packaged_and_homebrew_locations() -> None:
     assert Path.home() / ".omlx" / "bin" / "omlx" in candidates
     assert Path("/opt/homebrew/bin/omlx") in candidates
     assert Path("/usr/local/bin/omlx") in candidates
+
+
+def test_omlx_installation_ownership_distinguishes_stable_and_head(
+    tmp_path: Path,
+) -> None:
+    stable = tmp_path / "Cellar" / "omlx" / "0.5.7" / "bin" / "omlx"
+    head = tmp_path / "Cellar" / "omlx" / "HEAD-aed846f" / "bin" / "omlx"
+    stable.parent.mkdir(parents=True)
+    head.parent.mkdir(parents=True)
+    stable.touch()
+    head.touch()
+
+    assert _omlx_installation_kind(str(stable)) == "homebrew_stable"
+    assert _omlx_installation_kind(str(head)) == "homebrew_head"
+    assert _omlx_installation_kind("/Applications/oMLX.app") == "official_app"
+    assert (
+        _omlx_installation_kind("http://127.0.0.1:17322")
+        == "running_external"
+    )
+
+
+@pytest.mark.asyncio
+async def test_supervised_omlx_homebrew_upgrade_uses_fixed_owner_commands(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cli = tmp_path / "Cellar" / "omlx" / "0.5.6" / "bin" / "omlx"
+    brew = tmp_path / "homebrew" / "bin" / "brew"
+    cli.parent.mkdir(parents=True)
+    brew.parent.mkdir(parents=True)
+    cli.touch(mode=0o755)
+    brew.touch(mode=0o755)
+    commands: list[tuple[str, ...]] = []
+
+    async def installed_status() -> dict:
+        return {
+            "omlx": {
+                "installed": True,
+                "version": "0.5.6",
+                "revision": None,
+                "path": str(cli),
+                "installation_kind": "homebrew_stable",
+            }
+        }
+
+    async def run_checked(*argv: str, **_kwargs: object) -> str:
+        commands.append(argv)
+        return "ok"
+
+    async def installed_omlx() -> tuple[str, None, str]:
+        return "0.5.7", None, str(cli)
+
+    manager = RuntimeUpdateManager(
+        omlx=OMLXConfig(),
+        mflux=MFluxConfig(),
+        ds4=DS4Config(),
+        root=tmp_path / "runtimes",
+    )
+    manager._last_checked_at = 1
+    manager._upstream_omlx = ("0.5.7", "https://example.invalid", None)
+    monkeypatch.setattr(manager, "installed_status", installed_status)
+    monkeypatch.setattr(manager, "_installed_omlx", installed_omlx)
+    monkeypatch.setattr(runtime_updates, "_homebrew_executable", lambda: brew)
+    monkeypatch.setattr(runtime_updates, "_omlx_cli_candidates", lambda: (cli,))
+    monkeypatch.setattr(runtime_updates, "_run_checked", run_checked)
+    try:
+        version, path = await manager.upgrade_omlx_homebrew("0.5.7")
+        assert version == "0.5.7"
+        assert path == str(cli)
+        assert commands == [
+            (str(cli), "stop"),
+            (str(brew), "update"),
+            (str(brew), "upgrade", "omlx"),
+            (str(cli), "start"),
+        ]
+    finally:
+        await manager.aclose()
+
+
+@pytest.mark.asyncio
+async def test_supervised_omlx_upgrade_restarts_after_ambiguous_stop_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cli = tmp_path / "Cellar" / "omlx" / "0.5.6" / "bin" / "omlx"
+    brew = tmp_path / "homebrew" / "bin" / "brew"
+    cli.parent.mkdir(parents=True)
+    brew.parent.mkdir(parents=True)
+    cli.touch(mode=0o755)
+    brew.touch(mode=0o755)
+    commands: list[tuple[str, ...]] = []
+
+    async def installed_status() -> dict:
+        return {
+            "omlx": {
+                "path": str(cli),
+                "installation_kind": "homebrew_stable",
+            }
+        }
+
+    async def run_checked(*argv: str, **_kwargs: object) -> str:
+        commands.append(argv)
+        if argv[1] == "stop":
+            raise RuntimeUpdateError("command timed out: omlx stop")
+        return "ok"
+
+    manager = RuntimeUpdateManager(
+        omlx=OMLXConfig(),
+        mflux=MFluxConfig(),
+        ds4=DS4Config(),
+        root=tmp_path / "runtimes",
+    )
+    manager._last_checked_at = 1
+    manager._upstream_omlx = ("0.5.7", "https://example.invalid", None)
+    monkeypatch.setattr(manager, "installed_status", installed_status)
+    monkeypatch.setattr(runtime_updates, "_homebrew_executable", lambda: brew)
+    monkeypatch.setattr(runtime_updates, "_omlx_cli_candidates", lambda: (cli,))
+    monkeypatch.setattr(runtime_updates, "_run_checked", run_checked)
+    try:
+        with pytest.raises(RuntimeUpdateError, match="command timed out"):
+            await manager.upgrade_omlx_homebrew("0.5.7")
+        assert commands == [(str(cli), "stop"), (str(cli), "start")]
+    finally:
+        await manager.aclose()
 
 
 @pytest.mark.asyncio
