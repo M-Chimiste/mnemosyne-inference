@@ -1,6 +1,11 @@
 import pytest
 
-from scripts.fleet_acceptance import _require_drained_baseline, _usage_counts
+from scripts.fleet_acceptance import (
+    _parse_required_node_service_classes,
+    _require_drained_baseline,
+    _require_node_service_classes,
+    _usage_counts,
+)
 
 
 def test_usage_counts_aggregate_alias_rows_per_serving_node() -> None:
@@ -94,4 +99,39 @@ def test_acceptance_baseline_can_skip_usage_but_not_active_work() -> None:
             status,
             eligible_nodes={"metis", "cuda-box"},
             require_usage=False,
+        )
+
+
+def test_required_node_service_classes_are_exact_and_closed() -> None:
+    required = _parse_required_node_service_classes(
+        ["mac-primary=primary", "nyx-worker=overflow"]
+    )
+    status_nodes = {
+        "mac-primary": {"service_class": "primary"},
+        "nyx-worker": {"service_class": "overflow"},
+    }
+    _require_node_service_classes(status_nodes, required)
+
+    status_nodes["nyx-worker"]["service_class"] = "primary"
+    with pytest.raises(RuntimeError, match="nyx-worker"):
+        _require_node_service_classes(status_nodes, required)
+
+
+@pytest.mark.parametrize(
+    "value",
+    (
+        "nyx-worker",
+        "=overflow",
+        "nyx-worker=limited",
+    ),
+)
+def test_required_node_service_class_rejects_malformed_values(value: str) -> None:
+    with pytest.raises(ValueError, match="NODE=primary"):
+        _parse_required_node_service_classes([value])
+
+
+def test_required_node_service_class_rejects_conflicting_duplicates() -> None:
+    with pytest.raises(ValueError, match="consistent"):
+        _parse_required_node_service_classes(
+            ["nyx-worker=overflow", "nyx-worker=primary"]
         )

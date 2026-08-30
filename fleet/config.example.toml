@@ -12,12 +12,95 @@ route_history_limit = 10000
 poll_interval_seconds = 2
 snapshot_ttl_seconds = 10
 
+[pairing]
+# Pairing is disabled by default so existing static deployments behave exactly
+# as before and the pairing routes are not mounted. The current release exposes
+# the Hub-side API/integration foundation; the signed Mac app ceremony and
+# production multi-host acceptance are still pending. Enable this only for
+# controlled integration after Nyx is served at this verified HTTPS origin and
+# a distinct 32-byte base64url master key is present in the environment.
+enabled = false
+# public_origin = "https://nyx.example.internal"
+# master_key_env = "MNEMOSYNE_FLEET_PAIRING_MASTER_KEY"
+# Omitted paths default below database_path's private/ subdirectory. That
+# directory and both databases must be owned by the service user and private.
+# metadata_database_path = "/var/lib/mnemosyne-fleet/private/pairing-metadata.db"
+# secret_database_path = "/var/lib/mnemosyne-fleet/private/pairing-secrets.db"
+# Path-free Mac inventory is kept in its own secret-free database so it cannot
+# silently become inference routing state or share the encrypted secret store.
+# inventory_database_path = "/var/lib/mnemosyne-fleet/mac-inventory.db"
+# Inventory freshness is independent from snapshot liveness and must remain
+# within 15-300 seconds. Persisted rows stay visible but stale after restart.
+# inventory_ttl_seconds = 60
+# activation_timeout_seconds = 15
+# Hub-to-Mac pairing locators fail closed unless every resolved address is in
+# the allowlist for its declared transport. Keep these ranges specific to the
+# networks Nyx is allowed to reach; do not use them as node identities.
+# https_cidr_allowlist = ["192.168.50.0/24", "fd12:3456:789a::/48"]
+# tailscale_cidr_allowlist = ["100.64.0.0/10", "fd7a:115c:a1e0::/48"]
+# Plain LAN HTTP is an advanced compatibility mode and is not part of the
+# secure-default acceptance gate. Leave it empty unless explicitly required.
+# trusted_lan_http_cidr_allowlist = ["192.168.50.0/24"]
+# Every locator must state a port from this bounded list. Add 443 only when a
+# Mac endpoint actually terminates verified end-to-end TLS there.
+# allowed_node_ports = [1240]
+# dns_resolution_timeout_seconds = 5
+
+[catalog]
+# The signed Apple Silicon compatibility catalog is an optional management
+# side path. It is disabled by default and never changes Fleet model mappings,
+# node membership, scheduler state, or inference routing. When enabling it,
+# pin one or more production Ed25519 public keys locally; never configure a
+# signing/private key or the repository's golden-vector test key here.
+enabled = false
+# state_directory = "/var/lib/mnemosyne-fleet/private/compatibility-catalog"
+# update_origin = "https://catalog.example.internal"
+# update_path = "/v1/apple-silicon/catalog.json"
+# update_interval_seconds = 3600
+# total_timeout_seconds = 20
+# connect_timeout_seconds = 5
+# max_attempts = 2
+# retry_delay_seconds = 0
+#
+# [[catalog.trusted_keys]]
+# key_id = "mnemosyne-catalog-2026-a"
+# public_key = "<canonical-unpadded-base64url-Ed25519-public-key>"
+# valid_from = 0
+# valid_until = 4102444800
+# minimum_catalog_sequence = 1
+# maximum_catalog_sequence = 9007199254740991
+
+[placement]
+# Advisory placement and Hub-owned DesiredInstall delivery are independently
+# off by default. Enabling this switch requires both the signed catalog and
+# dynamic pairing. The administrator must explicitly submit one exact eligible
+# Mac/storage basis from a current recommendation; Nyx never chooses a target.
+# This enables only the Hub journal and outbound-sync wire. It does not execute
+# a job, download weights, install a runtime, select a local path, or delete.
+remote_installs_enabled = false
+recommendation_valid_seconds = 60
+# The desired-install journal is a distinct mode-0600 SQLite database below a
+# mode-0700 private directory. It must not share Fleet, pairing, inventory, or
+# catalog state. The defaults shown here apply only when the switch is true.
+# desired_install_database_path = "/var/lib/mnemosyne-fleet/private/desired-installs.db"
+# desired_install_valid_seconds = 900
+# maximum_active_desired_installs = 1000
+# desired_install_history_limit = 10000
+
+# Static stanzas may remain while pairing is enabled. They keep their existing
+# environment-backed credentials and default primary scheduling class; pairing
+# never rewrites them automatically. A dynamically paired Mac is absent from
+# this file, begins Hub-disabled, and enters routing only after activation plus
+# a separate authenticated admin enable.
+
 [[nodes]]
 node_id = "metis"
 url = "http://metis:1240"
-# Fleet snapshot and inference credentials are separate trust channels.
+# Static Fleet snapshot and inference credentials are separate trust channels.
 fleet_token_env = "MNEMOSYNE_METIS_FLEET_KEY"
 inference_token_env = "MNEMOSYNE_METIS_INFERENCE_KEY"
+# Hub-owned scheduling class. Omit for the backward-compatible "primary".
+service_class = "primary"
 # Optional. This may reduce, but cannot raise, the node's derived capacity.
 routing_weight = 2
 
@@ -26,6 +109,17 @@ node_id = "cuda-box"
 url = "http://cuda-box:8000"
 fleet_token_env = "MNEMOSYNE_CUDA_FLEET_KEY"
 inference_token_env = "MNEMOSYNE_CUDA_INFERENCE_KEY"
+
+# A limited inference worker colocated on Nyx must be an independently
+# isolated node service, not part of the Fleet gateway process. Copy and
+# uncomment the complete stanza below after assigning its own ports, state,
+# model storage, and credentials:
+# [[nodes]]
+# node_id = "nyx-worker"
+# url = "http://127.0.0.1:18000"
+# fleet_token_env = "MNEMOSYNE_NYX_WORKER_FLEET_KEY"
+# inference_token_env = "MNEMOSYNE_NYX_WORKER_INFERENCE_KEY"
+# service_class = "overflow"
 
 [[models]]
 name = "qwen-coder"
@@ -38,4 +132,3 @@ queue_timeout_seconds = 120
 [ledger]
 # Optional read-only Postgres role for dashboard aggregates.
 dsn_env = "MNEMOSYNE_FLEET_LEDGER_DSN"
-

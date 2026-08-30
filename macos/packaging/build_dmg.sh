@@ -11,6 +11,21 @@ VOLUME_NAME="Unified Inference"
 CODESIGN_IDENTITY="${CODESIGN_IDENTITY:-}"
 NOTARYTOOL_PROFILE="${NOTARYTOOL_PROFILE:-}"
 NOTARYTOOL_NO_S3_ACCELERATION="${NOTARYTOOL_NO_S3_ACCELERATION:-0}"
+PACKAGING_PYTHON="$(command -v python3)"
+PACKAGING_UV="$(command -v uv)"
+PACKAGING_TOOL_PATH="$(dirname "$PACKAGING_PYTHON"):$(dirname "$PACKAGING_UV"):/usr/bin:/bin:/usr/sbin:/sbin"
+
+run_isolated_verify_release() {
+    /usr/bin/env -i \
+        "LC_ALL=C" \
+        "PATH=$PACKAGING_TOOL_PATH" \
+        "TMPDIR=/private/tmp" \
+        "PYTHONDONTWRITEBYTECODE=1" \
+        "PYTHONNOUSERSITE=1" \
+        "PYTHONPATH=$SCRIPT_DIR" \
+        "$PACKAGING_PYTHON" -B -s \
+        "$SCRIPT_DIR/verify_release.py" "$@"
+}
 
 usage() {
     cat <<'EOF'
@@ -108,6 +123,7 @@ if [[ "$OUTPUT_NAME" != *.dmg ]]; then
 fi
 
 codesign --verify --deep --strict --verbose=2 "$APP_PATH"
+run_isolated_verify_release --app "$APP_PATH"
 if [[ -n "$NOTARYTOOL_PROFILE" ]]; then
     if [[ -z "$CODESIGN_IDENTITY" || "$CODESIGN_IDENTITY" == "-" ]]; then
         echo "Notarization requires a Developer ID CODESIGN_IDENTITY." >&2
@@ -190,9 +206,14 @@ fi
 
 ditto "$APP_PATH" "$SOURCE_DIR/Unified Inference.app"
 ln -s /Applications "$SOURCE_DIR/Applications"
+install -m 755 \
+    "$SCRIPT_DIR/pilot_install_or_upgrade.command" \
+    "$SOURCE_DIR/Install or Upgrade Unified Inference.command"
+install -m 755 \
+    "$SCRIPT_DIR/pilot_uninstall_preserving_data.command" \
+    "$SOURCE_DIR/Uninstall Unified Inference (Preserve Data).command"
 
 hdiutil create \
-    -quiet \
     -fs HFS+ \
     -format UDZO \
     -imagekey zlib-level=9 \
@@ -241,7 +262,16 @@ if [[ "$(readlink "$MOUNT_DIR/Applications")" != "/Applications" ]]; then
     echo "Verification failed: mounted DMG has no Applications shortcut" >&2
     exit 1
 fi
+MOUNTED_UPGRADE="$MOUNT_DIR/Install or Upgrade Unified Inference.command"
+MOUNTED_UNINSTALL="$MOUNT_DIR/Uninstall Unified Inference (Preserve Data).command"
+if [[ ! -x "$MOUNTED_UPGRADE" || ! -x "$MOUNTED_UNINSTALL" ]]; then
+    echo "Verification failed: mounted DMG is missing its executable lifecycle assistants" >&2
+    exit 1
+fi
+/bin/bash -n "$MOUNTED_UPGRADE"
+/bin/bash -n "$MOUNTED_UNINSTALL"
 codesign --verify --deep --strict --verbose=2 "$MOUNTED_APP"
+run_isolated_verify_release --app "$MOUNTED_APP"
 if [[ -n "$NOTARYTOOL_PROFILE" ]]; then
     xcrun stapler validate "$MOUNTED_APP"
     spctl \
@@ -270,7 +300,7 @@ python3 "$SCRIPT_DIR/collect_acceptance.py" "${ACCEPTANCE_ARGS[@]}"
 
 echo "Built $OUTPUT_PATH"
 echo "Acceptance evidence: $ACCEPTANCE_REPORT"
-echo "Volume contents verified: Unified Inference.app and Applications shortcut"
+echo "Volume contents verified: app, Applications shortcut, and lifecycle assistants"
 if [[ -n "$NOTARYTOOL_PROFILE" ]]; then
     echo "DMG notarized and stapled with profile: $NOTARYTOOL_PROFILE"
 elif [[ -n "$CODESIGN_IDENTITY" && "$CODESIGN_IDENTITY" != "-" ]]; then

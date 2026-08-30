@@ -15,12 +15,17 @@ class RouteRecord:
     public_model: str
     deployment_id: str
     node_id: str
+    enrollment_id: str
     instance_id: str
     endpoint: str
     queue_ms: float
     response_ms: float | None
     status_code: int | None
     failure_code: str | None
+
+    @property
+    def reporting_node_id(self) -> str:
+        return self.node_id
 
 
 class FleetStore:
@@ -73,6 +78,7 @@ class FleetStore:
                     public_model TEXT NOT NULL,
                     deployment_id TEXT NOT NULL,
                     node_id TEXT NOT NULL,
+                    enrollment_id TEXT NOT NULL,
                     instance_id TEXT NOT NULL,
                     endpoint TEXT NOT NULL,
                     queue_ms REAL NOT NULL,
@@ -84,6 +90,28 @@ class FleetStore:
                     ON routes(started_at DESC);
                 CREATE INDEX IF NOT EXISTS routes_node_idx
                     ON routes(node_id, started_at DESC);
+                """
+            )
+            route_columns = {
+                str(row[1])
+                for row in conn.execute("PRAGMA table_info(routes)").fetchall()
+            }
+            if "enrollment_id" not in route_columns:
+                # Pre-pairing route history used the reporting node ID as its
+                # membership authority. Static enrollment preserves exactly
+                # that identity, so it is the only safe migration value.
+                conn.execute("ALTER TABLE routes ADD COLUMN enrollment_id TEXT")
+            conn.execute(
+                """
+                UPDATE routes
+                   SET enrollment_id=node_id
+                 WHERE enrollment_id IS NULL OR enrollment_id=''
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS routes_enrollment_idx
+                    ON routes(enrollment_id, started_at DESC)
                 """
             )
             now = time.time()
@@ -135,9 +163,10 @@ class FleetStore:
                 """
                 INSERT INTO routes(
                     route_id, started_at, completed_at, public_model,
-                    deployment_id, node_id, instance_id, endpoint, queue_ms,
+                    deployment_id, node_id, enrollment_id, instance_id,
+                    endpoint, queue_ms,
                     response_ms, status_code, failure_code
-                ) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL)
+                ) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL)
                 """,
                 (
                     record.route_id,
@@ -145,6 +174,7 @@ class FleetStore:
                     record.public_model,
                     record.deployment_id,
                     record.node_id,
+                    record.enrollment_id,
                     record.instance_id,
                     record.endpoint,
                     record.queue_ms,
@@ -209,7 +239,9 @@ class FleetStore:
             rows = conn.execute(
                 """
                 SELECT route_id, started_at, completed_at, public_model,
-                       deployment_id, node_id, endpoint, queue_ms, response_ms,
+                       deployment_id, node_id,
+                       node_id AS reporting_node_id, enrollment_id, endpoint,
+                       queue_ms, response_ms,
                        status_code, failure_code
                 FROM routes
                 ORDER BY started_at DESC

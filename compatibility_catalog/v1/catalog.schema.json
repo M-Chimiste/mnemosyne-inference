@@ -1,0 +1,883 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mnemosyne.local/schemas/compatibility-catalog/v1/catalog.schema.json",
+  "title": "Mnemosyne signed Apple Silicon compatibility catalog v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "catalog_digest",
+    "catalog",
+    "signatures"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "catalog_digest": {
+      "$ref": "#/$defs/sha256"
+    },
+    "catalog": {
+      "$ref": "#/$defs/catalog"
+    },
+    "signatures": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 8,
+      "items": {
+        "$ref": "#/$defs/signature"
+      }
+    }
+  },
+  "$defs": {
+    "safe_identifier": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:+-]{0,127}$"
+    },
+    "bounded_label": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 160,
+      "pattern": "^[^/\\\\\\u0000-\\u001f]{1,160}$"
+    },
+    "sha256": {
+      "type": "string",
+      "minLength": 71,
+      "maxLength": 71,
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "timestamp": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 4102444800
+    },
+    "sequence": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9007199254740991
+    },
+    "bytes": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 1125899906842624
+    },
+    "positive_bytes": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 1125899906842624
+    },
+    "version": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[0-9A-Za-z][0-9A-Za-z._+-]{0,63}$"
+    },
+    "commit": {
+      "type": "string",
+      "minLength": 40,
+      "maxLength": 64,
+      "pattern": "^[0-9a-f]{40,64}$"
+    },
+    "repository_id": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 200,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,98}/[A-Za-z0-9][A-Za-z0-9._-]{0,98}$"
+    },
+    "relative_file": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*//)(?!.*\\\\)[A-Za-z0-9._+@=-]+(?:/[A-Za-z0-9._+@=-]+)*$"
+    },
+    "capability": {
+      "enum": [
+        "chat/completions",
+        "completions",
+        "embeddings",
+        "messages",
+        "rerank",
+        "responses"
+      ]
+    },
+    "capabilities": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 6,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/capability"
+      }
+    },
+    "engine": {
+      "enum": [
+        "ds4",
+        "llama.cpp",
+        "omlx"
+      ]
+    },
+    "signature": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "key_id",
+        "algorithm",
+        "signature"
+      ],
+      "properties": {
+        "key_id": {
+          "$ref": "#/$defs/safe_identifier"
+        },
+        "algorithm": {
+          "const": "Ed25519"
+        },
+        "signature": {
+          "type": "string",
+          "minLength": 86,
+          "maxLength": 86,
+          "pattern": "^[A-Za-z0-9_-]{86}$"
+        }
+      }
+    },
+    "catalog": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "catalog_id",
+        "catalog_version",
+        "catalog_sequence",
+        "issued_at",
+        "expires_at",
+        "publisher",
+        "build_revision",
+        "logical_models",
+        "artifacts",
+        "recipes"
+      ],
+      "properties": {
+        "catalog_id": {
+          "$ref": "#/$defs/safe_identifier"
+        },
+        "catalog_version": {
+          "$ref": "#/$defs/version"
+        },
+        "catalog_sequence": {
+          "$ref": "#/$defs/sequence"
+        },
+        "issued_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "expires_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "publisher": {
+          "$ref": "#/$defs/safe_identifier"
+        },
+        "build_revision": {
+          "$ref": "#/$defs/commit"
+        },
+        "logical_models": {
+          "type": "array",
+          "maxItems": 10000,
+          "items": {
+            "$ref": "#/$defs/logical_model"
+          }
+        },
+        "artifacts": {
+          "type": "array",
+          "maxItems": 50000,
+          "items": {
+            "$ref": "#/$defs/artifact"
+          }
+        },
+        "recipes": {
+          "type": "array",
+          "maxItems": 100000,
+          "items": {
+            "$ref": "#/$defs/recipe"
+          }
+        }
+      }
+    },
+    "logical_model": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "logical_model_id",
+        "display_name",
+        "family",
+        "kind",
+        "capabilities",
+        "declared_max_context_tokens"
+      ],
+      "properties": {
+        "logical_model_id": {
+          "$ref": "#/$defs/safe_identifier"
+        },
+        "display_name": {
+          "$ref": "#/$defs/bounded_label"
+        },
+        "family": {
+          "$ref": "#/$defs/safe_identifier"
+        },
+        "kind": {
+          "enum": [
+            "generation",
+            "embedding",
+            "rerank"
+          ]
+        },
+        "capabilities": {
+          "$ref": "#/$defs/capabilities"
+        },
+        "declared_max_context_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1,
+          "maximum": 100000000
+        }
+      }
+    },
+    "artifact_file": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "size_bytes",
+        "sha256"
+      ],
+      "properties": {
+        "path": {
+          "$ref": "#/$defs/relative_file"
+        },
+        "size_bytes": {
+          "$ref": "#/$defs/positive_bytes"
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "gguf_layout": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "primary_file",
+        "required_shards",
+        "selected_projector_file"
+      ],
+      "properties": {
+        "kind": {
+          "const": "gguf-file-set"
+        },
+        "primary_file": {
+          "$ref": "#/$defs/relative_file"
+        },
+        "required_shards": {
+          "type": "array",
+          "maxItems": 4095,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/relative_file"
+          }
+        },
+        "selected_projector_file": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/relative_file"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "huggingface_source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "transport",
+        "registry",
+        "repository_id",
+        "revision"
+      ],
+      "properties": {
+        "kind": {
+          "const": "huggingface"
+        },
+        "transport": {
+          "const": "https"
+        },
+        "registry": {
+          "const": "huggingface.co"
+        },
+        "repository_id": {
+          "$ref": "#/$defs/repository_id"
+        },
+        "revision": {
+          "$ref": "#/$defs/commit"
+        }
+      }
+    },
+    "github_source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "transport",
+        "registry",
+        "repository_id",
+        "revision",
+        "release_id"
+      ],
+      "properties": {
+        "kind": {
+          "const": "github_release"
+        },
+        "transport": {
+          "const": "https"
+        },
+        "registry": {
+          "const": "github.com"
+        },
+        "repository_id": {
+          "$ref": "#/$defs/repository_id"
+        },
+        "revision": {
+          "$ref": "#/$defs/commit"
+        },
+        "release_id": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        }
+      }
+    },
+    "pypi_source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "transport",
+        "registry",
+        "project",
+        "version"
+      ],
+      "properties": {
+        "kind": {
+          "const": "pypi"
+        },
+        "transport": {
+          "const": "https"
+        },
+        "registry": {
+          "const": "pypi.org"
+        },
+        "project": {
+          "$ref": "#/$defs/safe_identifier"
+        },
+        "version": {
+          "$ref": "#/$defs/version"
+        }
+      }
+    },
+    "source": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/huggingface_source"
+        },
+        {
+          "$ref": "#/$defs/github_source"
+        },
+        {
+          "$ref": "#/$defs/pypi_source"
+        }
+      ]
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "artifact_id",
+        "logical_model_id",
+        "format",
+        "quantization",
+        "source",
+        "files",
+        "manifest_digest",
+        "total_size_bytes"
+      ],
+      "properties": {
+        "artifact_id": {
+          "$ref": "#/$defs/safe_identifier"
+        },
+        "logical_model_id": {
+          "$ref": "#/$defs/safe_identifier"
+        },
+        "format": {
+          "enum": [
+            "ds4-weights",
+            "gguf",
+            "mlx"
+          ]
+        },
+        "quantization": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$"
+        },
+        "source": {
+          "$ref": "#/$defs/source"
+        },
+        "files": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 4096,
+          "items": {
+            "$ref": "#/$defs/artifact_file"
+          }
+        },
+        "gguf_layout": {
+          "$ref": "#/$defs/gguf_layout"
+        },
+        "manifest_digest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "total_size_bytes": {
+          "$ref": "#/$defs/positive_bytes"
+        }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "evidence_class",
+        "evidence_id",
+        "evidence_digest",
+        "observed_at",
+        "expires_at"
+      ],
+      "properties": {
+        "evidence_class": {
+          "enum": [
+            "calculated",
+            "catalog_tested",
+            "conservative",
+            "upstream_documented"
+          ]
+        },
+        "evidence_id": {
+          "$ref": "#/$defs/safe_identifier"
+        },
+        "evidence_digest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "observed_at": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 4102444800
+        },
+        "expires_at": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 4102444800
+        }
+      }
+    },
+    "context_contract": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "guaranteed_tokens",
+        "native_max_tokens",
+        "evidence"
+      ],
+      "properties": {
+        "guaranteed_tokens": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100000000
+        },
+        "native_max_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1,
+          "maximum": 100000000
+        },
+        "evidence": {
+          "$ref": "#/$defs/evidence"
+        }
+      }
+    },
+    "memory_contract": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "weights_bytes",
+        "runtime_overhead_bytes",
+        "activation_overhead_bytes",
+        "kv_bytes_per_token_per_slot",
+        "safety_headroom_bytes",
+        "max_recommended_concurrency",
+        "estimate_class",
+        "evidence"
+      ],
+      "properties": {
+        "weights_bytes": {
+          "$ref": "#/$defs/positive_bytes"
+        },
+        "runtime_overhead_bytes": {
+          "$ref": "#/$defs/bytes"
+        },
+        "activation_overhead_bytes": {
+          "$ref": "#/$defs/bytes"
+        },
+        "kv_bytes_per_token_per_slot": {
+          "$ref": "#/$defs/bytes"
+        },
+        "safety_headroom_bytes": {
+          "$ref": "#/$defs/positive_bytes"
+        },
+        "max_recommended_concurrency": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1024
+        },
+        "estimate_class": {
+          "enum": [
+            "calculated",
+            "catalog_tested",
+            "conservative"
+          ]
+        },
+        "evidence": {
+          "$ref": "#/$defs/evidence"
+        }
+      }
+    },
+    "hardware_constraints": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "architecture",
+        "soc_families",
+        "minimum_gpu_cores",
+        "minimum_unified_memory_bytes",
+        "minimum_macos",
+        "maximum_macos_exclusive",
+        "required_features"
+      ],
+      "properties": {
+        "architecture": {
+          "const": "arm64"
+        },
+        "soc_families": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 128,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 8,
+            "maxLength": 64,
+            "pattern": "^apple-m[1-9][0-9]?(?:-(?:pro|max|ultra))?$"
+          }
+        },
+        "minimum_gpu_cores": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1,
+          "maximum": 10000
+        },
+        "minimum_unified_memory_bytes": {
+          "$ref": "#/$defs/positive_bytes"
+        },
+        "minimum_macos": {
+          "$ref": "#/$defs/os_version"
+        },
+        "maximum_macos_exclusive": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/os_version"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "required_features": {
+          "type": "array",
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/safe_identifier"
+          }
+        }
+      }
+    },
+    "os_version": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "major",
+        "minor"
+      ],
+      "properties": {
+        "major": {
+          "type": "integer",
+          "minimum": 11,
+          "maximum": 99
+        },
+        "minor": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 99
+        }
+      }
+    },
+    "runtime_constraints": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "engine",
+        "release_tier",
+        "minimum_version",
+        "maximum_version_exclusive",
+        "known_bad_versions",
+        "allowed_runtime_fingerprints",
+        "known_bad_runtime_fingerprints",
+        "required_features"
+      ],
+      "properties": {
+        "engine": {
+          "$ref": "#/$defs/engine"
+        },
+        "release_tier": {
+          "enum": [
+            "preview",
+            "stable"
+          ]
+        },
+        "minimum_version": {
+          "$ref": "#/$defs/version"
+        },
+        "maximum_version_exclusive": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/version"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "known_bad_versions": {
+          "type": "array",
+          "maxItems": 256,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/version"
+          }
+        },
+        "allowed_runtime_fingerprints": {
+          "type": "array",
+          "maxItems": 256,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/sha256"
+          }
+        },
+        "known_bad_runtime_fingerprints": {
+          "type": "array",
+          "maxItems": 256,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/sha256"
+          }
+        },
+        "required_features": {
+          "type": "array",
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/safe_identifier"
+          }
+        }
+      }
+    },
+    "llamacpp_launch": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "engine",
+        "parallel_slots",
+        "gpu_offload",
+        "flash_attention"
+      ],
+      "properties": {
+        "engine": {
+          "const": "llama.cpp"
+        },
+        "parallel_slots": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1024
+        },
+        "gpu_offload": {
+          "enum": [
+            "all",
+            "automatic"
+          ]
+        },
+        "flash_attention": {
+          "enum": [
+            "automatic",
+            "disabled",
+            "enabled"
+          ]
+        }
+      }
+    },
+    "omlx_launch": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "engine",
+        "scheduler_slots",
+        "memory_guard"
+      ],
+      "properties": {
+        "engine": {
+          "const": "omlx"
+        },
+        "scheduler_slots": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1024
+        },
+        "memory_guard": {
+          "enum": [
+            "optional",
+            "required"
+          ]
+        }
+      }
+    },
+    "ds4_launch": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "engine",
+        "batched_sessions",
+        "execution_mode"
+      ],
+      "properties": {
+        "engine": {
+          "const": "ds4"
+        },
+        "batched_sessions": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1024
+        },
+        "execution_mode": {
+          "const": "single-node"
+        }
+      }
+    },
+    "launch_contract": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/llamacpp_launch"
+        },
+        {
+          "$ref": "#/$defs/omlx_launch"
+        },
+        {
+          "$ref": "#/$defs/ds4_launch"
+        }
+      ]
+    },
+    "recipe": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "recipe_id",
+        "logical_model_id",
+        "artifact_id",
+        "engine",
+        "capabilities",
+        "compatibility_tier",
+        "context",
+        "memory",
+        "hardware",
+        "runtime",
+        "launch",
+        "evidence"
+      ],
+      "properties": {
+        "recipe_id": {
+          "$ref": "#/$defs/safe_identifier"
+        },
+        "logical_model_id": {
+          "$ref": "#/$defs/safe_identifier"
+        },
+        "artifact_id": {
+          "$ref": "#/$defs/safe_identifier"
+        },
+        "engine": {
+          "$ref": "#/$defs/engine"
+        },
+        "capabilities": {
+          "$ref": "#/$defs/capabilities"
+        },
+        "compatibility_tier": {
+          "enum": [
+            "experimental",
+            "verified"
+          ]
+        },
+        "context": {
+          "$ref": "#/$defs/context_contract"
+        },
+        "memory": {
+          "$ref": "#/$defs/memory_contract"
+        },
+        "hardware": {
+          "$ref": "#/$defs/hardware_constraints"
+        },
+        "runtime": {
+          "$ref": "#/$defs/runtime_constraints"
+        },
+        "launch": {
+          "$ref": "#/$defs/launch_contract"
+        },
+        "evidence": {
+          "$ref": "#/$defs/evidence"
+        }
+      }
+    }
+  }
+}

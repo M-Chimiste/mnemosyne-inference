@@ -33,6 +33,53 @@ SUPPORTED_ENDPOINTS = {
     "/v1/rerank",
     "/v1/images/generations",
 }
+SERVICE_CLASSES = frozenset({"primary", "opportunistic", "overflow"})
+
+
+def _parse_required_node_service_classes(
+    values: list[str],
+) -> dict[str, str]:
+    """Parse repeatable NODE=CLASS assertions without guessing identities."""
+
+    required: dict[str, str] = {}
+    for value in values:
+        node_id, separator, service_class = value.partition("=")
+        node_id = node_id.strip()
+        service_class = service_class.strip()
+        if (
+            separator != "="
+            or not node_id
+            or service_class not in SERVICE_CLASSES
+            or (node_id in required and required[node_id] != service_class)
+        ):
+            raise ValueError(
+                "--require-node-service-class must be a consistent "
+                "NODE=primary|opportunistic|overflow assertion"
+            )
+        required[node_id] = service_class
+    return required
+
+
+def _require_node_service_classes(
+    status_nodes: Mapping[str, Mapping[str, Any]],
+    required: Mapping[str, str],
+) -> None:
+    problems: list[str] = []
+    for node_id, expected in sorted(required.items()):
+        node = status_nodes.get(node_id)
+        if node is None:
+            problems.append(f"{node_id}: status is unavailable")
+            continue
+        actual = node.get("service_class")
+        if actual != expected:
+            problems.append(
+                f"{node_id}: expected {expected!r}, observed {actual!r}"
+            )
+    if problems:
+        raise RuntimeError(
+            "required node service classes do not match: "
+            + "; ".join(problems)
+        )
 
 
 def _secret(name: str) -> str:
@@ -187,6 +234,9 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
     admin_key = _secret(args.admin_key_env)
     if client_key == admin_key:
         raise ValueError("client and admin credentials must be different")
+    required_node_service_classes = _parse_required_node_service_classes(
+        args.require_node_service_class
+    )
 
     endpoint = args.endpoint
     if endpoint not in SUPPORTED_ENDPOINTS:
@@ -254,7 +304,9 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
                 f"only {len(eligible_nodes)} eligible nodes; "
                 f"{args.min_eligible_nodes} required"
             )
-        required_nodes = set(args.require_node)
+        required_nodes = set(args.require_node) | set(
+            required_node_service_classes
+        )
         missing = required_nodes - eligible_nodes
         if missing:
             raise RuntimeError(
@@ -265,6 +317,10 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
             for node in before_status.get("nodes", [])
             if isinstance(node, dict) and node.get("node_id") is not None
         }
+        _require_node_service_classes(
+            status_nodes,
+            required_node_service_classes,
+        )
         eligible_platforms = {
             str(status_nodes[node_id]["platform"])
             for node_id in eligible_nodes
@@ -329,8 +385,10 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
 
         deadline = time.monotonic() + args.metadata_timeout
         new_routes: list[dict[str, Any]] = []
+        final_status = before_status
         while time.monotonic() < deadline:
             status = await _admin_json(client, "/fleet/api/status", admin_key)
+            final_status = status
             new_routes = [
                 row
                 for row in status.get("routes", [])
@@ -360,6 +418,16 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
                 "window inconclusive"
             )
 
+        final_status_nodes = {
+            str(node["node_id"]): node
+            for node in final_status.get("nodes", [])
+            if isinstance(node, dict) and node.get("node_id") is not None
+        }
+        _require_node_service_classes(
+            final_status_nodes,
+            required_node_service_classes,
+        )
+
         routed_nodes = {str(row["node_id"]) for row in new_routes}
         if len(routed_nodes) < args.min_routed_nodes:
             raise RuntimeError(
@@ -373,11 +441,11 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
                 f"{sorted(unrouted_required_nodes)}"
             )
         routed_platforms = {
-            str(status_nodes[node_id]["platform"])
+            str(final_status_nodes[node_id]["platform"])
             for node_id in routed_nodes
             if (
-                node_id in status_nodes
-                and status_nodes[node_id].get("platform") is not None
+                node_id in final_status_nodes
+                and final_status_nodes[node_id].get("platform") is not None
             )
         }
         unrouted_required_platforms = required_platforms - routed_platforms
@@ -435,6 +503,19 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
         "eligible_platforms": sorted(eligible_platforms),
         "routed_nodes": sorted(routed_nodes),
         "routed_platforms": sorted(routed_platforms),
+        "routed_service_classes": sorted(
+            {
+                str(final_status_nodes[node_id]["service_class"])
+                for node_id in routed_nodes
+                if (
+                    node_id in final_status_nodes
+                    and final_status_nodes[node_id].get("service_class") is not None
+                )
+            }
+        ),
+        "required_node_service_classes": dict(
+            sorted(required_node_service_classes.items())
+        ),
         "http_statuses": statuses,
         "usage_increment": usage_increment,
     }
@@ -456,6 +537,16 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-eligible-nodes", type=int, default=2)
     parser.add_argument("--min-routed-nodes", type=int, default=2)
     parser.add_argument("--require-node", action="append", default=[])
+    parser.add_argument(
+        "--require-node-service-class",
+        action="append",
+        default=[],
+        metavar="NODE=CLASS",
+        help=(
+            "require this exact eligible and routed node to retain its "
+            "primary, opportunistic, or overflow service class"
+        ),
+    )
     parser.add_argument(
         "--require-platform",
         action="append",

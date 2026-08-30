@@ -44,6 +44,9 @@ final class MenuAppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApplication.shared.setActivationPolicy(.accessory)
+        let guidedSetupCompleted = UserDefaults.standard.bool(
+            forKey: GuidedSetupEvidenceStore.completionKey
+        )
         if Bundle.main.object(forInfoDictionaryKey: "SUPublicEDKey") != nil {
             updaterController = SPUStandardUpdaterController(
                 startingUpdater: true,
@@ -53,6 +56,9 @@ final class MenuAppDelegate: NSObject, NSApplicationDelegate {
         }
         Task {
             await registration.refreshChangedBundleRegistrationsIfNeeded()
+            await registration.applyStartupAtLoginDefaultsIfNeeded(
+                guidedSetupCompleted: guidedSetupCompleted
+            )
         }
 
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)

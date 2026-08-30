@@ -9,15 +9,17 @@ http://127.0.0.1:1240/v1
 ```
 
 Docker and LM Studio are not required. oMLX is installed separately through
-its official app or Homebrew. The optional Preview mlxcel and mistral.rs
-binaries also use their official external installers. llama.cpp, DS4, and
-MFLUX are installed or updated from Unified Inference.
+its official app or Homebrew. llama.cpp, DS4, and MFLUX are installed or
+updated from Unified Inference.
 
 The current 0.9 line is a release candidate. Use the private DMG for local
 testing, but do not treat it as the V1 distribution until the
 [acceptance ledger](acceptance/v1.json) is clear and a Developer ID-notarized
 artifact is published. The exact Stable/Preview contract is in
 [V1_SCOPE.md](V1_SCOPE.md).
+
+The current pilot boundary, candidate checksum, existing-pilot upgrade,
+recoverable uninstall, and required evidence are in [PILOT.md](PILOT.md).
 
 ## What gets installed
 
@@ -27,8 +29,6 @@ artifact is published. The exact Stable/Preview contract is in
 | oMLX | Stable | MLX generation, embedding, and rerank models | Official oMLX app (recommended) | `17322` |
 | DS4 | Preview | Supported DeepSeek V4 and GLM 5.2 layouts | **Settings → Runtime Updates** | `17323` |
 | MFLUX | Preview | Apple Silicon image generation | Bundled; updates in **Runtime Updates** | `17324` |
-| mlxcel | Preview | MLX language and vision-language models | Official Homebrew tap | `17326` |
-| mistral.rs | Preview | Safetensors language and multimodal models | Official installer | `17327` |
 
 Clients never call those private ports. Unified Inference owns model selection,
 global residency, proxying, and language-token accounting on port `1240`.
@@ -38,19 +38,16 @@ global residency, proxying, and language-token accounting on port `1240`.
 You need:
 
 - An Apple Silicon Mac running macOS 15 or newer.
-- Apple Command Line Tools for DS4. The recommended official oMLX app includes
-  its custom Metal kernels and does not require a local kernel build.
-- Optional: [Homebrew](https://brew.sh/) for a headless oMLX installation or
-  the Preview mlxcel runtime.
+- Apple Command Line Tools for DS4. When they are missing, the selected-model
+  runtime card opens Apple's fixed system installer after explicit approval;
+  no Terminal command is required. The app continues to show the prerequisite
+  as unverified until later fixed toolchain/compiler probes prove installation
+  completed. The
+  recommended official oMLX app includes its custom Metal kernels and does not
+  require a local kernel build.
+- Optional: [Homebrew](https://brew.sh/) for a headless oMLX installation.
   Full Xcode is needed only for the advanced Homebrew HEAD custom-kernel build.
 - Enough internal or external storage for model weights.
-
-Install DS4's command-line build prerequisite with:
-
-```bash
-xcode-select --install
-xcode-select --print-path
-```
 
 ## 2. Install Unified Inference
 
@@ -65,12 +62,38 @@ The same signed arm64 disk image can be copied to every Apple Silicon Mac; it
 does not need to be rebuilt on Metis, Athena, or another workstation. Engine
 runtimes and model folders are prepared separately on each machine.
 
+For an existing 0.9 pilot, quit the menu app and run **Install or Upgrade
+Unified Inference.command** from the mounted disk image instead of merging app
+bundle directories. The assistant stages and verifies the complete candidate,
+moves the prior app to Trash for rollback, installs at the canonical path,
+then launches the new app so its exact Service Management registrations are
+refreshed. It never writes below `~/Library/Application Support/Mnemosyne` and
+proves the existing private `.env` has the same SHA-256 before and after. The
+configuration, selected storage paths, weights, local token ledger/outbox,
+node identity, and reporting DSN therefore survive the upgrade.
+
+On a fresh installation, the first app launch requests both native Service
+Management registrations: the inference LaunchAgent starts at login with
+`RunAtLoad`/`KeepAlive`, and the menu controller opens at login. macOS may
+require approval in **System Settings → General → Login Items & Extensions**.
+This default is applied only once. An upgrade preserves the current choices,
+and explicitly disabling either registration is never undone on a later app
+launch.
+
+For a recoverable uninstall, disable **Background service**, turn off **Open
+Unified Inference at login**, quit the menu app, and run **Uninstall Unified Inference
+(Preserve Data).command** from the mounted image. The assistant moves only the
+exact installed app and default manager-owned `runtimes` folder to Trash. It
+retains `.env`, config, SQLite state/outbox, storage grants, pairing data, and
+all model locations so reinstall resumes token accounting without an identity
+reset. It never removes externally owned oMLX installs.
+
 For a private, non-notarized local build, use Finder's **Control-click →
 Open** once if Gatekeeper asks. Do not disable Gatekeeper system-wide.
 
 Unified Inference is a menu-bar app, so it intentionally has no Dock icon.
-Open its menu-bar item and choose **Settings → Setup & Health**. Enable the
-background service, then approve the background item in **System Settings →
+Open its menu-bar item and choose **Settings → Setup & Health**. Confirm the
+background service, then approve the registered items in **System Settings →
 General → Login Items & Extensions** if macOS requests it. Setup & Health
 shows actionable core, engine, storage, model, download, and reporting state;
 use **Reconcile Engines**, **Restart Service**, or **Open Logs** when a check
@@ -252,61 +275,22 @@ Official references:
 - [oMLX CLI configuration](https://github.com/jundot/omlx#cli-configuration)
 - [Official oMLX releases](https://github.com/jundot/omlx/releases)
 
-## 6. Install mlxcel (Preview)
-
-mlxcel is the lower-overhead native MLX alternative. Unified Inference owns
-the exact per-model `mlxcel-server` child, but it never replaces Homebrew's
-binary or lets the server download weights while handling an inference
-request.
-
-1. Install the official stable formula:
-
-   ```bash
-   brew tap lablup/tap
-   brew install mlxcel
-   ```
-
-2. Open **Settings → Engines**, enable **mlxcel**, and confirm its binary is
-   `/opt/homebrew/bin/mlxcel-server`.
-3. In **Model Library**, install a result carrying the **mlxcel** support badge.
-   Compatibility is metadata-derived until the exact pinned snapshot passes a
-   real load; `mlxcel arch` is the upstream architecture authority.
-
-Do not start a separate persistent server on `17326`. See the
-[official mlxcel repository](https://github.com/lablup/mlxcel) for its current
-architecture table and release notes.
-
-## 7. Install mistral.rs (Preview)
-
-mistral.rs provides a second native execution path for pinned Hugging Face
-Safetensors snapshots. Use the upstream stable installer:
-
-```bash
-curl --proto '=https' --tlsv1.2 -sSf \
-  https://raw.githubusercontent.com/EricLBuehler/mistral.rs/master/install.sh | sh
-```
-
-The installer exposes `~/.local/bin/mistralrs`. Enable **mistral.rs** under
-**Settings → Engines**, then install a Model Library result carrying its
-support badge. Unified Inference starts it with a local model path, loopback
-binding, no built-in UI, and no runtime token source; the inference path does
-not fetch or authenticate to Hugging Face.
-
-Do not start another server on `17327`. The
-[official mistral.rs quickstart](https://ericlbuehler.github.io/mistral.rs/quickstart/)
-documents its installer and supported model families.
-
-## 8. Install DS4
+## 6. Install DS4
 
 DS4 is specialized; it is not a second general-purpose GGUF engine.
 
-1. Confirm `xcode-select --print-path` succeeds.
-2. Open **Settings → Runtime Updates** and choose **Check Now**.
-3. Install DS4, then leave it enabled under **Settings → Engines**.
-4. In the unified **Model Library**, choose a result carrying the **DS4**
-   support badge. An empty search shows the complete current catalog: four
-   DeepSeek V4 Flash choices, one DeepSeek V4 Pro choice, and four GLM 5.2
-   choices.
+1. In the unified **Model Library**, choose a result carrying the **DS4**
+   support badge. Its runtime card checks Apple's developer tools. If they are
+   missing, choose **Install Apple Tools…**, approve the fixed system dialog,
+   finish Apple's installation, and choose **Check Prerequisites**. Requesting
+   the dialog alone does not mark the tools ready.
+2. From the same model card, install the exact official DS4 runtime. Then
+   enable DS4 when prompted, save, and restart the background service.
+3. Choose the exact model files and Download-to folder. An empty search shows
+   the complete current catalog: four DeepSeek V4 Flash choices, one DeepSeek
+   V4 Pro choice, and four GLM 5.2 choices.
+4. The download remains cold: it does not load the model, change the selected
+   folder, or bypass ordinary JIT residency when the first request arrives.
 
 Unified Inference downloads an exact commit from the official
 [antirez/ds4 repository](https://github.com/antirez/ds4), builds
@@ -329,7 +313,7 @@ decode batching, but each slot owns a complete KV state. Leave it unset on a
 memory-tight machine; GLM currently gains request fairness rather than native
 Metal batch speed.
 
-## 9. Prepare MFLUX
+## 7. Prepare MFLUX
 
 Do not install MFLUX globally with `pip` or `uv tool` for the packaged app.
 Unified Inference includes an isolated MFLUX worker and can update its upstream
@@ -349,7 +333,7 @@ The standalone upstream project is
 [filipstrand/mflux](https://github.com/filipstrand/mflux), but its global CLI
 environment is not used by Unified Inference.
 
-## 10. Import an existing LM Studio library
+## 8. Import an existing LM Studio library
 
 LM Studio is not required and is never used as an inference engine. To reuse
 weights from an older installation:
@@ -366,7 +350,7 @@ The source hint reads only LM Studio's on-disk settings and conventional model
 directory. The scan does not contact LM Studio, load a model, copy weights, or
 treat a multimodal projector as a primary model.
 
-## 11. Verify the complete installation
+## 9. Verify the complete installation
 
 The catalog should list only models whose engines are enabled and whose
 profiles are usable:
@@ -469,12 +453,6 @@ outbox remain in Application Support. Follow the exact recovery sequence in
   stop`, `brew update`, `brew upgrade omlx`, and `omlx start`, then verifies
   that the upgraded control plane is healthy and empty before reopening
   admission.
-- mlxcel: use `brew update` followed by `brew upgrade mlxcel`. Disable the
-  engine or unload its resident model first; the next runtime fingerprint
-  automatically invalidates older benchmark evidence.
-- mistral.rs installer-managed binaries: run `mistralrs update`. As with
-  mlxcel, unload first and rerun the affected model benchmark after the binary
-  changes.
 - Advanced oMLX custom-kernel HEAD installations:
 
   ```bash

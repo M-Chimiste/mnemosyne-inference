@@ -168,11 +168,43 @@ def _identifier(*parts: str) -> str:
 
 
 def _within(root: Path, candidate: Path) -> Path | None:
+    # The selected root itself may be a Finder-selected symlink, but a model
+    # candidate below that boundary must have one unambiguous lexical spelling.
+    # Descendant symlinks are therefore never projected into persistent config.
+    if candidate.is_symlink():
+        return None
     try:
         resolved = candidate.resolve(strict=True)
     except OSError:
         return None
     return resolved if resolved.is_relative_to(root) else None
+
+
+def _lexical_projection(
+    root: Path,
+    lexical_root: Path,
+    candidate: Path,
+) -> Path:
+    """Project one validated physical candidate beneath the selected spelling."""
+
+    try:
+        relative = candidate.relative_to(root)
+    except ValueError as exc:
+        raise LocalModelError("discovered model path escapes the selected folder") from exc
+    projected = Path(os.path.abspath(str(lexical_root.joinpath(relative))))
+    try:
+        if projected != lexical_root and not projected.is_relative_to(lexical_root):
+            raise ValueError
+        observed = projected.resolve(strict=True)
+    except (OSError, ValueError) as exc:
+        raise LocalModelError(
+            "discovered model path cannot be projected under the selected folder"
+        ) from exc
+    if observed != candidate:
+        raise LocalModelError(
+            "discovered model path changed during lexical projection"
+        )
+    return projected
 
 
 def _is_projector(path: Path) -> bool:
@@ -459,6 +491,7 @@ def mark_omlx_id_conflicts(
 def scan_local_models(
     path: str | Path,
     *,
+    lexical_root: str | Path | None = None,
     max_files: int = 100_000,
     max_models: int = 2_000,
 ) -> list[LocalModel]:
@@ -471,6 +504,20 @@ def scan_local_models(
         raise LocalModelError(f"selected model folder is unavailable: {exc}") from exc
     if not root.is_dir():
         raise LocalModelError("selected model path is not a directory")
+    selected_spelling = Path(
+        os.path.abspath(
+            os.path.expanduser(str(path if lexical_root is None else lexical_root))
+        )
+    )
+    try:
+        if selected_spelling.resolve(strict=True) != root:
+            raise LocalModelError(
+                "selected model folder changed during lexical projection"
+            )
+    except OSError as exc:
+        raise LocalModelError(
+            f"selected model folder is unavailable: {exc}"
+        ) from exc
 
     ggufs: list[Path] = []
     mlx_directories: set[Path] = set()
@@ -544,16 +591,27 @@ def scan_local_models(
         if not all(_gguf_magic(item) for item in group):
             compatibility = "unavailable"
             reason = "One or more selected files do not have a valid GGUF header."
-        nearby = tuple(
-            LocalProjector(
-                id=_identifier(str(root), str(projector)),
-                path=str(projector),
-                filename=projector.name,
-                size_bytes=projector.stat().st_size,
+        nearby_items: list[LocalProjector] = []
+        for projector in sorted(projectors):
+            if projector.parent != primary.parent:
+                continue
+            lexical_projector = _lexical_projection(
+                root,
+                selected_spelling,
+                projector,
             )
-            for projector in sorted(projectors)
-            if projector.parent == primary.parent
-        )
+            nearby_items.append(
+                LocalProjector(
+                    id=_identifier(
+                        str(selected_spelling),
+                        str(lexical_projector),
+                    ),
+                    path=str(lexical_projector),
+                    filename=projector.name,
+                    size_bytes=projector.stat().st_size,
+                )
+            )
+        nearby = tuple(nearby_items)
         selected_projector = recommended_projector(
             nearby,
             name=lambda item: item.filename,
@@ -564,14 +622,18 @@ def scan_local_models(
         except OSError:
             metadata = metadata_from_gguf_stream(io.BytesIO())
         model_card = _read_model_card(primary.parent)
-        all_paths = tuple(str(item) for item in group)
+        lexical_primary = _lexical_projection(root, selected_spelling, primary)
+        all_paths = tuple(
+            str(_lexical_projection(root, selected_spelling, item))
+            for item in group
+        )
         results.append(
             LocalModel(
-                id=_identifier(str(root), *all_paths),
+                id=_identifier(str(selected_spelling), *all_paths),
                 source_key=_source_key(root, primary),
                 engine=EngineName.LLAMA_CPP.value,
                 display_name=primary.parent.name or primary.stem,
-                model_path=str(primary),
+                model_path=str(lexical_primary),
                 all_paths=all_paths,
                 shard_count=len(group),
                 quantization=_quantization(primary.name),
@@ -613,14 +675,26 @@ def scan_local_models(
         config = _read_json_object(config_path) or {}
         metadata = metadata_from_config(config)
         model_card = _read_model_card(directory)
-        all_paths = tuple(str(item) for item in (*weights, config_path))
+        lexical_directory = _lexical_projection(
+            root,
+            selected_spelling,
+            directory,
+        )
+        all_paths = tuple(
+            str(_lexical_projection(root, selected_spelling, item))
+            for item in (*weights, config_path)
+        )
         results.append(
             LocalModel(
-                id=_identifier(str(root), str(directory), *all_paths),
+                id=_identifier(
+                    str(selected_spelling),
+                    str(lexical_directory),
+                    *all_paths,
+                ),
                 source_key=_source_key(root, directory / "model.safetensors"),
                 engine=EngineName.OMLX.value,
                 display_name=directory.name,
-                model_path=str(directory),
+                model_path=str(lexical_directory),
                 all_paths=all_paths,
                 shard_count=len(weights),
                 quantization=None,

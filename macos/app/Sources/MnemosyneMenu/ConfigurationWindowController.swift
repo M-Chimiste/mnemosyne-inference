@@ -27,7 +27,10 @@ final class ConfigurationWindowController: NSObject, NSWindowDelegate {
     }
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
-        guard viewModel.hasUnsavedChanges else { return true }
+        guard viewModel.hasUnsavedChanges else {
+            viewModel.fleetPairingViewDidDisappear()
+            return true
+        }
 
         let alert = NSAlert()
         alert.alertStyle = .warning
@@ -39,6 +42,7 @@ final class ConfigurationWindowController: NSObject, NSWindowDelegate {
         let response = alert.runModal()
         guard response == .alertSecondButtonReturn else { return false }
         viewModel.discardChanges()
+        viewModel.fleetPairingViewDidDisappear()
         return true
     }
 

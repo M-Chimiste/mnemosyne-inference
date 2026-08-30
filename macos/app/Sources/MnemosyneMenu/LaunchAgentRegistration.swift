@@ -31,6 +31,51 @@ final class LaunchAgentRegistration: ObservableObject {
         menuLoginStatus = menuLoginItem.status
     }
 
+    /// Apply the ordinary first-install startup behavior exactly once. Existing
+    /// configured installations retain their current choices, and an explicit
+    /// later disable is never undone on a subsequent app launch.
+    func applyStartupAtLoginDefaultsIfNeeded(
+        guidedSetupCompleted: Bool
+    ) async {
+        let action = StartupAtLoginDefaults.pendingAction(
+            guidedSetupCompleted: guidedSetupCompleted
+        )
+        guard action != .none else { return }
+        guard action == .enableBoth else {
+            StartupAtLoginDefaults.markApplied()
+            return
+        }
+        guard beginRegistrationChange() else { return }
+        defer { finishRegistrationChange() }
+
+        var failures: [String] = []
+        var notices: [String] = []
+        for (service, name) in [
+            (agent, "Background service"),
+            (menuLoginItem, "Menu login item"),
+        ] {
+            do {
+                let status = try await registerAndWait(
+                    service,
+                    serviceName: name
+                )
+                if status == .requiresApproval {
+                    notices.append(approvalMessage(for: name))
+                }
+            } catch {
+                failures.append(
+                    "Could not enable \(name.lowercased()) at login: \(error.localizedDescription)"
+                )
+            }
+        }
+
+        if failures.isEmpty {
+            StartupAtLoginDefaults.markApplied()
+        }
+        let messages = failures + notices
+        lastError = messages.isEmpty ? nil : messages.joined(separator: "\n")
+    }
+
     /// ServiceManagement caches the containing app's path and code requirement.
     /// Refresh enabled registrations when the installed signed bundle changes. This
     /// covers the Mnemosyne.app rename and subsequent locally ad-hoc-signed

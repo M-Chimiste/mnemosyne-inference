@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "product": "Unified Inference for macOS",
-  "last_updated": "2026-07-26",
+  "last_updated": "2026-08-30",
   "candidate_version": "0.9.0",
   "release_version": "1.0.0",
   "release_ready": false,
@@ -31,6 +31,48 @@
       "required": true,
       "status": "passed",
       "evidence": "GitHub Actions macOS CI run 30265133377 passed every version/lock, native service, image worker, packaging, Swift build/test, runtime-link-aware bare-app verification, acceptance-report, and artifact-upload step for implementation commit 8fd50e9. The signed release workflow remains gated separately on Apple and Sparkle credentials."
+    },
+    {
+      "id": "mac-pool-pairing-and-self-revoke",
+      "required": true,
+      "status": "pending",
+      "evidence": "The default-off Hub and Mac pairing foundations, distinct role credentials, pinned activation, exact-request local revocation fence, credential tombstone, malformed/oversized/redirect ambiguity recovery, fail-closed corrupt tombstones, and bounded retired invitation/pairing/credential-bundle fingerprint fences have automated coverage. Tests reject restoration of the old pairing identity or exact old bearer bundle without persisting bearer values. Routine credential rotation, remote administrator-to-Mac notification, and static-enrollment adoption remain implementation gaps. A signed two-Mac ceremony, Nyx/Mac restart, offline revocation/re-pair, administrator revoke/forget behavior, and proof that the actually issued retired bearers receive no Hub or Mac authority still require production multi-host artifact evidence."
+    },
+    {
+      "id": "mac-pool-participation-limited-overflow",
+      "required": true,
+      "status": "pending",
+      "evidence": "Automated coverage exercises durable local join/pause, full-response participation leases, closed paused capacity, local-request independence, Hub service classes, and limited-worker overflow ordering. Signed multi-host evidence must still prove drain during a live stream, restart while paused, cold JIT rejoin, and Nyx-local worker process/resource isolation under saturation without degrading the Hub."
+    },
+    {
+      "id": "mac-pool-inventory-placement-download",
+      "required": true,
+      "status": "pending",
+      "evidence": "Strict path-free inventory and desired-install schemas, authenticated synchronization, signed-recipe placement scoring, explicit Mac/storage selection, durable Mac-local execution, and exact storage-generation fencing have automated coverage. Exact lexical weight-location regressions exercise a nested symlink-selected root through resolution, download, cold registration, JIT inference/accounting, and in-place migration with no default-folder fallback. An active Settings rebind remains denied across restart, while a pre-claim legacy downloaded row fails closed instead of adopting current volume/scope authority; both retain the original bytes and avoid redownload/profile registration. Representative signed Macs must still prove complete inventory reconciliation and redaction, recommendations across hardware tiers, selection of a non-default Mac and exact internal/external registered folder, restart/resume and response-loss convergence, and no fallback relocation or Hub-proxied weight bytes."
+    },
+    {
+      "id": "mac-pool-jit-batching-accounting",
+      "required": true,
+      "status": "pending",
+      "evidence": "Existing automated suites retain cold-model JIT loading, one global resident target, warm-first routing, bounded queues, full-stream leases, engine-owned batching/capacity, idle unloading, and content-free durable usage events. The exact signed candidate still needs multi-Mac concurrent streaming and non-streaming evidence proving one load per cold target, correct serving-device attribution, exactly one ledger row per completed route through Nyx/ledger outages, and matching bounded pool aggregates."
+    },
+    {
+      "id": "signed-compatibility-catalog",
+      "required": true,
+      "status": "pending",
+      "evidence": "The closed Apple Silicon catalog schema, signature verifier, monotonic last-known-good activation, failure isolation, update client, cross-component contract fixtures, and offline encrypted-key/detached-signature/multi-signer assembly/exact-byte publication ceremony have automated coverage. The ceremony rejects the repository test key and fences publication against prior sequence/digest state. No production trust anchor, canonical HTTPS publication endpoint, or production-signed expiry-valid catalog with exact hardware/runtime recipes has been accepted on the release artifact; DeepSeek V4 Flash and GLM 5.3 Flash remain unclaimed until their exact recipes pass representative compatibility evidence."
+    },
+    {
+      "id": "model-first-runtime-preparation",
+      "required": true,
+      "status": "pending",
+      "evidence": "Catalog-bound model and runtime contracts are implemented without granting the Hub filesystem or engine authority. Claim-backed and current-attempt native installs retain the exact user-selected lexical storage binding; registration refuses a changed root, destination, volume, scope, or revision, and legacy post-download rows without durable/current-attempt authority fail closed rather than infer it from current Settings. The signed app has not yet demonstrated the complete Stable model-first flow on a clean supported Mac: choose a model, obtain or validate its required runtime without a terminal or source checkout, select an exact registered folder, verify and register weights, leave the model cold, then JIT-load and infer successfully."
+    },
+    {
+      "id": "executable-migration-rollback-uninstall",
+      "required": true,
+      "status": "pending",
+      "evidence": "Path-free previews, exact private retention manifests, durable transaction claims, rollback fencing, and the primitive-free lifecycle orchestration core have automated coverage. Production effects deliberately remain disabled: no accepted signed helper/runner authority executes the closed effect graph. Signed existing-Mac migration, forced rollback, all uninstall retention levels, offline Hub-revocation recovery, and reinstall discovery with exact weights/storage preserved remain required."
     },
     {
       "id": "guided-clean-install",

@@ -33,7 +33,11 @@ import httpx
 
 from .base import AdapterError, CapacityHint, Deadline, EngineAdapter
 from ..config import DS4Config
-from ..runtime_updates import resolve_active_runtime
+from ..runtime_updates import (
+    ActiveRuntime,
+    DS4_GLM53_PREVIEW_CHANNEL,
+    resolve_active_runtime,
+)
 from ..scoped_process import wrap_scoped_argv
 from ..models import (
     Endpoint,
@@ -498,7 +502,7 @@ class DS4Adapter(EngineAdapter):
 
     async def runtime_fingerprint(self, *, deadline: Deadline) -> str | None:
         del deadline
-        config = self._effective_config()
+        config = await asyncio.to_thread(self._effective_config)
         binary = Path(config.binary).expanduser()
         try:
             stat = await asyncio.to_thread(binary.stat)
@@ -511,15 +515,90 @@ class DS4Adapter(EngineAdapter):
         return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
     def _effective_config(self) -> DS4Config:
+        _managed, config = self._runtime_snapshot()
+        return config
+
+    def _runtime_snapshot(self) -> tuple[ActiveRuntime | None, DS4Config]:
+        """Resolve one internally consistent runtime/configuration snapshot."""
+
         managed = resolve_active_runtime("ds4", root=self._runtime_root)
         if managed is None:
-            return self.config
-        return self.config.model_copy(
+            return None, self.config
+        return managed, self.config.model_copy(
             update={
                 "binary": str(managed.path("binary")),
                 "working_directory": str(managed.path("working_directory")),
             }
         )
+
+    def _target_runtime_preflight_sync(self, target: ResolvedTarget) -> DS4Config:
+        """Resolve config and fence GLM 5.3 using one validated snapshot.
+
+        ``resolve_active_runtime`` validates the preview source script, its
+        digest, and the manifest capability rows before returning an
+        ``ActiveRuntime``.  Match the target against those same in-memory rows
+        instead of reading and hashing the source contract a second time.
+        """
+
+        managed, config = self._runtime_snapshot()
+        if target.wire_model != "glm-5.3-flash":
+            return config
+        if managed is None or managed.channel != DS4_GLM53_PREVIEW_CHANNEL:
+            raise AdapterError(
+                self.engine,
+                "load",
+                "GLM 5.3 Flash requires the managed DS4 glm-5.3-flash preview runtime",
+            )
+        filename = Path(target.key.canonical_model_id).name
+        if not any(
+            item.get("repo_id") == "antirez/glm-5.3-flash-gguf"
+            and item.get("filename") == filename
+            for item in managed.capabilities
+        ):
+            raise AdapterError(
+                self.engine,
+                "load",
+                "the active managed DS4 preview runtime does not declare this exact GLM 5.3 file",
+            )
+        return config
+
+    async def _target_runtime_preflight(
+        self,
+        target: ResolvedTarget,
+        *,
+        deadline: Deadline,
+    ) -> DS4Config:
+        remaining = deadline.remaining()
+        if remaining <= 0:
+            raise AdapterError(
+                self.engine,
+                "load",
+                "DS4 runtime-contract deadline expired",
+                retryable=True,
+            )
+        try:
+            async with asyncio.timeout(remaining):
+                return await asyncio.to_thread(
+                    self._target_runtime_preflight_sync,
+                    target,
+                )
+        except TimeoutError as exc:
+            raise AdapterError(
+                self.engine,
+                "load",
+                "DS4 runtime-contract deadline expired",
+                retryable=True,
+            ) from exc
+
+    async def target_contract_eligible(self, target: ResolvedTarget) -> bool:
+        try:
+            await self._target_runtime_preflight(
+                target,
+                deadline=Deadline.after(5.0),
+            )
+            return True
+        except AdapterError:
+            return False
 
     def _build_argv(self, config: DS4Config, target: ResolvedTarget) -> list[str]:
         return build_ds4_argv(config, target)
@@ -632,7 +711,7 @@ class DS4Adapter(EngineAdapter):
         *,
         deadline: Deadline,
     ) -> bool:
-        config = self._effective_config()
+        config = await asyncio.to_thread(self._effective_config)
         try:
             target = metadata.target(self.engine)
             expected_argv = tuple(
@@ -846,9 +925,9 @@ class DS4Adapter(EngineAdapter):
         argv: list[str],
         deadline: Deadline,
         *,
+        config: DS4Config,
         transient_argv: list[str] | None = None,
     ) -> ProcessIdentity:
-        config = self._effective_config()
         identity_deadline = time.monotonic() + min(2.0, deadline.remaining())
         while time.monotonic() <= identity_deadline:
             if process.returncode is not None:
@@ -939,7 +1018,7 @@ class DS4Adapter(EngineAdapter):
                 f"port {self.config.port} is occupied; refusing to signal an unknown process",
             )
 
-        config = self._effective_config()
+        config = await self._target_runtime_preflight(target, deadline=deadline)
         binary = Path(config.binary).expanduser()
         working_directory = Path(config.working_directory).expanduser()
         if not binary.is_file() or not os.access(binary, os.X_OK):
@@ -985,6 +1064,7 @@ class DS4Adapter(EngineAdapter):
                 process,
                 argv,
                 deadline,
+                config=config,
                 transient_argv=spawn_argv if spawn_argv != argv else None,
             )
             metadata = _OwnedProcessMetadata.for_spawn(

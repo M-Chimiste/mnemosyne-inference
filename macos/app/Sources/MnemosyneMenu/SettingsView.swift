@@ -37,6 +37,27 @@ struct SettingsView: View {
         .task {
             if !viewModel.isLoaded { await viewModel.load() }
         }
+        .onChange(of: viewModel.pairingOwnsFleetCredentials) { _, pairingOwns in
+            guard pairingOwns else { return }
+            previewedCredentialDrafts = Set(
+                previewedCredentialDrafts.filter {
+                    !$0.isFleetPairingCredential
+                }
+            )
+        }
+        .onChange(of: viewModel.selectedSection) { _, section in
+            switch section {
+            case .pool:
+                Task { await viewModel.refreshDesiredInstalls() }
+            case .lifecycle:
+                Task { await viewModel.refreshNativeLifecycle() }
+            default:
+                break
+            }
+        }
+        .onDisappear {
+            viewModel.fleetPairingViewDidDisappear()
+        }
         .alert("Discard unsaved changes?", isPresented: $viewModel.confirmDiscard) {
             Button("Cancel", role: .cancel) {}
             Button("Discard Changes", role: .destructive) {
@@ -50,13 +71,13 @@ struct SettingsView: View {
             Button("Keep Files", role: .destructive) {
                 viewModel.removeSelectedModel()
             }
-            Button("Delete Files", role: .destructive) {
-                Task { await viewModel.deleteSelectedModelFiles() }
+            if viewModel.modelCleanupDecision.permitsFileCleanup {
+                Button("Move Files to Trash", role: .destructive) {
+                    Task { await viewModel.deleteSelectedModelFiles() }
+                }
             }
         } message: {
-            Text(
-                "Keep Files removes only the profile after you save. Delete Files immediately removes the profile and cleans up the matching model inside its registered storage folder. Imported models are moved to Trash so they can be recovered."
-            )
+            Text(viewModel.modelCleanupDecision.confirmationMessage)
         }
         .alert(
             "Install oMLX with Homebrew?",
@@ -89,6 +110,32 @@ struct SettingsView: View {
             )
         }
         .alert(
+            "Install the experimental GLM 5.3 runtime?",
+            isPresented: $viewModel.confirmDS4GLM53PreviewInstall
+        ) {
+            Button("Cancel", role: .cancel) {}
+            Button("Install Experimental Runtime") {
+                Task { await viewModel.installDS4GLM53PreviewRuntime() }
+            }
+        } message: {
+            Text(
+                "This explicitly switches the managed DS4 runtime to the official glm-5.3-flash preview branch. It does not download model weights. Afterward, choose a configured Model Library folder and separately download Q2 (128 GB minimum unified memory) or Q4_K (256 GB minimum). This preview is resident Mac inference only: no FP8, vision, SSD streaming, CUDA, or cross-Mac tensor parallelism."
+            )
+        }
+        .alert(
+            "Install Apple's developer tools?",
+            isPresented: $viewModel.confirmAppleDeveloperToolsInstall
+        ) {
+            Button("Cancel", role: .cancel) {}
+            Button("Open Apple Installer") {
+                Task { await viewModel.requestAppleDeveloperToolsInstallation() }
+            }
+        } message: {
+            Text(
+                "DS4 is built locally from an exact verified upstream commit and needs Apple's compiler tools. Unified Inference will run only `/usr/bin/xcode-select --install`, which opens Apple's system installer. It will not run a shell, use Homebrew, download model weights, or change their storage folder."
+            )
+        }
+        .alert(
             "Reset oMLX SSD cache?",
             isPresented: $viewModel.confirmOMLXCacheReset
         ) {
@@ -99,6 +146,22 @@ struct SettingsView: View {
         } message: {
             Text(
                 "Unified Inference will drain active requests and unload the resident model, then ask oMLX to delete its reusable SSD KV-cache blocks. Model weights and configuration are not changed. The next matching prompt will need a fresh prefill."
+            )
+        }
+        .alert(
+            "Prepare this removal plan?",
+            isPresented: $viewModel.confirmPrepareNativeLifecycle
+        ) {
+            Button("Cancel", role: .cancel) {
+                viewModel.cancelNativeLifecyclePreparation()
+            }
+            Button("Prepare Plan") {
+                Task { await viewModel.prepareConfirmedNativeLifecycle() }
+            }
+        } message: {
+            Text(
+                (viewModel.pendingNativeLifecycleMode?.effectDescription ?? "")
+                    + "\n\nThe app will first recheck the exact current plan. Preparing writes only a private resumable journal record. Execution is unavailable in this release slice: inference stays running, the background service remains registered, the app remains installed, and no model files are moved or deleted."
             )
         }
         .sheet(isPresented: $viewModel.showLocalModelImporter) {
@@ -225,11 +288,13 @@ struct SettingsView: View {
             switch viewModel.selectedSection {
             case .setup: setupPage
             case .general: generalPage
+            case .pool: poolPage
             case .engines: enginesPage
             case .updates: runtimeUpdatesPage
             case .storage: storagePage
             case .library: libraryPage
             case .models: modelsPage
+            case .lifecycle: lifecyclePage
             case .usage: usagePage
             case .credentials: credentialsPage
             }
@@ -304,12 +369,12 @@ struct SettingsView: View {
                 }
 
                 setupCard(
-                    title: "2. Stable inference engines",
+                    title: "2. Inference engines",
                     symbol: "cpu",
                     ready: stableEngineReady
                 ) {
                     if let engines = viewModel.readinessSnapshot?.engines {
-                        ForEach(engines) { engine in
+                        ForEach(engines.filter { $0.engine.isSupported }) { engine in
                             engineHealthRow(engine)
                         }
                     } else {
@@ -621,10 +686,8 @@ struct SettingsView: View {
             viewModel.settings.engines.ds4.enabled
         case .mflux:
             viewModel.settings.engines.mflux.enabled
-        case .mlxcel:
-            viewModel.settings.engines.mlxcel.enabled
-        case .mistralRs:
-            viewModel.settings.engines.mistralRs.enabled
+        case .mlxcel, .mistralRs:
+            false
         }
     }
 
@@ -831,6 +894,319 @@ struct SettingsView: View {
         .formStyle(.grouped)
     }
 
+    private var poolPage: some View {
+        Form {
+            Section("Hub enrollment") {
+                LabeledContent(
+                    "Status",
+                    value: viewModel.fleetPairingCeremony.statusText
+                )
+                if let pairing = viewModel.fleetPairing,
+                   pairing.state == "paired"
+                {
+                    LabeledContent(
+                        "Reporting identity",
+                        value: pairing.reportingNodeId ?? "Assigned"
+                    )
+                    LabeledContent(
+                        "Credential generation",
+                        value: pairing.credentialGeneration.map(String.init)
+                            ?? "Assigned"
+                    )
+                }
+                if let phase = viewModel.fleetPairingCeremony.workflowPhase,
+                   phase != "complete"
+                {
+                    LabeledContent("Workflow", value: pairingPhaseLabel(phase))
+                }
+                Text(viewModel.fleetPairingCeremony.nextActionText)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                HStack {
+                    Button("Refresh Status") {
+                        Task { await viewModel.refreshFleetPairing() }
+                    }
+                    .disabled(viewModel.isAdvancingFleetPairing)
+                    Spacer()
+                    if viewModel.fleetPairingCeremony.hasSecretInMemory {
+                        Button("Clear Invitation Details", role: .destructive) {
+                            viewModel.clearFleetPairingCeremony()
+                        }
+                        .disabled(viewModel.isAdvancingFleetPairing)
+                    }
+                }
+                if let pairing = viewModel.fleetPairing,
+                   pairing.legacyCredentialsPresent != true,
+                   pairing.state == "paired" || pairing.selfRevoke != nil
+                {
+                    Divider()
+                    HStack {
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(
+                                pairing.selfRevoke == nil
+                                    ? "Remove this Mac from Hub"
+                                    : "Hub removal needs confirmation"
+                            )
+                            .fontWeight(.medium)
+                            Text(
+                                "This permanently revokes the current pool enrollment. It does not delete or relocate weights, change storage folders, or affect local inference and token history."
+                            )
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        Button(
+                            pairing.selfRevoke == nil
+                                ? "Remove…" : "Retry Removal",
+                            role: .destructive
+                        ) {
+                            if pairing.selfRevoke == nil {
+                                viewModel.confirmRevokeFleetPairing = true
+                            } else {
+                                Task { await viewModel.revokeFleetPairing() }
+                            }
+                        }
+                        .disabled(
+                            viewModel.isAdvancingFleetPairing
+                                || viewModel.isRevokingFleetPairing
+                        )
+                    }
+                }
+            }
+
+            if viewModel.fleetPairingCeremony.showsInvitationEntry {
+                Section("Pair this Mac") {
+                    TextField(
+                        "Invitation ID",
+                        text: viewModel.fleetPairingInvitationIDBinding
+                    )
+                    .textFieldStyle(.roundedBorder)
+                    SecureField(
+                        "Pairing secret",
+                        text: viewModel.fleetPairingSecretBinding
+                    )
+                    .textFieldStyle(.roundedBorder)
+                    .privacySensitive()
+                    TextField(
+                        "Hub HTTPS origin (https://hub.example)",
+                        text: viewModel.fleetPairingHubOriginBinding
+                    )
+                    .textFieldStyle(.roundedBorder)
+                    TextField(
+                        "This Mac's pool address (https://mac.example:1240)",
+                        text: viewModel.fleetPairingLocatorBinding
+                    )
+                    .textFieldStyle(.roundedBorder)
+                    Text(
+                        "The invitation secret is sent only to the local control service. After submission it is hidden and kept only in memory long enough to resume this open ceremony. Closing Settings clears it and requires re-entry."
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    HStack {
+                        Spacer()
+                        Button(pairingSubmissionButtonTitle) {
+                            viewModel.advanceFleetPairing()
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(
+                            !viewModel.fleetPairingCeremony.canSubmit
+                                || viewModel.isAdvancingFleetPairing
+                        )
+                    }
+                }
+            } else if viewModel.fleetPairingCeremony.canResumeWithoutReentry {
+                Section("Current ceremony") {
+                    Text(
+                        "The submitted invitation is no longer shown. Resume reuses its in-memory value only for this open Settings window."
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    HStack {
+                        Spacer()
+                        Button("Resume Pairing") {
+                            viewModel.advanceFleetPairing()
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(viewModel.isAdvancingFleetPairing)
+                    }
+                }
+            }
+
+            Section {
+                HStack {
+                    if viewModel.isRefreshingDesiredInstalls {
+                        ProgressView().controlSize(.small)
+                        Text("Refreshing requests…")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Text(
+                            viewModel.desiredInstalls.total == 1
+                                ? "1 request"
+                                : "\(viewModel.desiredInstalls.total) requests"
+                        )
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Button("Refresh Requests") {
+                        Task { await viewModel.refreshDesiredInstalls() }
+                    }
+                    .disabled(
+                        viewModel.isRefreshingDesiredInstalls
+                            || !viewModel.desiredInstallInFlightJobIDs.isEmpty
+                    )
+                }
+
+                if !viewModel.desiredInstallError.isEmpty {
+                    Label(
+                        viewModel.desiredInstallError,
+                        systemImage: "exclamationmark.triangle.fill"
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                }
+
+                if viewModel.desiredInstalls.items.isEmpty,
+                   !viewModel.isRefreshingDesiredInstalls
+                {
+                    Text(
+                        viewModel.desiredInstalls.executorAvailable
+                            ? "The Hub has not requested a model download on this Mac."
+                            : "Desired installs are unavailable in the running local service."
+                    )
+                    .foregroundStyle(.secondary)
+                } else {
+                    ForEach(viewModel.desiredInstalls.items) { item in
+                        desiredInstallRow(item)
+                    }
+                }
+            } header: {
+                Text("Downloads requested by Hub")
+            } footer: {
+                Text(
+                    "The Hub identifies only a storage target ID. This Mac binds that ID to the exact folder selected locally; paths and bookmarks are never exposed to the Hub. Downloaded weights remain cold until a normal inference request triggers JIT loading. Refusing does not download anything, and cancellation is stop-only—it never deletes weights."
+                )
+            }
+
+            Section("Safety boundary") {
+                Text(
+                    "Pairing changes only this Mac's pool enrollment credentials. It does not move model weights, change storage folders, load a model, alter token accounting, or enable pooled requests. The Hub has a separate enable control after activation."
+                )
+                .foregroundStyle(.secondary)
+            }
+        }
+        .formStyle(.grouped)
+        .confirmationDialog(
+            "Remove this Mac from Hub?",
+            isPresented: $viewModel.confirmRevokeFleetPairing,
+            titleVisibility: .visible
+        ) {
+            Button("Remove This Mac", role: .destructive) {
+                Task { await viewModel.revokeFleetPairing() }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(
+                "The current enrollment credentials will be revoked. Models, user-selected weight locations, local inference, and token history stay on this Mac. Re-enrollment requires a new Hub invitation."
+            )
+        }
+    }
+
+    @ViewBuilder
+    private func desiredInstallRow(_ item: DesiredInstallItem) -> some View {
+        let acknowledgement = item.acknowledgement
+        let isInFlight = viewModel.isDesiredInstallInFlight(item)
+
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .firstTextBaseline) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(item.job.alias ?? item.job.logicalModelID)
+                        .fontWeight(.semibold)
+                    Text(desiredInstallStateLabel(acknowledgement.state))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                engineBadge(item.job.engine)
+            }
+
+            LabeledContent("Model") {
+                Text(item.job.logicalModelID)
+                    .textSelection(.enabled)
+            }
+            if let alias = item.job.alias {
+                LabeledContent("Alias") {
+                    Text(alias).textSelection(.enabled)
+                }
+            }
+            LabeledContent("Local storage target ID") {
+                Text(item.job.storageLocationID)
+                    .font(.caption.monospaced())
+                    .textSelection(.enabled)
+            }
+
+            if let fraction = acknowledgement.progressFraction {
+                ProgressView(value: fraction)
+                Text(
+                    "\(byteCount(acknowledgement.bytesDownloaded)) of "
+                        + "\(byteCount(acknowledgement.totalBytes ?? 0))"
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .monospacedDigit()
+            } else if acknowledgement.bytesDownloaded > 0 {
+                Text("\(byteCount(acknowledgement.bytesDownloaded)) downloaded")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
+            }
+
+            if let resultCode = acknowledgement.resultCode {
+                LabeledContent("Result") {
+                    Text(resultCode)
+                        .font(.caption.monospaced())
+                        .textSelection(.enabled)
+                }
+            }
+
+            if item.canApprove || item.canRefuse || item.canCancel || isInFlight {
+                HStack {
+                    if isInFlight {
+                        ProgressView().controlSize(.small)
+                    }
+                    Spacer()
+                    if item.canRefuse {
+                        Button("Refuse", role: .destructive) {
+                            Task { await viewModel.refuseDesiredInstall(item) }
+                        }
+                        .disabled(
+                            isInFlight || viewModel.isRefreshingDesiredInstalls
+                        )
+                    }
+                    if item.canCancel {
+                        Button("Stop Download", role: .destructive) {
+                            Task { await viewModel.cancelDesiredInstall(item) }
+                        }
+                        .disabled(
+                            isInFlight || viewModel.isRefreshingDesiredInstalls
+                        )
+                    }
+                    if item.canApprove {
+                        Button("Approve Download") {
+                            Task { await viewModel.approveDesiredInstall(item) }
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(
+                            isInFlight || viewModel.isRefreshingDesiredInstalls
+                        )
+                    }
+                }
+            }
+        }
+        .padding(.vertical, 4)
+    }
+
     private var enginesPage: some View {
         Form {
             Section {
@@ -925,74 +1301,6 @@ struct SettingsView: View {
                 engineHeader("MFLUX", detail: "Qwen Image and Krea 2")
             }
 
-            Section {
-                Toggle(
-                    "Enable mlxcel (Preview)",
-                    isOn: $viewModel.settings.engines.mlxcel.enabled
-                )
-                LabeledContent("Local port") {
-                    TextField(
-                        "Port",
-                        value: $viewModel.settings.engines.mlxcel.port,
-                        format: .number.grouping(.never)
-                    )
-                    .labelsHidden()
-                    .textFieldStyle(.roundedBorder)
-                    .multilineTextAlignment(.trailing)
-                    .frame(width: 80)
-                }
-                TextField(
-                    "mlxcel-server executable",
-                    text: $viewModel.settings.engines.mlxcel.binary
-                )
-                TextField(
-                    "Working folder",
-                    text: $viewModel.settings.engines.mlxcel.workingDirectory
-                )
-                LabeledContent("Request timeout") {
-                    secondsField($viewModel.settings.engines.mlxcel.requestTimeoutSeconds)
-                }
-                Text("Install and upgrade the official Homebrew formula with `brew tap lablup/tap` and `brew install mlxcel`. Unified Inference owns only the model server process.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            } header: {
-                engineHeader("mlxcel", detail: "Native MLX text and vision serving")
-            }
-
-            Section {
-                Toggle(
-                    "Enable mistral.rs (Preview)",
-                    isOn: $viewModel.settings.engines.mistralRs.enabled
-                )
-                LabeledContent("Local port") {
-                    TextField(
-                        "Port",
-                        value: $viewModel.settings.engines.mistralRs.port,
-                        format: .number.grouping(.never)
-                    )
-                    .labelsHidden()
-                    .textFieldStyle(.roundedBorder)
-                    .multilineTextAlignment(.trailing)
-                    .frame(width: 80)
-                }
-                TextField(
-                    "mistralrs executable",
-                    text: $viewModel.settings.engines.mistralRs.binary
-                )
-                TextField(
-                    "Working folder",
-                    text: $viewModel.settings.engines.mistralRs.workingDirectory
-                )
-                LabeledContent("Request timeout") {
-                    secondsField($viewModel.settings.engines.mistralRs.requestTimeoutSeconds)
-                }
-                Text("The official mistral.rs installer owns the binary and its `mistralrs update` path. Unified Inference launches it offline against a pinned local snapshot.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            } header: {
-                engineHeader("mistral.rs", detail: "Safetensors language and multimodal models")
-            }
-
         }
         .formStyle(.grouped)
     }
@@ -1034,7 +1342,7 @@ struct SettingsView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
-                    ForEach(snapshot.engines) { update in
+                    ForEach(snapshot.engines.filter { $0.engine.isSupported }) { update in
                         runtimeUpdateCard(update)
                     }
                 } else if viewModel.isCheckingRuntimeUpdates {
@@ -1048,7 +1356,7 @@ struct SettingsView: View {
                     ContentUnavailableView(
                         "No Update Information",
                         systemImage: "arrow.triangle.2.circlepath",
-                            description: Text("Choose Check Now to inspect llama.cpp, oMLX, MFLUX, DS4, mlxcel, and mistral.rs.")
+                            description: Text("Choose Check Now to inspect llama.cpp, oMLX, MFLUX, and DS4.")
                     )
                     .frame(maxWidth: .infinity, minHeight: 260)
                 }
@@ -1155,6 +1463,80 @@ struct SettingsView: View {
                 .font(.callout)
                 .foregroundStyle(.secondary)
 
+            if let preview = update.ds4GLM53FlashPreview {
+                Divider()
+                VStack(alignment: .leading, spacing: 9) {
+                    HStack(alignment: .firstTextBaseline) {
+                        Text("GLM 5.3 Flash")
+                            .font(.headline)
+                        Text(preview.releaseTierLabel)
+                            .font(.caption2.weight(.bold))
+                            .foregroundStyle(.orange)
+                            .padding(.horizontal, 7)
+                            .padding(.vertical, 3)
+                            .background(.orange.opacity(0.12), in: Capsule())
+                        Spacer()
+                        if preview.availableVersion != nil,
+                           !preview.updateAvailable,
+                           preview.diagnostic == nil {
+                            Text("CURRENT")
+                                .font(.caption2.weight(.bold))
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+
+                    Text("An explicit Mac-only preview from the official antirez/ds4 `glm-5.3-flash` branch. Installing this runtime does not download weights or choose a storage folder.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+
+                    HStack(spacing: 12) {
+                        Label("Q2: 128+ GB", systemImage: "memorychip")
+                        Label("Q4_K: 256+ GB", systemImage: "memorychip.fill")
+                    }
+                    .font(.caption.weight(.semibold))
+
+                    Text("Experimental resident inference only. No FP8, vision, SSD streaming, CUDA, or cross-Mac tensor parallelism is enabled.")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+
+                    if let version = preview.availableVersion {
+                        LabeledContent("Preview commit", value: version)
+                            .font(.caption)
+                    }
+                    if let diagnostic = preview.diagnostic {
+                        Label(diagnostic, systemImage: "exclamationmark.triangle")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                    }
+
+                    HStack {
+                        if preview.canInstall {
+                            Button("Install GLM 5.3 Preview…") {
+                                viewModel.requestDS4GLM53PreviewInstall()
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .disabled(viewModel.updatingRuntimeEngine != nil)
+                        } else if preview.availableVersion != nil,
+                                  preview.diagnostic == nil {
+                            Button("Browse GLM 5.3 Models") {
+                                viewModel.searchGLM53PreviewModels()
+                            }
+                        }
+                        Spacer()
+                        if let target = preview.releaseNotesUrl,
+                           let url = URL(string: target) {
+                            Link("Preview Source", destination: url)
+                        }
+                    }
+                }
+                .padding(12)
+                .background(.orange.opacity(0.06), in: RoundedRectangle(cornerRadius: 9))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 9)
+                        .stroke(.orange.opacity(0.25), lineWidth: 1)
+                }
+            }
+
             if update.engine == .omlx, !update.installed {
                 Text("Download the official app, drag it to Applications, and start its server on 127.0.0.1:17322. Then choose Check Again. The official app avoids the fragile Homebrew HEAD custom-kernel build.")
                     .font(.caption)
@@ -1193,15 +1575,6 @@ struct SettingsView: View {
             }
 
             HStack {
-                if (update.engine == .mlxcel || update.engine == .mistralRs),
-                   let target = update.officialInstallerUrl,
-                   let url = URL(string: target) {
-                    Link(
-                        update.installed ? "Update Instructions" : "Install Instructions",
-                        destination: url
-                    )
-                    .buttonStyle(.borderedProminent)
-                }
                 if update.engine == .omlx,
                    !update.installed,
                    let target = update.officialInstallerUrl,
@@ -1418,6 +1791,27 @@ struct SettingsView: View {
                     .foregroundStyle(.secondary)
             }
             .padding(14)
+            if viewModel.shouldOfferGLM53PreviewRuntimeInstall {
+                HStack(alignment: .top, spacing: 12) {
+                    Image(systemName: "cpu.fill")
+                        .foregroundStyle(.orange)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("GLM 5.3 Flash needs its DS4 preview runtime")
+                            .font(.headline)
+                        Text("The exact Mac-compatible candidates stay hidden until you explicitly install the official experimental `glm-5.3-flash` runtime. Q2 requires at least 128 GB unified memory; Q4_K requires at least 256 GB. Weights and their destination are selected separately afterward.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    Spacer()
+                    Button("Open Runtime Updates") {
+                        viewModel.openGLM53PreviewRuntimeUpdates()
+                    }
+                    .buttonStyle(.borderedProminent)
+                }
+                .padding(.horizontal, 14)
+                .padding(.bottom, 12)
+            }
             Divider()
 
             HSplitView {
@@ -1483,6 +1877,25 @@ struct SettingsView: View {
                                 )
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                            }
+                            if searchResult.engine == .ds4,
+                               searchResult.family == "glm-5.3-flash",
+                               searchResult.releaseTier == "experimental" {
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Label(
+                                        "Experimental Mac-only preview",
+                                        systemImage: "exclamationmark.triangle.fill"
+                                    )
+                                    .font(.caption.weight(.semibold))
+                                    if let memory = searchResult.recommendedMemoryGb {
+                                        Text("The selected \(searchResult.quantization ?? "GGUF") variant requires at least \(memory) GB unified memory.")
+                                            .font(.caption)
+                                    }
+                                    Text("Resident inference only; no FP8, vision, SSD streaming, CUDA, or cross-Mac tensor parallelism. Downloading uses the exact folder selected below and does not load the model; normal cold/JIT loading begins only when an API request selects its alias.")
+                                        .font(.caption)
+                                }
+                                .foregroundStyle(.orange)
                                 .fixedSize(horizontal: false, vertical: true)
                             }
                             if viewModel.isLoadingLibraryDetails {
@@ -1566,6 +1979,10 @@ struct SettingsView: View {
                         }
 
                         Divider()
+                        if let preparation = viewModel.selectedModelRuntimePreparation {
+                            modelRuntimePreparationCard(preparation)
+                            Divider()
+                        }
                         if searchResult.needsFileSelection {
                             if viewModel.isLoadingLibraryFiles {
                                 HStack(spacing: 8) {
@@ -1645,7 +2062,7 @@ struct SettingsView: View {
                                 .foregroundStyle(.secondary)
                         }
 
-                        Picker("Download to", selection: $viewModel.selectedLibraryStorage) {
+                        Picker("Download to", selection: viewModel.libraryStorageBinding) {
                             ForEach(viewModel.settings.storage.locations) { location in
                                 Text(storageDisplayName(location.name)).tag(location.name)
                             }
@@ -1669,14 +2086,7 @@ struct SettingsView: View {
                         }
                         .buttonStyle(.borderedProminent)
                         .disabled(
-                            viewModel.isWorking
-                                || viewModel.hasUnsavedChanges
-                                || viewModel.requiresRestart
-                                || viewModel.selectedLibraryModel?.isInstallable != true
-                                || !viewModel.availableLibraryRoles.contains(
-                                    viewModel.selectedLibraryRole
-                                )
-                                || viewModel.storageStatus(for: viewModel.selectedLibraryStorage)?.isAvailable != true
+                            !viewModel.canInstallSelectedLibraryModel
                         )
                         if !searchResult.needsFileSelection, !searchResult.isInstallable {
                             Label(
@@ -1733,6 +2143,66 @@ struct SettingsView: View {
                 .padding(.horizontal, 16)
                 .padding(.vertical, 10)
             }
+        }
+    }
+
+    private func modelRuntimePreparationCard(
+        _ preparation: ModelRuntimePreparation
+    ) -> some View {
+        HStack(alignment: .top, spacing: 11) {
+            Image(
+                systemName: preparation.ready
+                    ? "checkmark.circle.fill"
+                    : "cpu.fill"
+            )
+            .foregroundStyle(preparation.ready ? Color.green : Color.orange)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(preparation.title)
+                    .font(.headline)
+                Text(preparation.detail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                if !preparation.ready {
+                    Text(
+                        "Runtime preparation and weight download are independent; neither action changes the Download-to selection."
+                    )
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                }
+            }
+            Spacer(minLength: 8)
+            if let actionLabel = preparation.actionLabel {
+                Button(actionLabel) {
+                    switch preparation.action {
+                    case .restartService:
+                        restartService()
+                    default:
+                        Task {
+                            await viewModel.performSelectedModelRuntimePreparation()
+                        }
+                    }
+                }
+                .buttonStyle(.bordered)
+                .disabled(
+                    viewModel.isCheckingRuntimeUpdates
+                        || viewModel.updatingRuntimeEngine != nil
+                        || viewModel.isWorking
+                        || viewModel.isRequestingAppleDeveloperTools
+                )
+            }
+        }
+        .padding(12)
+        .background(
+            (preparation.ready ? Color.green : Color.orange).opacity(0.06),
+            in: RoundedRectangle(cornerRadius: 9)
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: 9)
+                .stroke(
+                    (preparation.ready ? Color.green : Color.orange).opacity(0.25),
+                    lineWidth: 1
+                )
         }
     }
 
@@ -1819,14 +2289,16 @@ struct SettingsView: View {
                     .frame(width: 52, height: 30)
                     .help("Download a compatible model from Hugging Face.")
                     Button {
-                        viewModel.confirmRemoveModel = true
+                        Task { await viewModel.prepareSelectedModelRemoval() }
                     } label: {
                         Image(systemName: "minus")
                             .frame(width: 30, height: 18)
                     }
                     .buttonStyle(.bordered)
                     .frame(width: 52, height: 30)
-                    .disabled(viewModel.selectedModelIndex == nil)
+                    .disabled(
+                        viewModel.selectedModelIndex == nil || viewModel.isWorking
+                    )
                     .help("Remove the profile, with an optional managed-file deletion.")
                     Spacer()
                 }
@@ -1929,7 +2401,7 @@ struct SettingsView: View {
         let profile = viewModel.settings.models[index]
         let alternatives = viewModel.settings.models[index].alternatives
         let pinnableEngines = [profile.engine] + alternatives
-            .filter(\.enabled)
+            .filter { $0.enabled && $0.engine.isSupported }
             .map(\.engine)
         let sources = viewModel.compatibleAlternativeSources(for: index)
         if !alternatives.isEmpty || !sources.isEmpty {
@@ -2176,20 +2648,6 @@ struct SettingsView: View {
                         value: $viewModel.settings.models[index].load.kvDiskSpaceMb
                     )
                 }
-                if engine == .mlxcel {
-                    optionalIntegerField(
-                        "Parallel request slots",
-                        value: $viewModel.settings.models[index].load.parallel
-                    )
-                    Text("mlxcel defaults to four continuously batched slots. Set an explicit value when memory pressure or benchmark results favor a different scheduler width.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                if engine == .mistralRs {
-                    Text("mistral.rs starts with a conservative single manager admission slot on Metal. Advanced runtime arguments remain configuration-only until upstream exposes an authoritative scheduler-capacity contract.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
             }
         } else {
             Section("Loading") {
@@ -2206,15 +2664,7 @@ struct SettingsView: View {
             .first(where: { $0.alias == profile.alias })?.candidates
             .first(where: { $0.engine == profile.engine })
         Section("Context window") {
-            if profile.engine == .mistralRs {
-                LabeledContent("Policy") {
-                    Text("Engine automatic")
-                        .foregroundStyle(.secondary)
-                }
-                Text("mistral.rs remains on its reviewed engine default until its Metal runtime exposes an authoritative context-setting contract.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            } else {
+            if profile.engine.isSupported {
                 Picker(
                     "Policy",
                     selection: contextModeBinding(for: index, observed: observed)
@@ -2264,6 +2714,10 @@ struct SettingsView: View {
                         }
                     }
                 }
+            } else {
+                Text("This profile uses a retired engine and is preserved only for upgrade compatibility. Its weights remain on disk, but it cannot be loaded.")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
             }
             HStack {
                 Button("Profile usable context") {
@@ -2404,6 +2858,300 @@ struct SettingsView: View {
         }
     }
 
+    private var lifecyclePage: some View {
+        Form {
+            Section {
+                Label(
+                    "Lifecycle effects are unavailable in this release slice",
+                    systemImage: "lock.shield.fill"
+                )
+                .font(.headline)
+                Text(
+                    "These controls inspect current local authority and can record a private, resumable plan only. They cannot stop inference, unregister the background service, remove the app, change settings, or move, copy, or delete model weights."
+                )
+                .foregroundStyle(.secondary)
+
+                HStack {
+                    if viewModel.isRefreshingNativeLifecycle
+                        || viewModel.isPreparingNativeLifecycle
+                        || viewModel.isAuthorizingNativeLifecycle
+                    {
+                        ProgressView().controlSize(.small)
+                    }
+                    Text(viewModel.nativeLifecycleMessage)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Refresh Evidence") {
+                        Task { await viewModel.refreshNativeLifecycle() }
+                    }
+                    .disabled(
+                        viewModel.isRefreshingNativeLifecycle
+                            || viewModel.isPreparingNativeLifecycle
+                            || viewModel.isAuthorizingNativeLifecycle
+                    )
+                }
+            } header: {
+                Text("Safety boundary")
+            }
+
+            Section("Migration status") {
+                if let status = viewModel.nativeLifecycleStatus {
+                    LabeledContent(
+                        "Planning journal",
+                        value: status.available ? "Available" : "Unavailable"
+                    )
+                    LabeledContent(
+                        "Signed candidate preview",
+                        value: status.migrationPreviewAvailable
+                            ? "Available" : "Not available"
+                    )
+                    LabeledContent(
+                        "Migration plans awaiting recovery",
+                        value: viewModel.nativeMigrationIncompleteCount.formatted()
+                    )
+                    if let migration = viewModel.nativeMigrationPreview {
+                        Label(
+                            "A signed candidate and rollback snapshot are ready. The migration contract retains private state, managed runtimes, storage grants, pool pairing, and all weights.",
+                            systemImage: "checkmark.seal.fill"
+                        )
+                        .foregroundStyle(.green)
+                        LabeledContent(
+                            "Legacy token sidecar",
+                            value: migration.plan.legacySidecarState
+                                .replacingOccurrences(of: "_", with: " ")
+                                .capitalized
+                        )
+                    } else if status.available {
+                        Text(
+                            "No signed migration candidate with a private rollback snapshot is available yet. Migration execution is not exposed. Existing inference, JIT loading, storage bindings, and token accounting remain unchanged."
+                        )
+                        .foregroundStyle(.secondary)
+                    }
+                } else if !viewModel.isRefreshingNativeLifecycle {
+                    Text("Refresh evidence to inspect migration readiness.")
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            if let status = viewModel.nativeLifecycleStatus,
+               status.authorizationAvailable
+            {
+                Section {
+                    let staged = status.incomplete.filter {
+                        $0.contractVersion == 2
+                            && [.helperStaged, .authorized].contains($0.phase)
+                    }
+                    if staged.isEmpty {
+                        Text(
+                            "No transaction has a complete recovery clone and staged helper yet. Preparing a plan alone cannot request owner authorization."
+                        )
+                        .foregroundStyle(.secondary)
+                    } else {
+                        ForEach(staged) { transaction in
+                            HStack {
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text(transaction.kind == .migration
+                                        ? "Migration" : "Removal")
+                                        .font(.headline)
+                                    Text(transaction.transactionID)
+                                        .font(.caption.monospaced())
+                                        .foregroundStyle(.secondary)
+                                    if let authorization =
+                                        viewModel.nativeLifecycleAuthorizationStatuses[
+                                            transaction.transactionID
+                                        ]
+                                    {
+                                        Text(
+                                            authorization.state.rawValue
+                                                .replacingOccurrences(
+                                                    of: "_", with: " "
+                                                )
+                                                .capitalized
+                                        )
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                    }
+                                }
+                                Spacer()
+                                if transaction.phase == .helperStaged {
+                                    Button("Authorize…") {
+                                        Task {
+                                            await viewModel
+                                                .authorizeNativeLifecycle(
+                                                    transaction
+                                                )
+                                        }
+                                    }
+                                    .buttonStyle(.borderedProminent)
+                                    .disabled(
+                                        viewModel.isRefreshingNativeLifecycle
+                                            || viewModel
+                                                .isPreparingNativeLifecycle
+                                            || viewModel
+                                                .isAuthorizingNativeLifecycle
+                                    )
+                                } else {
+                                    Label(
+                                        "Authorized",
+                                        systemImage: "checkmark.shield.fill"
+                                    )
+                                    .foregroundStyle(.green)
+                                }
+                            }
+                        }
+                    }
+                } header: {
+                    Text("Signed owner authorization")
+                } footer: {
+                    Text(
+                        "Authorization launches only the sealed helper bundled inside this app, uses an unnamed local socket, and records a short-lived one-time receipt. It does not execute migration, uninstall, cleanup, or any model-file operation."
+                    )
+                }
+            }
+
+            Section {
+                ForEach(NativeLifecycleRetentionMode.allCases) { mode in
+                    nativeLifecyclePreviewCard(mode)
+                    if mode != NativeLifecycleRetentionMode.allCases.last {
+                        Divider()
+                    }
+                }
+            } header: {
+                HStack {
+                    Text("Removal retention previews")
+                    Spacer()
+                    if viewModel.nativeLifecycleStatus != nil {
+                        Text(
+                            "\(viewModel.nativeUninstallIncompleteCount) prepared"
+                        )
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .accessibilityLabel(
+                            "\(viewModel.nativeUninstallIncompleteCount) removal plans awaiting recovery"
+                        )
+                    }
+                }
+            } footer: {
+                Text(
+                    "Each preview is path-free. Storage paths, bookmark data, private authority fingerprints, and manifest receipts never appear in Settings. Preparing a plan writes its exact private evidence to the service journal, but still performs none of the listed effects."
+                )
+            }
+
+            if let prepared = viewModel.preparedNativeLifecycleTransaction,
+               let plan = prepared.plan.uninstall
+            {
+                Section("Prepared in this session") {
+                    Label(
+                        plan.retentionMode.title,
+                        systemImage: "checkmark.circle.fill"
+                    )
+                    .foregroundStyle(.green)
+                    LabeledContent("Journal phase", value: prepared.phase.title)
+                    Text(
+                        "The exact transaction was re-read from the private journal. No execution control is available, and no existing app, service registration, state, runtime, or model file was changed."
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                }
+            }
+        }
+        .formStyle(.grouped)
+    }
+
+    @ViewBuilder
+    private func nativeLifecyclePreviewCard(
+        _ mode: NativeLifecycleRetentionMode
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text(mode.title)
+                .font(.headline)
+            Text(mode.effectDescription)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+
+            if let preview = viewModel.nativeUninstallPreviews[mode] {
+                HStack(spacing: 18) {
+                    LabeledContent(
+                        "Known weights",
+                        value: preview.plan.retentionManifest.itemCount.formatted()
+                    )
+                    LabeledContent(
+                        "Retained",
+                        value: preview.plan.retentionManifest.retainedCount.formatted()
+                    )
+                    LabeledContent(
+                        "Future Trash eligible",
+                        value: preview.plan.retentionManifest.trashCount.formatted()
+                    )
+                }
+                .font(.caption)
+
+                LabeledContent(
+                    "Queued token events",
+                    value: preview.plan.tokenOutboxCount.formatted()
+                )
+                LabeledContent(
+                    "Token outbox treatment",
+                    value: preview.plan.outboxDecision.title
+                )
+                LabeledContent(
+                    "Hub revocation",
+                    value: preview.plan.hubRevocationState.title
+                )
+
+                ForEach(preview.plan.components) { component in
+                    HStack {
+                        Text(component.kind.title)
+                        Spacer()
+                        Text(component.disposition.title)
+                            .foregroundStyle(
+                                component.disposition == .retain
+                                    ? Color.secondary : Color.orange
+                            )
+                    }
+                    .font(.caption)
+                }
+
+                HStack {
+                    Label(
+                        "Prepare only; cannot execute",
+                        systemImage: "doc.badge.gearshape"
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Review & Prepare…") {
+                        viewModel.requestNativeLifecyclePreparation(mode)
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(
+                        !preview.preparable
+                            || viewModel.isRefreshingNativeLifecycle
+                            || viewModel.isPreparingNativeLifecycle
+                            || viewModel.isAuthorizingNativeLifecycle
+                    )
+                }
+            } else if let error = viewModel.nativeUninstallPreviewErrors[mode] {
+                Label(error, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            } else if viewModel.isRefreshingNativeLifecycle {
+                HStack {
+                    ProgressView().controlSize(.small)
+                    Text("Building a current path-free preview…")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            } else {
+                Text("Refresh evidence to build this preview.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(.vertical, 6)
+    }
+
     private var usagePage: some View {
         Form {
             Section("Token reporting") {
@@ -2467,12 +3215,41 @@ struct SettingsView: View {
     private var credentialsPage: some View {
         Form {
             Section {
-                Text("Saved credentials are never displayed. Enter a value in the bordered field to add or replace a credential; leave it blank to keep the saved value.")
+                Text(
+                    viewModel.pairingOwnsFleetCredentials
+                        ? "Hub pairing manages this Mac's Fleet credentials. Their values are never displayed or editable here; all other saved credentials remain write-only."
+                        : "Saved credentials are never displayed. Enter a value in the bordered field to add or replace a credential; leave it blank to keep the saved value."
+                )
                     .foregroundStyle(.secondary)
+            }
+            if viewModel.pairingOwnsFleetCredentials,
+               let pairing = viewModel.fleetPairing
+            {
+                Section("Hub-managed enrollment") {
+                    LabeledContent(
+                        "Enrollment",
+                        value: fleetPairingStatusLabel(pairing)
+                    )
+                    LabeledContent(
+                        "Credentials",
+                        value: pairing.credentialsConfigured == true
+                            ? "Configured" : "Not configured"
+                    )
+                    LabeledContent(
+                        "Credential generation",
+                        value: pairing.credentialGeneration.map(String.init)
+                            ?? "Not assigned"
+                    )
+                    Text("Pairing controls the Fleet snapshot and dispatch credentials as one generation. Revoke or forget the enrollment through the Hub workflow before configuring a different static enrollment.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
             ForEach(
                 ManagedCredential.allCases.filter {
                     $0 != .tokenSidecarPostgresDSN
+                        && (!viewModel.pairingOwnsFleetCredentials
+                            || !$0.isFleetPairingCredential)
                 }
             ) { credential in
                 Section {
@@ -2483,6 +3260,23 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
+    }
+
+    private func fleetPairingStatusLabel(
+        _ pairing: FleetPairingSnapshot
+    ) -> String {
+        switch pairing.state {
+        case "paired":
+            "Paired"
+        case "pending":
+            "Activation pending"
+        case "revoked":
+            "Revoked"
+        case "recovery_required":
+            "Needs recovery"
+        default:
+            "Not paired"
+        }
     }
 
     @ViewBuilder
@@ -2620,13 +3414,50 @@ struct SettingsView: View {
         switch viewModel.selectedSection {
         case .setup: "First-run guidance, system health, recovery, and verification"
         case .general: "Ports, timeouts, model residency, and local storage"
+        case .pool: "Pair this Mac with a Hub and manage path-free download requests"
         case .engines: "Choose and connect the inference engines available on this Mac"
         case .updates: "Check and install updates from each engine's official source"
         case .storage: "Choose exact internal or external folders for downloaded models"
         case .library: "Find compatible Hugging Face models and download them without loading"
         case .models: "Create friendly aliases and tune how each model loads"
+        case .lifecycle: "Inspect migration readiness and prepare a non-executing removal plan"
         case .usage: "Configure local token accounting and central reporting"
         case .credentials: "Replace or remove private API keys without revealing saved values"
+        }
+    }
+
+    private var pairingSubmissionButtonTitle: String {
+        if viewModel.fleetPairingCeremony.workflowPhase != nil
+            || viewModel.fleetPairing?.state == "pending"
+        {
+            return "Resume Pairing"
+        }
+        return "Pair with Hub"
+    }
+
+    private func pairingPhaseLabel(_ phase: String) -> String {
+        switch phase {
+        case "claiming": "Submitting claim"
+        case "awaiting_approval": "Waiting for approval"
+        case "staging": "Installing credentials"
+        case "activation_pending": "Verifying this Mac"
+        default: "In progress"
+        }
+    }
+
+    private func desiredInstallStateLabel(_ state: DesiredInstallState) -> String {
+        switch state {
+        case .received: "Received"
+        case .awaitingLocalApproval: "Awaiting local approval"
+        case .accepted: "Approved"
+        case .downloading: "Downloading"
+        case .verifying: "Verifying"
+        case .downloadedUnregistered: "Downloaded; registration pending"
+        case .registered: "Registered"
+        case .completed: "Completed"
+        case .refused: "Refused"
+        case .cancelled: "Cancelled"
+        case .failed: "Failed"
         }
     }
 

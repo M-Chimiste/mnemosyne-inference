@@ -4,6 +4,7 @@ import asyncio
 import base64
 import contextlib
 import ctypes
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -14,7 +15,12 @@ import threading
 import pytest
 
 import mnemosyne_macos.filesystem as filesystem_module
+import mnemosyne_macos.fs_worker as fs_worker_module
 from mnemosyne_macos.filesystem import FilesystemProbe, FilesystemProbeError
+from mnemosyne_macos.install_provenance import (
+    OwnedFile,
+    canonical_owned_files_json,
+)
 from mnemosyne_macos.scoped_process import wrap_scoped_argv
 from mnemosyne_macos.security_scopes import (
     DarwinBookmarkResolver,
@@ -115,6 +121,25 @@ async def test_filesystem_probe_scans_gguf_without_loading_it(
 
 
 @pytest.mark.asyncio
+async def test_filesystem_probe_scan_preserves_selected_symlink_spelling(
+    tmp_path: Path,
+) -> None:
+    physical = tmp_path / "Volumes" / "Athena" / "models"
+    model = _gguf(physical / "publisher" / "model-Q4_K_M.gguf")
+    selected = tmp_path / "selected-models"
+    selected.symlink_to(physical, target_is_directory=True)
+    probe = FilesystemProbe(
+        scope_root=tmp_path / "state" / "security-scopes",
+        timeout_seconds=5,
+    )
+
+    status, models = await probe.scan(str(selected))
+
+    assert status.path == str(selected)
+    assert models[0].model_path == str(selected / model.relative_to(physical))
+
+
+@pytest.mark.asyncio
 async def test_filesystem_probe_validates_llama_model_and_projector(
     tmp_path: Path,
 ) -> None:
@@ -190,6 +215,350 @@ async def test_filesystem_probe_ensures_directory_and_measures_size(
     assert deleted is True
     assert not destination.exists()
     assert root.is_dir()
+
+
+@pytest.mark.asyncio
+async def test_filesystem_probe_prepares_absent_managed_destination_and_captures_manifest(
+    tmp_path: Path,
+) -> None:
+    physical_root = tmp_path / "PhysicalModels"
+    physical_root.mkdir()
+    lexical_root = tmp_path / "Models"
+    lexical_root.symlink_to(physical_root, target_is_directory=True)
+    lexical_destination = lexical_root / "llama.cpp" / "owner" / "model"
+    probe = FilesystemProbe(
+        scope_root=tmp_path / "state" / "security-scopes",
+        timeout_seconds=5,
+    )
+
+    prepared = await probe.prepare_managed_destination(
+        root=str(lexical_root),
+        path=str(lexical_destination),
+        expected_volume_uuid=None,
+        scope_id=None,
+    )
+
+    physical_destination = physical_root / "llama.cpp" / "owner" / "model"
+    destination_metadata = physical_destination.stat()
+    assert prepared.path == str(lexical_destination)
+    assert prepared.state_before == "absent"
+    assert prepared.created is True
+    assert prepared.directory_device == destination_metadata.st_dev
+    assert prepared.directory_inode == destination_metadata.st_ino
+
+    first_payload = b"first-weight"
+    second_payload = b"{}"
+    (physical_destination / "model.gguf").write_bytes(first_payload)
+    metadata = physical_destination / "Metadata"
+    metadata.mkdir()
+    (metadata / "config.json").write_bytes(second_payload)
+
+    captured = await probe.capture_managed_manifest(
+        root=str(lexical_root),
+        path=str(lexical_destination),
+        expected_volume_uuid=None,
+        scope_id=None,
+        expected_directory_device=prepared.directory_device,
+        expected_directory_inode=prepared.directory_inode,
+    )
+
+    assert captured.path == str(lexical_destination)
+    assert captured.directory_device == prepared.directory_device
+    assert captured.directory_inode == prepared.directory_inode
+    assert captured.total_bytes == len(first_payload) + len(second_payload)
+    assert captured.files == (
+        OwnedFile(
+            path="Metadata/config.json",
+            size_bytes=len(second_payload),
+            sha256="sha256:" + hashlib.sha256(second_payload).hexdigest(),
+        ),
+        OwnedFile(
+            path="model.gguf",
+            size_bytes=len(first_payload),
+            sha256="sha256:" + hashlib.sha256(first_payload).hexdigest(),
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_filesystem_probe_prepare_is_absent_only_and_rejects_descendant_symlinks(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "Models"
+    root.mkdir()
+    destination = root / "managed" / "model"
+    destination.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    linked_parent = root / "linked"
+    linked_parent.symlink_to(outside, target_is_directory=True)
+    probe = FilesystemProbe(
+        scope_root=tmp_path / "state" / "security-scopes",
+        timeout_seconds=5,
+    )
+
+    with pytest.raises(FilesystemProbeError, match="must be absent"):
+        await probe.prepare_managed_destination(
+            root=str(root),
+            path=str(destination),
+            expected_volume_uuid=None,
+            scope_id=None,
+        )
+    with pytest.raises(FilesystemProbeError, match="descendant symlink"):
+        await probe.prepare_managed_destination(
+            root=str(root),
+            path=str(linked_parent / "model"),
+            expected_volume_uuid=None,
+            scope_id=None,
+        )
+
+    assert not (outside / "model").exists()
+
+
+@pytest.mark.asyncio
+async def test_filesystem_probe_capture_rejects_replaced_destination_identity(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "Models"
+    root.mkdir()
+    destination = root / "managed" / "model"
+    probe = FilesystemProbe(
+        scope_root=tmp_path / "state" / "security-scopes",
+        timeout_seconds=5,
+    )
+    prepared = await probe.prepare_managed_destination(
+        root=str(root),
+        path=str(destination),
+        expected_volume_uuid=None,
+        scope_id=None,
+    )
+    old_destination = root / "managed" / "old-model"
+    destination.rename(old_destination)
+    destination.mkdir()
+    (destination / "model.gguf").write_bytes(b"replacement")
+
+    with pytest.raises(FilesystemProbeError, match="identity changed"):
+        await probe.capture_managed_manifest(
+            root=str(root),
+            path=str(destination),
+            expected_volume_uuid=None,
+            scope_id=None,
+            expected_directory_device=prepared.directory_device,
+            expected_directory_inode=prepared.directory_inode,
+        )
+    replacement = b"replacement"
+    with pytest.raises(FilesystemProbeError, match="identity changed"):
+        await probe.verify_exact_manifest(
+            root=str(root),
+            path=str(destination),
+            files=(
+                OwnedFile(
+                    path="model.gguf",
+                    size_bytes=len(replacement),
+                    sha256=(
+                        "sha256:" + hashlib.sha256(replacement).hexdigest()
+                    ),
+                ),
+            ),
+            expected_volume_uuid=None,
+            scope_id=None,
+            expected_directory_device=prepared.directory_device,
+            expected_directory_inode=prepared.directory_inode,
+        )
+
+
+def test_filesystem_worker_capture_rejects_file_mutation_during_hash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "Models"
+    destination = root / "managed" / "model"
+    destination.mkdir(parents=True)
+    model = destination / "model.gguf"
+    model.write_bytes(b"a" * (2 * 1024 * 1024))
+    real_read = fs_worker_module.os.read
+    changed = False
+
+    def read_then_change(descriptor: int, size: int) -> bytes:
+        nonlocal changed
+        block = real_read(descriptor, size)
+        if block and not changed:
+            changed = True
+            model.write_bytes(b"b" * (2 * 1024 * 1024))
+        return block
+
+    monkeypatch.setattr(fs_worker_module.os, "read", read_then_change)
+
+    with pytest.raises(ValueError, match="changed while hashing"):
+        fs_worker_module._capture_managed_manifest(
+            root.resolve(strict=True),
+            str(root),
+            str(destination),
+            expected_directory_device=None,
+            expected_directory_inode=None,
+            max_files=10,
+            max_entries=20,
+            max_manifest_bytes=1024 * 1024,
+        )
+
+    assert changed is True
+
+
+@pytest.mark.asyncio
+async def test_filesystem_probe_capture_rejects_symlinks_special_files_and_empty_directories(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "Models"
+    destination = root / "managed" / "model"
+    destination.mkdir(parents=True)
+    model = destination / "model.gguf"
+    model.write_bytes(b"weights")
+    probe = FilesystemProbe(
+        scope_root=tmp_path / "state" / "security-scopes",
+        timeout_seconds=5,
+    )
+
+    link = destination / "linked.gguf"
+    link.symlink_to(model)
+    with pytest.raises(FilesystemProbeError, match="contains a symlink"):
+        await probe.capture_managed_manifest(
+            root=str(root),
+            path=str(destination),
+            expected_volume_uuid=None,
+            scope_id=None,
+        )
+    link.unlink()
+
+    fifo = destination / "download.pipe"
+    os.mkfifo(fifo)
+    with pytest.raises(FilesystemProbeError, match="special entry"):
+        await probe.capture_managed_manifest(
+            root=str(root),
+            path=str(destination),
+            expected_volume_uuid=None,
+            scope_id=None,
+        )
+    fifo.unlink()
+
+    (destination / "empty").mkdir()
+    with pytest.raises(FilesystemProbeError, match="empty directory"):
+        await probe.capture_managed_manifest(
+            root=str(root),
+            path=str(destination),
+            expected_volume_uuid=None,
+            scope_id=None,
+        )
+
+
+@pytest.mark.asyncio
+async def test_filesystem_probe_capture_enforces_file_entry_path_and_json_bounds(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "Models"
+    destination = root / "managed" / "model"
+    destination.mkdir(parents=True)
+    (destination / "one.bin").write_bytes(b"1")
+    (destination / "two.bin").write_bytes(b"2")
+    probe = FilesystemProbe(
+        scope_root=tmp_path / "state" / "security-scopes",
+        timeout_seconds=5,
+    )
+
+    with pytest.raises(FilesystemProbeError, match="too many files"):
+        await probe.capture_managed_manifest(
+            root=str(root),
+            path=str(destination),
+            expected_volume_uuid=None,
+            scope_id=None,
+            max_files=1,
+        )
+    with pytest.raises(FilesystemProbeError, match="too many entries"):
+        await probe.capture_managed_manifest(
+            root=str(root),
+            path=str(destination),
+            expected_volume_uuid=None,
+            scope_id=None,
+            max_entries=1,
+        )
+    with pytest.raises(FilesystemProbeError, match="JSON is too large"):
+        await probe.capture_managed_manifest(
+            root=str(root),
+            path=str(destination),
+            expected_volume_uuid=None,
+            scope_id=None,
+            max_manifest_bytes=32,
+        )
+
+    long_parent = destination / ("a" * 200) / ("b" * 200) / ("c" * 110)
+    long_parent.mkdir(parents=True)
+    (long_parent / "weight.bin").write_bytes(b"long")
+    with pytest.raises(FilesystemProbeError, match="invalid path"):
+        await probe.capture_managed_manifest(
+            root=str(root),
+            path=str(destination),
+            expected_volume_uuid=None,
+            scope_id=None,
+        )
+
+
+@pytest.mark.asyncio
+async def test_filesystem_probe_capture_preserves_case_distinct_manifest_entries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "Models"
+    destination = root / "managed" / "model"
+    destination.mkdir(parents=True)
+    probe = FilesystemProbe(
+        scope_root=tmp_path / "state" / "security-scopes",
+        timeout_seconds=5,
+    )
+    metadata = destination.stat()
+    upper = b"upper"
+    lower = b"lower"
+    files = (
+        OwnedFile(
+            path="Model.bin",
+            size_bytes=len(upper),
+            sha256="sha256:" + hashlib.sha256(upper).hexdigest(),
+        ),
+        OwnedFile(
+            path="model.bin",
+            size_bytes=len(lower),
+            sha256="sha256:" + hashlib.sha256(lower).hexdigest(),
+        ),
+    )
+
+    async def fake_run(*_arguments: str, **_kwargs: object) -> dict[str, object]:
+        return {
+            "ok": True,
+            "path": str(destination),
+            "directory_device": metadata.st_dev,
+            "directory_inode": metadata.st_ino,
+            "files": json.loads(canonical_owned_files_json(files)),
+            "file_count": 2,
+            "total_bytes": len(upper) + len(lower),
+            "manifest_digest": (
+                "sha256:"
+                + hashlib.sha256(
+                    canonical_owned_files_json(files).encode("utf-8")
+                ).hexdigest()
+            ),
+        }
+
+    monkeypatch.setattr(probe, "_run", fake_run)
+
+    captured = await probe.capture_managed_manifest(
+        root=str(root),
+        path=str(destination),
+        expected_volume_uuid=None,
+        scope_id=None,
+    )
+
+    assert tuple(item.path for item in captured.files) == (
+        "Model.bin",
+        "model.bin",
+    )
 
 
 @pytest.mark.parametrize(
@@ -308,6 +677,103 @@ async def test_filesystem_probe_refuses_storage_root_and_symlink_deletion(
 
 
 @pytest.mark.asyncio
+async def test_filesystem_probe_verifies_exact_manifest_through_lexical_symlink_root(
+    tmp_path: Path,
+) -> None:
+    physical_root = tmp_path / "PhysicalModels"
+    destination = physical_root / "managed" / "model"
+    nested = destination / "metadata"
+    nested.mkdir(parents=True)
+    model = destination / "model.gguf"
+    marker = nested / "marker.json"
+    model.write_bytes(b"GGUFmanaged")
+    marker.write_bytes(b"")
+    lexical_root = tmp_path / "Models"
+    lexical_root.symlink_to(physical_root, target_is_directory=True)
+    lexical_destination = lexical_root / "managed" / "model"
+    files = (
+        OwnedFile(
+            path="metadata/marker.json",
+            size_bytes=0,
+            sha256="sha256:" + hashlib.sha256(b"").hexdigest(),
+        ),
+        OwnedFile(
+            path="model.gguf",
+            size_bytes=model.stat().st_size,
+            sha256="sha256:" + hashlib.sha256(b"GGUFmanaged").hexdigest(),
+        ),
+    )
+    probe = FilesystemProbe(
+        scope_root=tmp_path / "state" / "security-scopes",
+        timeout_seconds=5,
+    )
+
+    assert await probe.verify_exact_manifest(
+        root=str(lexical_root),
+        path=str(lexical_destination),
+        files=files,
+        expected_volume_uuid=None,
+        scope_id=None,
+        expected_directory_device=destination.stat().st_dev,
+        expected_directory_inode=destination.stat().st_ino,
+    )
+
+    extra = destination / "unexpected.txt"
+    extra.write_text("extra", encoding="utf-8")
+    with pytest.raises(FilesystemProbeError, match="extra entry"):
+        await probe.verify_exact_manifest(
+            root=str(lexical_root),
+            path=str(lexical_destination),
+            files=files,
+            expected_volume_uuid=None,
+            scope_id=None,
+        )
+    extra.unlink()
+
+    linked = destination / "linked.bin"
+    linked.symlink_to(model)
+    with pytest.raises(FilesystemProbeError, match="symlink"):
+        await probe.verify_exact_manifest(
+            root=str(lexical_root),
+            path=str(lexical_destination),
+            files=files,
+            expected_volume_uuid=None,
+            scope_id=None,
+        )
+    linked.unlink()
+
+    model.write_bytes(b"GGUFchanged-size")
+    with pytest.raises(FilesystemProbeError, match="size changed"):
+        await probe.verify_exact_manifest(
+            root=str(lexical_root),
+            path=str(lexical_destination),
+            files=files,
+            expected_volume_uuid=None,
+            scope_id=None,
+        )
+    model.write_bytes(b"GGUFmanaged")
+    model.write_bytes(b"BAD!managed")
+    with pytest.raises(FilesystemProbeError, match="digest changed"):
+        await probe.verify_exact_manifest(
+            root=str(lexical_root),
+            path=str(lexical_destination),
+            files=files,
+            expected_volume_uuid=None,
+            scope_id=None,
+        )
+    model.write_bytes(b"GGUFmanaged")
+    marker.unlink()
+    with pytest.raises(FilesystemProbeError, match="missing a proven file"):
+        await probe.verify_exact_manifest(
+            root=str(lexical_root),
+            path=str(lexical_destination),
+            files=files,
+            expected_volume_uuid=None,
+            scope_id=None,
+        )
+
+
+@pytest.mark.asyncio
 async def test_filesystem_probe_trashes_only_explicit_paths_with_bundled_helper(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -362,6 +828,112 @@ async def test_filesystem_probe_trashes_only_explicit_paths_with_bundled_helper(
         "scope_path": str(root),
         "timeout_seconds": 120.0,
     }
+
+
+@pytest.mark.asyncio
+async def test_filesystem_probe_passes_exact_manifest_to_trash_helper_stdin(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "Models"
+    destination = root / "managed"
+    destination.mkdir(parents=True)
+    model = destination / "model.gguf"
+    model.write_bytes(b"GGUFmanaged")
+    helper = tmp_path / "mnemosyne-file-trash"
+    helper.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    helper.chmod(0o755)
+    probe = FilesystemProbe(
+        scope_root=tmp_path / "state" / "security-scopes",
+        timeout_seconds=5,
+        trash_helper=helper,
+    )
+    files = (
+        OwnedFile(
+            path="model.gguf",
+            size_bytes=model.stat().st_size,
+            sha256="sha256:" + "c" * 64,
+        ),
+    )
+    captured: dict[str, object] = {}
+
+    async def fake_inspect(*_args: object, **_kwargs: object):
+        return inspect_path(str(root))
+
+    async def fake_run_argv(
+        argv: list[str],
+        **kwargs: object,
+    ) -> dict[str, object]:
+        captured["argv"] = argv
+        captured["kwargs"] = kwargs
+        return {"ok": True, "trashed": [str(destination)], "skipped": []}
+
+    monkeypatch.setattr(probe, "inspect", fake_inspect)
+    monkeypatch.setattr(probe, "_run_argv", fake_run_argv)
+
+    assert await probe.trash_paths(
+        root=str(root),
+        paths=(str(destination),),
+        expected_volume_uuid=None,
+        scope_id=None,
+        exact_manifest=files,
+        expected_directory_device=destination.stat().st_dev,
+        expected_directory_inode=destination.stat().st_ino,
+    )
+    assert captured["argv"] == [
+        str(helper),
+        "--root",
+        str(root),
+        "--path",
+        str(destination),
+        "--verify-manifest-stdin",
+        "--expected-directory-device",
+        str(destination.stat().st_dev),
+        "--expected-directory-inode",
+        str(destination.stat().st_ino),
+    ]
+    assert captured["kwargs"] == {
+        "scope_id": None,
+        "scope_path": str(root),
+        "timeout_seconds": 120.0,
+        "stdin_payload": canonical_owned_files_json(files).encode("utf-8"),
+    }
+
+
+@pytest.mark.asyncio
+async def test_filesystem_probe_requires_paired_trash_directory_identity_and_manifest(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "Models"
+    destination = root / "managed"
+    destination.mkdir(parents=True)
+    helper = tmp_path / "mnemosyne-file-trash"
+    helper.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    helper.chmod(0o755)
+    probe = FilesystemProbe(
+        scope_root=tmp_path / "state" / "security-scopes",
+        timeout_seconds=5,
+        trash_helper=helper,
+    )
+
+    with pytest.raises(FilesystemProbeError, match="provided together"):
+        await probe.trash_paths(
+            root=str(root),
+            paths=(str(destination),),
+            expected_volume_uuid=None,
+            scope_id=None,
+            exact_manifest=(),
+            expected_directory_device=destination.stat().st_dev,
+        )
+    with pytest.raises(FilesystemProbeError, match="requires an exact"):
+        await probe.trash_paths(
+            root=str(root),
+            paths=(str(destination),),
+            expected_volume_uuid=None,
+            scope_id=None,
+            expected_directory_device=destination.stat().st_dev,
+            expected_directory_inode=destination.stat().st_ino,
+        )
 
 
 def _process_is_running(pid: int) -> bool:

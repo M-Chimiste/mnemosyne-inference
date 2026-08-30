@@ -1,0 +1,953 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mnemosyne.local/schemas/mac-pool/inventory/v1/mac_inventory.schema.json",
+  "title": "Mnemosyne MacInventory v1",
+  "description": "Path-free Mac placement and model inventory. This document never grants inference routing authority.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "inventory_instance_id",
+    "inventory_sequence",
+    "observed_at",
+    "pairing_id",
+    "credential_generation",
+    "service",
+    "hardware",
+    "participation",
+    "storage_locations",
+    "runtimes",
+    "installations",
+    "usage_delivery",
+    "job_acknowledgements"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "inventory_instance_id": {
+      "$ref": "#/$defs/uuid"
+    },
+    "inventory_sequence": {
+      "$ref": "#/$defs/sequence"
+    },
+    "observed_at": {
+      "$ref": "#/$defs/timestamp"
+    },
+    "pairing_id": {
+      "$ref": "#/$defs/uuid"
+    },
+    "credential_generation": {
+      "$ref": "#/$defs/generation"
+    },
+    "service": {
+      "$ref": "#/$defs/service"
+    },
+    "hardware": {
+      "$ref": "#/$defs/hardware"
+    },
+    "participation": {
+      "$ref": "#/$defs/participation"
+    },
+    "storage_locations": {
+      "type": "array",
+      "maxItems": 128,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/storage_location"
+      }
+    },
+    "runtimes": {
+      "type": "array",
+      "maxItems": 16,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/runtime"
+      }
+    },
+    "installations": {
+      "type": "array",
+      "maxItems": 10000,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/installation"
+      }
+    },
+    "usage_delivery": {
+      "$ref": "#/$defs/usage_delivery"
+    },
+    "job_acknowledgements": {
+      "type": "array",
+      "maxItems": 256,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/job_acknowledgement"
+      }
+    }
+  },
+  "$defs": {
+    "uuid": {
+      "type": "string",
+      "minLength": 36,
+      "maxLength": 36,
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "sha256": {
+      "type": "string",
+      "minLength": 71,
+      "maxLength": 71,
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "safe_identifier": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:+-]{0,127}$"
+    },
+    "safe_version": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:+-]{0,127}$"
+    },
+    "safe_alias": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[^/\\\\\\u0000-\\u001f]{1,128}$"
+    },
+    "diagnostic_code": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[a-z][a-z0-9_]{0,63}$"
+    },
+    "timestamp": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 4102444800
+    },
+    "sequence": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "generation": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 2147483647
+    },
+    "byte_count": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 1152921504606846976
+    },
+    "nullable_byte_count": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/byte_count"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "nullable_timestamp": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/timestamp"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "nullable_identifier": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/safe_identifier"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "nullable_diagnostic_code": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/diagnostic_code"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "engine": {
+      "enum": [
+        "ds4",
+        "llama.cpp",
+        "mflux",
+        "omlx"
+      ]
+    },
+    "capability": {
+      "enum": [
+        "chat/completions",
+        "completions",
+        "embeddings",
+        "images/generations",
+        "messages",
+        "rerank",
+        "responses"
+      ]
+    },
+    "capabilities": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 7,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/capability"
+      }
+    },
+    "evidence_class": {
+      "enum": [
+        "measured",
+        "catalog_tested",
+        "calculated",
+        "conservative"
+      ]
+    },
+    "remote_install_policy": {
+      "enum": [
+        "allow",
+        "ask",
+        "local-only"
+      ]
+    },
+    "service": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "version",
+        "platform",
+        "architecture",
+        "supported_inventory_versions",
+        "supported_job_versions",
+        "catalog_version",
+        "catalog_digest"
+      ],
+      "properties": {
+        "version": {
+          "$ref": "#/$defs/safe_version"
+        },
+        "platform": {
+          "const": "macos"
+        },
+        "architecture": {
+          "const": "arm64"
+        },
+        "supported_inventory_versions": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 16,
+          "uniqueItems": true,
+          "items": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 65535
+          }
+        },
+        "supported_job_versions": {
+          "type": "array",
+          "minItems": 0,
+          "maxItems": 16,
+          "uniqueItems": true,
+          "items": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 65535
+          }
+        },
+        "catalog_version": {
+          "$ref": "#/$defs/safe_version"
+        },
+        "catalog_digest": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "hardware": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "probe_version",
+        "soc_family",
+        "architecture",
+        "performance_cores",
+        "efficiency_cores",
+        "gpu_cores",
+        "unified_memory_bytes",
+        "allocatable_memory_bytes",
+        "os_major",
+        "os_minor",
+        "power_source",
+        "low_power_mode",
+        "pressure_class",
+        "observed_at",
+        "evidence_class"
+      ],
+      "properties": {
+        "probe_version": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "soc_family": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9 ._+-]{0,63}$"
+        },
+        "architecture": {
+          "const": "arm64"
+        },
+        "performance_cores": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 256
+        },
+        "efficiency_cores": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 256
+        },
+        "gpu_cores": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 2048
+        },
+        "unified_memory_bytes": {
+          "$ref": "#/$defs/byte_count"
+        },
+        "allocatable_memory_bytes": {
+          "$ref": "#/$defs/byte_count"
+        },
+        "os_major": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 99
+        },
+        "os_minor": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 99
+        },
+        "power_source": {
+          "enum": [
+            "ac",
+            "battery",
+            "unknown"
+          ]
+        },
+        "low_power_mode": {
+          "type": "boolean"
+        },
+        "pressure_class": {
+          "enum": [
+            "nominal",
+            "fair",
+            "serious",
+            "critical",
+            "unknown"
+          ]
+        },
+        "observed_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "evidence_class": {
+          "$ref": "#/$defs/evidence_class"
+        }
+      }
+    },
+    "participation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "state",
+        "remote_install_policy"
+      ],
+      "properties": {
+        "state": {
+          "enum": [
+            "joined",
+            "draining",
+            "paused"
+          ]
+        },
+        "remote_install_policy": {
+          "$ref": "#/$defs/remote_install_policy"
+        }
+      }
+    },
+    "storage_location": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "storage_location_id",
+        "binding_generation",
+        "kind",
+        "share_label",
+        "availability",
+        "writable",
+        "total_bytes",
+        "free_bytes",
+        "write_speed_class",
+        "remote_install_policy",
+        "observed_at",
+        "evidence_class",
+        "diagnostic_code"
+      ],
+      "properties": {
+        "storage_location_id": {
+          "$ref": "#/$defs/uuid"
+        },
+        "binding_generation": {
+          "$ref": "#/$defs/generation"
+        },
+        "kind": {
+          "enum": [
+            "internal",
+            "external",
+            "other"
+          ]
+        },
+        "share_label": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[^/\\\\\\u0000-\\u001f]{1,64}$"
+        },
+        "availability": {
+          "enum": [
+            "available",
+            "missing",
+            "wrong_volume",
+            "permission_required",
+            "read_only",
+            "unhealthy"
+          ]
+        },
+        "writable": {
+          "type": "boolean"
+        },
+        "total_bytes": {
+          "$ref": "#/$defs/nullable_byte_count"
+        },
+        "free_bytes": {
+          "$ref": "#/$defs/nullable_byte_count"
+        },
+        "write_speed_class": {
+          "enum": [
+            "fast",
+            "moderate",
+            "slow",
+            "unknown"
+          ]
+        },
+        "remote_install_policy": {
+          "$ref": "#/$defs/remote_install_policy"
+        },
+        "observed_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "evidence_class": {
+          "$ref": "#/$defs/evidence_class"
+        },
+        "diagnostic_code": {
+          "enum": [
+            null,
+            "volume_missing",
+            "wrong_volume",
+            "permission_required",
+            "read_only",
+            "probe_timeout",
+            "probe_failed"
+          ]
+        }
+      }
+    },
+    "runtime": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "engine",
+        "release_tier",
+        "enabled",
+        "ownership",
+        "version",
+        "runtime_fingerprint",
+        "health",
+        "catalog_status",
+        "catalog_digest",
+        "observed_at",
+        "diagnostic_code"
+      ],
+      "properties": {
+        "engine": {
+          "$ref": "#/$defs/engine"
+        },
+        "release_tier": {
+          "enum": [
+            "stable",
+            "preview"
+          ]
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "ownership": {
+          "enum": [
+            "managed",
+            "bundled",
+            "external"
+          ]
+        },
+        "version": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/safe_version"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "runtime_fingerprint": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/sha256"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "health": {
+          "enum": [
+            "healthy",
+            "degraded",
+            "unhealthy",
+            "unknown"
+          ]
+        },
+        "catalog_status": {
+          "enum": [
+            "available",
+            "missing",
+            "disabled",
+            "known_bad",
+            "unsupported_os",
+            "unhealthy",
+            "unknown"
+          ]
+        },
+        "catalog_digest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "observed_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "diagnostic_code": {
+          "enum": [
+            null,
+            "runtime_missing",
+            "engine_disabled",
+            "version_unknown",
+            "runtime_known_bad",
+            "unsupported_os",
+            "health_probe_failed",
+            "health_probe_timeout"
+          ]
+        }
+      }
+    },
+    "verification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "state",
+        "evidence_class",
+        "verified_at"
+      ],
+      "properties": {
+        "state": {
+          "enum": [
+            "unverified",
+            "revision_verified",
+            "digest_verified",
+            "self_tested"
+          ]
+        },
+        "evidence_class": {
+          "$ref": "#/$defs/evidence_class"
+        },
+        "verified_at": {
+          "$ref": "#/$defs/nullable_timestamp"
+        }
+      }
+    },
+    "installation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "installation_id",
+        "aliases",
+        "logical_model_id",
+        "artifact_id",
+        "recipe_id",
+        "deployment_id",
+        "identity_confidence",
+        "engine",
+        "model_kind",
+        "capabilities",
+        "guaranteed_context_tokens",
+        "source_kind",
+        "ownership_class",
+        "lifecycle",
+        "availability",
+        "residency",
+        "storage_location_id",
+        "storage_binding_generation",
+        "runtime_compatibility",
+        "verification",
+        "bytes_downloaded",
+        "total_bytes",
+        "observed_at",
+        "diagnostic_code"
+      ],
+      "properties": {
+        "installation_id": {
+          "$ref": "#/$defs/uuid"
+        },
+        "aliases": {
+          "type": "array",
+          "maxItems": 32,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/safe_alias"
+          }
+        },
+        "logical_model_id": {
+          "$ref": "#/$defs/nullable_identifier"
+        },
+        "artifact_id": {
+          "$ref": "#/$defs/nullable_identifier"
+        },
+        "recipe_id": {
+          "$ref": "#/$defs/nullable_identifier"
+        },
+        "deployment_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/sha256"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "identity_confidence": {
+          "enum": [
+            "authoritative",
+            "unverified"
+          ]
+        },
+        "engine": {
+          "$ref": "#/$defs/engine"
+        },
+        "model_kind": {
+          "enum": [
+            "language",
+            "image"
+          ]
+        },
+        "capabilities": {
+          "$ref": "#/$defs/capabilities"
+        },
+        "guaranteed_context_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1,
+          "maximum": 100000000
+        },
+        "source_kind": {
+          "enum": [
+            "managed_download",
+            "local_import",
+            "legacy_migration",
+            "external_reference"
+          ]
+        },
+        "ownership_class": {
+          "enum": [
+            "exclusive_managed",
+            "user_owned",
+            "external_owned",
+            "shared",
+            "unknown"
+          ]
+        },
+        "lifecycle": {
+          "enum": [
+            "configured",
+            "queued",
+            "downloading",
+            "partial",
+            "verifying",
+            "downloaded_unregistered",
+            "registered",
+            "failed",
+            "cancelled"
+          ]
+        },
+        "availability": {
+          "enum": [
+            "available",
+            "storage_missing",
+            "wrong_volume",
+            "permission_required",
+            "corrupt",
+            "engine_disabled",
+            "runtime_incompatible",
+            "unknown"
+          ]
+        },
+        "residency": {
+          "enum": [
+            "cold",
+            "loading",
+            "warm",
+            "draining",
+            "unloading",
+            "unknown"
+          ]
+        },
+        "storage_location_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/uuid"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "storage_binding_generation": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/generation"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "runtime_compatibility": {
+          "enum": [
+            "compatible_verified",
+            "compatible_unverified",
+            "runtime_missing",
+            "engine_disabled",
+            "version_mismatch",
+            "known_bad",
+            "unsupported_os",
+            "unhealthy"
+          ]
+        },
+        "verification": {
+          "$ref": "#/$defs/verification"
+        },
+        "bytes_downloaded": {
+          "$ref": "#/$defs/byte_count"
+        },
+        "total_bytes": {
+          "$ref": "#/$defs/nullable_byte_count"
+        },
+        "observed_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "diagnostic_code": {
+          "enum": [
+            null,
+            "storage_missing",
+            "wrong_volume",
+            "permission_required",
+            "artifact_corrupt",
+            "engine_disabled",
+            "runtime_incompatible",
+            "download_failed",
+            "verification_failed",
+            "registration_failed",
+            "cancelled"
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "storage_location_id": {
+                "type": "null"
+              }
+            },
+            "required": [
+              "storage_location_id"
+            ]
+          },
+          "then": {
+            "properties": {
+              "storage_binding_generation": {
+                "type": "null"
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "storage_binding_generation": {
+                "$ref": "#/$defs/generation"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "usage_delivery": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "enabled",
+        "writer_ready",
+        "outbox_pending",
+        "last_flush_at",
+        "last_error_code"
+      ],
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "writer_ready": {
+          "type": "boolean"
+        },
+        "outbox_pending": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 10000000
+        },
+        "last_flush_at": {
+          "$ref": "#/$defs/nullable_timestamp"
+        },
+        "last_error_code": {
+          "enum": [
+            null,
+            "ledger_unconfigured",
+            "writer_unavailable",
+            "outbox_full",
+            "delivery_failed",
+            "delivery_timeout"
+          ]
+        }
+      }
+    },
+    "job_acknowledgement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "job_id",
+        "job_revision",
+        "state",
+        "bytes_downloaded",
+        "total_bytes",
+        "updated_at",
+        "result_code"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": 1
+        },
+        "job_id": {
+          "$ref": "#/$defs/uuid"
+        },
+        "job_revision": {
+          "$ref": "#/$defs/generation"
+        },
+        "installation_id": {
+          "$ref": "#/$defs/uuid"
+        },
+        "state": {
+          "enum": [
+            "received",
+            "awaiting_local_approval",
+            "accepted",
+            "downloading",
+            "verifying",
+            "downloaded_unregistered",
+            "registered",
+            "completed",
+            "refused",
+            "cancelled",
+            "failed"
+          ]
+        },
+        "bytes_downloaded": {
+          "$ref": "#/$defs/byte_count"
+        },
+        "total_bytes": {
+          "$ref": "#/$defs/nullable_byte_count"
+        },
+        "updated_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "result_code": {
+          "enum": [
+            null,
+            "local_approval_required",
+            "local_policy_refused",
+            "pairing_generation_changed",
+            "inventory_basis_stale",
+            "catalog_changed",
+            "recipe_unknown",
+            "artifact_mismatch",
+            "storage_location_unknown",
+            "storage_binding_changed",
+            "storage_unavailable",
+            "storage_read_only",
+            "insufficient_storage",
+            "runtime_unavailable",
+            "verification_failed",
+            "registration_failed",
+            "cancelled_by_hub",
+            "cancelled_locally",
+            "idempotency_conflict",
+            "internal_error"
+          ]
+        }
+      }
+    }
+  }
+}

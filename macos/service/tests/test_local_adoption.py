@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from mnemosyne_macos.config import MacConfig, load_config, save_config
+from mnemosyne_macos.install_launch import install_launch_json
 from mnemosyne_macos.install_store import InstallRecord
 from mnemosyne_macos.local_models import LocalModelError, scan_local_models
 from mnemosyne_macos.models import Endpoint, EngineName
@@ -21,6 +22,30 @@ class _DirectFilesystem:
 
     async def inspect(self, path: str, **_kwargs):
         return inspect_path(path)
+
+
+class _OMLXContractAdapter:
+    def __init__(self, *, slots: int = 2, guard: bool = True) -> None:
+        self.slots = slots
+        self.guard = guard
+        self.contract_checks = 0
+        self.load_calls = 0
+
+    async def require_launch_contract(self, launch, *, deadline):
+        del deadline
+        self.contract_checks += 1
+        if launch.scheduler_slots != self.slots:
+            raise RuntimeError("scheduler mismatch")
+        if launch.memory_guard == "required" and not self.guard:
+            raise RuntimeError("memory guard mismatch")
+        return SimpleNamespace(
+            scheduler_slots=self.slots,
+            memory_guard_enabled=self.guard,
+        )
+
+    async def load(self, *_args, **_kwargs):
+        self.load_calls += 1
+        raise AssertionError("registration must remain cold")
 
 
 def _gguf(path: Path, payload: bytes = b"fixture") -> Path:
@@ -335,6 +360,215 @@ async def test_ds4_install_registration_uses_the_upstream_family_wire_model(
 
 
 @pytest.mark.parametrize(
+    ("gpu_offload", "flash_attention", "expected_gpu", "expected_flash"),
+    [
+        ("all", "enabled", 999, True),
+        ("automatic", "automatic", None, None),
+        ("automatic", "disabled", None, False),
+    ],
+)
+@pytest.mark.asyncio
+async def test_llama_signed_launch_materializes_exact_typed_load_settings(
+    tmp_path: Path,
+    gpu_offload: str,
+    flash_attention: str,
+    expected_gpu: int | None,
+    expected_flash: bool | None,
+) -> None:
+    root = tmp_path / "Models"
+    selected = root / "nested" / "selected"
+    destination = selected / "llama.cpp" / "publisher" / "model"
+    filename = _gguf(destination / "model-Q4_K_M.gguf").name
+    config_path = tmp_path / "settings" / "config.yaml"
+    config = MacConfig.model_validate(
+        {
+            "engines": {"llama_cpp": {"enabled": True}},
+            "paths": {"state_database": str(tmp_path / "state.db")},
+            "storage": {
+                "default": "exact-selected-root",
+                "locations": [
+                    {"name": "exact-selected-root", "path": str(selected)}
+                ],
+            },
+        }
+    )
+    save_config(config, config_path)
+    runtime = _runtime_for_adoption(config, config_path)
+    install = InstallRecord(
+        id="install-signed-llama",
+        repo_id="publisher/model",
+        engine=EngineName.LLAMA_CPP.value,
+        storage="exact-selected-root",
+        alias="signed-model",
+        destination=str(destination),
+        status="installed",
+        filename=filename,
+        context_length=8192,
+        launch_json=install_launch_json(
+            "llama.cpp",
+            {
+                "engine": "llama.cpp",
+                "parallel_slots": 3,
+                "gpu_offload": gpu_offload,
+                "flash_attention": flash_attention,
+            },
+        ),
+    )
+
+    await runtime._register_installed_model(install)  # noqa: SLF001
+
+    profile = load_config(config_path).models[0]
+    assert profile.storage == "exact-selected-root"
+    assert profile.model == str(destination / filename)
+    assert profile.load.parallel == 3
+    assert profile.load.gpu_layers == expected_gpu
+    assert profile.load.flash_attention is expected_flash
+
+
+@pytest.mark.asyncio
+async def test_ds4_signed_launch_maps_batched_sessions_to_parallel(tmp_path: Path) -> None:
+    root = tmp_path / "Models"
+    destination = root / "ds4" / "antirez" / "model"
+    filename = _gguf(destination / "model.gguf").name
+    config_path = tmp_path / "settings" / "config.yaml"
+    config = MacConfig.model_validate(
+        {
+            "engines": {"ds4": {"enabled": True}},
+            "paths": {"state_database": str(tmp_path / "state.db")},
+            "storage": {
+                "default": "models",
+                "locations": [{"name": "models", "path": str(root)}],
+            },
+        }
+    )
+    save_config(config, config_path)
+    runtime = _runtime_for_adoption(config, config_path)
+    install = InstallRecord(
+        id="install-signed-ds4",
+        repo_id="antirez/model",
+        engine=EngineName.DS4.value,
+        storage="models",
+        alias="signed-ds4",
+        destination=str(destination),
+        status="installed",
+        filename=filename,
+        family="model",
+        launch_json=install_launch_json(
+            "ds4",
+            {
+                "engine": "ds4",
+                "batched_sessions": 4,
+                "execution_mode": "single-node",
+            },
+        ),
+    )
+
+    await runtime._register_installed_model(install)  # noqa: SLF001
+
+    profile = load_config(config_path).models[0]
+    assert profile.load.parallel == 4
+    assert profile.storage == "models"
+
+
+@pytest.mark.asyncio
+async def test_omlx_signed_launch_registers_cold_after_exact_global_proof(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "Models"
+    destination = _mlx_model(root / "omlx" / "publisher" / "model")
+    config_path = tmp_path / "settings" / "config.yaml"
+    config = MacConfig.model_validate(
+        {
+            "engines": {"omlx": {"enabled": True}},
+            "paths": {"state_database": str(tmp_path / "state.db")},
+            "storage": {
+                "default": "models",
+                "locations": [{"name": "models", "path": str(root)}],
+            },
+        }
+    )
+    save_config(config, config_path)
+    runtime = _runtime_for_adoption(config, config_path)
+    adapter = _OMLXContractAdapter()
+    runtime.adapters[EngineName.OMLX] = adapter  # type: ignore[assignment]
+    install = InstallRecord(
+        id="install-signed-omlx",
+        repo_id="publisher/model",
+        engine=EngineName.OMLX.value,
+        storage="models",
+        alias="signed-omlx",
+        destination=str(destination),
+        status="installed",
+        launch_json=install_launch_json(
+            "omlx",
+            {
+                "engine": "omlx",
+                "scheduler_slots": 2,
+                "memory_guard": "required",
+            },
+        ),
+    )
+
+    await runtime._register_installed_model(install)  # noqa: SLF001
+
+    profile = load_config(config_path).models[0]
+    assert profile.alias == "signed-omlx"
+    assert profile.engine == EngineName.OMLX
+    assert profile.model == "model"
+    assert profile.storage == "models"
+    assert adapter.contract_checks == 2
+    assert adapter.load_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_omlx_signed_launch_refuses_registration_after_global_drift(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "Models"
+    destination = _mlx_model(root / "omlx" / "publisher" / "model")
+    config_path = tmp_path / "settings" / "config.yaml"
+    config = MacConfig.model_validate(
+        {
+            "engines": {"omlx": {"enabled": True}},
+            "paths": {"state_database": str(tmp_path / "state.db")},
+            "storage": {
+                "default": "models",
+                "locations": [{"name": "models", "path": str(root)}],
+            },
+        }
+    )
+    save_config(config, config_path)
+    before = config_path.read_bytes()
+    runtime = _runtime_for_adoption(config, config_path)
+    adapter = _OMLXContractAdapter(slots=1)
+    runtime.adapters[EngineName.OMLX] = adapter  # type: ignore[assignment]
+    install = InstallRecord(
+        id="install-signed-omlx-drift",
+        repo_id="publisher/model",
+        engine=EngineName.OMLX.value,
+        storage="models",
+        alias="signed-omlx",
+        destination=str(destination),
+        status="installed",
+        launch_json=install_launch_json(
+            "omlx",
+            {
+                "engine": "omlx",
+                "scheduler_slots": 2,
+                "memory_guard": "required",
+            },
+        ),
+    )
+
+    with pytest.raises(RuntimeConfigurationError, match="does not match"):
+        await runtime._register_installed_model(install)  # noqa: SLF001
+
+    assert config_path.read_bytes() == before
+    assert adapter.contract_checks == 1
+    assert adapter.load_calls == 0
+
+
+@pytest.mark.parametrize(
     ("alias", "architecture", "expected"),
     [
         (
@@ -532,10 +766,17 @@ async def test_lmstudio_symlink_root_stays_exact_through_scan_and_import(
 ) -> None:
     target = tmp_path / "Volumes" / "Athena" / "nested" / "models"
     model = _gguf(target / "publisher" / "chat" / "chat-Q4_K_M.gguf")
+    physical_projector = _gguf(
+        target / "publisher" / "chat" / "mmproj-chat-f16.gguf"
+    )
     selected = tmp_path / "home" / ".lmstudio" / "models"
     selected.parent.mkdir(parents=True)
     selected.symlink_to(target, target_is_directory=True)
     candidate = scan_local_models(selected)[0]
+    expected_model = selected / model.relative_to(target)
+    expected_projector = selected / physical_projector.relative_to(target)
+    assert candidate.model_path == str(expected_model)
+    assert candidate.projector_options[0].path == str(expected_projector)
     config_path = tmp_path / "settings" / "config.yaml"
     config = MacConfig.model_validate(
         {
@@ -561,7 +802,12 @@ async def test_lmstudio_symlink_root_stays_exact_through_scan_and_import(
 
     result = await runtime.adopt_local_models(
         str(selected),
-        [{"candidate_id": candidate.id}],
+        [
+            {
+                "candidate_id": candidate.id,
+                "projector_id": candidate.projector_options[0].id,
+            }
+        ],
         scope_id=scope_id,
     )
 
@@ -575,7 +821,13 @@ async def test_lmstudio_symlink_root_stays_exact_through_scan_and_import(
     assert storage.path == str(selected)
     assert storage.scope_id == scope_id
     assert adopted.engine == EngineName.LLAMA_CPP
-    assert adopted.model == str(model.resolve())
+    assert adopted.model == str(expected_model)
+    assert adopted.load.projector_path == str(expected_projector)
+    assert result["imported"][0]["model_path"] == str(expected_model)
+    assert runtime.storage_scope_for_path(adopted.model) == (
+        scope_id,
+        str(selected),
+    )
     assert scopes.required
     assert all(item == (scope_id, str(selected)) for item in scopes.required)
 

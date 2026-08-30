@@ -134,10 +134,23 @@ the public key is injected into the signed app. Never commit either Apple
 credential or the Sparkle private key.
 
 The workflow reruns all native gates, exports both locked Python layers, signs
-nested code from the inside out, notarizes/staples/Gatekeeper-assesses the app
-before imaging it, then does the same for the DMG, generates an EdDSA-signed
-appcast, writes the acceptance report and SHA-256 checksums, and publishes all
-of them as immutable GitHub release assets. The app checks the HTTPS
+nested code from the inside out, generates the closed lifecycle role manifest
+after the exact bundled service Python, helper, and inert runner are signed,
+and seals it with the outer app signature. Release verification requires exact
+app/helper/runner/service-Python Team consistency, identifiers, CDHashes,
+requirement digests, and hardened runtime on Developer ID builds. The Python
+role is explicitly non-authoritative, the helper currently provides
+authentication transport only, and the runner returns only
+`runner_adapter_unavailable`; all lifecycle effects remain unavailable.
+Migration preview also remains unavailable until a production signed-code and
+consistent-snapshot collector can supply the exact predecessor, recovery-clone,
+candidate-member, state, storage, model-provenance, outbox, pairing, and
+participation evidence. The preparation validators do not infer or create that
+evidence and do not enable execution.
+The workflow then notarizes/staples/Gatekeeper-assesses the app before imaging
+it, does the same for the DMG, generates an EdDSA-signed appcast, writes the
+acceptance report and SHA-256 checksums, and publishes all of them as immutable
+GitHub release assets. The app checks the HTTPS
 `releases/latest/download/appcast.xml` feed through Sparkle.
 
 Version 0.x artifacts are published as prereleases for acceptance testing.

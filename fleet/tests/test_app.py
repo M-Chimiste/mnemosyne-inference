@@ -10,6 +10,7 @@ import httpx
 
 from mnemosyne_fleet.app import create_app
 from mnemosyne_fleet.config import LedgerConfig, NodeConfig
+from mnemosyne_fleet.locator_policy import LocatorPolicy
 
 from .helpers import capacity, fleet_config, snapshot_payload
 
@@ -40,6 +41,65 @@ async def test_owned_clients_leave_active_capacity_to_the_scheduler(
             assert limits.max_keepalive_connections == 20
             assert kwargs["trust_env"] is False
             assert kwargs["follow_redirects"] is False
+
+
+async def test_dashboard_status_exposes_only_the_non_secret_service_class(
+    tmp_path,
+) -> None:
+    node = NodeConfig(
+        node_id="nyx-worker",
+        url="http://nyx-worker",
+        fleet_token="nyx-fleet-secret",
+        inference_token="nyx-inference-secret",
+        service_class="overflow",
+    )
+    app = create_app(
+        fleet_config(tmp_path, nodes=(node,)),
+        start_polling=False,
+    )
+
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://fleet",
+        ) as client:
+            dashboard = await client.get("/fleet/")
+            status = await client.get(
+                "/fleet/api/status",
+                headers={"Authorization": "Bearer admin-key"},
+            )
+
+    assert "Service class:" in dashboard.text
+    payload = status.json()
+    assert payload["nodes"][0]["service_class"] == "overflow"
+    assert payload["models"][0]["nodes"][0]["service_class"] == "overflow"
+    assert payload["mac_pool"] == {
+        "schema_version": 1,
+        "pairing": {
+            "enabled": False,
+            "available": False,
+            "error_code": None,
+        },
+        "inventory": {
+            "enabled": False,
+            "available": False,
+            "error_code": None,
+        },
+        "catalog": {
+            "enabled": False,
+            "available": False,
+            "error_code": None,
+        },
+        "remote_installs": {
+            "enabled": False,
+            "available": False,
+            "error_code": None,
+        },
+    }
+    serialized = json.dumps(payload)
+    assert "nyx-fleet-secret" not in serialized
+    assert "nyx-inference-secret" not in serialized
+    assert "http://nyx-worker" not in serialized
 
 
 async def test_proxy_rewrites_only_model_and_uses_inference_secret(tmp_path) -> None:
@@ -317,6 +377,21 @@ async def test_inference_and_admin_endpoints_require_separate_client_keys(tmp_pa
             assert "All enrolled candidates" in dashboard.text
             assert "online strict" in dashboard.text
             assert "Usage enabled" in dashboard.text
+            assert "Mac model pool" in dashboard.text
+            assert "Mac device inventory" in dashboard.text
+            assert "Unified signed model catalog" in dashboard.text
+            assert "Hardware-aware placement" in dashboard.text
+            assert "DesiredInstall delivery and progress" in dashboard.text
+            assert "LIMITED / overflow" in dashboard.text
+            assert 'headers:{"If-Match":`"${revision}"`}' in dashboard.text
+            assert "window.confirm" in dashboard.text
+            for forbidden in (
+                "snapshot_bearer",
+                "dispatch_bearer",
+                "management_bearer",
+                "/Volumes/",
+            ):
+                assert forbidden not in dashboard.text
 
 
 async def test_non_finite_json_is_rejected_before_routing(tmp_path) -> None:
@@ -495,6 +570,7 @@ async def test_decoded_buffered_429_drops_stale_content_encoding(tmp_path) -> No
 async def test_dashboard_route_and_ledger_views_share_node_and_model_identity(
     tmp_path,
 ) -> None:
+    pairing_id = "11111111-1111-4111-8111-111111111111"
     snapshot = snapshot_payload("node-a")
     alternate = dict(snapshot["deployments"][0])
     alternate["alias"] = "node-a-qwen-alternate"
@@ -506,8 +582,17 @@ async def test_dashboard_route_and_ledger_views_share_node_and_model_identity(
     def proxy_handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"ok": True})
 
+    base = fleet_config(tmp_path)
+    paired_node = replace(
+        base.nodes[0],
+        url="http://node-a:1240",
+        source="paired",
+        enrollment_id=pairing_id,
+        locator_transport="trusted_lan_http",
+    )
     config = replace(
-        fleet_config(tmp_path),
+        base,
+        nodes=(paired_node,),
         ledger=LedgerConfig(dsn="postgresql://read-only.invalid/ledger"),
     )
     app = create_app(
@@ -519,6 +604,27 @@ async def test_dashboard_route_and_ledger_views_share_node_and_model_identity(
             transport=httpx.MockTransport(proxy_handler)
         ),
         start_polling=False,
+        pairing_locator_policy=LocatorPolicy(
+            cidr_allowlists={
+                "https": (),
+                "tailscale": (),
+                "trusted_lan_http": ("10.0.0.0/8",),
+            },
+            allowed_ports=(1240,),
+            resolver=lambda _host, _port: ("10.20.30.40",),
+        ),
+        paired_registry_client_factory=lambda locator, **_kwargs: (
+            httpx.AsyncClient(
+                base_url=locator.origin,
+                transport=httpx.MockTransport(registry_handler),
+            )
+        ),
+        paired_proxy_client_factory=lambda locator, **_kwargs: (
+            httpx.AsyncClient(
+                base_url=locator.origin,
+                transport=httpx.MockTransport(proxy_handler),
+            )
+        ),
     )
 
     async def aggregate(*, hours: int):
@@ -562,8 +668,19 @@ async def test_dashboard_route_and_ledger_views_share_node_and_model_identity(
             ).json()
 
     assert status["routes"][0]["node_id"] == "node-a"
+    assert status["routes"][0]["reporting_node_id"] == "node-a"
+    assert status["routes"][0]["enrollment_id"] == pairing_id
     assert status["routes"][0]["public_model"] == "qwen-coder"
+    assert status["nodes"][0]["reporting_node_id"] == "node-a"
+    assert status["nodes"][0]["enrollment_id"] == pairing_id
+    assert status["nodes"][0]["source"] == "paired"
+    assert status["models"][0]["nodes"][0]["reporting_node_id"] == "node-a"
+    assert status["models"][0]["nodes"][0]["enrollment_id"] == pairing_id
     assert status["models"][0]["nodes"][0]["eligible"] is True
+    serialized_status = json.dumps(status)
+    assert paired_node.url not in serialized_status
+    assert paired_node.fleet_token not in serialized_status
+    assert paired_node.inference_token not in serialized_status
     assert usage["rows"][0]["node_id"] == "node-a"
     assert usage["rows"][0]["public_model"] == "qwen-coder"
     assert usage["rows"][0]["public_models"] == ["qwen-coder"]

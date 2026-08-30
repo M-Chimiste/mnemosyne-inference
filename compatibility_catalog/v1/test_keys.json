@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "keys": [
+    {
+      "key_id": "test-catalog-2026-a",
+      "algorithm": "Ed25519",
+      "public_key": "ebVWLo_mVPlAeLES6KmLp5AfhTrmlb7X4OORC60ElmQ"
+    }
+  ]
+}

@@ -1,7 +1,9 @@
 # Mnemosyne Fleet Gateway Architecture
 
-Status: protocol and services implemented; target-host rollout evidence is
-tracked in [fleet acceptance](fleet_acceptance.md).
+Status: the static protocol-v1 gateway and services are implemented; target-
+host rollout evidence is tracked in [fleet acceptance](fleet_acceptance.md).
+The opt-in dynamic-pairing foundation is implemented only to the boundary
+described below and is not yet a production signed-app workflow.
 
 ## Purpose
 
@@ -50,11 +52,71 @@ Nyx uses separate credentials for:
 - dashboard and Fleet admin API access;
 - each enrolled node's read-only snapshot endpoint;
 - each enrolled node's inference plane;
+- each paired node's own pairing-management operations;
 - read-only token-ledger queries;
 
 Credentials are stored only in Nyx's private secret store or environment and
 are never returned by fleet APIs, written to route history, or sent to the
 browser.
+
+Existing static nodes resolve snapshot and inference credentials from the
+configured environment references. A paired Mac instead receives three
+independent generated bearers: snapshot, Fleet-only dispatch, and management.
+The dispatch bearer is accepted by the native service for normal inference
+only alongside Nyx's canonical Fleet route marker and never replaces the
+Mac's ordinary local inference credential. Dynamic locator and credential
+values remain encrypted outside Fleet's route database; public/admin status
+exposes only opaque identity, generation, lifecycle, and fixed failure fields.
+
+### Dynamic pairing implementation boundary
+
+Pairing is opt-in and disabled by default. When disabled, its API routes are
+absent and static enrollment behaves exactly as before. When enabled, the Hub
+implements strict version-1 invitation, claim, approval/rejection,
+claim-bound provisioning, activation acknowledgement, enable/disable,
+revocation, encrypted secret persistence, and restart reconciliation. Its
+locator policy rejects unapproved schemes, ports, networks, ambiguous DNS, and
+topology changes. Activation and paired dispatch use a transport pinned to the
+approved numeric peer while retaining normal TLS hostname verification,
+disabling redirects, and ignoring ambient proxies.
+
+Activation performs only authenticated snapshot and reduced path-free model
+probes and checks that neither probe changed residency. The production flow
+keeps a newly activated pairing Hub-disabled until a separate administrator
+enable publishes it to the scheduler. Paired registry records use opaque
+`pairing_id` for enrollment/revocation ownership while preserving snapshot-v1
+and token-ledger `reporting_node_id`; persisted snapshots never regain routing
+authority after restart without a fresh poll. Static and paired records share
+the scheduler but retain explicit source and credential ownership.
+
+The Mac service has the matching durable local pairing journal, private
+credential-file transaction, staged-versus-active authentication rules,
+secret-free status, and Fleet-only path-free model probe. The Swift app renders
+pairing status, prevents generic editing of pairing-owned credentials, exposes
+the independent participation toggle, and drives invitation claim, approval
+resume, credential delivery/staging, and activation with a memory-only secret.
+It also exposes authenticated permanent self-revoke and exact-request retry
+recovery independently from the reversible participation toggle. Signed-
+artifact acceptance, routine rotation, lifecycle integration, and the full
+crash matrix remain pending. Static adoption, remote notification,
+representative signed multi-host acceptance, and the broader inventory/catalog
+and migration workflows remain target behavior in
+[the pairing protocol](fleet_pairing_protocol.md).
+
+### Nyx-hosted limited compute
+
+Nyx may also run a limited inference worker, but the worker is an ordinary
+enrolled node rather than part of the Fleet gateway. It must have an
+independent service identity, listener, state directory, model-storage roots,
+runtime lifecycle, and snapshot/inference credentials. The gateway must not
+launch, adopt, signal, or share mutable engine state with that worker.
+
+The enrollment should set `service_class = "overflow"` so primary and
+opportunistic nodes remain preferred even when the Nyx worker is already warm.
+The class is Hub-owned scheduling policy and is deliberately absent from
+deployment identity and the node snapshot protocol. Configuration alone does
+not create OS process or resource isolation; those deployment boundaries are
+an operator prerequisite for enrollment.
 
 ## Versioned node protocol
 
@@ -65,8 +127,11 @@ GET /fleet/v1/snapshot
 Authorization: Bearer <node FLEET_API_KEY>
 ```
 
-This credential is distinct from the node's `INFERENCE_API_KEY`. The response
-is one self-consistent document with these top-level fields:
+This credential is distinct from the credential Nyx uses to dispatch
+inference. Static nodes retain the current configured inference bearer; a
+paired native Mac uses its dedicated `FLEET_INFERENCE_API_KEY`, with the
+ordinary `INFERENCE_API_KEY` remaining local-client policy. The response is one
+self-consistent document with these top-level fields:
 
 ```json
 {
@@ -293,7 +358,15 @@ CUDA must satisfy this contract before it participates in fleet routing.
 
 Nyx resolves the request's public `model` to a strict deployment group,
 filters candidates by endpoint capability and live authoritative state, then
-uses the following ordered tiers:
+applies the enrollment's Hub-owned service class before residency. Classes are
+strictly ordered `primary`, `opportunistic`, then `overflow`, with omitted
+configuration defaulting to `primary` for existing enrollments. A lower class
+is considered only when no higher-class node currently yields an admissible
+candidate. A cold/loadable primary therefore precedes a warm overflow node,
+while a saturated primary with no bounded queue room does not block a lower
+class.
+
+Within the selected service class, Fleet uses the following ordered tiers:
 
 1. requested deployment already resident with an available permit;
 2. requested deployment resident with the shortest bounded queue;
@@ -303,7 +376,7 @@ uses the following ordered tiers:
 6. `429` with `Retry-After` when the fleet queue is full or its deadline
    expires.
 
-Within a tier, Nyx uses weighted least-outstanding selection. A node's
+Within a class and tier, Nyx uses weighted least-outstanding selection. A node's
 effective limit is the default weight; operator weights may only reduce its
 share until representative performance data justifies a higher derived
 capacity.
@@ -384,6 +457,69 @@ authenticated deployment inventory. Stale inventory remains visible only for
 diagnosis and is labeled offline; it never regains routing authority. Public
 model promotion remains an explicit configuration action.
 
+This snapshot-derived deployment view remains separate from the Mac management
+inventory. Native Macs now produce strict path-free `MacInventory` v1
+observations, synchronize them through the pairing-management credential, and
+Nyx persists them in a secret-free database with replay, generation, instance,
+restart, expiry, and revocation fences. The authenticated inventory endpoints
+expose summaries or the exact path-free document; persisted observations never
+become inference authority.
+
+The optional signed compatibility-catalog service is also integrated as a
+management-only side path. It loads a verified last-known-good catalog or the
+built-in empty offline catalog from a dedicated mode-`0700` directory, accepts
+updates only from one canonical HTTPS origin/path, and verifies them against
+locally pinned Ed25519 public keys. Background and admin-triggered checks are
+bounded, credential-free, redirect-free, and failure-isolated. Admin-only,
+no-store status, paginated model metadata, and paginated recipe metadata are
+available only when `[catalog].enabled = true`. Neither startup catalog health
+nor an update result mutates public model mappings, node membership, scheduler
+reservations, or `/v1/*` routing.
+
+When dynamic pairing, the signed catalog, and the independent
+`placement.remote_installs_enabled` switch are all explicitly enabled, Nyx
+accepts a closed placement intent at
+`POST /fleet/api/v1/placement/recommendations`. The caller can state only the
+exact logical-model/recipe IDs and required capability, context, concurrency,
+and allowed service classes. Nyx stamps the recommendation UUID and time,
+resolves every recipe fact from the verified catalog, and scores every
+inventory-backed Mac/storage binding. Results are short-lived, explainable,
+path-free advice and contain no selected/chosen target. Runtime installation
+policy is currently `not_allowed`.
+
+Under that same hard-default-off switch, the Hub now owns a separate private,
+bounded DesiredInstall v1 journal. `POST /fleet/api/v1/desired-installs`
+accepts only the original closed user contract, a canonical idempotency key,
+and one exact candidate `basis` copied from the advisory response. The caller
+cannot supply job identity/revision/time, artifact or engine facts, hardware or
+memory facts, runtime/install policy, a selected-path value, or any desired
+destination. Nyx stamps the job UUID/time, re-resolves the active signed
+catalog, recomputes all candidates, and creates revision 1 only when that exact
+Mac×storage basis remains eligible; it never infers or substitutes a target.
+Exact-ID read, bounded list, and revision-bumping cancellation are admin-only
+and `no-store`.
+
+The journal is not the routing database, pairing database, inventory database,
+or catalog store. It records fixed user contract and signed identities,
+pairing/credential generation, catalog version/digest, recipe/artifact,
+inventory instance/sequence, opaque storage ID/generation, TTL, delivery, and
+bounded acknowledgement state. Pending documents leave Nyx only in the
+authenticated response to the selected Mac's outbound inventory sync after
+that inventory has been accepted. Same-instance increasing sequences are
+eligible for redelivery only after current pairing/catalog/storage fences are
+rechecked; instance, credential generation, catalog, recipe/artifact, or
+storage-binding changes never retarget the job. Acknowledgements are
+idempotent and monotonic. A delayed older-revision acknowledgement cannot
+unwind a cancellation, and bounded retired terminal acknowledgements are safe
+to ignore rather than wedging future inventory sync. Cancellation authorizes
+only stopping the exact job and carries no cleanup/delete authority. No Mac
+executor or downloader consumes this wire yet.
+
+Frozen snapshot v1 remains the only live routing authority and must not accept
+inventory or placement fields. Nyx never learns an exact model path, volume
+UUID, scope/bookmark, or raw destination and cannot silently choose a default
+directory or relocate existing weights.
+
 ## Usage and observability
 
 The serving node remains the sole token-accounting authority. Existing local
@@ -400,10 +536,13 @@ public model mapping. If two public synonyms deliberately map to the same
 node alias, the dashboard shows both names and does not invent a single
 historical attribution.
 
-Fleet route history is separate from `public.token_usage`. A future optional
-request/route ID may be carried in a fixed internal header and stored in both
-systems for correlation, but lack of that correlation does not weaken
-per-node token attribution.
+Fleet route history is separate from `public.token_usage`. Fleet now carries
+its canonical route UUID in the fixed `X-Mnemosyne-Fleet-Route` internal
+header, and the native Mac writer reuses that UUID as the token event ID. This
+gives a content-free, retry-stable join key without making Nyx a second usage
+writer. Extending the central row with pairing generation, deployment ID, and
+mapping version remains target work; node ID remains the authoritative serving
+device attribution in the current ledger.
 
 The realtime dashboard displays:
 
@@ -421,12 +560,16 @@ to node inference or control planes.
 
 ## Persistence on Nyx
 
-The existing token ledger remains authoritative for historical usage. Nyx's
-private TOML contains node URLs, environment-variable references, logical
-model mappings, queue bounds, and routing weights. Secret values live only in
-its private environment. Fleet's separate SQLite database persists enrolled
-node IDs, logical model/deployment mappings, and bounded route metadata with
-fixed failure codes. It contains no request bodies or token rows.
+The existing token ledger remains authoritative for historical usage. For
+static nodes, Nyx's private TOML contains node URLs and environment-variable
+references alongside logical model mappings, queue bounds, and routing
+weights; their secret values live only in its private environment. Dynamic
+pairing metadata lives in a separate private SQLite database and refers to
+locator/credential records in a separate authenticated-encryption database
+whose master key is environment-backed. Neither pairing database is the route
+history database, and browser-facing APIs expose neither raw locator nor
+secret reference. Fleet's route database persists bounded route metadata with
+fixed failure codes and contains no request bodies or token rows.
 
 High-frequency heartbeats and active reservations are in-memory state.
 Persisting occasional last-known snapshots is permitted for diagnostics, but
@@ -448,8 +591,11 @@ stale persisted state is never eligible for routing after Nyx restarts.
 - Node failure before headers: return an error unless non-acceptance is
   provable.
 - Node failure after headers: terminate the client stream without failover.
-- Token ledger outage: node-local outboxes retain usage; inference continues
-  within the configured outbox cap.
+- Token ledger outage: node-local outboxes retain usage; language inference
+  continues only while durable capacity remains. At the configured cap, the
+  native Mac closes new accounted admission with `usage_outbox_full` instead
+  of pruning an undelivered row. Image inference remains outside token
+  accounting.
 - Uncertain engine state: capacity zero and no new routing until local
   reconciliation succeeds.
 

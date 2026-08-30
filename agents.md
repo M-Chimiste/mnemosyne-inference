@@ -20,12 +20,60 @@ engine process.
 - `fleet_protocol.py` and `fleet_protocol/v1/` define shared, secret-free
   deployment identity, capacity helpers, the node snapshot schema, and golden
   cross-platform vectors.
+- `mac_pool_protocol/v1/` defines the separate, strict, path-free Mac inventory,
+  advisory-placement, and desired-install schemas and complete cross-component
+  golden fixtures. It does not extend or grant authority to frozen Fleet
+  snapshot v1.
+- `fleet/src/mnemosyne_fleet/placement.py` consumes fresh authenticated Mac
+  inventory plus one normalized signed-catalog recipe and produces an
+  expiring, path-free advisory ranking for explicit Mac/storage selection. It
+  never chooses a target, creates a desired job, or grants routing authority.
+- `fleet/src/mnemosyne_fleet/catalog_service.py` owns Fleet's optional,
+  failure-isolated last-known-good/update lifecycle, while
+  `placement_api.py` stamps closed caller intent and adapts paired enrollment
+  plus Mac inventory into scorer inputs. Both are default-off management side
+  paths and must never mutate the registry, scheduler, public model mappings,
+  node storage, or downloads.
+- `fleet/src/mnemosyne_fleet/desired_install_protocol.py`,
+  `desired_install_store.py`, and `desired_install_api.py` implement the
+  default-off Hub DesiredInstall v1 authority. The administrator must submit
+  one exact current advisory Mac/storage basis; Nyx re-resolves the signed
+  recipe and recomputes placement before journaling a path-free job in its own
+  private bounded SQLite database. Delivery occurs only through the selected
+  Mac's authenticated outbound inventory sync and is fenced by exact pairing,
+  credential generation, service instance, catalog, inventory sequence, and
+  opaque storage generation. Cancellation is a revisioned stop intent, never
+  cleanup/delete. This Hub layer has no filesystem path authority, downloader,
+  runtime installer, live model claim, or inference-routing authority; the
+  selected Mac independently validates and executes the path-free intent.
+- `compatibility_catalog/v1/` defines the closed signed Apple Silicon catalog
+  envelope for logical models, immutable artifacts, and typed `llama.cpp`,
+  `omlx`, and `ds4` recipes. `compatibility_catalog/catalog.py` is vendored
+  byte-for-byte into Fleet and the native service; both wheels embed the same
+  normative schema. This trust substrate is read/verify/activate only and does
+  not authorize downloads, runtime mutation, placement, or local storage.
+  `macos/service/catalog_runtime.py` owns the native optional default-off LKG
+  and update lifecycle. Its private state is anchored beside the active Mac
+  config, and failures must remain isolated from inference, JIT residency,
+  downloads, exact storage bindings, Settings, and accounting.
+  `compatibility_catalog/ceremony.py` is the offline-only encrypted Ed25519
+  key generation, detached-signature, multi-signer assembly, and exact-byte
+  publication verifier. It must never create or consume a private key below
+  the repository, accept the golden test key as publication authority, contact
+  a network, or treat a valid signature as model/runtime/hardware evidence.
 - `fleet/` is the independently locked Nyx service. It owns explicit node
   enrollment, authenticated snapshot polling, strict model mappings,
   capacity-aware routing, bounded fleet queues, metadata-only route history,
   the realtime dashboard, and read-only token-ledger aggregates. It must run
   as one process unless reservations are moved to a shared transactional
   scheduler.
+- `fleet/src/mnemosyne_fleet/pairing_store.py`, `secret_store.py`,
+  `locator_policy.py`, `paired_transport.py`, `pairing_probe.py`,
+  `pairing_coordinator.py`, and `pairing_api.py` implement the opt-in Hub-side
+  bearer-pairing foundation: strict/idempotent lifecycle metadata, encrypted
+  secrets, bounded locator policy, peer-pinned non-loading activation, and
+  dynamic registry publication. This is not the signed Mac ceremony; pairing
+  remains disabled by default and static enrollment must remain compatible.
 - `downloader.py` and `download_worker.py` implement install/download orchestration. Installs run as killable subprocesses and persist state in SQLite.
 - `hf_search.py`, `repo_probe.py`, `vllm_supported_architectures.json`, and `scripts/refresh_arch_list.py` support HuggingFace discovery, vLLM architecture filtering, and GGUF probing.
 - `ui/` contains the React/Vite/TypeScript/Tailwind admin UI that is built into `/app/static` by the Dockerfile and served from the admin plane.
@@ -38,10 +86,46 @@ engine process.
   behavior pytest cannot exercise. `project_docs/fleet_architecture.md`,
   `fleet_security.md`, and `fleet_acceptance.md` define the cross-node
   protocol, threat boundary, and target-host rollout evidence.
+  `project_docs/mac_pool_architecture.md` and
+  `project_docs/mac_pool_acceptance.md` define the Mac-first pooled-product
+  target and its non-regression/release gates. They describe target state;
+  never treat an unimplemented section as current behavior.
+  `project_docs/fleet_pairing_protocol.md` defines the versioned dynamic
+  enrollment, credential, activation, revocation, and recovery target; its
+  initial and deferred security layers must remain explicitly distinguished.
 - `scripts/fleet_acceptance.py` runs a bounded, content-redacted multi-node
   probe through Nyx and checks metadata fan-out plus exactly one normal token
   event per completed language request.
 - `macos/service/` is an independent Python package for the native inference/control planes, engine adapters, lease-based global residency coordinator, and durable usage outbox. Its dependencies and lock file stay below that directory.
+- `macos/service/desired_install_runtime.py`, `desired_install_store.py`, and
+  `desired_install_executor.py` own the selected Mac's bounded DesiredInstall
+  inbox and execution path. They revalidate pairing, service instance, signed
+  catalog, exact recipe/artifact, opaque storage generation, free space, and
+  cancellation before launching the existing durable native installer. The
+  Hub never receives a path or bookmark, downloads remain residency-neutral,
+  and profile registration/JIT loading continue through the ordinary native
+  coordinator. Exact GGUF shard sets and an optional selected projector are
+  catalog-bound artifact roles, not inferred after approval.
+- `macos/service/mac_inventory.py`, `mac_inventory_store.py`, and
+  `mac_inventory_sync.py` produce and deliver the path-free authoritative Mac
+  hardware/storage/model inventory. Local lexical paths, bookmark/scope data,
+  credentials, and arbitrary diagnostics must never enter this protocol.
+- `macos/service/fleet_participation.py` persists the Mac owner's independent
+  join/pause preference and counts only canonical Fleet-routed requests through
+  complete response cleanup. Pausing must close Fleet admission while leaving
+  local inference, downloads, storage, residency policy, and usage delivery
+  intact.
+- `macos/service/fleet_pairing.py` owns the Mac-local pairing journal and the
+  atomic private-environment lifecycle for snapshot, Fleet-only dispatch, and
+  management credentials. The service exposes only secret-free status and
+  staged/active authentication gates. Its outbound client and the Swift
+  Inference Pool page drive invitation claim, approval resume, provisioning,
+  staging, and activation with a memory-only invitation secret. They also own
+  an explicitly confirmed permanent self-revoke path with a durable exact-
+  request recovery fence, pairing-only credential retirement, and safe new-
+  invitation re-pair. Revoke must never alter models, exact weight paths,
+  inference profiles, or token history; signed-artifact and multi-host
+  acceptance remain release gates.
 - `macos/service/storage.py`, `model_library.py`, `install_store.py`, `installer.py`, and `download_worker.py` implement exact nested-folder/volume validation, engine-aware Hugging Face discovery, and process-isolated durable native downloads. The install store retains a compact transition journal so target-Mac cancel/retry/registration/dismiss/delete acceptance remains provable after UI history is hidden. Managed downloads must remain residency-neutral.
 - `macos/service/local_models.py` scans Finder-selected GGUF/MLX libraries without loading or copying weights. `macos/service/engines/llamacpp.py` translates typed profiles into a manager-owned upstream `llama-server` process while reusing the hardened managed-process ownership proof.
 - `macos/service/security_scopes.py` consumes Finder-created transfer
@@ -63,6 +147,33 @@ engine process.
   persists missing values into Unified Inference's private `.env`. Unified
   Inference is the native token sidecar; the legacy process is not in the
   inference path and must not remain a permanent reporting dependency.
+- `macos/service/native_lifecycle.py` and `native_lifecycle_runtime.py` own the
+  path-free migration/uninstall preview, private exact-path retention manifest,
+  journal-only prepare API, and authenticated loopback authorization trigger.
+  `native_lifecycle_helper_transport.py` is the bounded service-owned direct
+  peer for the bootstrap-pinned bundled helper; the menu must never spawn that
+  helper because the sealed peer manifest authorizes only the bundled service
+  Python. Transport availability is not proof authority: production remains
+  fail-closed before helper launch until a real per-install OS-backed proof
+  verifier is provisioned. Migration staging must bind the predecessor to the
+  exact installed application identity, require candidate signing-Team
+  continuity, and enumerate the candidate's complete retained bundle-member
+  inventory under a distinct lexical tree; a signed identity or build digest
+  alone is never candidate authority. `native_lifecycle_executor.py` is a closed,
+  restart-safe orchestration core with inert production defaults. Its durable
+  product-wide claim, monotonic rollback intent, and prior-effect observations
+  prevent concurrent or forward-after-rollback replay; an expired/abandoned
+  claim enters manual recovery and blocks every other lifecycle transaction.
+  The separate v2 runner receipt ledger enforces the immutable direction's
+  exact effect order across grants and restart: a later opaque target cannot
+  begin until the prior target has a conclusive finalized receipt. This is a
+  validation fence, not execution or phase-advance authority. Manual-recovery
+  effects, terminal recovery-clone cleanup, and the receipt-to-phase bridge
+  remain deliberately unavailable.
+  It contains no launchctl, process, filesystem-removal, Trash, or signing
+  primitive. Do not enable execution until an authenticated signed bundled
+  helper implements every named effect plus manual recovery and the
+  credentialed release/hardware gates pass.
 - Keep configured model profiles when an engine is disabled, but exclude them
   from the resolved/callable catalog until that engine is enabled. An external
   engine being unavailable must not make the control plane or Settings UI
@@ -163,6 +274,17 @@ The live `docker-compose.yml` is intentionally machine-specific and may live out
   credentials, and neither credential is an admin credential. Fleet's public
   client key, dashboard-admin key, all node credentials, and read-only ledger
   DSN must remain distinct environment-backed secrets.
+- Dynamic Mac pairing is an opt-in, partially implemented layer over that
+  boundary. With pairing disabled its routes are absent and static nodes retain
+  their current environment-backed behavior. The implemented Hub foundation
+  covers bounded version-1 invitation/claim/approval/provisioning, encrypted
+  per-role credentials, pinned non-loading activation probes, explicit
+  enable/disable/revoke, restart reconciliation, and paired registry
+  membership. A production pairing starts Hub-disabled and requires a separate
+  admin enable after activation. Do not claim a complete product workflow
+  until the implemented Swift ceremony passes signed-artifact acceptance and
+  lifecycle integration, routine rotation, static adoption, and multi-host
+  artifact acceptance exist.
 - Snapshot liveness is based on Nyx monotonic receipt time, instance identity,
   and increasing sequence. Persisted snapshots never regain routing authority
   after restart without a fresh poll.
@@ -189,12 +311,24 @@ The live `docker-compose.yml` is intentionally machine-specific and may live out
 
 ### Native macOS deployment
 
-- Inference defaults to `127.0.0.1:1240` so Unified Inference is a drop-in replacement for the previous token sidecar; the native Settings UI may deliberately switch only that public inference listener to `0.0.0.0:1240` for LAN/VPN clients. Control stays on `127.0.0.1:17321`, oMLX uses `:17322`, the manager-owned DS4 child uses `:17323`, the manager-owned MFLUX worker uses `:17324`, manager-owned llama.cpp uses `:17325`, Preview mlxcel uses `:17326`, and Preview mistral.rs uses `:17327`. Reserve `17320` and `17328-17329` for later native services. The legacy sidecar must be booted out and persistently disabled or removed before Unified Inference binds `:1240`; merely unloading it lets it return at the next login.
+- Inference defaults to `127.0.0.1:1240` so Unified Inference is a drop-in replacement for the previous token sidecar; the native Settings UI may deliberately switch only that public inference listener to `0.0.0.0:1240` for LAN/VPN clients. Control stays on `127.0.0.1:17321`, oMLX uses `:17322`, the manager-owned DS4 child uses `:17323`, the manager-owned MFLUX worker uses `:17324`, and manager-owned llama.cpp uses `:17325`. Reserve `17320` and `17326-17329` for later native services. The legacy sidecar must be booted out and persistently disabled or removed before Unified Inference binds `:1240`; merely unloading it lets it return at the next login.
 - The inference plane also exposes read-only `GET /fleet/v1/snapshot` only
   when its independent `FLEET_API_KEY` is configured. Discovery fails closed
   with `fleet_inference_auth_unconfigured` unless the inference key is also
   configured. Never reuse the inference key, control password, or another
   node's credential.
+- Fleet pairing/enrollment and Mac-local participation are separate. Existing
+  manually enrolled Macs default joined for backward compatibility. The
+  authenticated control route `/manager/fleet/participation` changes only the
+  durable local preference. A valid canonical `X-Mnemosyne-Fleet-Route`
+  request holds a participation lease through the complete response; pause
+  rejects later Fleet work with the proven pre-work `node_busy` response while
+  local requests without that internal marker remain available. Snapshot v1
+  stays shape-compatible and closes its advertised capacity/loadability while
+  paused or draining. Permanent self-revoke is a separate control-plane action:
+  it requires a new invitation to re-pair and may retire only the exact pairing-
+  owned credentials, never models, exact storage bindings, profiles, local
+  inference, token history, or the usage outbox.
 - A per-user LaunchAgent owns Mnemosyne Core. The controller uses an explicit AppKit `NSStatusItem` with a SwiftUI popover; quitting it must not terminate inference. `SMAppService.agent` registers the embedded plist and the bootstrap must `execve` the bundled Python without daemonizing.
 - `ResidencyCoordinator` owns the cross-engine invariant. A request holds an epoch-tagged model lease through its complete stream. FIFO queuing stops old-target admission once a switch is pending, drains active leases, proves all enabled adapters empty, loads one target, and proves exactly one ready manager-owned resident. Engine-derived capacity is capped by optional `server.max_concurrency`; `server.max_queue_depth` and `server.queue_timeout_seconds` bound admission.
 - oMLX capacity comes from its authoritative admin
@@ -205,8 +339,25 @@ The live `docker-compose.yml` is intentionally machine-specific and may live out
   global ceiling. Performance telemetry must remain bounded, in-memory, and
   metadata-only: never retain prompts, responses, credentials, or arbitrary
   upstream diagnostics.
+- A signed managed oMLX install retains its exact catalog launch contract in
+  the hidden-inclusive install journal. Before registration, every local/JIT
+  load, benchmarks, and every fresh Fleet snapshot, Mnemosyne must prove by an
+  authenticated GET that the externally owned oMLX service already has the
+  exact scheduler slot count and any required prefill memory guard. Never
+  mutate those service-global settings as an install/load side effect. Drift,
+  malformed state, timeout, or authorization failure keeps the alias visible
+  but unverified, non-loadable, and Fleet-ineligible without hiding unrelated
+  local profiles or taking down the node. A later install-journal read fault
+  must preserve the last successful signed/ordinary/conflict classification
+  for each exact unchanged oMLX target; an unknown or changed target fails
+  closed and a previously signed target must never be downgraded to ordinary.
 - oMLX is an external loopback service controlled through its native lifecycle APIs. llama.cpp and DS4 are model-specific process groups started by Mnemosyne. Never kill an unknown PID or listener; persisted managed-process identity must match executable, argv, start identity, and process group before recovery or signaling.
-- Preview mlxcel and mistral.rs are also model-specific process groups and must reuse the same hardened managed-process ownership proof. Their upstream installations remain externally owned; enabling an adapter must never install, update, or replace its binary. Model Library must pin and download local snapshots before load so an engine process never performs an implicit model download.
+- The supported macOS engine set is llama.cpp, oMLX, DS4, and MFLUX. Keep
+  legacy mlxcel and mistral.rs configuration parseable for upgrade safety, but
+  always treat it as disabled and exclude it from adapters, callable profiles,
+  Model Library, runtime updates, readiness, inventory, Fleet placement, and
+  DesiredInstall. Never delete its external binaries, profile records, or
+  model weights as an upgrade side effect.
 - Configuration schema v6 may attach exact engine alternatives to one public model alias. The original profile remains the unconditional fallback and `selection.mode` defaults to `fixed`. A user may explicitly set `selection.mode: pinned` plus `pinned_engine` to bypass benchmark ranking and prefer that declared engine; if it is disabled or cannot load before inference starts, use the original fallback without replaying ambiguous upstream work. Benchmark selection is opt-in, applies only to capabilities the selected alternative actually supports, requires a context guarantee at least as large as the primary, and requires fresh content-free evidence matching the exact ordered candidate/load fingerprint, runtime fingerprint, benchmark suite, and local Mac. Unrelated settings or other-model edits must not invalidate that evidence. A missing/stale/failed result must select the fallback; it must never make a profile disappear. Fleet must exclude any alias whose local policy can route away from the exact advertised primary deployment.
 - Every schema-v6 language candidate owns a context policy: `automatic` applies fresh long-prefill evidence for the exact model/runtime/system and otherwise retains the configured safe fallback; `native` requests detected model metadata without claiming it was profiled; and `fixed` applies the explicit user limit. oMLX context inspection and changes must use its official status and per-model settings APIs; when available, its native memory-guard context benchmark runs only inside the coordinator's global-empty maintenance barrier. Other context profiling must use sequential coordinator leases. Persist only fixed fingerprints, requested/verified/prompt token counts, suite/runtime/system identities, and timestamps. Never persist the synthetic probe prompt, response, arbitrary diagnostics, credentials, or unhashed paths. `/v1/models.max_model_len` must equal the selected candidate's guaranteed contract.
 - Cross-engine benchmark rows may retain only fixed engine/model fingerprints, sample counts, success rate, TTFT, total latency, output throughput, suite/config/runtime/system fingerprints, and timestamps. Never persist prompts, generated text, arbitrary upstream diagnostics, credentials, or unhashed local model paths. Benchmarks must use coordinator leases sequentially and hold each lease through the complete response stream.
@@ -271,7 +422,16 @@ The live `docker-compose.yml` is intentionally machine-specific and may live out
 - Native Hugging Face installs are engine-aware and durable. The Model Library
   presents one cross-engine result list; each candidate retains and displays
   its authoritative engine compatibility, and selecting it drives the exact
-  engine-specific validation/install flow. Model-card rendering must remove
+  engine-specific validation/install flow. The selected-model card also
+  presents an advisory runtime-preparation plan for the exact engine and, for
+  DS4, the exact managed source channel. It must never start a weight download,
+  replace the selected Download-to key, move files, or imply readiness before
+  the runtime and enabled-engine health are proved. A missing DS4 Apple
+  toolchain may open only the explicit, bounded `/usr/bin/xcode-select
+  --install` system dialog after confirmation; requesting that dialog remains
+  unverified until later fixed `xcode-select --print-path` and `xcrun --find
+  clang` probes succeed and both the selected toolchain and compiler exist.
+  Model-card rendering must remove
   Hub YAML front matter, preserve safe Markdown structure, and remain readable
   and scrollable without compressing the rest of the install controls. llama.cpp search
   requires explicit GGUF quant/shard selection, automatically selects the
@@ -339,7 +499,7 @@ The live `docker-compose.yml` is intentionally machine-specific and may live out
 - The menu app reads and writes structured configuration through the control plane. The service remains the schema authority and atomically persists validated YAML; credential values are write-only in the UI and never returned by the API. Preserve `schema_version`; an older app must refuse to save a newer schema instead of dropping unknown fields. Config snapshots carry an optimistic revision that every save must echo. Serialize saves, download-completion profile creation, and local imports through the same mutation lock; reject a stale Settings save instead of overwriting a concurrent model addition.
 - Setup & Health is the native first-run authority. It must remain usable when
   the service is disabled or degraded, present bounded and secret-redacted
-  readiness, distinguish Stable llama.cpp/oMLX from Preview DS4/MFLUX/mlxcel/mistral.rs, and
+  readiness, distinguish Stable llama.cpp/oMLX from Preview DS4/MFLUX, and
   provide recovery actions. First-run setup completes only after its self-test
   sends a real request through the public listener and verifies the matching
   durable local usage row; Postgres delivery is separately authoritative from
@@ -361,7 +521,34 @@ The live `docker-compose.yml` is intentionally machine-specific and may live out
   inspect both the dependency and `LC_RPATH`; deep code-signature validation
   alone does not prove that the app can reach
   `applicationDidFinishLaunching`.
-- Mac usage events normalize OpenAI, Responses, and Anthropic token shapes and atomically write local analytics plus the SQLite Postgres outbox. The central schema and retry/idempotency behavior match the CUDA deployment.
+  A full stage must also reject any relocatable Python export whose closed
+  provenance does not match both committed native lock files, and must embed
+  byte-identical compatibility-catalog and DesiredInstall schemas. Release
+  builds must use the pinned venvstacks version, bind registry installs to the
+  exact target-compatible wheel URL and SHA-256 in the committed locks, rebuild
+  generated layers cleanly, and reject every bundled Mach-O slice whose
+  deployment target exceeds the app's declared macOS minimum. The production
+  bootstrap must scrub ambient `PYTHON*` state and use only its closed bundled
+  Python/source paths. A complete bundle must ignore
+  `MNEMOSYNE_PYTHON_OVERRIDE`; consult it only when an intentionally bare
+  development bundle has no embedded runtime. Release verification compares the complete bundled Python source inventories and
+  critical runtime dependencies; `--allow-bare` is development-only and must
+  never weaken a DMG/release verification.
+- Mac usage events normalize OpenAI, Responses, and Anthropic token shapes and
+  atomically write local analytics plus the SQLite Postgres outbox. A
+  Fleet-routed request reuses the authenticated route UUID as its stable event
+  ID. Reserve that UUID and any required outbox slot atomically before JIT or
+  coordinator admission; concurrent/restarted service connections must not
+  both accept the final slot or execute a duplicate route. Mark the durable
+  reservation started immediately before request bytes may reach an engine.
+  Pre-work failures may release it, but post-dispatch Fleet failures retain a
+  bounded replay fence. The native service must commit accounting before
+  non-stream success or a recognized terminal SSE event. A Fleet 2xx language
+  response without normalized usage must fail closed with `usage_missing`
+  without fabricating counts; preserve standalone missing-usage compatibility.
+  A full durable outbox must close new language admission with
+  `usage_outbox_full` and zero Fleet capacity; never prune an undelivered row
+  to make space. Image requests remain outside token accounting.
 - Image requests intentionally do not emit token-usage records. Do not add image prompt/output policy hooks; this repository is a local homelab tool.
 
 ## Configuration
@@ -511,8 +698,10 @@ uv run --directory fleet --frozen python -m compileall -q \
   src/mnemosyne_fleet
 uv run --directory fleet --frozen \
   python ../scripts/fleet_acceptance.py --url http://nyx:17400 \
-  --model <public-model> --require-node <mac-node> \
-  --require-node <cuda-node>
+  --model <public-model> \
+  --require-node-service-class <primary-mac>=primary \
+  --require-node-service-class <limited-nyx-worker>=overflow \
+  --require-platform macos
 ```
 
 ## Verification Expectations
@@ -576,3 +765,5 @@ When behavior touches process launch, ports, engine argv construction, Docker mo
 11. `project_docs/smoke_checks.md` for CUDA-host validation
 12. `macos/INSTALL.md`, `macos/README.md`, then
     `project_docs/macos_native_architecture.md`, for the native sibling
+13. `project_docs/mac_pool_architecture.md` and
+    `project_docs/mac_pool_acceptance.md` for the Mac-first pool target

@@ -34,7 +34,16 @@ _MODEL_FORMAT_SUFFIX_RE = re.compile(
     re.IGNORECASE,
 )
 _STORAGE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+_CATALOG_KEY_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:+-]{0,127}$")
+_ENVIRONMENT_NAME_RE = re.compile(r"^[A-Z_][A-Z0-9_]{0,127}$")
+_CATALOG_HOST_LABEL_RE = re.compile(
+    r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$"
+)
+_CATALOG_PATH_SEGMENT_RE = re.compile(r"^[A-Za-z0-9._~-]+$")
 _APP_SUPPORT = Path.home() / "Library" / "Application Support" / "Mnemosyne"
+
+_MAX_CATALOG_SEQUENCE = 9_007_199_254_740_991
+_MAX_CATALOG_TIMESTAMP = 4_102_444_800
 
 
 class ConfigError(RuntimeError):
@@ -62,6 +71,8 @@ def ds4_wire_model_name(model: str) -> str:
     """Return the canonical model id accepted by the upstream DS4 server."""
 
     basename = Path(model).name.casefold()
+    if "glm-5.3-flash" in basename:
+        return "glm-5.3-flash"
     if "glm-5.2" in basename:
         return "glm-5.2"
     if "deepseek-v4-pro" in basename:
@@ -91,6 +102,11 @@ class ServerConfig(BaseModel):
     startup_policy: str = "unload_all"
     inference_api_key_env: str = "INFERENCE_API_KEY"
     fleet_api_key_env: str = "FLEET_API_KEY"
+    # Paired Hub dispatch uses a credential that cannot authenticate ordinary
+    # unmarked local requests. Existing static deployments remain compatible:
+    # when this environment value is empty they fall back to
+    # ``inference_api_key_env`` for Fleet-routed requests only.
+    fleet_inference_api_key_env: str = "FLEET_INFERENCE_API_KEY"
     control_password_env: str = "ADMIN_PASSWORD"
 
     @model_validator(mode="after")
@@ -148,14 +164,22 @@ class OMLXConfig(BaseModel):
     @field_validator("model_directories")
     @classmethod
     def _model_directories_are_unique(cls, value: list[str]) -> list[str]:
-        normalized = [
-            str(Path(item).expanduser().resolve(strict=False)) for item in value
-        ]
         if any(not item.strip() for item in value):
             raise ValueError("oMLX model directories must not be empty")
-        if len(normalized) != len(set(normalized)):
+        # Preserve the exact user-selected lexical spelling in configuration.
+        # A separate resolved key is used only to prevent the same directory
+        # from being registered twice through symlinks or other aliases.
+        canonical_keys = [
+            os.path.normcase(
+                os.path.normpath(
+                    str(Path(item).expanduser().resolve(strict=False))
+                )
+            )
+            for item in value
+        ]
+        if len(canonical_keys) != len(set(canonical_keys)):
             raise ValueError("oMLX model directories must be unique")
-        return normalized
+        return value
 
 
 class DS4Config(BaseModel):
@@ -183,11 +207,10 @@ class DS4Config(BaseModel):
 
 
 class MLXcelConfig(BaseModel):
-    """Manager-owned native MLX server (Preview).
+    """Read-only upgrade compatibility for the retired mlxcel adapter.
 
-    The conventional Homebrew path is only a discovery-friendly default.
-    Mnemosyne never installs, upgrades, or replaces that external binary as a
-    side effect of enabling the adapter.
+    The current product never enables or launches this engine. Retaining its
+    typed fields lets older configuration load without deleting user data.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -208,7 +231,7 @@ class MLXcelConfig(BaseModel):
 
 
 class MistralRSConfig(BaseModel):
-    """Manager-owned mistral.rs server (Preview)."""
+    """Read-only upgrade compatibility for the retired mistral.rs adapter."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -260,8 +283,8 @@ class EnginesConfig(BaseModel):
     omlx: OMLXConfig = Field(default_factory=OMLXConfig)
     ds4: DS4Config = Field(default_factory=DS4Config)
     mflux: MFluxConfig = Field(default_factory=MFluxConfig)
-    mlxcel: MLXcelConfig = Field(default_factory=MLXcelConfig)
-    mistral_rs: MistralRSConfig = Field(default_factory=MistralRSConfig)
+    mlxcel: MLXcelConfig = Field(default_factory=MLXcelConfig, exclude=True)
+    mistral_rs: MistralRSConfig = Field(default_factory=MistralRSConfig, exclude=True)
 
 
 class ModelLoadConfig(BaseModel):
@@ -821,6 +844,166 @@ class PathsConfig(BaseModel):
     log_directory: str = str(_APP_SUPPORT / "logs")
 
 
+class CatalogTrustKeyConfig(BaseModel):
+    """One local Ed25519 trust anchor referenced through the private env."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    key_id: str
+    public_key_env: str
+    valid_from: int = Field(default=0, ge=0, le=_MAX_CATALOG_TIMESTAMP)
+    valid_until: int = Field(
+        default=_MAX_CATALOG_TIMESTAMP,
+        ge=1,
+        le=_MAX_CATALOG_TIMESTAMP,
+    )
+    minimum_catalog_sequence: int = Field(
+        default=1,
+        ge=1,
+        le=_MAX_CATALOG_SEQUENCE,
+    )
+    maximum_catalog_sequence: int = Field(
+        default=_MAX_CATALOG_SEQUENCE,
+        ge=1,
+        le=_MAX_CATALOG_SEQUENCE,
+    )
+
+    @field_validator("key_id")
+    @classmethod
+    def _valid_key_id(cls, value: str) -> str:
+        if _CATALOG_KEY_ID_RE.fullmatch(value) is None:
+            raise ValueError("catalog trust key_id is invalid")
+        return value
+
+    @field_validator("public_key_env")
+    @classmethod
+    def _valid_public_key_environment(cls, value: str) -> str:
+        if _ENVIRONMENT_NAME_RE.fullmatch(value) is None:
+            raise ValueError("catalog public_key_env is invalid")
+        return value
+
+    @model_validator(mode="after")
+    def _valid_windows(self) -> "CatalogTrustKeyConfig":
+        if self.valid_from >= self.valid_until:
+            raise ValueError("catalog trust key time window is invalid")
+        if self.minimum_catalog_sequence > self.maximum_catalog_sequence:
+            raise ValueError("catalog trust key sequence window is invalid")
+        return self
+
+
+class CompatibilityCatalogConfig(BaseModel):
+    """Optional, read-only updater policy for signed compatibility metadata."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    update_origin: str | None = None
+    update_path: str | None = None
+    update_interval_seconds: float = Field(
+        default=3600,
+        ge=300,
+        le=604_800,
+    )
+    total_timeout_seconds: float = Field(default=20, ge=0.05, le=300)
+    connect_timeout_seconds: float = Field(default=5, ge=0.05, le=300)
+    max_attempts: int = Field(default=2, ge=1, le=3)
+    retry_delay_seconds: float = Field(default=0, ge=0, le=5)
+    trusted_keys: list[CatalogTrustKeyConfig] = Field(
+        default_factory=list,
+        max_length=16,
+    )
+
+    @field_validator("update_origin")
+    @classmethod
+    def _canonical_update_origin(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if not value.isascii() or not 1 <= len(value) <= 512:
+            raise ValueError("catalog update_origin must be a canonical HTTPS origin")
+        parsed = urlsplit(value)
+        try:
+            port = parsed.port
+        except ValueError:
+            raise ValueError(
+                "catalog update_origin must be a canonical HTTPS origin"
+            ) from None
+        hostname = parsed.hostname
+        labels = [] if hostname is None else hostname.split(".")
+        if (
+            parsed.scheme != "https"
+            or hostname is None
+            or hostname != hostname.lower()
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.path != ""
+            or parsed.query != ""
+            or parsed.fragment != ""
+            or port in {0, 443}
+            or not 1 <= len(hostname) <= 253
+            or hostname.endswith(".")
+            or not labels
+            or any(
+                _CATALOG_HOST_LABEL_RE.fullmatch(label) is None
+                for label in labels
+            )
+        ):
+            raise ValueError("catalog update_origin must be a canonical HTTPS origin")
+        canonical = f"https://{hostname}"
+        if port is not None:
+            canonical += f":{port}"
+        if value != canonical:
+            raise ValueError("catalog update_origin must be a canonical HTTPS origin")
+        return value
+
+    @field_validator("update_path")
+    @classmethod
+    def _canonical_update_path(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if (
+            not value.isascii()
+            or not 1 <= len(value) <= 512
+            or not value.startswith("/")
+            or value.endswith("/")
+            or "//" in value
+            or "\\" in value
+            or "?" in value
+            or "#" in value
+            or "%" in value
+        ):
+            raise ValueError("catalog update_path must be a canonical absolute path")
+        segments = value[1:].split("/")
+        if any(
+            segment in {"", ".", ".."}
+            or _CATALOG_PATH_SEGMENT_RE.fullmatch(segment) is None
+            for segment in segments
+        ):
+            raise ValueError("catalog update_path must be a canonical absolute path")
+        return value
+
+    @model_validator(mode="after")
+    def _complete_enabled_policy(self) -> "CompatibilityCatalogConfig":
+        key_ids = [key.key_id for key in self.trusted_keys]
+        environment_names = [key.public_key_env for key in self.trusted_keys]
+        if len(key_ids) != len(set(key_ids)):
+            raise ValueError("catalog trusted key IDs must be unique")
+        if len(environment_names) != len(set(environment_names)):
+            raise ValueError("catalog public-key environment names must be unique")
+        if self.connect_timeout_seconds > self.total_timeout_seconds:
+            raise ValueError(
+                "catalog connect_timeout_seconds cannot exceed total_timeout_seconds"
+            )
+        if self.enabled and (
+            self.update_origin is None
+            or self.update_path is None
+            or not self.trusted_keys
+        ):
+            raise ValueError(
+                "enabled catalog updates require an origin, path, and trusted keys"
+            )
+        return self
+
+
 class StorageLocationConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -846,7 +1029,11 @@ class StorageLocationConfig(BaseModel):
     def _path_required(cls, value: str) -> str:
         if not value.strip():
             raise ValueError("storage location path must not be empty")
-        return value
+        # Persist one absolute lexical spelling everywhere storage authority is
+        # compared.  ``abspath`` deliberately normalizes ``~`` and relative
+        # components without resolving the selected root, so a Finder-selected
+        # symlink remains the user's exact route to the weights.
+        return os.path.abspath(os.path.expanduser(value))
 
     @field_validator("volume_uuid")
     @classmethod
@@ -927,6 +1114,9 @@ class MacConfig(BaseModel):
     server: ServerConfig = Field(default_factory=ServerConfig)
     engines: EnginesConfig = Field(default_factory=EnginesConfig)
     paths: PathsConfig = Field(default_factory=PathsConfig)
+    catalog: CompatibilityCatalogConfig = Field(
+        default_factory=CompatibilityCatalogConfig
+    )
     storage: StorageConfig = Field(default_factory=StorageConfig)
     models: list[ModelProfile] = Field(default_factory=list)
     migration: MigrationConfig = Field(default_factory=MigrationConfig)
@@ -1028,6 +1218,10 @@ class MacConfig(BaseModel):
 
     @model_validator(mode="after")
     def _validate_cross_references(self) -> "MacConfig":
+        # Normalize stale pilot settings immediately so the control API and a
+        # later explicit save cannot imply that a retired engine is active.
+        self.engines.mlxcel.enabled = False
+        self.engines.mistral_rs.enabled = False
         aliases = [profile.alias for profile in self.models]
         if len(aliases) != len(set(aliases)):
             duplicates = sorted({alias for alias in aliases if aliases.count(alias) > 1})
@@ -1074,10 +1268,6 @@ class MacConfig(BaseModel):
             ports["ds4"] = self.engines.ds4.port
         if self.engines.mflux.enabled:
             ports["mflux"] = self.engines.mflux.port
-        if self.engines.mlxcel.enabled:
-            ports["mlxcel"] = self.engines.mlxcel.port
-        if self.engines.mistral_rs.enabled:
-            ports["mistral.rs"] = self.engines.mistral_rs.port
         by_port: dict[int, list[str]] = {}
         for name, port in ports.items():
             by_port.setdefault(port, []).append(name)
@@ -1087,13 +1277,16 @@ class MacConfig(BaseModel):
         return self
 
     def engine_enabled(self, engine: EngineName) -> bool:
+        # mlxcel and mistral.rs remain parseable so existing v6 files upgrade
+        # cleanly, but they are deliberately inert even when an older config
+        # still says enabled: true.
         return {
             EngineName.LLAMA_CPP: self.engines.llama_cpp.enabled,
             EngineName.OMLX: self.engines.omlx.enabled,
             EngineName.DS4: self.engines.ds4.enabled,
             EngineName.MFLUX: self.engines.mflux.enabled,
-            EngineName.MLXCEL: self.engines.mlxcel.enabled,
-            EngineName.MISTRAL_RS: self.engines.mistral_rs.enabled,
+            EngineName.MLXCEL: False,
+            EngineName.MISTRAL_RS: False,
         }[engine]
 
     @staticmethod
@@ -1265,6 +1458,12 @@ def save_config(config: MacConfig, path: str | Path) -> None:
             os.fsync(handle.fileno())
         os.replace(temporary_path, config_path)
         os.chmod(config_path, 0o600)
+        directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        directory_descriptor = os.open(config_path.parent, directory_flags)
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
     except Exception:
         if descriptor >= 0:
             os.close(descriptor)

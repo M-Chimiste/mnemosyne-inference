@@ -5,12 +5,14 @@ import json
 import logging
 import math
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 
 import httpx
 from fastapi import Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
+from .locator_policy import LocatorPolicy, LocatorPolicyError
+from .paired_transport import PairedTransportError, create_pinned_node_client
 from .scheduler import (
     CapabilityError,
     FleetBusyError,
@@ -55,6 +57,7 @@ _RESPONSE_HEADER_DENYLIST = {
     "x-mnemosyne-error",
 }
 _NODE_BUSY_RETRY = object()
+PairedClientFactory = Callable[..., httpx.AsyncClient]
 
 
 def _finite_float(value: str) -> float:
@@ -93,10 +96,14 @@ class FleetProxy:
         store: FleetStore,
         client: httpx.AsyncClient,
         max_body_bytes: int,
+        paired_locator_policy: LocatorPolicy | None = None,
+        paired_client_factory: PairedClientFactory = create_pinned_node_client,
     ) -> None:
         self._scheduler = scheduler
         self._store = store
         self._client = client
+        self._paired_locator_policy = paired_locator_policy
+        self._paired_client_factory = paired_client_factory
         self._max_body_bytes = max_body_bytes
         self._log = logging.getLogger("mnemosyne-fleet.proxy")
 
@@ -164,7 +171,7 @@ class FleetProxy:
         if not isinstance(public_model, str) or not public_model.strip():
             return error_response(400, "model_required", "A non-empty model is required.")
 
-        excluded_nodes: set[str] = set()
+        excluded_enrollment_ids: set[str] = set()
         all_retries_were_node_busy = True
         max_attempts = max(1, self._scheduler.node_count)
         for _attempt in range(max_attempts):
@@ -172,7 +179,9 @@ class FleetProxy:
                 reservation = await self._scheduler.acquire(
                     public_model=public_model,
                     capability=capability,
-                    excluded_nodes=frozenset(excluded_nodes),
+                    excluded_enrollment_ids=frozenset(
+                        excluded_enrollment_ids
+                    ),
                 )
             except UnknownModelError:
                 return error_response(404, "model_not_found", "The requested model is unavailable.")
@@ -196,14 +205,14 @@ class FleetProxy:
                 reservation=reservation,
             )
             if result is _NODE_BUSY_RETRY:
-                excluded_nodes.add(reservation.node_id)
+                excluded_enrollment_ids.add(reservation.enrollment_id)
                 continue
             if result is not None:
                 return result
             all_retries_were_node_busy = False
-            excluded_nodes.add(reservation.node_id)
+            excluded_enrollment_ids.add(reservation.enrollment_id)
 
-        if excluded_nodes and all_retries_were_node_busy:
+        if excluded_enrollment_ids and all_retries_were_node_busy:
             return error_response(
                 429,
                 "fleet_capacity_busy",
@@ -224,7 +233,16 @@ class FleetProxy:
         payload: dict[str, object],
         reservation: Reservation,
     ):
-        node = self._scheduler.enrollment(reservation.node_id)
+        if not self._scheduler.dispatch_is_current(reservation):
+            # Membership was revoked after acquire but before any route
+            # metadata or upstream work. Return the reservation and let the
+            # caller try another current enrollment.
+            await reservation.release()
+            return None
+        # The reservation owns the exact enrollment generation selected by
+        # the scheduler. Once dispatch passes the current-enrollment boundary,
+        # later deactivation must not invalidate response-stream cleanup.
+        node = reservation.enrollment
         started_at = time.time()
         owner = _RouteOwnership(
             proxy=self,
@@ -236,6 +254,7 @@ class FleetProxy:
                 public_model=reservation.public_model,
                 deployment_id=reservation.deployment_id,
                 node_id=reservation.node_id,
+                enrollment_id=reservation.enrollment_id,
                 instance_id=reservation.instance_id,
                 endpoint=request.url.path,
                 queue_ms=reservation.queue_ms,
@@ -274,11 +293,66 @@ class FleetProxy:
         headers["Authorization"] = f"Bearer {node.inference_token}"
         headers["Content-Type"] = "application/json"
         headers["X-Mnemosyne-Fleet-Route"] = reservation.route_id
+
+        upstream_client = self._client
+        if node.source == "paired":
+            locator_policy = self._paired_locator_policy
+            locator_transport = node.locator_transport
+            if locator_policy is None or locator_transport is None:
+                await owner.complete(
+                    status_code=None,
+                    failure_code="paired_transport_unavailable",
+                )
+                return None
+            try:
+                # Resolve on every attempt, immediately before building the
+                # one-use peer-pinned client. No DNS result or connection pool
+                # survives into a later request or membership generation.
+                locator = await locator_policy.resolve(
+                    node.url,
+                    transport=locator_transport,
+                )
+            except asyncio.CancelledError:
+                await owner.complete(
+                    status_code=None,
+                    failure_code="client_cancelled",
+                )
+                raise
+            except LocatorPolicyError:
+                await owner.complete(
+                    status_code=None,
+                    failure_code="paired_transport_rejected",
+                )
+                return None
+
+            if not self._scheduler.dispatch_is_current(reservation):
+                await owner.complete(
+                    status_code=None,
+                    failure_code="enrollment_deactivated_before_dispatch",
+                )
+                return None
+            try:
+                upstream_client = self._paired_client_factory(
+                    locator,
+                    timeout=self._client.timeout,
+                )
+                if upstream_client is self._client:
+                    # Even an accidentally injected factory must not route a
+                    # paired bearer through the shared DNS-capable client.
+                    raise PairedTransportError("paired_shared_client_forbidden")
+                owner.attach_client(upstream_client)
+            except (PairedTransportError, ValueError, TypeError):
+                await owner.complete(
+                    status_code=None,
+                    failure_code="paired_transport_rejected",
+                )
+                return None
+
         try:
             upstream_url = f"{node.url}{request.url.path}"
             if request.url.query:
                 upstream_url = f"{upstream_url}?{request.url.query}"
-            upstream_request = self._client.build_request(
+            upstream_request = upstream_client.build_request(
                 method=request.method,
                 url=upstream_url,
                 headers=headers,
@@ -295,8 +369,18 @@ class FleetProxy:
                 "The selected node request could not be created.",
             )
 
+        if not self._scheduler.dispatch_is_current(reservation):
+            # Route metadata may have yielded to a concurrent revocation.
+            # Recheck at the final pre-send boundary so revoked credentials
+            # never begin new upstream work.
+            await owner.complete(
+                status_code=None,
+                failure_code="enrollment_deactivated_before_dispatch",
+            )
+            return None
+
         try:
-            response = await self._client.send(upstream_request, stream=True)
+            response = await upstream_client.send(upstream_request, stream=True)
         except asyncio.CancelledError:
             await owner.complete(
                 status_code=None,
@@ -431,6 +515,17 @@ class FleetProxy:
             except BaseException:
                 self._log.warning("upstream response close failed")
 
+        # Dynamic enrollments own a fresh peer-pinned client for exactly this
+        # route attempt. Keep it alive for the complete upstream response
+        # stream, then close it once after the response itself. Static nodes
+        # continue to use the app-owned shared client and never attach one.
+        client = owner.owned_client
+        if client is not None:
+            try:
+                await client.aclose()
+            except BaseException:
+                self._log.warning("paired upstream client close failed")
+
         route_started = await owner.route_started()
         try:
             if route_started:
@@ -459,6 +554,7 @@ class _RouteOwnership:
         self._start_task: asyncio.Task[None] | None = None
         self._completion_task: asyncio.Task[None] | None = None
         self.response: httpx.Response | None = None
+        self.owned_client: httpx.AsyncClient | None = None
         self.stream_failure_code: str | None = None
 
     async def start(self) -> None:
@@ -476,6 +572,11 @@ class _RouteOwnership:
 
     def attach_response(self, response: httpx.Response) -> None:
         self.response = response
+
+    def attach_client(self, client: httpx.AsyncClient) -> None:
+        if self.owned_client is not None:
+            raise RuntimeError("owned upstream client is already attached")
+        self.owned_client = client
 
     def note_stream_failure(self, code: str) -> None:
         if self.stream_failure_code is None:

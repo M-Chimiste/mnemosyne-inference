@@ -77,9 +77,78 @@ public struct ServerSettings: Codable, Equatable, Sendable {
     public var startupPolicy = "unload_all"
     public var inferenceApiKeyEnv = "INFERENCE_API_KEY"
     public var fleetApiKeyEnv = "FLEET_API_KEY"
+    public var fleetInferenceApiKeyEnv = "FLEET_INFERENCE_API_KEY"
     public var controlPasswordEnv = "ADMIN_PASSWORD"
 
     public init() {}
+
+    enum CodingKeys: String, CodingKey {
+        case inferenceBind, inferencePort, controlBind, controlPort
+        case idleUnloadSeconds, startupTimeoutSeconds, swapQueueTimeoutSeconds
+        case maxConcurrency, maxQueueDepth, shutdownGraceSeconds
+        case reconcileIntervalSeconds, imageRequestTimeoutSeconds, imageMaxPixels
+        case startupPolicy, inferenceApiKeyEnv, fleetApiKeyEnv
+        case fleetInferenceApiKeyEnv, controlPasswordEnv
+    }
+
+    public init(from decoder: Decoder) throws {
+        self.init()
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        inferenceBind = try values.decodeIfPresent(
+            String.self, forKey: .inferenceBind
+        ) ?? inferenceBind
+        inferencePort = try values.decodeIfPresent(
+            Int.self, forKey: .inferencePort
+        ) ?? inferencePort
+        controlBind = try values.decodeIfPresent(
+            String.self, forKey: .controlBind
+        ) ?? controlBind
+        controlPort = try values.decodeIfPresent(
+            Int.self, forKey: .controlPort
+        ) ?? controlPort
+        idleUnloadSeconds = try values.decodeIfPresent(
+            Int.self, forKey: .idleUnloadSeconds
+        )
+        startupTimeoutSeconds = try values.decodeIfPresent(
+            Double.self, forKey: .startupTimeoutSeconds
+        ) ?? startupTimeoutSeconds
+        swapQueueTimeoutSeconds = try values.decodeIfPresent(
+            Double.self, forKey: .swapQueueTimeoutSeconds
+        ) ?? swapQueueTimeoutSeconds
+        maxConcurrency = try values.decodeIfPresent(
+            Int.self, forKey: .maxConcurrency
+        )
+        maxQueueDepth = try values.decodeIfPresent(
+            Int.self, forKey: .maxQueueDepth
+        ) ?? maxQueueDepth
+        shutdownGraceSeconds = try values.decodeIfPresent(
+            Double.self, forKey: .shutdownGraceSeconds
+        ) ?? shutdownGraceSeconds
+        reconcileIntervalSeconds = try values.decodeIfPresent(
+            Double.self, forKey: .reconcileIntervalSeconds
+        ) ?? reconcileIntervalSeconds
+        imageRequestTimeoutSeconds = try values.decodeIfPresent(
+            Double.self, forKey: .imageRequestTimeoutSeconds
+        ) ?? imageRequestTimeoutSeconds
+        imageMaxPixels = try values.decodeIfPresent(
+            Int.self, forKey: .imageMaxPixels
+        ) ?? imageMaxPixels
+        startupPolicy = try values.decodeIfPresent(
+            String.self, forKey: .startupPolicy
+        ) ?? startupPolicy
+        inferenceApiKeyEnv = try values.decodeIfPresent(
+            String.self, forKey: .inferenceApiKeyEnv
+        ) ?? inferenceApiKeyEnv
+        fleetApiKeyEnv = try values.decodeIfPresent(
+            String.self, forKey: .fleetApiKeyEnv
+        ) ?? fleetApiKeyEnv
+        fleetInferenceApiKeyEnv = try values.decodeIfPresent(
+            String.self, forKey: .fleetInferenceApiKeyEnv
+        ) ?? fleetInferenceApiKeyEnv
+        controlPasswordEnv = try values.decodeIfPresent(
+            String.self, forKey: .controlPasswordEnv
+        ) ?? controlPasswordEnv
+    }
 
     public var allowsLocalNetworkInference: Bool {
         get { inferenceBind == "0.0.0.0" }
@@ -113,6 +182,18 @@ public struct EngineSettings: Codable, Equatable, Sendable {
             MistralRSSettings.self,
             forKey: .mistralRs
         ) ?? .init()
+        // These fields remain decodable so build upgrades preserve old config,
+        // but retired engines cannot be reactivated by stale settings.
+        mlxcel.enabled = false
+        mistralRs.enabled = false
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(llamaCpp, forKey: .llamaCpp)
+        try container.encode(omlx, forKey: .omlx)
+        try container.encode(ds4, forKey: .ds4)
+        try container.encode(mflux, forKey: .mflux)
     }
 }
 
@@ -238,7 +319,9 @@ public struct StorageLocationSettings: Codable, Equatable, Identifiable, Sendabl
 
     public static let internalDefault = StorageLocationSettings(
         name: "internal",
-        path: "~/Library/Application Support/Mnemosyne/models"
+        path: FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/Mnemosyne/models")
+            .path
     )
 }
 
@@ -251,6 +334,12 @@ public enum InferenceEngine: String, Codable, CaseIterable, Identifiable, Sendab
     case mistralRs = "mistral.rs"
 
     public var id: String { rawValue }
+
+    public static let supportedCases: [InferenceEngine] = [
+        .llamaCpp, .omlx, .ds4, .mflux,
+    ]
+
+    public var isSupported: Bool { Self.supportedCases.contains(self) }
 
     public var displayName: String {
         switch self {

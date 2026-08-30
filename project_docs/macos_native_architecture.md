@@ -5,8 +5,8 @@ Status: implemented native architecture; target-Mac acceptance remains pending.
 ## Purpose
 
 The macOS deployment provides one OpenAI/Anthropic-compatible endpoint for a
-manager-owned llama.cpp runtime, oMLX, DwarfStar (DS4), a managed MFLUX image
-worker, and optional Preview mlxcel or mistral.rs children. LM Studio is not an inference engine; its configured and
+manager-owned llama.cpp runtime, oMLX, DwarfStar (DS4), and a managed MFLUX
+image worker. LM Studio is not an inference engine; its configured and
 conventional model directories are read only as Finder-confirmed migration
 hints. The deployment preserves the
 single-resident-model behavior of the CUDA deployment while running natively so
@@ -33,9 +33,7 @@ Default ports are deliberately outside common development defaults:
 | 17323 | DS4 | Managed native subprocess | `127.0.0.1` |
 | 17324 | MFLUX | Managed native image worker | `127.0.0.1` |
 | 17325 | llama.cpp | Managed native GGUF subprocess | `127.0.0.1` |
-| 17326 | mlxcel | Managed Preview MLX subprocess | `127.0.0.1` |
-| 17327 | mistral.rs | Managed Preview Safetensors subprocess | `127.0.0.1` |
-| 17328-17329 | Reserved | Future local engines/diagnostics | unbound |
+| 17326-17329 | Reserved | Future local engines/diagnostics | unbound |
 
 All ports remain configurable. Startup validates that inference and control
 ports differ, all managed inner ports differ, and no configured inner port is
@@ -46,7 +44,7 @@ The application bundle has two cooperating components:
 
 1. **Mnemosyne Core** is a per-user background service. It owns the catalog,
    global swap coordinator, proxy, usage outbox, and manager-owned
-   llama.cpp/DS4/MFLUX/mlxcel/mistral.rs subprocesses.
+   llama.cpp/DS4/MFLUX subprocesses.
 2. **Unified Inference.app** owns an explicit AppKit `NSStatusItem` and renders its
    controller as a SwiftUI popover. It reads status and sends commands through
    the control API. The UI may exit without interrupting an inference request.
@@ -80,10 +78,9 @@ There is exactly one lifecycle owner: Mnemosyne Core.
 - MFLUX is a dependency-isolated worker process owned by Mnemosyne. It exists
   only while an image profile is resident and is terminated on unload,
   timeout, or cancellation so Metal memory release follows process exit.
-- mlxcel and mistral.rs are model-specific Preview child processes owned by
-  Mnemosyne. Their official Homebrew/installer binaries remain externally
-  owned; persisted PID, process-group, start identity, executable, and complete
-  argv must match before recovery or signaling.
+- Retired mlxcel and mistral.rs configuration remains parseable during an
+  upgrade, but those engines are not launched, cataloged, or advertised. Their
+  existing model weights and external installations are left untouched.
 - Routine llama.cpp, MFLUX, and DS4 engine updates come directly from their
   official upstreams below Application Support. Mnemosyne verifies the
   official llama.cpp asset name, URL, published size and SHA-256, safe archive
@@ -91,8 +88,8 @@ There is exactly one lifecycle owner: Mnemosyne Core.
   PyPI package; or builds an exact `antirez/ds4` commit while normal requests
   continue, then activates it only through the coordinator's all-engines-empty
   maintenance barrier. The signed app's MFLUX layer and configured DS4 paths
-  remain fallbacks. oMLX, mlxcel, and mistral.rs remain externally installed
-  and use their official update mechanisms.
+  remain fallbacks. oMLX remains externally installed and uses its official
+  update mechanisms.
 - Clients use Mnemosyne on port 1240. Direct client traffic to an inner engine
   can violate the single-resident invariant and is unsupported.
 
@@ -142,16 +139,6 @@ engines:
     enabled: true
     host: 127.0.0.1
     port: 17324
-  mlxcel:
-    enabled: false
-    host: 127.0.0.1
-    port: 17326
-    binary: /opt/homebrew/bin/mlxcel-server
-  mistral_rs:
-    enabled: false
-    host: 127.0.0.1
-    port: 17327
-    binary: ~/.local/bin/mistralrs
 
 # Fresh installs have no model profiles. Model Library and Finder discovery
 # create profiles only after the user selects the exact model and destination;

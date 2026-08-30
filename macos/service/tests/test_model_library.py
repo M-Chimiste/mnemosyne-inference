@@ -6,6 +6,8 @@ from types import SimpleNamespace
 
 import pytest
 
+import mnemosyne_macos.model_library as model_library
+import mnemosyne_macos.runtime_updates as runtime_updates
 from mnemosyne_macos.model_library import (
     download_size,
     gguf_files,
@@ -18,7 +20,39 @@ from mnemosyne_macos.model_library import (
 from mnemosyne_macos.models import EngineName
 
 
-def test_ds4_and_mflux_only_offer_curated_artifacts() -> None:
+def _glm53_preview_runtime(tmp_path, *, source_branch="glm-5.3-flash"):
+    source = tmp_path / "source"
+    source.mkdir(parents=True, exist_ok=True)
+    (source / "download_model.sh").write_text(
+        'GLM53_REPO="antirez/glm-5.3-flash-gguf"\n'
+        'GLM53_Q2_FILE="GLM-5.3-Flash-Q2.gguf"\n'
+        'GLM53_Q4_FILE="GLM-5.3-Flash-Q4_K.gguf"\n'
+        'case "$MODEL" in\n'
+        'glm53-q2)\nREPO=$GLM53_REPO\nMODEL_FILE=$GLM53_Q2_FILE\n'
+        'FORCE_HF_DOWNLOAD=1\n;;\n'
+        'glm53-q4)\nREPO=$GLM53_REPO\nMODEL_FILE=$GLM53_Q4_FILE\n'
+        'FORCE_HF_DOWNLOAD=1\n;;\nesac\n',
+        encoding="utf-8",
+    )
+    capabilities, digest = runtime_updates._ds4_glm53_source_contract(source)
+    return runtime_updates.ActiveRuntime(
+        engine="ds4",
+        version="a" * 12,
+        source_revision="a" * 40,
+        root=tmp_path,
+        entrypoint={
+            "binary": "source/ds4-server",
+            "working_directory": "source",
+        },
+        capabilities=capabilities,
+        channel="glm-5.3-flash",
+        source_branch=source_branch,
+        source_contract_sha256=digest,
+    )
+
+
+def test_ds4_and_mflux_only_offer_curated_artifacts(monkeypatch) -> None:
+    monkeypatch.setattr(model_library, "resolve_active_runtime", lambda _engine: None)
     ds4 = recommended_models(EngineName.DS4)
     assert len(ds4) == 9
     assert {item.repo_id for item in ds4} == {
@@ -43,7 +77,161 @@ def test_ds4_and_mflux_only_offer_curated_artifacts() -> None:
     }
 
 
-def test_ds4_search_verifies_exact_hub_files_sizes_and_revision(monkeypatch) -> None:
+def test_glm53_preview_is_exposed_only_by_exact_managed_runtime(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.setattr(model_library, "resolve_active_runtime", lambda _engine: None)
+    assert all(
+        item.repo_id != "antirez/glm-5.3-flash-gguf"
+        for item in recommended_models(EngineName.DS4)
+    )
+
+    wrong = _glm53_preview_runtime(tmp_path / "wrong", source_branch="main")
+    monkeypatch.setattr(
+        model_library,
+        "resolve_active_runtime",
+        lambda _engine: wrong,
+    )
+    assert all(
+        item.repo_id != "antirez/glm-5.3-flash-gguf"
+        for item in recommended_models(EngineName.DS4)
+    )
+
+    valid = _glm53_preview_runtime(tmp_path / "valid")
+    monkeypatch.setattr(
+        model_library,
+        "resolve_active_runtime",
+        lambda _engine: valid,
+    )
+    ds4 = recommended_models(EngineName.DS4)
+    existing = [item for item in ds4 if item.repo_id != "antirez/glm-5.3-flash-gguf"]
+    preview = [item for item in ds4 if item.repo_id == "antirez/glm-5.3-flash-gguf"]
+    assert len(existing) == 9
+    assert len(preview) == 2
+    assert {item.filename for item in preview} == {
+        "GLM-5.3-Flash-Q2.gguf",
+        "GLM-5.3-Flash-Q4_K.gguf",
+    }
+    assert {item.recommended_memory_gb for item in preview} == {128, 256}
+    assert all(
+        item.compatibility == "experimental"
+        and item.release_tier == "experimental"
+        and item.family == "glm-5.3-flash"
+        and "FP8" in item.compatibility_reason
+        and "vision" in item.compatibility_reason
+        for item in preview
+    )
+
+
+def test_glm53_preview_search_pins_hub_revision_and_complete_sizes(
+    monkeypatch, tmp_path
+) -> None:
+    runtime = _glm53_preview_runtime(tmp_path)
+    monkeypatch.setattr(
+        model_library,
+        "resolve_active_runtime",
+        lambda _engine: runtime,
+    )
+    sizes = {
+        "GLM-5.3-Flash-Q2.gguf": 96_505_816_384,
+        "GLM-5.3-Flash-Q4_K.gguf": 190_875_526_464,
+    }
+
+    class FakeAPI:
+        def __init__(self, token=None):
+            assert token == "secret"
+
+        def model_info(self, repo_id, **kwargs):
+            assert repo_id == "antirez/glm-5.3-flash-gguf"
+            assert kwargs == {"files_metadata": True}
+            return SimpleNamespace(
+                sha="b" * 40,
+                downloads=12,
+                likes=3,
+                siblings=[
+                    SimpleNamespace(rfilename=filename, size=size)
+                    for filename, size in sizes.items()
+                ],
+            )
+
+    monkeypatch.setattr(model_library, "HfApi", FakeAPI)
+    preview = search_models(
+        "GLM 5.3",
+        engine=EngineName.DS4,
+        token="secret",
+    )
+    assert len(preview) == 2
+    assert all(
+        item.installable
+        and item.resolved_revision == "b" * 40
+        and item.size_bytes == sizes[item.filename]
+        for item in preview
+    )
+
+
+def test_glm53_preview_hub_inventory_fails_closed_when_stale_or_incomplete(
+    monkeypatch, tmp_path
+) -> None:
+    runtime = _glm53_preview_runtime(tmp_path)
+    monkeypatch.setattr(
+        model_library,
+        "resolve_active_runtime",
+        lambda _engine: runtime,
+    )
+
+    class StaleAPI:
+        def __init__(self, token=None):
+            self.token = token
+
+        def model_info(self, repo_id, **kwargs):
+            assert repo_id == "antirez/glm-5.3-flash-gguf"
+            return SimpleNamespace(
+                sha="c" * 40,
+                siblings=[
+                    SimpleNamespace(
+                        rfilename="GLM-5.3-Flash-Q2.gguf",
+                        size=96_505_816_384,
+                    )
+                ],
+            )
+
+    monkeypatch.setattr(model_library, "HfApi", StaleAPI)
+    preview = search_models("GLM 5.3", engine=EngineName.DS4)
+    by_name = {item.filename: item for item in preview}
+    assert by_name["GLM-5.3-Flash-Q2.gguf"].installable is True
+    assert by_name["GLM-5.3-Flash-Q4_K.gguf"].installable is False
+
+    class IncompleteAPI:
+        def __init__(self, token=None):
+            self.token = token
+
+        def model_info(self, repo_id, **kwargs):
+            return SimpleNamespace(
+                sha="d" * 40,
+                siblings=[
+                    SimpleNamespace(rfilename=filename, size=None)
+                    for filename in (
+                        "GLM-5.3-Flash-Q2.gguf",
+                        "GLM-5.3-Flash-Q4_K.gguf",
+                    )
+                ],
+            )
+
+    monkeypatch.setattr(model_library, "HfApi", IncompleteAPI)
+    incomplete = search_models("GLM 5.3", engine=EngineName.DS4)
+    assert all(not item.installable for item in incomplete)
+    with pytest.raises(ValueError, match="complete positive file-size metadata"):
+        validate_install_candidate(
+            engine=EngineName.DS4,
+            repo_id="antirez/glm-5.3-flash-gguf",
+            filename="GLM-5.3-Flash-Q2.gguf",
+        )
+
+
+def test_ds4_search_verifies_exact_hub_files_sizes_and_revision(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.setenv("MNEMOSYNE_RUNTIME_ROOT", str(tmp_path / "runtimes"))
     catalog = recommended_models(EngineName.DS4)
     by_repo: dict[str, set[str]] = {}
     for model in catalog:
@@ -386,79 +574,12 @@ def test_omlx_install_candidate_retains_resolved_hub_revision(monkeypatch) -> No
     assert candidate.resolved_revision == "b" * 40
 
 
-def test_mlxcel_search_keeps_mlx_candidates_engine_scoped(monkeypatch) -> None:
-    class FakeAPI:
-        def __init__(self, token=None):
-            self.token = token
-
-        def list_models(self, **kwargs):
-            assert kwargs["filter"] == "mlx"
-            return [
-                SimpleNamespace(
-                    id="mlx-community/Qwen-4bit",
-                    tags=["mlx", "4bit"],
-                    pipeline_tag="text-generation",
-                    downloads=10,
-                    likes=2,
-                    usedStorage=123,
-                )
-            ]
-
-    monkeypatch.setattr("mnemosyne_macos.model_library.HfApi", FakeAPI)
-    results = search_models("qwen", engine=EngineName.MLXCEL)
-
-    assert len(results) == 1
-    assert results[0].engine == "mlxcel"
-    assert results[0].suggested_role == "generation"
-    assert "Final architecture compatibility" in results[0].compatibility_reason
-
-
-def test_mistral_rs_install_requires_pinned_safetensors_snapshot(monkeypatch) -> None:
-    class FakeAPI:
-        def __init__(self, token=None):
-            self.token = token
-
-        def model_info(self, repo_id, **kwargs):
-            assert repo_id == "owner/model"
-            assert kwargs == {"revision": "main", "files_metadata": True}
-            return SimpleNamespace(
-                sha="c" * 40,
-                tags=["text-generation"],
-                siblings=[
-                    SimpleNamespace(rfilename="config.json", size=100),
-                    SimpleNamespace(rfilename="model.safetensors", size=1_000),
-                ],
-            )
-
-    monkeypatch.setattr("mnemosyne_macos.model_library.HfApi", FakeAPI)
-    candidate = validate_install_candidate(
-        engine=EngineName.MISTRAL_RS,
-        repo_id="owner/model",
-        filename=None,
-        revision="main",
-    )
-
-    assert candidate.resolved_revision == "c" * 40
-    assert candidate.engine == "mistral.rs"
-    assert candidate.suggested_role == "generation"
-
-
-def test_mistral_rs_rejects_repositories_without_safetensors(monkeypatch) -> None:
-    class FakeAPI:
-        def __init__(self, token=None):
-            self.token = token
-
-        def model_info(self, *_args, **_kwargs):
-            return SimpleNamespace(
-                sha="d" * 40,
-                tags=["text-generation"],
-                siblings=[SimpleNamespace(rfilename="config.json", size=100)],
-            )
-
-    monkeypatch.setattr("mnemosyne_macos.model_library.HfApi", FakeAPI)
-    with pytest.raises(ValueError, match="Safetensors weights"):
+@pytest.mark.parametrize("engine", [EngineName.MLXCEL, EngineName.MISTRAL_RS])
+def test_retired_engines_are_absent_from_search_and_install(engine: EngineName) -> None:
+    assert search_models("qwen", engine=engine) == []
+    with pytest.raises(ValueError, match="retired on macOS"):
         validate_install_candidate(
-            engine=EngineName.MISTRAL_RS,
+            engine=engine,
             repo_id="owner/model",
             filename=None,
         )

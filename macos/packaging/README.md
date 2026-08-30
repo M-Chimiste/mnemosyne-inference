@@ -53,19 +53,49 @@ service plus on-demand manager-owned engine processes:
   second app bundle inside the main app. The bootstrap resolves the outer
   app's bundled Python and then calls `execve`; it does not daemonize or add a
   second supervisor.
+- `Contents/Helpers/MnemosyneLifecycleAuthorization.app/Contents/MacOS/mnemosyne-lifecycle-helper`
+  is a separately identified, on-demand
+  authentication transport inside a fixed app-like wrapper. It accepts
+  exactly one inherited, unnamed Unix socket session, verifies the complete
+  enclosing outer-app seal and the connected service Python transport through
+  its audit token and the sealed `lifecycle-helper-peer-v2.json` manifest. The
+  wrapper gives a future credentialed build the supported location for its
+  provisioning profile, but the helper deliberately cannot emit a production
+  authorization receipt because no private helper proof key is provisioned.
+  It exposes no named listener, path/PID/port/LaunchAgent/argv operation, or
+  lifecycle effect. An ad-hoc build includes the binary for packaging
+  validation but remains explicitly unavailable as authorization authority.
+  The credentialed profile/entitlement contract, Keychain/Secure Enclave proof
+  design, mutual peer-pinning ceremony, and release gates required to activate
+  this transport are specified in
+  [`../../project_docs/native_lifecycle_authorization.md`](../../project_docs/native_lifecycle_authorization.md).
+- `Contents/MacOS/mnemosyne-lifecycle-runner` is a separately identified,
+  one-shot inert adapter. It accepts only one bounded registration frame over
+  an inherited unnamed Unix stream socket, checks the sealed app/runner and
+  connected service-Python role identities, and returns only the fixed
+  `runner_adapter_unavailable` refusal before exiting nonzero. The Python role
+  is explicitly non-authoritative. This runner has no journal, lifecycle
+  command, effect implementation, peer-supplied path, or process operation;
+  signed and ad-hoc builds are both execution-disabled in this milestone.
 - A managed `llama-server` is launched in a proven-owned process group on
   loopback `17325` only while a GGUF profile is resident. Its binary is
   installed from the official upstream release below Application Support,
   not embedded in the signed app or stored beside model weights.
-- DS4, mlxcel, mistral.rs, and the private MFLUX worker are also
-  manager-owned, on-demand process groups. mlxcel and mistral.rs retain
-  externally installed official binaries while the service owns only their
-  exact child server processes on `17326` and `17327`. MFLUX uses loopback port `17324` and the independent
+- DS4 and the private MFLUX worker are also manager-owned, on-demand process
+  groups. Retired mlxcel and mistral.rs configuration remains parseable but
+  inert so an existing pilot can upgrade without losing profile metadata or
+  model weights. oMLX retains its externally installed official runtime.
+  MFLUX uses loopback port `17324` and the independent
   `framework-mnemosyne-image` Python export layer.
 
 The LaunchAgent owns the service lifetime, so **Quit Menu App** does not stop
 inference on port `1240`. Disabling the background service unregisters it and
 causes macOS to terminate the job. `KeepAlive=true` handles unexpected exits.
+On a genuinely fresh setup, the first app launch requests both the LaunchAgent
+and main-app login registrations. Existing configured installations retain
+their current choices, and the one-time default never restores a registration
+that the user later disables. Approval-required registrations direct the user
+to macOS Login Items rather than bypassing Service Management consent.
 
 ## Development
 
@@ -100,7 +130,14 @@ The runtime builder requires `uv`. It exports the production dependency graph
 from the committed `macos/service/uv.lock` and
 `macos/image-worker/uv.lock` with cache-free, offline `uv export --locked`,
 rejects non-exact requirements, and passes each graph to its own venvstacks
-framework layer.
+framework layer through the exact `venvstacks==0.7.0` builder.
+Every registry dependency is rewritten to the one CPython 3.12 / Apple Silicon
+wheel selected from its committed lock record for the app's macOS 15 deployment
+target, including the lock's SHA-256. Generated layer environments are rebuilt
+cleanly so an older same-version host wheel cannot survive. Export and release
+verification then parse every slice of every bundled Mach-O and reject a
+declared minimum newer than macOS 15; wheel tags alone are not accepted as
+proof.
 An HTTPS GitHub dependency is accepted only when pinned to a full commit SHA;
 the builder turns it into a commit-keyed wheel under `packaging/_wheels` before
 the hash-locked, binary-only venvstacks install. This currently covers the
@@ -150,12 +187,38 @@ CODESIGN_IDENTITY="Apple Development: Example Name (TEAMID)" \
   macos/packaging/build_app.sh release
 ```
 
-The script uses that identity for nested Mach-O files, the direct helper, and
-the outer app, applies hardened runtime and secure timestamps, then performs a
-deep strict verification. If a target Mac has no valid code-signing identity,
+The script uses that identity for nested Mach-O files, the direct service and
+Trash helpers, the nested lifecycle-helper wrapper, the inert lifecycle
+runner, and the outer app. After nested Python/helper/runner signing it
+generates a closed role-identity manifest
+containing their exact bundle-relative locations, identifiers, Team
+Identifiers, CDHashes, requirement digests, and app version/build binding. The
+service Python entry is marked non-authoritative, and the final outer signature
+seals the manifest. Developer ID builds apply the hardened runtime and secure
+timestamps throughout, then perform a deep strict verification. If a target
+Mac has no valid code-signing identity,
 its local build remains ad hoc. Rebuilding an ad-hoc app changes its code
 identity and macOS may require each protected model folder to be selected
 again.
+
+A credentialed lifecycle-helper wrapper additionally requires an externally
+managed Developer ID Application provisioning profile. Keep it outside the
+repository and pass only its exact path:
+
+```bash
+CODESIGN_IDENTITY="Developer ID Application: Example Name (TEAMID)" \
+SPARKLE_PUBLIC_ED_KEY="<public EdDSA key>" \
+MNEMOSYNE_LIFECYCLE_HELPER_PROVISIONING_PROFILE="/secure/path/helper.provisionprofile" \
+  macos/packaging/build_app.sh release
+```
+
+The build accepts only a current macOS Developer ID distribution profile for
+the fixed helper App ID and Team, extracts exactly the application identifier,
+Team identifier, and dedicated Keychain access group entitlements, and rejects
+debugging or mismatched profiles. Embedding a valid profile does not enable
+owner authorization or lifecycle effects; the OS-backed proof authority,
+mutual service-side peer verification, and effects runner remain separate
+fail-closed gates.
 
 ## Building a disk image
 
@@ -173,6 +236,16 @@ usual drag-to-install workflow. The builder validates the source app, creates
 and optionally signs the compressed image, verifies it with `hdiutil`, mounts
 it read-only, and revalidates the app and shortcut before replacing the final
 artifact.
+
+The production service bootstrap also removes ambient `PYTHON*` controls,
+sets only the bundled runtime's `PYTHONHOME` and closed source paths, disables
+user-site and unsafe-path loading, and launches with `-B -P -s`. The explicit
+`MNEMOSYNE_PYTHON_OVERRIDE` path is consulted only when the bundle has no
+embedded runtime, so it remains a bare source-development escape hatch and
+cannot replace Python in a complete packaged release. Full-app verification
+executes the sealed bootstrap's configuration check with hostile `PYTHON*`
+values and a false override, then rechecks the complete code seal to prove the
+inspection itself did not mutate the bundle.
 
 Every build also writes a mode-`0600`, secret-redacted
 `Unified-Inference-<version>-macos-<architecture>-acceptance.json` beside the
@@ -196,6 +269,14 @@ activation/restarted-inference/rollback/restarted-inference/corrupt-rejection
 chain and the original active version. Service-instance UUIDs prove the two
 restart boundaries without exposing a PID history or credentials. See
 [`../RELEASE.md`](../RELEASE.md) for the composed target-Mac commands.
+`--exercise-fleet-participation` runs only when the Mac has no active Fleet
+requests, pauses and rejoins the node, restores the exact prior participation
+preference, and rejects the evidence if model/runtime/storage configuration
+changes. The report retains only fixed states and equality checks, not local
+model paths. Run this local exercise only while Hub dispatch to the Mac is
+disabled or otherwise quiesced: its status read and update are separate HTTP
+operations, and a request entering between them correctly makes the exercise
+fail rather than weakening that request's drain lease.
 For a clean-install pass, `--require-guided-setup` requires candidate-scoped
 first-presentation and completion timestamps from the app preferences plus the
 same report's durable-usage self-test. The operator must reset the menu app's
@@ -255,18 +336,22 @@ and is retried on the next launch. This covers the former `Mnemosyne.app`
 filename migration and local ad-hoc-signed updates without restarting either
 registration on ordinary launches.
 
-For an ad-hoc-signed update, do not merge the staged directory over a running
-installation. In the old app, first disable the background service (and menu
-login item if enabled), wait for the LaunchAgent and ports to disappear, then
-quit the menu app. Copy the staged bundle to a new sibling under
-`/Applications` and verify that copy. Move the old canonical bundle to an
-explicit sibling backup such as
-`/Applications/Unified Inference.previous.app`, then atomically move the
-verified candidate into the exact `/Applications/Unified Inference.app` path.
-If that second move fails, restore the backup to the canonical path before
-continuing. Launch the new app and explicitly enable the service again;
-approve it in Login Items if macOS reports approval-required. Keep the backup
-until the protected-folder and engine-swap smokes pass.
+For an ad-hoc-signed pilot update, do not merge the staged directory over a
+running installation. Build the DMG, quit the menu app, and run its **Install
+or Upgrade Unified Inference.command**. The assistant verifies the exact
+candidate identity and signature, refuses a downgrade, stages a complete
+bundle on the Applications filesystem, moves the old app to Trash, atomically
+activates the candidate, and launches it. An already-enabled service may keep
+serving during bundle staging; the new menu app then refreshes that exact
+Service Management registration and the assistant requires a changed healthy
+agent PID. The assistant hashes `.env` before and after and never writes to
+Application Support or model storage.
+
+The DMG also carries **Uninstall Unified Inference (Preserve Data).command**.
+It requires the exact service to be disabled and the menu app to be quit, then
+moves the canonical app and default manager-owned runtime directory to Trash.
+It deliberately retains the entire accounting recovery surface: `.env`,
+config, SQLite usage/outbox state, identity, scopes, pairing, and weights.
 
 Ad-hoc signing is for local development only. `CODESIGN_IDENTITY` provides
 signature stability but does not by itself implement distribution.

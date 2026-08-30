@@ -8,9 +8,11 @@ version = "0.9.0"
 description = "Native macOS inference coordinator for multiple upstream Apple Silicon engines"
 requires-python = ">=3.11"
 dependencies = [
+  "cryptography>=50,<51",
   "fastapi>=0.115,<1",
   "huggingface-hub>=1.24,<2",
   "httpx>=0.27,<1",
+  "jsonschema>=4.23,<5",
   "psycopg[binary]>=3.2,<4",
   "pydantic>=2.9,<3",
   "pyyaml>=6,<7",
@@ -29,6 +31,10 @@ mnemosyne-macos = "mnemosyne_macos.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/mnemosyne_macos"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"../../compatibility_catalog/v1/catalog.schema.json" = "mnemosyne_macos/schemas/compatibility_catalog.schema.json"
+"../../mac_pool_protocol/v1/desired_install.schema.json" = "mnemosyne_macos/schemas/desired_install.schema.json"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

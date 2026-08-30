@@ -1,0 +1,194 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mnemosyne.local/schemas/mac-pool/desired-install/v1/desired_install.schema.json",
+  "title": "Mnemosyne DesiredInstall v1",
+  "description": "An idempotent signed-catalog install intent delivered only through the selected Mac's outbound management sync.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "job_id",
+    "job_revision",
+    "idempotency_key",
+    "desired_state",
+    "created_at",
+    "expires_at",
+    "valid_for_seconds",
+    "pairing_id",
+    "credential_generation",
+    "recommendation_basis",
+    "catalog_version",
+    "catalog_digest",
+    "logical_model_id",
+    "recipe_id",
+    "artifact_id",
+    "engine",
+    "capabilities",
+    "guaranteed_context_tokens",
+    "storage_location_id",
+    "storage_binding_generation"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "job_id": {
+      "$ref": "#/$defs/uuid"
+    },
+    "job_revision": {
+      "$ref": "#/$defs/generation"
+    },
+    "idempotency_key": {
+      "$ref": "#/$defs/uuid"
+    },
+    "desired_state": {
+      "enum": [
+        "run",
+        "cancel"
+      ]
+    },
+    "created_at": {
+      "$ref": "#/$defs/timestamp"
+    },
+    "expires_at": {
+      "$ref": "#/$defs/timestamp"
+    },
+    "valid_for_seconds": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 604800
+    },
+    "pairing_id": {
+      "$ref": "#/$defs/uuid"
+    },
+    "credential_generation": {
+      "$ref": "#/$defs/generation"
+    },
+    "recommendation_basis": {
+      "$ref": "#/$defs/recommendation_basis"
+    },
+    "catalog_version": {
+      "$ref": "#/$defs/safe_identifier"
+    },
+    "catalog_digest": {
+      "$ref": "#/$defs/sha256"
+    },
+    "logical_model_id": {
+      "$ref": "#/$defs/safe_identifier"
+    },
+    "recipe_id": {
+      "$ref": "#/$defs/safe_identifier"
+    },
+    "artifact_id": {
+      "$ref": "#/$defs/safe_identifier"
+    },
+    "engine": {
+      "$ref": "#/$defs/engine"
+    },
+    "capabilities": {
+      "$ref": "#/$defs/capabilities"
+    },
+    "guaranteed_context_tokens": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 1,
+      "maximum": 100000000
+    },
+    "alias": {
+      "$ref": "#/$defs/safe_alias"
+    },
+    "storage_location_id": {
+      "$ref": "#/$defs/uuid"
+    },
+    "storage_binding_generation": {
+      "$ref": "#/$defs/generation"
+    }
+  },
+  "$defs": {
+    "uuid": {
+      "type": "string",
+      "minLength": 36,
+      "maxLength": 36,
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "sha256": {
+      "type": "string",
+      "minLength": 71,
+      "maxLength": 71,
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "safe_identifier": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:+-]{0,127}$"
+    },
+    "safe_alias": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[^/\\\\\\u0000-\\u001f]{1,128}$"
+    },
+    "timestamp": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 4102444800
+    },
+    "sequence": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "generation": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 2147483647
+    },
+    "engine": {
+      "enum": [
+        "ds4",
+        "llama.cpp",
+        "mflux",
+        "omlx"
+      ]
+    },
+    "capability": {
+      "enum": [
+        "chat/completions",
+        "completions",
+        "embeddings",
+        "images/generations",
+        "messages",
+        "rerank",
+        "responses"
+      ]
+    },
+    "capabilities": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 7,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/capability"
+      }
+    },
+    "recommendation_basis": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "inventory_instance_id",
+        "inventory_sequence"
+      ],
+      "properties": {
+        "inventory_instance_id": {
+          "$ref": "#/$defs/uuid"
+        },
+        "inventory_sequence": {
+          "$ref": "#/$defs/sequence"
+        }
+      }
+    }
+  }
+}

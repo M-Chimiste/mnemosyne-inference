@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import hashlib
 import ipaddress
 import json
@@ -13,7 +13,7 @@ import os
 from pathlib import Path
 import re
 import time
-from typing import Mapping
+from typing import Callable, Mapping
 from uuid import uuid4
 
 import httpx
@@ -32,6 +32,7 @@ from .benchmarking import (
     target_fingerprint,
     target_with_context_window,
 )
+from .catalog_runtime import NativeCatalogRuntime
 from .config import (
     ImageProfileConfig,
     MacConfig,
@@ -44,10 +45,21 @@ from .config import (
     suggested_model_alias,
 )
 from .coordinator import CoordinatorState, CoordinatorStatus, ResidencyCoordinator
+from .desired_install_store import (
+    DesiredInstallConflictError,
+    DesiredInstallIntegrityError,
+    DesiredInstallNotFoundError,
+    DesiredInstallRecord,
+    DesiredInstallStore,
+)
+from .desired_install_executor import (
+    DesiredInstallExecutor,
+    DesiredInstallExecutorError,
+)
+from .desired_install_runtime import NativeDesiredInstallAuthorities
 from .engines.base import Deadline, EngineAdapter
 from .engines.ds4 import DS4Adapter
 from .engines.llamacpp import LlamaCppAdapter
-from .engines.managed_apple import MLXcelAdapter, MistralRSAdapter
 from .engines.mflux import MFluxAdapter
 from .engines.omlx import OMLXAdapter
 from .filesystem import FilesystemProbe, FilesystemProbeError
@@ -59,7 +71,25 @@ from .fleet_protocol import (
     immutable_revision,
     portable_load_config,
 )
+from .fleet_participation import (
+    FleetParticipationState,
+    FleetParticipationStore,
+)
+from .fleet_pairing import (
+    FleetPairingStore,
+    PairingErrorCode,
+    PairingRecord,
+    PairingState,
+    PrivateEnvironmentInvalid,
+)
+from .fleet_pairing_client import (
+    FleetPairingClient,
+    PairingClientError,
+    PairingClientErrorCode,
+    PairingInvitation,
+)
 from .models import (
+    ACTIVE_ENGINE_NAMES,
     ContextWindowHint,
     ENGINE_RELEASE_TIER,
     Endpoint,
@@ -68,6 +98,19 @@ from .models import (
     ServiceState,
 )
 from .performance import PerformanceTracker
+from .install_provenance import (
+    InstallationProvenance,
+    ProvenanceProofRejected,
+)
+from .install_launch import (
+    DS4InstallLaunch,
+    InstallLaunchError,
+    LlamaCppInstallLaunch,
+    OMLX_TARGET_LAUNCH_KEY,
+    OMLXInstallLaunch,
+    omlx_target_launch,
+    with_omlx_target_launch,
+)
 from .install_store import InstallRecord
 from .installer import NativeInstaller
 from .local_models import (
@@ -75,17 +118,155 @@ from .local_models import (
     LocalModelError,
     mark_omlx_id_conflicts,
 )
+from .mac_inventory import HardwareProbe, MacInventoryProducer
+from .mac_inventory_store import (
+    MacInventoryIndex,
+    MacInventoryIndexError,
+    StorageBinding,
+    canonical_uuid,
+)
+from .mac_inventory_sync import MacInventorySyncClient
+from .model_cleanup_journal import (
+    CleanupConfigState,
+    CleanupKind,
+    CleanupPhase,
+    CleanupRecoveryAction,
+    DestinationState,
+    InstallLedgerState,
+    ModelCleanupJournal,
+    ModelCleanupJournalError,
+    decide_cleanup_recovery,
+)
+from .native_lifecycle import NativeLifecycleJournal, RetentionMode
+from .native_lifecycle_helper_transport import (
+    BundledLifecycleHelperTransport,
+    LifecycleHelperTransport,
+)
+from .native_lifecycle_runtime import NativeLifecycleManager
 from .usage import UsageEvent, normalize_usage
-from .usage_delivery import UsageService
+from .usage_delivery import UsageReservationLease, UsageService
 from .runtime_updates import RuntimeUpdateManager
 from .scope_process import SecurityScopeProcess
 from .security_scopes import SecurityScopeRegistry
+from .storage import StorageError, install_destination
 
 
 logger = logging.getLogger("mnemosyne-macos.runtime")
 
 DEFAULT_INTERACTIVE_CONTEXT_LENGTH = 32_768
 MAX_INTERACTIVE_CONTEXT_LENGTH = 65_536
+# llama.cpp's established manager convention for its open-ended "all layers"
+# request.  Leaving ``gpu_layers`` unset is the distinct upstream automatic
+# policy; the two catalog values must never collapse into one profile.
+LLAMA_CPP_ALL_GPU_LAYERS = 999
+# DesiredInstall is advertised only because signed launch contracts are
+# persisted and materialized exactly for every supported recipe. oMLX's
+# scheduler/memory-guard values remain external service globals: Mnemosyne
+# observes and revalidates them but never mutates them for one model.
+SIGNED_LAUNCH_MATERIALIZATION_ENABLED = True
+OMLX_SIGNED_LAUNCH_RECORD_LIMIT = 1025
+
+# In-memory index values are deliberately tri-state. A successful install
+# journal read proves that an exact configured target is ordinary, signed, or
+# conflicting. If a later read fails, only that last known exact state may be
+# reused; a new/changed target is fenced rather than guessed ordinary.
+_OMLX_CONTRACT_ORDINARY = object()
+_OMLX_CONTRACT_CONFLICT = object()
+
+
+def _omlx_contract_binding_key(target: ResolvedTarget) -> tuple[object, ...]:
+    """Identify the configured target independently of manager authority."""
+
+    load = dict(target.load_options)
+    load.pop(OMLX_TARGET_LAUNCH_KEY, None)
+    return (
+        target.alias,
+        target.key.engine,
+        target.key.canonical_model_id,
+        target.wire_model,
+        tuple(sorted(item.value for item in target.capabilities)),
+        json.dumps(load, sort_keys=True, separators=(",", ":")),
+        target.storage_path,
+        target.scope_id,
+        target.storage_volume_uuid,
+        target.context_mode,
+        target.native_context_length,
+        target.context_max_verified_age_hours,
+        target.kind,
+    )
+
+
+def _target_with_omlx_launch(
+    target: ResolvedTarget,
+    launch: OMLXInstallLaunch,
+) -> ResolvedTarget:
+    """Project durable install authority onto an in-memory target identity."""
+
+    load = with_omlx_target_launch(target.load_options, launch)
+    digest = hashlib.sha256(
+        json.dumps(
+            {
+                "configured_load": target.key.load_config_digest,
+                "manager_load": load,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()[:16]
+    return replace(
+        target,
+        key=replace(target.key, load_config_digest=digest),
+        load_options=load,
+    )
+
+
+def _target_with_omlx_launch_conflict(target: ResolvedTarget) -> ResolvedTarget:
+    """Retain local catalog visibility while making every load fail closed."""
+
+    load = dict(target.load_options)
+    load[OMLX_TARGET_LAUNCH_KEY] = {"conflict": True}
+    return replace(target, load_options=load)
+
+
+def _desired_install_payload(
+    record: DesiredInstallRecord,
+    *,
+    executor_available: bool = False,
+) -> dict[str, object]:
+    """Expose only the closed wire intent and acknowledgement shapes."""
+
+    return {
+        "job": json.loads(record.document.canonical_json),
+        "acknowledgement": json.loads(
+            record.acknowledgement().canonical_json
+        ),
+        "local_actions": {
+            "refusal_available": (
+                not record.terminal
+                and record.document.desired_state == "run"
+                and record.state == "awaiting_local_approval"
+            ),
+            "approval_available": (
+                executor_available
+                and not record.terminal
+                and record.document.desired_state == "run"
+                and record.state == "awaiting_local_approval"
+            ),
+            "cancellation_available": (
+                executor_available
+                and not record.terminal
+                and record.document.desired_state == "run"
+                and record.state
+                in {
+                    "accepted",
+                    "downloading",
+                    "verifying",
+                    "downloaded_unregistered",
+                    "registered",
+                }
+            ),
+        },
+    }
 
 
 def recommended_interactive_context_length(detected: int | None) -> int:
@@ -138,6 +319,8 @@ def _redact_diagnostic(
     for key in (
         "INFERENCE_API_KEY",
         "FLEET_API_KEY",
+        "FLEET_INFERENCE_API_KEY",
+        "FLEET_MANAGEMENT_API_KEY",
         "ADMIN_PASSWORD",
         "OMLX_API_KEY",
         "OMLX_ADMIN_SESSION",
@@ -177,6 +360,35 @@ def configuration_revision(config: MacConfig) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def _model_profile_fingerprint(profile: ModelProfile) -> str:
+    """Hash one exact profile without retaining its alias or storage path."""
+
+    payload = json.dumps(
+        profile.model_dump(mode="json"),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+async def _await_owned_task(task: asyncio.Task):
+    """Finish a post-mutation task before replaying caller cancellation."""
+
+    cancellation: asyncio.CancelledError | None = None
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as exc:
+            cancellation = cancellation or exc
+        except Exception:
+            break
+    result = task.result()
+    if cancellation is not None:
+        raise cancellation
+    return result
+
+
 def _restart_sensitive_configuration_changed(
     candidate: MacConfig,
     applied: MacConfig,
@@ -188,6 +400,7 @@ def _restart_sensitive_configuration_changed(
             candidate.server != applied.server,
             candidate.engines != applied.engines,
             candidate.paths != applied.paths,
+            candidate.catalog != applied.catalog,
             candidate.storage != applied.storage,
             candidate.token_sidecar != applied.token_sidecar,
         )
@@ -400,12 +613,38 @@ def _profile_filesystem_references(profile: ModelProfile) -> tuple[str, ...]:
     """Return exact absolute paths a configured profile can reference."""
 
     references: list[str] = []
-    if os.path.isabs(os.path.expanduser(profile.model)):
-        references.append(profile.model)
-    projector = profile.load.projector_path
-    if projector is not None and os.path.isabs(os.path.expanduser(projector)):
-        references.append(projector)
+    candidates = (
+        (profile.model, profile.load.projector_path),
+        *(
+            (alternative.model, alternative.load.projector_path)
+            for alternative in profile.alternatives
+        ),
+    )
+    for model, projector in candidates:
+        if os.path.isabs(os.path.expanduser(model)):
+            references.append(model)
+        if projector is not None and os.path.isabs(os.path.expanduser(projector)):
+            references.append(projector)
     return tuple(references)
+
+
+def _profile_references_omlx_model(
+    profile: ModelProfile,
+    model_id: str,
+) -> bool:
+    """Return whether any primary or alternative candidate names an oMLX model."""
+
+    candidates = (
+        (profile.engine, profile.model),
+        *(
+            (alternative.engine, alternative.model)
+            for alternative in profile.alternatives
+        ),
+    )
+    return any(
+        engine == EngineName.OMLX and Path(model).name == model_id
+        for engine, model in candidates
+    )
 
 
 def _cleanup_targets_overlap_other_profiles(
@@ -420,10 +659,9 @@ def _cleanup_targets_overlap_other_profiles(
     for profile in profiles:
         if profile.alias == alias:
             continue
-        if (
-            omlx_model_id is not None
-            and profile.engine == EngineName.OMLX
-            and Path(profile.model).name == omlx_model_id
+        if omlx_model_id is not None and _profile_references_omlx_model(
+            profile,
+            omlx_model_id,
         ):
             return profile.alias
         for reference in _profile_filesystem_references(profile):
@@ -434,6 +672,37 @@ def _cleanup_targets_overlap_other_profiles(
             ):
                 return profile.alias
     return None
+
+
+def _current_storage_binding_matches(
+    *,
+    provenance: InstallationProvenance,
+    binding: StorageBinding | None,
+    location: StorageLocationConfig,
+) -> bool:
+    """Match every path-bearing field without resolving lexical spelling."""
+
+    return bool(
+        binding is not None
+        and provenance.storage_location_id == binding.storage_location_id
+        and provenance.storage_binding_generation == binding.binding_generation
+        and binding.local_key == location.name
+        and provenance.storage_lexical_root == binding.exact_path
+        and binding.exact_path == location.path
+        and provenance.storage_volume_uuid == binding.volume_uuid
+        and binding.volume_uuid == location.volume_uuid
+        and provenance.storage_scope_id == binding.scope_id
+        and binding.scope_id == location.scope_id
+    )
+
+
+def _managed_manifest_timeout(record: InstallRecord) -> float:
+    expected_bytes = max(
+        0,
+        record.total_bytes or 0,
+        record.bytes_downloaded,
+    )
+    return min(21_600.0, max(300.0, 120.0 + expected_bytes / (20 * 1024 * 1024)))
 
 
 def _storage_scope_for_path(
@@ -483,16 +752,6 @@ def build_adapters(
             runtime_root=runtime_root,
             security_scope_root=security_scope_root,
         )
-    if config.engines.mlxcel.enabled:
-        adapters[EngineName.MLXCEL] = MLXcelAdapter(
-            config.engines.mlxcel,
-            security_scope_root=security_scope_root,
-        )
-    if config.engines.mistral_rs.enabled:
-        adapters[EngineName.MISTRAL_RS] = MistralRSAdapter(
-            config.engines.mistral_rs,
-            security_scope_root=security_scope_root,
-        )
     return adapters
 
 
@@ -508,6 +767,21 @@ class NativeRuntime:
         adapters: Mapping[EngineName, EngineAdapter] | None = None,
         proxy_client: httpx.AsyncClient | None = None,
         self_test_client: httpx.AsyncClient | None = None,
+        pairing_transport: httpx.AsyncBaseTransport | None = None,
+        inventory_transport: httpx.AsyncBaseTransport | None = None,
+        inventory_hardware_probe: HardwareProbe | None = None,
+        inventory_sync_interval_seconds: float = 30.0,
+        catalog_transport: httpx.AsyncBaseTransport | None = None,
+        catalog_clock: Callable[[], int | float] = time.time,
+        catalog_environment: Mapping[str, str] | None = None,
+        catalog_update_interval_seconds: float | None = None,
+        desired_install_store: DesiredInstallStore | None = None,
+        desired_install_executor: DesiredInstallExecutor | None = None,
+        model_cleanup_journal: ModelCleanupJournal | None = None,
+        native_lifecycle_journal: NativeLifecycleJournal | None = None,
+        native_lifecycle_helper_transport: (
+            LifecycleHelperTransport | None
+        ) = None,
         usage_service: UsageService | None = None,
         update_manager: RuntimeUpdateManager | None = None,
         runtime_root: str | Path | None = None,
@@ -588,6 +862,21 @@ class NativeRuntime:
             config.paths.state_database,
             config.token_sidecar,
         )
+        self.fleet_participation = FleetParticipationStore.open(
+            config.paths.state_database
+        )
+        pairing_environment_path = (
+            self.env_path
+            if self.env_path is not None
+            else Path(config.paths.state_database).expanduser().parent / ".env"
+        )
+        self.fleet_pairing = FleetPairingStore(
+            config.paths.state_database,
+            pairing_environment_path,
+        )
+        self._fleet_pairing_record: PairingRecord | None = None
+        self._fleet_pairing_error_code: PairingErrorCode | None = None
+        self._fleet_pairing_revocation_denied = False
         self.performance = PerformanceTracker()
         self.benchmark_store = BenchmarkStore(config.paths.state_database)
         # Routing must not touch SQLite. Durable evidence is loaded once per
@@ -609,19 +898,27 @@ class NativeRuntime:
         )
         self._benchmark_lock = asyncio.Lock()
         self._runtime_fingerprints: dict[EngineName, str | None] = {}
+        # The private index is also the sole authority for binding a newly
+        # created managed destination to the exact user-selected storage
+        # path/generation. It remains optional for inference and downloads:
+        # an unavailable index merely leaves cleanup ownership unknown.
+        self.mac_inventory_index = MacInventoryIndex(config.paths.state_database)
         self.installer = NativeInstaller(
             config.paths.state_database,
             on_installed=self._register_installed_model,
             storage=config.storage,
             filesystem_probe=self.filesystem,
+            inventory_index=self.mac_inventory_index,
         )
+        # Rebuild once the install journal exists so signed oMLX contracts are
+        # projected onto their exact cold targets before any request,
+        # benchmark, inventory, or Fleet snapshot can observe them.
+        self._apply_profiles(config)
         self.runtime_updates = update_manager or RuntimeUpdateManager(
             llama_cpp=config.engines.llama_cpp,
             omlx=config.engines.omlx,
             mflux=config.engines.mflux,
             ds4=config.engines.ds4,
-            mlxcel=config.engines.mlxcel,
-            mistral_rs=config.engines.mistral_rs,
             root=runtime_root,
         )
         self._started = False
@@ -630,6 +927,109 @@ class NativeRuntime:
         self._runtime_update_lock = asyncio.Lock()
         self._fleet_snapshot_lock = asyncio.Lock()
         self._fleet_instance_id = uuid4().hex
+        self.fleet_pairing_client = FleetPairingClient(
+            config.paths.state_database,
+            pairing_store=self.fleet_pairing,
+            reporting_node_id=self.usage.identity.node_id,
+            service_version=__version__,
+            service_instance_id=self._fleet_instance_id,
+            transport=pairing_transport,
+            on_pairing_authority_changed=self._refresh_fleet_pairing_authority,
+            on_self_revoke_pending=self._deny_fleet_pairing_authority,
+            on_self_revoke_aborted=(
+                self._clear_fleet_pairing_revocation_denial
+            ),
+            on_completed_revoke_reset=(
+                self._clear_fleet_pairing_revocation_denial
+            ),
+        )
+        self.compatibility_catalog = NativeCatalogRuntime(
+            config.catalog,
+            config_path=self.config_path,
+            environment=catalog_environment,
+            transport=catalog_transport,
+            clock=catalog_clock,
+            update_interval_seconds=catalog_update_interval_seconds,
+            on_activation=self._catalog_did_activate,
+        )
+        self.mac_inventory = MacInventoryProducer(
+            self,
+            self.mac_inventory_index,
+            hardware_probe=inventory_hardware_probe,
+        )
+        desired_install_root = (
+            self.config_path.parent / "state"
+            if self.config_path is not None
+            else Path(config.paths.state_database).expanduser().parent
+        )
+        self.desired_install_store = desired_install_store or DesiredInstallStore(
+            desired_install_root / "desired-installs.sqlite3"
+        )
+        self.desired_install_authorities = NativeDesiredInstallAuthorities(self)
+        self.desired_install_executor = (
+            desired_install_executor
+            if desired_install_executor is not None
+            else DesiredInstallExecutor(
+                store=self.desired_install_store,
+                catalog=self.compatibility_catalog,
+                pairing=self.desired_install_authorities,
+                inventory=self.desired_install_authorities,
+                storage=self.desired_install_authorities,
+                runtimes=self.desired_install_authorities,
+                installer=self.installer,
+            )
+        )
+        self.model_cleanup_journal = (
+            model_cleanup_journal
+            if model_cleanup_journal is not None
+            else (
+                ModelCleanupJournal(self.config_path)
+                if self.config_path is not None
+                else None
+            )
+        )
+        self.native_lifecycle_journal = (
+            native_lifecycle_journal
+            if native_lifecycle_journal is not None
+            else (
+                NativeLifecycleJournal(self.config_path)
+                if self.config_path is not None
+                else None
+            )
+        )
+        if native_lifecycle_helper_transport is None:
+            lifecycle_helper = os.environ.get("MNEMOSYNE_LIFECYCLE_HELPER", "")
+            native_lifecycle_helper_transport = (
+                BundledLifecycleHelperTransport(lifecycle_helper)
+                if lifecycle_helper
+                else None
+            )
+        self.native_lifecycle = NativeLifecycleManager(
+            self,
+            self.native_lifecycle_journal,
+            native_lifecycle_helper_transport,
+        )
+        self.mac_inventory_sync = MacInventorySyncClient(
+            self.mac_inventory,
+            self.fleet_pairing,
+            transport=inventory_transport,
+            interval_seconds=inventory_sync_interval_seconds,
+        )
+        self._mac_inventory_available = False
+        self._mac_inventory_error_code: str | None = None
+        self._desired_install_available = False
+        self._desired_install_executor_available = False
+        self._desired_install_reconcile_task: asyncio.Task[None] | None = None
+        self._desired_install_reconcile_wake = asyncio.Event()
+        self._desired_install_executor_lock = asyncio.Lock()
+        self._desired_install_reconcile_offset = 0
+        self._desired_install_confirmed_cancellations: set[
+            tuple[str, int, str]
+        ] = set()
+        self._model_cleanup_journal_available = False
+        self._model_cleanup_recovery_error_code: str | None = None
+        self._fleet_pairing_client_available = False
+        self._fleet_pairing_client_error_code: PairingClientErrorCode | None = None
         self._fleet_snapshot_sequence = 0
         self._omlx_directory_sync_pending = False
         self.startup_error: str | None = None
@@ -665,9 +1065,12 @@ class NativeRuntime:
         if self._started:
             return
         self._started = True
+        await self._initialize_fleet_pairing()
         try:
             await self._activate_configured_security_scopes()
             await self.coordinator.initialize()
+            await self.installer.start()
+            await self._initialize_model_cleanup_journal()
             await self._sync_omlx_model_directories()
             await self._refresh_runtime_fingerprints()
         except Exception as exc:
@@ -682,7 +1085,23 @@ class NativeRuntime:
             self._maintenance_loop(), name="mnemosyne-macos-maintenance"
         )
         await self.usage.start()
-        await self.installer.start()
+        # Signed catalog work is advisory and starts only after every local
+        # inference/JIT/download/accounting dependency. Its own failures are
+        # isolated and can never become ``startup_error``.
+        try:
+            await self.compatibility_catalog.start()
+        except Exception:
+            logger.error(
+                "native compatibility catalog is unavailable: catalog_internal_error"
+            )
+        # Inventory publication is optional management-plane work. Starting
+        # its loop after every inference dependency ensures that a damaged
+        # index or unavailable Hub can never degrade local startup/JIT.
+        await self._initialize_mac_inventory()
+        # Native migration/uninstall planning is an auxiliary, non-executing
+        # control-plane slice. Its journal and inventory can fail closed while
+        # local inference, JIT residency, downloads, and accounting continue.
+        await self.native_lifecycle.initialize()
 
     async def stop(self) -> None:
         if not self._started:
@@ -695,6 +1114,31 @@ class NativeRuntime:
             except asyncio.CancelledError:
                 pass
             self._maintenance_task = None
+        with contextlib.suppress(Exception):
+            await self.compatibility_catalog.stop()
+        desired_task = self._desired_install_reconcile_task
+        self._desired_install_reconcile_task = None
+        self._desired_install_executor_available = False
+        if desired_task is not None:
+            # Cancellation must be requested before waking the inner
+            # ``Event.wait``.  Waking first can let ``wait_for`` consume the
+            # cancellation and leave shutdown waiting on a disabled loop.
+            desired_task.cancel()
+            self._desired_install_reconcile_wake.set()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await desired_task
+        self._desired_install_reconcile_wake.clear()
+        with contextlib.suppress(Exception):
+            await self.native_lifecycle.close()
+        with contextlib.suppress(Exception):
+            await self.mac_inventory_sync.stop()
+        with contextlib.suppress(Exception):
+            await self.mac_inventory.close()
+        with contextlib.suppress(Exception):
+            await self.desired_install_store.close()
+        if self.model_cleanup_journal is not None:
+            with contextlib.suppress(Exception):
+                await asyncio.to_thread(self.model_cleanup_journal.close)
         try:
             await self.installer.stop()
             await self.coordinator.shutdown()
@@ -713,7 +1157,979 @@ class NativeRuntime:
                             if self._owns_self_test_client:
                                 await self.self_test_client.aclose()
                         finally:
-                            await asyncio.to_thread(self.security_scopes.close)
+                            try:
+                                await asyncio.to_thread(self.security_scopes.close)
+                            finally:
+                                try:
+                                    await self.fleet_participation.close()
+                                finally:
+                                    try:
+                                        await self.fleet_pairing_client.close()
+                                    finally:
+                                        await self.fleet_pairing.close()
+
+    async def _initialize_fleet_pairing(self) -> None:
+        """Load pairing authority without making local inference depend on Nyx."""
+
+        try:
+            self._fleet_pairing_record = await self.fleet_pairing.initialize()
+            self._fleet_pairing_error_code = None
+        except Exception as exc:
+            self._fleet_pairing_record = None
+            self._fleet_pairing_error_code = (
+                PairingErrorCode.PRIVATE_ENVIRONMENT_INVALID
+                if isinstance(exc, PrivateEnvironmentInvalid)
+                else PairingErrorCode.STATE_INCONSISTENT
+            )
+            logger.error(
+                "native Fleet pairing state failed closed: %s",
+                self._fleet_pairing_error_code.value,
+            )
+            return
+        try:
+            await self.fleet_pairing_client.initialize()
+            self._fleet_pairing_revocation_denied = (
+                await self.fleet_pairing_client.self_revoke_authority_denied()
+            )
+            self._fleet_pairing_client_available = True
+            self._fleet_pairing_client_error_code = None
+        except Exception:
+            if self._uses_managed_fleet_credentials():
+                self._fleet_pairing_revocation_denied = True
+            self._fleet_pairing_client_available = False
+            self._fleet_pairing_client_error_code = (
+                PairingClientErrorCode.STATE_CONFLICT
+            )
+            logger.error(
+                "native Fleet pairing client failed closed: %s",
+                self._fleet_pairing_client_error_code.value,
+            )
+
+    async def _initialize_mac_inventory(self) -> None:
+        """Start optional inventory without making local service depend on it."""
+
+        try:
+            await self.desired_install_store.initialize()
+            self.mac_inventory_sync.attach_desired_install_store(
+                self.desired_install_store
+            )
+        except Exception:
+            self._desired_install_available = False
+            logger.error(
+                "native desired-install journal is unavailable: "
+                "desired_install_store_unavailable"
+            )
+        else:
+            self._desired_install_available = True
+        try:
+            await self.mac_inventory.initialize()
+            self._desired_install_executor_available = bool(
+                self._desired_install_available
+                and SIGNED_LAUNCH_MATERIALIZATION_ENABLED
+            )
+            if self._desired_install_executor_available:
+                self._desired_install_reconcile_offset = 0
+                self._desired_install_reconcile_wake.clear()
+                self._desired_install_reconcile_task = asyncio.create_task(
+                    self._desired_install_reconcile_loop(),
+                    name="mnemosyne-desired-install-reconcile",
+                )
+            await self.mac_inventory_sync.start()
+        except Exception:
+            self._mac_inventory_available = False
+            self._mac_inventory_error_code = "inventory_local_unavailable"
+            logger.error("native Mac inventory is unavailable: inventory_local_unavailable")
+            return
+        self._mac_inventory_available = True
+        self._mac_inventory_error_code = None
+
+    async def _desired_install_reconcile_loop(self) -> None:
+        """Reconcile exact approved installs without touching residency."""
+
+        while self._desired_install_executor_available:
+            try:
+                await asyncio.wait_for(
+                    self._desired_install_reconcile_wake.wait(),
+                    timeout=1.0,
+                )
+            except TimeoutError:
+                pass
+            self._desired_install_reconcile_wake.clear()
+            if not self._desired_install_executor_available:
+                return
+            try:
+                records, total = (
+                    await self.desired_install_store.list_reconcilable(
+                        offset=self._desired_install_reconcile_offset,
+                        limit=256,
+                    )
+                )
+                next_offset = self._desired_install_reconcile_offset + len(
+                    records
+                )
+                self._desired_install_reconcile_offset = (
+                    0 if not records or next_offset >= total else next_offset
+                )
+                changed = False
+                async with self._desired_install_executor_lock:
+                    for record in records:
+                        if record.state == "awaiting_local_approval":
+                            continue
+                        cancellation_key: tuple[str, int, str] | None = None
+                        if (
+                            record.state == "cancelled"
+                            and record.installation_id is not None
+                        ):
+                            cancellation_key = (
+                                record.document.job_id,
+                                record.document.job_revision,
+                                record.installation_id,
+                            )
+                            if (
+                                cancellation_key
+                                in self._desired_install_confirmed_cancellations
+                            ):
+                                continue
+                        before = record.acknowledgement().payload_digest
+                        try:
+                            current = (
+                                await self.desired_install_executor.reconcile(
+                                    record.document.job_id
+                                )
+                            )
+                        except (
+                            DesiredInstallStoreError,
+                            DesiredInstallExecutorError,
+                        ):
+                            # One ambiguous provider/stop observation must not
+                            # hide unrelated jobs later in this bounded page.
+                            # The cursor rotates and the exact row remains
+                            # retryable on the next scan.
+                            continue
+                        if cancellation_key is not None:
+                            self._desired_install_confirmed_cancellations.add(
+                                cancellation_key
+                            )
+                        changed = changed or (
+                            current.acknowledgement().payload_digest != before
+                        )
+                if changed:
+                    self.mac_inventory_sync.trigger()
+            except asyncio.CancelledError:
+                raise
+            except (DesiredInstallStoreError, DesiredInstallExecutorError):
+                # Keep the exact journal state retryable.  Provider/executor
+                # failures are fixed-code management-plane outcomes and must
+                # never become inference startup or maintenance failures.
+                continue
+            except Exception:
+                logger.error(
+                    "native desired-install reconciliation failed: "
+                    "desired_install_internal_error"
+                )
+
+    async def _initialize_model_cleanup_journal(self) -> None:
+        """Recover cross-resource cleanup without gating local inference.
+
+        The journal is optional management-plane state.  Corruption or an
+        unresolved recovery item disables further cleanup, but never changes
+        model profiles, JIT admission, or the inference/accounting startup
+        result merely because this auxiliary store is unavailable.
+        """
+
+        journal = self.model_cleanup_journal
+        if journal is None:
+            self._model_cleanup_journal_available = False
+            self._model_cleanup_recovery_error_code = (
+                "model_cleanup_journal_unavailable"
+            )
+            return
+        try:
+            # Cleanup recovery resolves only opaque storage IDs. Initialize
+            # that private index here before ordinary inventory publication;
+            # failure remains isolated from inference startup.
+            await self.mac_inventory_index.initialize()
+            await asyncio.to_thread(journal.initialize)
+            self._model_cleanup_journal_available = True
+            self._model_cleanup_recovery_error_code = None
+            await self._recover_model_cleanup_transactions()
+        except ModelCleanupJournalError as exc:
+            self._model_cleanup_journal_available = False
+            self._model_cleanup_recovery_error_code = exc.code
+            logger.error("native model cleanup recovery failed: %s", exc.code)
+        except Exception:
+            self._model_cleanup_journal_available = False
+            self._model_cleanup_recovery_error_code = (
+                "model_cleanup_recovery_observation_conflict"
+            )
+            logger.error(
+                "native model cleanup recovery failed: "
+                "model_cleanup_recovery_observation_conflict"
+            )
+
+    async def _recover_model_cleanup_transactions(self) -> None:
+        journal = self.model_cleanup_journal
+        if journal is None:
+            return
+        transactions = await asyncio.to_thread(journal.list_incomplete)
+        for transaction in transactions:
+            if transaction.phase is CleanupPhase.MANUAL_RECOVERY:
+                continue
+
+            async def recover_one(_deadline, *, item=transaction) -> None:
+                await self._recover_model_cleanup_transaction(item)
+
+            await self.coordinator.run_empty_maintenance(
+                recover_one,
+                name="recover model cleanup",
+            )
+
+    async def _recover_model_cleanup_transaction(self, transaction) -> None:
+        """Reconcile one immutable cleanup plan while admission is empty."""
+
+        journal = self.model_cleanup_journal
+        if journal is None:
+            raise ModelCleanupJournalError(
+                "model_cleanup_journal_unavailable"
+            )
+        if self.config_path is None:
+            await asyncio.to_thread(
+                journal.mark_manual_recovery,
+                transaction.transaction_id,
+                "config_unavailable",
+            )
+            return
+
+        fresh = load_config(self.config_path, env_path=self.env_path)
+        revision = configuration_revision(fresh)
+        if revision == transaction.original_config_revision:
+            config_state = CleanupConfigState.ORIGINAL
+        elif revision == transaction.result_config_revision:
+            config_state = CleanupConfigState.RESULT
+        else:
+            config_state = CleanupConfigState.CONFLICT
+        matching_profiles = [
+            item
+            for item in fresh.models
+            if _model_profile_fingerprint(item)
+            == transaction.alias_profile_fingerprint
+        ]
+        profile_present = len(matching_profiles) == 1
+        if len(matching_profiles) > 1:
+            config_state = CleanupConfigState.CONFLICT
+
+        if transaction.cleanup_kind is CleanupKind.MANAGED:
+            (
+                destination_state,
+                ledger_state,
+            ) = await self._managed_cleanup_recovery_observation(
+                transaction.installation_id,
+                fresh,
+                matching_profiles[0] if profile_present else None,
+            )
+        else:
+            # A durable trash_confirmed phase is sufficient to finish an
+            # imported cleanup without retaining paths in this private
+            # journal.  A prepared-only imported transaction is intentionally
+            # manual: after a crash there is no exclusive managed manifest
+            # with which to distinguish Trash from an unrelated removal.
+            destination_state = (
+                DestinationState.UNAVAILABLE
+                if transaction.phase is CleanupPhase.PREPARED
+                else DestinationState.MISSING
+            )
+            ledger_state = InstallLedgerState.NOT_APPLICABLE
+
+        decision = decide_cleanup_recovery(
+            transaction,
+            destination_state=destination_state,
+            profile_fingerprint_present=profile_present,
+            install_ledger_state=ledger_state,
+            config_state=config_state,
+        )
+        if decision.action is CleanupRecoveryAction.NO_ACTION:
+            return
+        if decision.action is CleanupRecoveryAction.ABORT_WITHOUT_MUTATION:
+            # The exact destination and every durable owner are unchanged.
+            # Close this transaction so repeated pre-Trash failures cannot
+            # exhaust protected journal capacity. A later explicit cleanup
+            # gets a fresh ID and revalidates all authority.
+            await asyncio.to_thread(
+                journal.abort_without_mutation,
+                transaction.transaction_id,
+            )
+            return
+        if decision.action is CleanupRecoveryAction.MANUAL_RECOVERY:
+            await asyncio.to_thread(
+                journal.mark_manual_recovery,
+                transaction.transaction_id,
+                decision.reason_code or "recovery_observation_conflict",
+            )
+            return
+
+        current = transaction
+        if current.phase is CleanupPhase.PREPARED:
+            current = (
+                await asyncio.to_thread(
+                    journal.advance,
+                    current.transaction_id,
+                    CleanupPhase.TRASH_CONFIRMED,
+                )
+            ).transaction
+
+        if decision.action is CleanupRecoveryAction.FINISH_LEDGER_AND_CONFIG:
+            assert current.installation_id is not None
+            install = await self.installer.get_by_id(current.installation_id)
+            if install.status == "installed":
+                await self.installer.mark_trashed(current.installation_id)
+            elif install.status != "trashed":
+                await asyncio.to_thread(
+                    journal.mark_manual_recovery,
+                    current.transaction_id,
+                    "install_status_conflict",
+                )
+                return
+
+        if current.phase is CleanupPhase.TRASH_CONFIRMED:
+            current = (
+                await asyncio.to_thread(
+                    journal.advance,
+                    current.transaction_id,
+                    CleanupPhase.LEDGER_MARKED,
+                )
+            ).transaction
+
+        if current.phase is CleanupPhase.LEDGER_MARKED:
+            if config_state is CleanupConfigState.ORIGINAL:
+                if not profile_present:
+                    await asyncio.to_thread(
+                        journal.mark_manual_recovery,
+                        current.transaction_id,
+                        "profile_conflict",
+                    )
+                    return
+                result = fresh.model_copy(
+                    update={
+                        "models": [
+                            item
+                            for item in fresh.models
+                            if _model_profile_fingerprint(item)
+                            != current.alias_profile_fingerprint
+                        ]
+                    }
+                )
+                result = MacConfig.model_validate(
+                    result.model_dump(mode="json")
+                )
+                if configuration_revision(result) != current.result_config_revision:
+                    await asyncio.to_thread(
+                        journal.mark_manual_recovery,
+                        current.transaction_id,
+                        "config_conflict",
+                    )
+                    return
+                await asyncio.to_thread(save_config, result, self.config_path)
+                fresh = result
+                self.config = result
+                self._apply_profiles(result)
+                self.installer.storage = result.storage
+            current = (
+                await asyncio.to_thread(
+                    journal.advance,
+                    current.transaction_id,
+                    CleanupPhase.CONFIG_SAVED,
+                )
+            ).transaction
+
+        if current.phase is CleanupPhase.CONFIG_SAVED:
+            await asyncio.to_thread(
+                journal.advance,
+                current.transaction_id,
+                CleanupPhase.COMPLETED,
+            )
+
+    async def _managed_cleanup_recovery_observation(
+        self,
+        installation_id: str | None,
+        config: MacConfig,
+        profile: ModelProfile | None,
+    ) -> tuple[DestinationState, InstallLedgerState]:
+        """Observe one exact managed destination without authorizing deletion."""
+
+        if installation_id is None:
+            return DestinationState.UNAVAILABLE, InstallLedgerState.MISSING
+        try:
+            install = await self.installer.get_by_id(installation_id)
+        except KeyError:
+            return DestinationState.UNAVAILABLE, InstallLedgerState.MISSING
+        if install.status == "installed":
+            ledger_state = InstallLedgerState.INSTALLED
+        elif install.status == "trashed":
+            ledger_state = InstallLedgerState.TRASHED
+        else:
+            return DestinationState.UNAVAILABLE, InstallLedgerState.CONFLICT
+        try:
+            provenance = await asyncio.to_thread(
+                self.installer.store.get_provenance,
+                installation_id,
+            )
+            if (
+                provenance.storage_location_id is None
+                or provenance.storage_binding_generation is None
+                or provenance.owned_files is None
+                or provenance.lexical_destination != install.destination
+            ):
+                return DestinationState.MISMATCH, ledger_state
+            binding = await self.mac_inventory_index.resolve_storage(
+                provenance.storage_location_id,
+                provenance.storage_binding_generation,
+            )
+            location = next(
+                (
+                    item
+                    for item in config.storage.locations
+                    if binding is not None and item.name == binding.local_key
+                ),
+                None,
+            )
+            if location is None or not _current_storage_binding_matches(
+                provenance=provenance,
+                binding=binding,
+                location=location,
+            ):
+                return DestinationState.UNAVAILABLE, ledger_state
+            if profile is not None and (
+                install.alias != profile.alias
+                or install.engine != profile.engine.value
+                or install.storage != profile.storage
+                or not _profile_uses_install_destination(profile, install)
+            ):
+                return DestinationState.MISMATCH, ledger_state
+            root_status = await self.filesystem.inspect(
+                location.path,
+                expected_volume_uuid=location.volume_uuid,
+                scope_id=location.scope_id,
+                scope_path=location.path,
+            )
+            if (
+                not root_status.exists
+                or not root_status.is_directory
+                or not root_status.volume_matches
+            ):
+                return DestinationState.UNAVAILABLE, ledger_state
+            target_status = await self.filesystem.inspect(
+                install.destination,
+                expected_volume_uuid=location.volume_uuid,
+                scope_id=location.scope_id,
+                scope_path=location.path,
+            )
+            if not target_status.exists:
+                return DestinationState.MISSING, ledger_state
+            if not target_status.is_directory or not target_status.volume_matches:
+                return DestinationState.MISMATCH, ledger_state
+            try:
+                await self.filesystem.verify_exact_manifest(
+                    root=location.path,
+                    path=install.destination,
+                    files=provenance.owned_files,
+                    expected_volume_uuid=location.volume_uuid,
+                    scope_id=location.scope_id,
+                    expected_directory_device=provenance.directory_device,
+                    expected_directory_inode=provenance.directory_inode,
+                    timeout_seconds=_managed_manifest_timeout(install),
+                )
+            except FilesystemProbeError:
+                return DestinationState.MISMATCH, ledger_state
+            return DestinationState.EXACT_PRESENT, ledger_state
+        except (FilesystemProbeError, MacInventoryIndexError, OSError, ValueError):
+            return DestinationState.UNAVAILABLE, ledger_state
+
+    async def native_lifecycle_status(self) -> dict[str, object]:
+        """Return path-free auxiliary lifecycle availability and receipts."""
+
+        return await self.native_lifecycle.status()
+
+    async def preview_native_uninstall(
+        self,
+        retention_mode: RetentionMode | str,
+    ) -> dict[str, object]:
+        """Build a non-executing preview from fresh local authority."""
+
+        return await self.native_lifecycle.preview_uninstall(retention_mode)
+
+    async def prepare_native_uninstall(
+        self,
+        transaction_id: str,
+        retention_mode: RetentionMode | str,
+    ) -> dict[str, object]:
+        """Persist one immutable plan; no lifecycle effect is performed."""
+
+        return await self.native_lifecycle.prepare_uninstall(
+            transaction_id,
+            retention_mode,
+        )
+
+    async def native_lifecycle_transaction(
+        self,
+        transaction_id: str,
+    ) -> dict[str, object]:
+        return await self.native_lifecycle.read(transaction_id)
+
+    async def native_lifecycle_authorization_status(
+        self,
+        transaction_id: str,
+    ) -> dict[str, object]:
+        return await self.native_lifecycle.authorization_status(transaction_id)
+
+    async def issue_native_lifecycle_authorization_challenge(
+        self,
+        transaction_id: str,
+    ) -> dict[str, object]:
+        return await self.native_lifecycle.issue_authorization_challenge(
+            transaction_id
+        )
+
+    async def submit_native_lifecycle_authorization_receipt(
+        self,
+        transaction_id: str,
+        receipt: Mapping[str, object],
+    ) -> dict[str, object]:
+        return await self.native_lifecycle.submit_authorization_receipt(
+            transaction_id, receipt
+        )
+
+    async def perform_native_lifecycle_authorization(
+        self,
+        transaction_id: str,
+    ) -> dict[str, object]:
+        """Ask the service-owned bundled helper transport to authorize."""
+
+        return await self.native_lifecycle.perform_authorization(transaction_id)
+
+    async def cancel_native_lifecycle_authorization_challenge(
+        self,
+        *,
+        transaction_id: str,
+        nonce: str,
+        session_id: str,
+    ) -> dict[str, object]:
+        return await self.native_lifecycle.cancel_authorization_challenge(
+            transaction_id=transaction_id,
+            nonce=nonce,
+            session_id=session_id,
+        )
+
+    async def preview_native_migration(self) -> dict[str, object]:
+        """Fail closed until signed candidate/rollback evidence is available."""
+
+        return await self.native_lifecycle.preview_migration()
+
+    async def mac_inventory_status(self) -> dict[str, object]:
+        """Return only the path-free observation and fixed sync metadata."""
+
+        if not self._mac_inventory_available:
+            return {
+                "schema_version": 1,
+                "available": False,
+                "last_error_code": self._mac_inventory_error_code
+                or "inventory_local_unavailable",
+                "sync": None,
+                "inventory": None,
+            }
+        try:
+            payload = await self.mac_inventory_sync.inspection()
+        except Exception:
+            return {
+                "schema_version": 1,
+                "available": False,
+                "last_error_code": "inventory_local_unavailable",
+                "sync": None,
+                "inventory": None,
+            }
+        return {
+            "schema_version": 1,
+            "available": True,
+            "last_error_code": None,
+            "sync": payload["sync"],
+            "inventory": payload["inventory"],
+        }
+
+    async def list_desired_installs(
+        self,
+        *,
+        offset: int = 0,
+        limit: int = 100,
+    ) -> dict[str, object]:
+        """List path-free local intents and their exact action authority."""
+
+        self._require_desired_install_store()
+        records, total = await self.desired_install_store.list(
+            offset=offset,
+            limit=limit,
+        )
+        return {
+            "schema_version": 1,
+            "executor_available": self._desired_install_executor_available,
+            "approval_available": self._desired_install_executor_available,
+            "offset": offset,
+            "limit": limit,
+            "total": total,
+            "items": [
+                _desired_install_payload(
+                    record,
+                    executor_available=(
+                        self._desired_install_executor_available
+                    ),
+                )
+                for record in records
+            ],
+        }
+
+    async def desired_install(self, job_id: str) -> dict[str, object]:
+        """Read one exact intent from the private local journal."""
+
+        self._require_desired_install_store()
+        record = await self.desired_install_store.get(job_id)
+        if record is None:
+            raise DesiredInstallNotFoundError("desired_install_job_unknown")
+        return {
+            "schema_version": 1,
+            "executor_available": self._desired_install_executor_available,
+            "approval_available": self._desired_install_executor_available,
+            "item": _desired_install_payload(
+                record,
+                executor_available=self._desired_install_executor_available,
+            ),
+        }
+
+    async def refuse_desired_install(
+        self,
+        job_id: str,
+        *,
+        job_revision: int,
+    ) -> dict[str, object]:
+        """Refuse only a job that is still awaiting local approval."""
+
+        self._require_desired_install_store()
+        record = await self.desired_install_store.get(job_id)
+        if record is None:
+            raise DesiredInstallNotFoundError("desired_install_job_unknown")
+        if record.document.job_revision != job_revision:
+            raise DesiredInstallConflictError(
+                "desired_install_revision_changed"
+            )
+        if record.state != "awaiting_local_approval" or record.terminal:
+            raise DesiredInstallConflictError(
+                "desired_install_state_conflict"
+            )
+        transition = await self.desired_install_store.transition(
+            job_id=record.document.job_id,
+            job_revision=job_revision,
+            installation_id=record.installation_id,
+            state="refused",
+            bytes_downloaded=record.bytes_downloaded,
+            total_bytes=record.total_bytes,
+            result_code="local_policy_refused",
+        )
+        self.mac_inventory_sync.trigger()
+        return {
+            "schema_version": 1,
+            "executor_available": self._desired_install_executor_available,
+            "approval_available": self._desired_install_executor_available,
+            "item": _desired_install_payload(
+                transition.record,
+                executor_available=self._desired_install_executor_available,
+            ),
+        }
+
+    async def approve_desired_install(
+        self,
+        job_id: str,
+        *,
+        job_revision: int,
+    ) -> dict[str, object]:
+        """Start one exact job only after this loopback local approval."""
+
+        self._require_desired_install_executor()
+        record = await self.desired_install_store.get(job_id)
+        if record is None:
+            raise DesiredInstallNotFoundError("desired_install_job_unknown")
+        if record.document.job_revision != job_revision:
+            raise DesiredInstallConflictError(
+                "desired_install_revision_changed"
+            )
+        async with self._desired_install_executor_lock:
+            current = await self.desired_install_executor.approve(job_id)
+        self._desired_install_reconcile_wake.set()
+        self.mac_inventory_sync.trigger()
+        return {
+            "schema_version": 1,
+            "executor_available": True,
+            "approval_available": True,
+            "item": _desired_install_payload(
+                current,
+                executor_available=True,
+            ),
+        }
+
+    async def cancel_desired_install(
+        self,
+        job_id: str,
+        *,
+        job_revision: int,
+    ) -> dict[str, object]:
+        """Stop one locally approved install without deleting its files."""
+
+        self._require_desired_install_executor()
+        record = await self.desired_install_store.get(job_id)
+        if record is None:
+            raise DesiredInstallNotFoundError("desired_install_job_unknown")
+        if record.document.job_revision != job_revision:
+            raise DesiredInstallConflictError(
+                "desired_install_revision_changed"
+            )
+        if record.state == "awaiting_local_approval":
+            raise DesiredInstallConflictError(
+                "desired_install_state_conflict"
+            )
+        async with self._desired_install_executor_lock:
+            current = await self.desired_install_executor.cancel_locally(job_id)
+        self.mac_inventory_sync.trigger()
+        return {
+            "schema_version": 1,
+            "executor_available": True,
+            "approval_available": True,
+            "item": _desired_install_payload(
+                current,
+                executor_available=True,
+            ),
+        }
+
+    def _require_desired_install_store(self) -> None:
+        if not self._desired_install_available:
+            raise DesiredInstallIntegrityError(
+                "desired_install_store_unavailable"
+            )
+
+    def _require_desired_install_executor(self) -> None:
+        self._require_desired_install_store()
+        if not self._desired_install_executor_available:
+            raise DesiredInstallExecutorError(
+                "desired_install_internal_error"
+            )
+
+    async def compatibility_catalog_status(self) -> dict[str, object]:
+        return await self.compatibility_catalog.status()
+
+    async def compatibility_catalog_metadata(self) -> dict[str, object]:
+        return await self.compatibility_catalog.metadata()
+
+    async def check_compatibility_catalog(self) -> dict[str, object]:
+        return await self.compatibility_catalog.check_now()
+
+    async def _catalog_did_activate(self, _snapshot: object) -> None:
+        """Publish a fresh inventory basis after an atomic catalog change."""
+
+        inventory_sync = getattr(self, "mac_inventory_sync", None)
+        if inventory_sync is not None:
+            inventory_sync.trigger()
+
+    async def _refresh_fleet_pairing_authority(self) -> None:
+        """Refresh only the credential-authorization cache from durable state."""
+
+        self._fleet_pairing_record = await self.fleet_pairing.status()
+        self._fleet_pairing_error_code = None
+        inventory_sync = getattr(self, "mac_inventory_sync", None)
+        if inventory_sync is not None:
+            inventory_sync.trigger()
+
+    def _deny_fleet_pairing_authority(self) -> None:
+        """Synchronously latch Fleet admission closed for self-revocation."""
+
+        self._fleet_pairing_revocation_denied = True
+
+    def _clear_fleet_pairing_revocation_denial(self) -> None:
+        """Open only the latch whose completed revoke was atomically reset."""
+
+        self._fleet_pairing_revocation_denied = False
+
+    async def _fleet_pairing_workflow_status(self) -> dict[str, object]:
+        if not getattr(self, "_fleet_pairing_client_available", False):
+            error_code = getattr(
+                self,
+                "_fleet_pairing_client_error_code",
+                None,
+            )
+            return {
+                "available": False,
+                "last_error_code": (
+                    error_code.value
+                    if error_code
+                    else PairingClientErrorCode.STATE_CONFLICT.value
+                ),
+            }
+        try:
+            record = await self.fleet_pairing_client.status()
+        except PairingClientError as exc:
+            self._fleet_pairing_client_error_code = exc.code
+            return {
+                "available": False,
+                "last_error_code": exc.code.value,
+            }
+        self._fleet_pairing_client_error_code = None
+        if record is None:
+            return {
+                "available": True,
+                "phase": None,
+                "last_error_code": None,
+            }
+        return {"available": True, **record.public_payload()}
+
+    async def begin_fleet_pairing(
+        self,
+        invitation: PairingInvitation,
+    ) -> dict[str, object]:
+        if not self._fleet_pairing_client_available:
+            raise PairingClientError(
+                PairingClientErrorCode.STATE_CONFLICT,
+                status_code=503,
+                retryable=False,
+            )
+        await self.fleet_pairing_client.begin(invitation)
+        await self.fleet_pairing_status()
+        return await self._fleet_pairing_workflow_status()
+
+    async def resume_fleet_pairing(
+        self,
+        invitation: PairingInvitation,
+    ) -> dict[str, object]:
+        if not self._fleet_pairing_client_available:
+            raise PairingClientError(
+                PairingClientErrorCode.STATE_CONFLICT,
+                status_code=503,
+                retryable=False,
+            )
+        await self.fleet_pairing_client.resume(invitation)
+        await self.fleet_pairing_status()
+        return await self._fleet_pairing_workflow_status()
+
+    async def revoke_fleet_pairing(
+        self,
+        *,
+        request_id: str,
+    ) -> dict[str, object]:
+        """Durably revoke this Mac's dynamic Nyx enrollment.
+
+        The caller owns one canonical request ID and must replay it after an
+        ambiguous response.  The pairing client writes its local denial fence
+        before contacting Nyx, so this operation cannot reopen pooled routing
+        while recovery is pending.  Local inference, storage, weights, usage,
+        and ordinary participation preferences are deliberately untouched.
+        """
+
+        if not self._fleet_pairing_client_available:
+            raise PairingClientError(
+                PairingClientErrorCode.STATE_CONFLICT,
+                status_code=503,
+                retryable=False,
+            )
+        result = await self.fleet_pairing_client.self_revoke_enrollment(
+            request_id=request_id,
+        )
+        return {
+            "schema_version": 1,
+            "result": result.public_payload(),
+            "pairing": await self.fleet_pairing_status(),
+        }
+
+    async def fleet_pairing_status(self) -> dict[str, object]:
+        """Return a bounded, credential-free view of local pairing state."""
+
+        try:
+            record = await self.fleet_pairing.status()
+        except Exception as exc:
+            self._fleet_pairing_record = None
+            self._fleet_pairing_error_code = (
+                PairingErrorCode.PRIVATE_ENVIRONMENT_INVALID
+                if isinstance(exc, PrivateEnvironmentInvalid)
+                else PairingErrorCode.STATE_INCONSISTENT
+            )
+            return {
+                "schema_version": 1,
+                "available": False,
+                "state": PairingState.RECOVERY_REQUIRED.value,
+                "last_error_code": self._fleet_pairing_error_code.value,
+                "workflow": await self._fleet_pairing_workflow_status(),
+            }
+        self._fleet_pairing_record = record
+        self._fleet_pairing_error_code = None
+        self_revoke: dict[str, object] | None = None
+        if getattr(self, "_fleet_pairing_client_available", False):
+            try:
+                self_revoke = (
+                    await self.fleet_pairing_client.self_revoke_status()
+                )
+            except PairingClientError:
+                self_revoke = None
+        return {
+            "schema_version": 1,
+            "available": True,
+            "state": record.state.value,
+            "device_id": record.device_id,
+            "pairing_id": record.pairing_id,
+            "reporting_node_id": record.node_id,
+            "credential_generation": record.credential_epoch,
+            "credentials_configured": record.credentials_owned,
+            "legacy_credentials_present": record.legacy_credentials_present,
+            "last_error_code": (
+                record.last_error_code.value if record.last_error_code else None
+            ),
+            "updated_at": record.updated_at,
+            "paired_at": record.paired_at,
+            "revoked_at": record.revoked_at,
+            "self_revoke": self_revoke,
+            "workflow": await self._fleet_pairing_workflow_status(),
+        }
+
+    def _uses_managed_fleet_credentials(self) -> bool:
+        record = self._fleet_pairing_record
+        return bool(
+            (record is not None and (record.credentials_owned or record.pairing_id))
+            or os.environ.get("FLEET_MANAGEMENT_API_KEY", "").strip()
+        )
+
+    def fleet_snapshot_credential_active(self) -> bool:
+        """Allow static nodes or paired/staged snapshot activation probes."""
+
+        if self._fleet_pairing_revocation_denied:
+            return False
+        if not self._uses_managed_fleet_credentials():
+            return True
+        record = self._fleet_pairing_record
+        return bool(
+            record is not None
+            and record.credentials_owned
+            and not record.credential_write_pending
+            and record.state in {PairingState.PENDING, PairingState.PAIRED}
+        )
+
+    def fleet_dispatch_credential_active(self, *, activation_probe: bool) -> bool:
+        """Keep staged dispatch credentials out of ordinary inference."""
+
+        if self._fleet_pairing_revocation_denied:
+            return False
+        if not self._uses_managed_fleet_credentials():
+            return True
+        record = self._fleet_pairing_record
+        if not (
+            record is not None
+            and record.credentials_owned
+            and not record.credential_write_pending
+        ):
+            return False
+        if record.state == PairingState.PAIRED:
+            return True
+        return activation_probe and record.state == PairingState.PENDING
 
     async def _activate_configured_security_scopes(self) -> None:
         referenced: set[str] = set()
@@ -842,14 +2258,15 @@ class NativeRuntime:
         alias: str,
         *,
         expected_revision: str,
+        installation_id: str | None = None,
     ) -> tuple[MacConfig, str, bool, str]:
         """Clean up one model's exact files and remove its profile.
 
-        Managed downloads keep their ledger-owned directory deletion. A model
-        without managed provenance must be uniquely rediscovered by a fresh,
-        bounded scan of its registered storage; those exact paths are moved to
-        the macOS Trash. The coordinator barrier prevents new leases while the
-        filesystem mutation and configuration update run.
+        An exact managed installation can move its whole destination to Trash
+        only with complete exclusive-ownership provenance and a current opaque
+        storage binding.  The legacy request shape remains limited to the
+        independently safe local-import scan path.  The coordinator barrier
+        prevents new leases while filesystem and configuration mutations run.
         """
 
         if self.config_path is None:
@@ -886,17 +2303,33 @@ class NativeRuntime:
                     "the model's registered storage folder is no longer configured"
                 )
 
-            install = await self.installer.latest_for_alias(alias)
-            managed_install = (
-                install
-                if install is not None and install.status == "installed"
-                else None
-            )
+            managed_install: InstallRecord | None = None
+            managed_provenance: InstallationProvenance | None = None
             cleanup_paths: tuple[str, ...]
-            disposition: str
-            if managed_install is not None:
+            disposition = "trashed"
+            omlx_model_id = (
+                profile.model if profile.engine == EngineName.OMLX else None
+            )
+
+            if installation_id is not None:
+                if canonical_uuid(installation_id) is None:
+                    raise ModelCleanupRejected(
+                        "managed cleanup requires a canonical installation ID"
+                    )
+                try:
+                    (
+                        managed_install,
+                        managed_provenance,
+                    ) = await self.installer.require_cleanup_authority(
+                        installation_id
+                    )
+                except ProvenanceProofRejected as exc:
+                    raise ModelCleanupRejected(
+                        f"managed cleanup refused: {exc.reason.value}"
+                    ) from exc
                 if (
-                    profile.engine.value != managed_install.engine
+                    managed_install.alias != alias
+                    or profile.engine.value != managed_install.engine
                     or profile.storage != managed_install.storage
                     or not _profile_uses_install_destination(
                         profile, managed_install
@@ -905,9 +2338,48 @@ class NativeRuntime:
                     raise ModelCleanupRejected(
                         "the model profile no longer matches its managed download"
                     )
+                assert managed_provenance.storage_location_id is not None
+                assert managed_provenance.storage_binding_generation is not None
+                try:
+                    binding = await self.mac_inventory_index.resolve_storage(
+                        managed_provenance.storage_location_id,
+                        managed_provenance.storage_binding_generation,
+                    )
+                except MacInventoryIndexError as exc:
+                    raise ModelCleanupRejected(
+                        "the managed model's storage binding is unavailable"
+                    ) from exc
+                if not _current_storage_binding_matches(
+                    provenance=managed_provenance,
+                    binding=binding,
+                    location=location,
+                ):
+                    raise ModelCleanupRejected(
+                        "the managed model's storage binding has changed"
+                    )
                 cleanup_paths = (managed_install.destination,)
-                disposition = "deleted"
             else:
+                # This hidden-inclusive lookup is denial-only. It never grants
+                # cleanup authority from a destination, alias, or lifecycle
+                # status; it prevents callers from omitting the exact ID and
+                # downgrading a managed download into the import workflow.
+                possible_managed = await self.installer.binding_records(
+                    engine=profile.engine.value,
+                    storage=profile.storage,
+                )
+                if len(possible_managed) > 10_000:
+                    raise ModelCleanupRejected(
+                        "managed installation history is too large to classify safely"
+                    )
+                if any(
+                    install.status not in {"deleted", "trashed"}
+                    and _profile_uses_install_destination(profile, install)
+                    for install in possible_managed
+                ):
+                    raise ModelCleanupRejected(
+                        "this profile matches managed installation history; "
+                        "select its exact installation before cleaning it up"
+                    )
                 if profile.engine not in {
                     EngineName.LLAMA_CPP,
                     EngineName.OMLX,
@@ -993,18 +2465,18 @@ class NativeRuntime:
                     raise ModelCleanupRejected(
                         "the fresh model scan did not identify any cleanup targets"
                     )
-                conflicting_alias = _cleanup_targets_overlap_other_profiles(
-                    fresh.models,
-                    alias=alias,
-                    targets=cleanup_paths,
-                    omlx_model_id=omlx_model_id,
+
+            conflicting_alias = _cleanup_targets_overlap_other_profiles(
+                fresh.models,
+                alias=alias,
+                targets=cleanup_paths,
+                omlx_model_id=omlx_model_id,
+            )
+            if conflicting_alias is not None:
+                raise ModelCleanupRejected(
+                    "model cleanup was refused because profile "
+                    f"'{conflicting_alias}' shares the selected files"
                 )
-                if conflicting_alias is not None:
-                    raise ModelCleanupRejected(
-                        "model cleanup was refused because profile "
-                        f"'{conflicting_alias}' shares the selected files"
-                    )
-                disposition = "trashed"
 
             updated_config = fresh.model_copy(
                 update={
@@ -1016,75 +2488,228 @@ class NativeRuntime:
             updated_config = MacConfig.model_validate(
                 updated_config.model_dump(mode="json")
             )
+            cleanup_journal = self.model_cleanup_journal
+            if (
+                cleanup_journal is None
+                or not self._model_cleanup_journal_available
+            ):
+                raise ModelCleanupRejected(
+                    "model cleanup is unavailable until its private recovery "
+                    "journal is healthy"
+                )
+            cleanup_transaction_id = str(uuid4())
+            cleanup_profile_fingerprint = _model_profile_fingerprint(profile)
+            cleanup_result_revision = configuration_revision(updated_config)
             removed_files = False
 
             async def remove(deadline) -> None:
                 nonlocal removed_files
                 if managed_install is not None:
-                    removed_files = await self.filesystem.delete_directory(
+                    assert installation_id is not None
+                    assert managed_provenance is not None
+                    try:
+                        (
+                            current_install,
+                            current_provenance,
+                        ) = await self.installer.require_cleanup_authority(
+                            installation_id
+                        )
+                    except ProvenanceProofRejected as exc:
+                        raise ModelCleanupRejected(
+                            f"managed cleanup refused: {exc.reason.value}"
+                        ) from exc
+                    if (
+                        current_install != managed_install
+                        or current_provenance != managed_provenance
+                    ):
+                        raise ModelCleanupRejected(
+                            "the managed installation changed before cleanup"
+                        )
+                    assert current_provenance.storage_location_id is not None
+                    assert (
+                        current_provenance.storage_binding_generation is not None
+                    )
+                    try:
+                        current_binding = (
+                            await self.mac_inventory_index.resolve_storage(
+                                current_provenance.storage_location_id,
+                                current_provenance.storage_binding_generation,
+                            )
+                        )
+                    except MacInventoryIndexError as exc:
+                        raise ModelCleanupRejected(
+                            "the managed model's storage binding is unavailable"
+                        ) from exc
+                    if not _current_storage_binding_matches(
+                        provenance=current_provenance,
+                        binding=current_binding,
+                        location=location,
+                    ):
+                        raise ModelCleanupRejected(
+                            "the managed model's storage binding has changed"
+                        )
+                    assert current_provenance.owned_files is not None
+                    await self.filesystem.verify_exact_manifest(
                         root=location.path,
-                        path=managed_install.destination,
+                        path=current_install.destination,
+                        files=current_provenance.owned_files,
                         expected_volume_uuid=location.volume_uuid,
                         scope_id=location.scope_id,
+                        expected_directory_device=(
+                            current_provenance.directory_device
+                        ),
+                        expected_directory_inode=(
+                            current_provenance.directory_inode
+                        ),
+                        timeout_seconds=_managed_manifest_timeout(
+                            current_install
+                        ),
                     )
+                    try:
+                        await asyncio.to_thread(
+                            cleanup_journal.prepare,
+                            transaction_id=cleanup_transaction_id,
+                            installation_id=installation_id,
+                            alias_profile_fingerprint=(
+                                cleanup_profile_fingerprint
+                            ),
+                            original_config_revision=current_revision,
+                            result_config_revision=cleanup_result_revision,
+                            cleanup_kind=CleanupKind.MANAGED,
+                        )
+                    except ModelCleanupJournalError as exc:
+                        raise ModelCleanupRejected(
+                            "model cleanup recovery journal refused the operation"
+                        ) from exc
+                    removed_files = await self.filesystem.trash_paths(
+                        root=location.path,
+                        paths=(current_install.destination,),
+                        expected_volume_uuid=location.volume_uuid,
+                        scope_id=location.scope_id,
+                        exact_manifest=current_provenance.owned_files,
+                        expected_directory_device=(
+                            current_provenance.directory_device
+                        ),
+                        expected_directory_inode=(
+                            current_provenance.directory_inode
+                        ),
+                        timeout_seconds=_managed_manifest_timeout(
+                            current_install
+                        ),
+                    )
+                    if not removed_files:
+                        raise FilesystemProbeError(
+                            "managed model destination changed before it could "
+                            "be moved to Trash"
+                        )
                 else:
+                    try:
+                        await asyncio.to_thread(
+                            cleanup_journal.prepare,
+                            transaction_id=cleanup_transaction_id,
+                            installation_id=None,
+                            alias_profile_fingerprint=(
+                                cleanup_profile_fingerprint
+                            ),
+                            original_config_revision=current_revision,
+                            result_config_revision=cleanup_result_revision,
+                            cleanup_kind=CleanupKind.IMPORTED,
+                        )
+                    except ModelCleanupJournalError as exc:
+                        raise ModelCleanupRejected(
+                            "model cleanup recovery journal refused the operation"
+                        ) from exc
                     removed_files = await self.filesystem.trash_paths(
                         root=location.path,
                         paths=cleanup_paths,
                         expected_volume_uuid=location.volume_uuid,
                         scope_id=location.scope_id,
                     )
-                save_config(updated_config, self.config_path)
-                self.config = updated_config
-                self._apply_profiles(updated_config)
-                self.installer.storage = updated_config.storage
-                if managed_install is not None:
-                    await asyncio.to_thread(
-                        self.installer.store.update,
-                        managed_install.id,
-                        status="deleted",
-                        hidden=1,
-                        pid=None,
-                        download_speed_bps=None,
-                        error=None,
-                    )
 
-                if profile.engine == EngineName.OMLX:
-                    adapter = self.adapters.get(EngineName.OMLX)
-                    if isinstance(adapter, OMLXAdapter):
-                        directories: list[str] = []
-                        for item in updated_config.storage.locations:
-                            try:
-                                model_root = await self.filesystem.ensure_directory(
-                                    root=item.path,
-                                    path=os.path.join(
-                                        item.path,
-                                        EngineName.OMLX.value,
-                                    ),
-                                    expected_volume_uuid=item.volume_uuid,
-                                    scope_id=item.scope_id,
-                                )
-                            except FilesystemProbeError:
-                                continue
-                            directories.append(model_root)
-                        directories.extend(
-                            updated_config.engines.omlx.model_directories
+                async def finalize_after_trash() -> None:
+                    def commit_durable_state() -> None:
+                        cleanup_journal.advance(
+                            cleanup_transaction_id,
+                            CleanupPhase.TRASH_CONFIRMED,
                         )
-                        directories = list(dict.fromkeys(directories))
-                        if directories:
-                            self._omlx_directory_sync_pending = True
-                            await adapter.register_model_directories(
-                                directories,
-                                deadline=deadline,
+                        if installation_id is not None:
+                            self.installer.store.mark_trashed(installation_id)
+                        cleanup_journal.advance(
+                            cleanup_transaction_id,
+                            CleanupPhase.LEDGER_MARKED,
+                        )
+                        assert self.config_path is not None
+                        save_config(updated_config, self.config_path)
+                        cleanup_journal.advance(
+                            cleanup_transaction_id,
+                            CleanupPhase.CONFIG_SAVED,
+                        )
+                        cleanup_journal.advance(
+                            cleanup_transaction_id,
+                            CleanupPhase.COMPLETED,
+                        )
+
+                    await asyncio.to_thread(commit_durable_state)
+                    self.config = updated_config
+                    self._apply_profiles(updated_config)
+                    self.installer.storage = updated_config.storage
+
+                    if profile.engine == EngineName.OMLX:
+                        adapter = self.adapters.get(EngineName.OMLX)
+                        if isinstance(adapter, OMLXAdapter):
+                            directories: list[str] = []
+                            for item in updated_config.storage.locations:
+                                try:
+                                    model_root = (
+                                        await self.filesystem.ensure_directory(
+                                            root=item.path,
+                                            path=os.path.join(
+                                                item.path,
+                                                EngineName.OMLX.value,
+                                            ),
+                                            expected_volume_uuid=item.volume_uuid,
+                                            scope_id=item.scope_id,
+                                        )
+                                    )
+                                except FilesystemProbeError:
+                                    continue
+                                directories.append(model_root)
+                            directories.extend(
+                                updated_config.engines.omlx.model_directories
                             )
-                        self._omlx_directory_sync_pending = False
+                            directories = list(dict.fromkeys(directories))
+                            if directories:
+                                self._omlx_directory_sync_pending = True
+                                try:
+                                    await adapter.register_model_directories(
+                                        directories,
+                                        deadline=deadline,
+                                    )
+                                finally:
+                                    self._omlx_directory_sync_pending = False
+
+                finalize_task = asyncio.create_task(
+                    finalize_after_trash(),
+                    name=f"finalize-model-cleanup-{cleanup_transaction_id}",
+                )
+                await _await_owned_task(finalize_task)
 
             try:
                 await self.coordinator.run_empty_maintenance(
                     remove,
                     name=f"clean up model {alias}",
                 )
-            except FilesystemProbeError:
+            except asyncio.CancelledError:
+                # The coordinator deliberately treats cancellation as distinct
+                # from an engine failure. Before Trash confirms, cleanup has
+                # not committed config or ledger state; after confirmation,
+                # synchronous commits already reflect the move. Re-prove
+                # emptiness before propagating cancellation in either case.
+                reconcile = asyncio.create_task(self.coordinator.reconcile())
+                with contextlib.suppress(Exception):
+                    await asyncio.shield(reconcile)
+                raise
+            except (FilesystemProbeError, ModelCleanupRejected):
                 # Filesystem refusal/failure does not make engine state
                 # uncertain. The barrier has already failed closed, so prove
                 # emptiness and reopen admission instead of leaving Setup
@@ -1155,6 +2780,10 @@ class NativeRuntime:
         if self._omlx_directory_sync_pending:
             await self._sync_omlx_model_directories()
         await self._refresh_runtime_fingerprints()
+        # Pairing reconciliation is residency-neutral. A missing or tampered
+        # credential bundle closes only Hub authority; local inference stays
+        # available and the fixed recovery state remains visible to Settings.
+        await self.fleet_pairing_status()
         self.startup_error = None
 
     def resolve(self, alias: str) -> ResolvedTarget:
@@ -1218,6 +2847,137 @@ class NativeRuntime:
             self.benchmark_store.list_context(alias=alias)
         )
 
+    def _apply_signed_omlx_contracts(
+        self,
+        candidates_by_alias: Mapping[str, tuple[ResolvedTarget, ...]],
+    ) -> dict[str, tuple[ResolvedTarget, ...]]:
+        """Bind immutable install contracts to exact in-memory oMLX targets.
+
+        The contract remains in the hidden-inclusive install journal rather
+        than YAML, so an older Settings client cannot erase it while saving an
+        unrelated field. This runs only while profiles are applied; request
+        routing performs no SQLite reads.
+        """
+
+        installer = getattr(self, "installer", None)
+        store = getattr(installer, "store", None)
+        if store is None or not hasattr(store, "signed_launch_records"):
+            return dict(candidates_by_alias)
+
+        locations = {
+            location.name: location for location in self.config.storage.locations
+        }
+        prior_index = dict(
+            getattr(self, "_omlx_signed_launch_bindings", {})
+        )
+        next_index = dict(prior_index)
+        result: dict[str, tuple[ResolvedTarget, ...]] = {}
+        for alias, candidates in candidates_by_alias.items():
+            if not any(
+                target.key.engine == EngineName.OMLX for target in candidates
+            ):
+                result[alias] = candidates
+                continue
+            try:
+                records = store.signed_launch_records(
+                    alias=alias,
+                    engine=EngineName.OMLX.value,
+                    limit=OMLX_SIGNED_LAUNCH_RECORD_LIMIT,
+                )
+            except Exception:
+                # Never turn an already-signed target into an ordinary local
+                # target because SQLite became unavailable. Reuse only the
+                # last successful result for the exact unchanged target. A
+                # new or changed target has no such proof and is fenced. This
+                # leaves independently proved ordinary local profiles alone.
+                recovered: list[ResolvedTarget] = []
+                for target in candidates:
+                    if target.key.engine != EngineName.OMLX:
+                        recovered.append(target)
+                        continue
+                    state = prior_index.get(
+                        _omlx_contract_binding_key(target),
+                        _OMLX_CONTRACT_CONFLICT,
+                    )
+                    if isinstance(state, OMLXInstallLaunch):
+                        recovered.append(_target_with_omlx_launch(target, state))
+                    elif state is _OMLX_CONTRACT_ORDINARY:
+                        recovered.append(target)
+                    else:
+                        recovered.append(_target_with_omlx_launch_conflict(target))
+                result[alias] = tuple(recovered)
+                continue
+
+            overflow = len(records) >= OMLX_SIGNED_LAUNCH_RECORD_LIMIT
+            bound: list[ResolvedTarget] = []
+            for target in candidates:
+                if target.key.engine != EngineName.OMLX:
+                    bound.append(target)
+                    continue
+                binding_key = _omlx_contract_binding_key(target)
+                matching: list[InstallRecord] = []
+                for record in records:
+                    location = locations.get(record.storage)
+                    if location is None:
+                        continue
+                    try:
+                        expected_destination = install_destination(
+                            Path(location.path),
+                            EngineName.OMLX,
+                            record.repo_id,
+                        )
+                    except (StorageError, ValueError):
+                        continue
+                    if (
+                        target.storage_path != location.path
+                        or target.scope_id != location.scope_id
+                        or target.storage_volume_uuid != location.volume_uuid
+                        or _lexical_path(record.destination)
+                        != _lexical_path(expected_destination)
+                        or Path(record.destination).name
+                        != target.key.canonical_model_id
+                    ):
+                        continue
+                    matching.append(record)
+
+                contracts: set[OMLXInstallLaunch] = set()
+                corrupt = overflow
+                for record in matching:
+                    try:
+                        launch = record.launch_contract
+                    except InstallLaunchError:
+                        corrupt = True
+                        continue
+                    if not isinstance(launch, OMLXInstallLaunch):
+                        corrupt = True
+                        continue
+                    contracts.add(launch)
+                if corrupt or len(contracts) > 1:
+                    bound.append(_target_with_omlx_launch_conflict(target))
+                    next_index[binding_key] = _OMLX_CONTRACT_CONFLICT
+                elif contracts:
+                    contract = next(iter(contracts))
+                    bound.append(
+                        _target_with_omlx_launch(target, contract)
+                    )
+                    next_index[binding_key] = contract
+                else:
+                    bound.append(target)
+                    next_index[binding_key] = _OMLX_CONTRACT_ORDINARY
+            result[alias] = tuple(bound)
+        # Drop stale cache entries only after every target represented in the
+        # current configuration received either fresh or preserved authority.
+        active_keys = {
+            _omlx_contract_binding_key(target)
+            for candidates in candidates_by_alias.values()
+            for target in candidates
+            if target.key.engine == EngineName.OMLX
+        }
+        self._omlx_signed_launch_bindings = {
+            key: value for key, value in next_index.items() if key in active_keys
+        }
+        return result
+
     def _fresh_context_record(self, target: ResolvedTarget):
         runtime = getattr(self, "_runtime_fingerprints", {}).get(target.key.engine)
         if runtime is None:
@@ -1255,6 +3015,7 @@ class NativeRuntime:
             if hasattr(self, "config")
             else self.profile_candidates
         )
+        baseline = self._apply_signed_omlx_contracts(baseline)
         updated: dict[str, tuple[ResolvedTarget, ...]] = {}
         for alias, candidates in baseline.items():
             resolved: list[ResolvedTarget] = []
@@ -1656,6 +3417,60 @@ class NativeRuntime:
                 status.diagnostic or f"storage for model '{target.alias}' is unavailable"
             )
 
+    async def _require_omlx_target_contract(
+        self,
+        target: ResolvedTarget,
+        *,
+        timeout_seconds: float = 5.0,
+    ) -> None:
+        """Revalidate one signed oMLX target without loading or mutation."""
+
+        if target.key.engine != EngineName.OMLX:
+            return
+        try:
+            launch = omlx_target_launch(target.load_options)
+        except InstallLaunchError as exc:
+            raise RuntimeConfigurationError(
+                "signed oMLX launch authority is conflicting or corrupt"
+            ) from exc
+        if launch is None:
+            return
+        adapter = self.adapters.get(EngineName.OMLX)
+        require_contract = getattr(adapter, "require_launch_contract", None)
+        if not callable(require_contract):
+            raise RuntimeConfigurationError(
+                "the configured oMLX adapter cannot prove the signed launch contract"
+            )
+        try:
+            async with asyncio.timeout(timeout_seconds):
+                await require_contract(
+                    launch,
+                    deadline=Deadline.after(timeout_seconds),
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            raise RuntimeConfigurationError(
+                "the running oMLX service does not prove the signed launch contract"
+            ) from exc
+
+    async def _omlx_target_contract_eligible(
+        self,
+        target: ResolvedTarget,
+    ) -> bool:
+        if (
+            target.key.engine == EngineName.DS4
+            and target.wire_model == "glm-5.3-flash"
+        ):
+            adapter = self.adapters.get(EngineName.DS4)
+            eligible = getattr(adapter, "target_contract_eligible", None)
+            return bool(callable(eligible) and await eligible(target))
+        try:
+            await self._require_omlx_target_contract(target)
+            return True
+        except (RuntimeConfigurationError, TimeoutError):
+            return False
+
     async def resolve_target(
         self,
         alias: str,
@@ -1690,6 +3505,17 @@ class NativeRuntime:
                 self._runtime_fingerprints[target.key.engine] = current_runtime
                 target = primary
         await self._validate_target_storage(target)
+        await self._require_omlx_target_contract(target)
+        if (
+            target.key.engine == EngineName.DS4
+            and target.wire_model == "glm-5.3-flash"
+        ):
+            adapter = self.adapters.get(EngineName.DS4)
+            eligible = getattr(adapter, "target_contract_eligible", None)
+            if not callable(eligible) or not eligible(target):
+                raise RuntimeConfigurationError(
+                    "the active DS4 runtime does not prove this model contract"
+                )
         return target
 
     async def resolve_fixed_target(
@@ -1705,6 +3531,17 @@ class NativeRuntime:
                 f"model '{alias}' does not support /v1/{endpoint.value}"
             )
         await self._validate_target_storage(target)
+        await self._require_omlx_target_contract(target)
+        if (
+            target.key.engine == EngineName.DS4
+            and target.wire_model == "glm-5.3-flash"
+        ):
+            adapter = self.adapters.get(EngineName.DS4)
+            eligible = getattr(adapter, "target_contract_eligible", None)
+            if not callable(eligible) or not eligible(target):
+                raise RuntimeConfigurationError(
+                    "the active DS4 runtime does not prove this model contract"
+                )
         return target
 
     def reject_benchmark_evidence(self, alias: str) -> int:
@@ -2174,6 +4011,7 @@ class NativeRuntime:
         secret_env_keys = (
             self.config.server.inference_api_key_env,
             self.config.server.fleet_api_key_env,
+            self.config.server.fleet_inference_api_key_env,
             self.config.server.control_password_env,
             self.config.engines.omlx.api_key_env,
             self.config.engines.omlx.admin_session_env,
@@ -2220,8 +4058,28 @@ class NativeRuntime:
                 *(self.installer.latest_for_alias(target.alias) for target in targets),
                 return_exceptions=True,
             )
+            contract_checks = await asyncio.gather(
+                *(
+                    self._omlx_target_contract_eligible(target)
+                    for target in targets
+                ),
+                return_exceptions=True,
+            )
+            contract_eligible_by_alias = {
+                target.alias: bool(result is True)
+                for target, result in zip(
+                    targets,
+                    contract_checks,
+                    strict=True,
+                )
+            }
             usage = await self.usage.status()
             coordinator = await self.coordinator.status()
+            participation = await self.fleet_participation.status()
+            participating = participation.state == FleetParticipationState.JOINED
+            accounting_available = bool(
+                usage.get("recording_capacity_available", True)
+            )
             node_id = self.usage.identity.node_id
 
             identity_by_alias: dict[str, tuple[str, dict, bool]] = {}
@@ -2257,13 +4115,19 @@ class NativeRuntime:
                 and coordinator.state
                 not in {CoordinatorState.DEGRADED, CoordinatorState.STOPPING}
             )
-            accepting = bool(authoritative and coordinator.accepting)
+            accepting = bool(
+                authoritative
+                and coordinator.accepting
+                and participating
+                and accounting_available
+            )
             deployments: list[dict] = []
             for target in targets:
                 profile = profiles[target.alias]
                 deployment_id, identity, eligible = (
                     identity_by_alias[target.alias]
                 )
+                contract_eligible = contract_eligible_by_alias[target.alias]
                 selection_guarantees_primary = bool(
                     profile.selection.mode == "fixed"
                     or (
@@ -2280,6 +4144,9 @@ class NativeRuntime:
                 queued = queued_by_deployment.get(deployment_id, 0)
                 warm_accepting = bool(
                     warm
+                    and contract_eligible
+                    and participating
+                    and accounting_available
                     and coordinator.state == CoordinatorState.READY
                     and coordinator.capacity is not None
                     and coordinator.capacity.available > 0
@@ -2292,7 +4159,11 @@ class NativeRuntime:
                     # remains discoverable while another model is resident;
                     # a warm resident, however, cannot advertise admission
                     # while it is draining, verifying, or fenced.
-                    accepting=(warm_accepting if warm else accepting),
+                    accepting=(
+                        warm_accepting
+                        if warm
+                        else accepting and contract_eligible
+                    ),
                 )
                 deployments.append(
                     {
@@ -2300,13 +4171,21 @@ class NativeRuntime:
                         "deployment_id": deployment_id,
                         "identity": identity,
                         "identity_confidence": (
-                            "authoritative" if eligible else "unverified"
+                            "authoritative"
+                            if eligible and contract_eligible
+                            else "unverified"
                         ),
                         "fleet_eligible": bool(
-                            eligible and selection_guarantees_primary
+                            eligible
+                            and contract_eligible
+                            and selection_guarantees_primary
                         ),
                         "loadable": bool(
-                            authoritative and selection_guarantees_primary
+                            authoritative
+                            and participating
+                            and accounting_available
+                            and contract_eligible
+                            and selection_guarantees_primary
                         ),
                         "warm": warm,
                         "capacity": capacity.to_dict(),
@@ -2352,6 +4231,8 @@ class NativeRuntime:
                     accepting=False,
                 ).to_dict()
             )
+            if not participating or not accounting_available:
+                root_capacity["available"] = 0
 
             if self.startup_error is not None:
                 diagnostic_code = "startup_error"
@@ -2370,6 +4251,24 @@ class NativeRuntime:
                 }
                 else coordinator.state.value
             )
+            if (
+                diagnostic_code is None
+                and participation.state == FleetParticipationState.DRAINING
+            ):
+                diagnostic_code = "fleet_participation_draining"
+                if coordinator.state in {
+                    CoordinatorState.IDLE,
+                    CoordinatorState.READY,
+                    CoordinatorState.DRAINING,
+                }:
+                    health_state = "draining"
+            elif (
+                diagnostic_code is None
+                and participation.state == FleetParticipationState.PAUSED
+            ):
+                diagnostic_code = "fleet_participation_paused"
+            elif diagnostic_code is None and not accounting_available:
+                diagnostic_code = "usage_outbox_full"
 
             self._fleet_snapshot_sequence += 1
             return {
@@ -2412,7 +4311,11 @@ class NativeRuntime:
                     "outbox_pending": int(usage.get("outbox_depth") or 0),
                     "last_flush_at": usage.get("last_flush_at"),
                     "last_error_code": (
-                        "delivery_error" if usage.get("last_error") else None
+                        "outbox_full"
+                        if usage.get("outbox_full")
+                        else "delivery_error"
+                        if usage.get("last_error")
+                        else None
                     ),
                 },
             }
@@ -2425,6 +4328,7 @@ class NativeRuntime:
         secret_env_keys = (
             self.config.server.inference_api_key_env,
             self.config.server.fleet_api_key_env,
+            self.config.server.fleet_inference_api_key_env,
             self.config.server.control_password_env,
             self.config.engines.omlx.api_key_env,
             self.config.engines.omlx.admin_session_env,
@@ -2527,7 +4431,9 @@ class NativeRuntime:
                     "diagnostic": redact(str(exc)),
                 }
 
-        engine_rows = await asyncio.gather(*(inspect_engine(engine) for engine in EngineName))
+        engine_rows = await asyncio.gather(
+            *(inspect_engine(engine) for engine in ACTIVE_ENGINE_NAMES)
+        )
         storage_results = await asyncio.gather(
             *(
                 self.filesystem.inspect(
@@ -2762,17 +4668,41 @@ class NativeRuntime:
         elif endpoint == Endpoint.IMAGES_GENERATIONS:
             response_preview = f"{len(decoded.get('data', []))} image result(s)"
 
+        performance_sample = next(
+            (
+                item
+                for item in reversed(self.performance.snapshot().get("recent", []))
+                if item.get("alias") == alias
+                and item.get("endpoint") == f"/v1/{endpoint.value}"
+                and isinstance(item.get("observed_at"), (int, float))
+                and float(item["observed_at"]) >= started_wall
+            ),
+            None,
+        )
+        cold_start = (
+            performance_sample.get("cold_start")
+            if isinstance(performance_sample, dict)
+            and isinstance(performance_sample.get("cold_start"), bool)
+            else None
+        )
+        post_test_status = await self.coordinator.status()
+        unloaded_after = (
+            bool(
+                post_test_status.resident_alias is None
+                and post_test_status.resident_engine is None
+                and post_test_status.inflight == 0
+            )
+            if unload_after
+            else None
+        )
+
         runtime_validation_recorded: bool | None = None
         record_validation = getattr(
             self.runtime_updates,
             "record_validation",
             None,
         )
-        externally_versioned = {
-            EngineName.OMLX,
-            EngineName.MLXCEL,
-            EngineName.MISTRAL_RS,
-        }
+        externally_versioned = {EngineName.OMLX}
         if callable(record_validation) and target.key.engine not in externally_versioned:
             try:
                 validation_event = await asyncio.to_thread(
@@ -2797,6 +4727,8 @@ class NativeRuntime:
             "vision": vision,
             "response_preview": response_preview,
             "response_ms": (time.monotonic() - started_monotonic) * 1000,
+            "cold_start": cold_start,
+            "unloaded_after": unloaded_after,
             "usage": (
                 {
                     "prompt_tokens": usage.prompt_tokens,
@@ -2811,8 +4743,13 @@ class NativeRuntime:
             "runtime_validation_recorded": runtime_validation_recorded,
         }
 
-    async def record_usage(self, event: UsageEvent) -> None:
-        await self.usage.record(event)
+    async def record_usage(
+        self,
+        event: UsageEvent,
+        *,
+        reservation: UsageReservationLease | None = None,
+    ) -> None:
+        await self.usage.record(event, reservation=reservation)
 
     async def _runtime_active_version(self, engine: str) -> str | None:
         if engine.casefold() == "omlx":
@@ -2846,10 +4783,8 @@ class NativeRuntime:
 
     async def check_runtime_updates(self, *, refresh: bool = True) -> dict:
         result = await self.runtime_updates.check(refresh=refresh)
-        # Runtime checks are also the observation point for externally owned
-        # mlxcel/mistral.rs binaries. Refresh the in-memory identities so a
-        # manual vendor upgrade makes old benchmark evidence ineligible before
-        # the next automatically selected request.
+        # Runtime checks also refresh identities used to invalidate benchmark
+        # evidence after an engine update.
         await self._refresh_runtime_fingerprints()
         return result
 
@@ -2921,11 +4856,19 @@ class NativeRuntime:
         }
 
     async def install_runtime_update(
-        self, engine: str, *, version: str | None = None
+        self,
+        engine: str,
+        *,
+        version: str | None = None,
+        channel: str | None = None,
     ) -> dict:
         """Stage without touching residency, then activate behind the barrier."""
 
         if engine.casefold() == "omlx":
+            if channel not in {None, "official"}:
+                raise RuntimeUpdateError(
+                    "oMLX does not support managed runtime channels"
+                )
             return await self._upgrade_external_omlx(version=version)
 
         async with self._runtime_update_lock:
@@ -2941,7 +4884,14 @@ class NativeRuntime:
                 )
             ]
             try:
-                prepared = await self.runtime_updates.prepare(engine, version)
+                if channel is None:
+                    prepared = await self.runtime_updates.prepare(engine, version)
+                else:
+                    prepared = await self.runtime_updates.prepare(
+                        engine,
+                        version,
+                        channel=channel,
+                    )
             except Exception as exc:
                 evidence_recorded.append(
                     await self._record_runtime_lifecycle(
@@ -2972,7 +4922,10 @@ class NativeRuntime:
 
             async def activate(_deadline) -> None:
                 nonlocal activated
-                activated = self.runtime_updates.activate(prepared)
+                activated = await asyncio.to_thread(
+                    self.runtime_updates.activate,
+                    prepared,
+                )
 
             try:
                 await self.coordinator.run_empty_maintenance(
@@ -3013,6 +4966,7 @@ class NativeRuntime:
                 "engine": activated.engine,
                 "version": activated.version,
                 "source_revision": activated.source_revision,
+                "channel": getattr(activated, "channel", "official"),
                 "path": str(activated.root),
             }
             result["lifecycle_evidence_recorded"] = all(evidence_recorded)
@@ -3118,7 +5072,10 @@ class NativeRuntime:
 
             async def rollback(_deadline) -> None:
                 nonlocal activated
-                activated = self.runtime_updates.rollback(engine)
+                activated = await asyncio.to_thread(
+                    self.runtime_updates.rollback,
+                    engine,
+                )
 
             try:
                 await self.coordinator.run_empty_maintenance(
@@ -3167,6 +5124,22 @@ class NativeRuntime:
         if self.config_path is None:
             raise RuntimeConfigurationError("runtime has no configured YAML path")
         engine = EngineName(install.engine)
+        if engine not in ACTIVE_ENGINE_NAMES:
+            raise RuntimeConfigurationError(
+                f"{engine.value} downloads can no longer be registered on macOS"
+            )
+        try:
+            launch = install.launch_contract
+        except InstallLaunchError as exc:
+            raise RuntimeConfigurationError(
+                "install record contains an invalid launch contract"
+            ) from exc
+        if engine == EngineName.OMLX and launch is not None:
+            if not isinstance(launch, OMLXInstallLaunch):
+                raise RuntimeConfigurationError(
+                    "install launch contract does not match oMLX"
+                )
+            await self._require_omlx_install_launch(launch)
         requested_capabilities: set[Endpoint] | None = None
         if install.capabilities is not None:
             try:
@@ -3183,7 +5156,7 @@ class NativeRuntime:
                     f"{engine.value} install is missing its GGUF filename"
                 )
             model = str(Path(install.destination) / install.filename)
-            load = {}
+            load: dict[str, object] = {}
             load["context_length"] = recommended_interactive_context_length(
                 install.context_length
             )
@@ -3191,6 +5164,29 @@ class NativeRuntime:
                 load["projector_path"] = str(
                     Path(install.destination) / install.projector_filename
                 )
+            if engine == EngineName.LLAMA_CPP and launch is not None:
+                if not isinstance(launch, LlamaCppInstallLaunch):
+                    raise RuntimeConfigurationError(
+                        "install launch contract does not match llama.cpp"
+                    )
+                load["parallel"] = launch.parallel_slots
+                if launch.gpu_offload == "all":
+                    load["gpu_layers"] = LLAMA_CPP_ALL_GPU_LAYERS
+                # ``automatic`` is exactly the absence of an explicit
+                # --n-gpu-layers override in the current typed profile.
+                if launch.flash_attention == "enabled":
+                    load["flash_attention"] = True
+                elif launch.flash_attention == "disabled":
+                    load["flash_attention"] = False
+                # ``automatic`` likewise leaves llama.cpp's reviewed default.
+            elif engine == EngineName.DS4 and launch is not None:
+                if not isinstance(launch, DS4InstallLaunch):
+                    raise RuntimeConfigurationError(
+                        "install launch contract does not match DS4"
+                    )
+                # execution_mode is closed to single-node by the durable
+                # parser; DS4's typed parallel setting owns --batched-session.
+                load["parallel"] = launch.batched_sessions
             profile = ModelProfile(
                 alias=install.alias,
                 engine=engine,
@@ -3313,6 +5309,41 @@ class NativeRuntime:
         applied = False
         async with self._reload_lock:
             fresh = load_config(self.config_path, env_path=self.env_path)
+            require_binding = getattr(
+                self.installer,
+                "require_registration_storage_binding",
+                None,
+            )
+            if require_binding is not None:
+                await require_binding(install, fresh.storage)
+            else:
+                # Small direct-construction tests and embedders predating the
+                # installer guard still fail closed when persisted Settings
+                # rebound this storage name away from the applied snapshot.
+                applied_location = next(
+                    (
+                        item
+                        for item in self.installer.storage.locations
+                        if item.name == install.storage
+                    ),
+                    None,
+                )
+                fresh_location = next(
+                    (
+                        item
+                        for item in fresh.storage.locations
+                        if item.name == install.storage
+                    ),
+                    None,
+                )
+                if (
+                    applied_location is None
+                    or fresh_location is None
+                    or fresh_location != applied_location
+                ):
+                    raise RuntimeConfigurationError(
+                        "registration_storage_binding_changed"
+                    )
             existing = next(
                 (candidate for candidate in fresh.models if candidate.alias == install.alias),
                 None,
@@ -3327,6 +5358,34 @@ class NativeRuntime:
                         raise RuntimeConfigurationError(
                             f"model alias '{install.alias}' exists with a different role"
                         )
+                    if existing.storage != profile.storage:
+                        raise RuntimeConfigurationError(
+                            f"model alias '{install.alias}' exists with a different "
+                            "storage binding"
+                        )
+                    if launch is not None and (
+                        existing.load != profile.load
+                        or existing.served_model_name != profile.served_model_name
+                    ):
+                        raise RuntimeConfigurationError(
+                            f"model alias '{install.alias}' exists with a different "
+                            "signed launch contract or storage binding"
+                        )
+                    if engine == EngineName.OMLX:
+                        # A previous attempt may have persisted the profile
+                        # and then failed its residency-neutral directory
+                        # refresh. Reapply the exact current config and retry
+                        # that proof instead of declaring registration done.
+                        if not _restart_sensitive_configuration_changed(
+                            fresh,
+                            self.config,
+                        ):
+                            self.config = fresh
+                            self._apply_profiles(fresh)
+                            self.installer.storage = fresh.storage
+                        await self._sync_omlx_model_directories()
+                        if isinstance(launch, OMLXInstallLaunch):
+                            await self._require_omlx_install_launch(launch)
                     return
                 raise RuntimeConfigurationError(
                     f"model alias '{install.alias}' was added while the download was running"
@@ -3340,6 +5399,37 @@ class NativeRuntime:
                 applied = True
         if engine == EngineName.OMLX and applied:
             await self._sync_omlx_model_directories()
+            if isinstance(launch, OMLXInstallLaunch):
+                await self._require_omlx_install_launch(launch)
+
+    async def _require_omlx_install_launch(
+        self,
+        launch: OMLXInstallLaunch,
+    ) -> None:
+        """Prove a signed global contract without changing external settings."""
+
+        adapter = self.adapters.get(EngineName.OMLX)
+        require_contract = getattr(adapter, "require_launch_contract", None)
+        if not callable(require_contract):
+            raise RuntimeConfigurationError(
+                "the configured oMLX adapter cannot prove signed launch settings"
+            )
+        timeout = min(
+            30.0,
+            self.config.server.swap_queue_timeout_seconds,
+        )
+        try:
+            async with asyncio.timeout(timeout):
+                await require_contract(
+                    launch,
+                    deadline=Deadline.after(timeout),
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            raise RuntimeConfigurationError(
+                "the running oMLX service does not match the signed launch settings"
+            ) from exc
 
     async def _sync_omlx_model_directories(self) -> None:
         adapter = self.adapters.get(EngineName.OMLX)
@@ -3414,6 +5504,25 @@ class NativeRuntime:
                 }
             )
         return rows
+
+    def fleet_probe_model_list(self) -> list[dict[str, str]]:
+        """Return the minimal path-free catalog used only to prove dispatch auth.
+
+        The ordinary local ``/v1/models`` response intentionally retains
+        engine-facing identifiers used by existing clients and Settings. Some
+        of those identifiers are absolute paths. A Hub-marked activation probe
+        therefore receives only public aliases and fixed OpenAI metadata; the
+        authoritative path-free deployment inventory remains snapshot-owned.
+        """
+
+        return [
+            {
+                "id": primary.alias,
+                "object": "model",
+                "owned_by": "mnemosyne",
+            }
+            for primary in self.profiles.values()
+        ]
 
     async def reload_profiles(self) -> None:
         if self.config_path is None:

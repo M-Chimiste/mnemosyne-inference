@@ -8,6 +8,7 @@ from starlette.requests import Request
 
 from mnemosyne_fleet.app import create_app
 from mnemosyne_fleet.config import NodeConfig
+from mnemosyne_fleet.locator_policy import LocatorPolicy
 
 from .helpers import fleet_config, snapshot_payload
 
@@ -92,6 +93,22 @@ class Releasable429Body(httpx.AsyncByteStream):
         self.closed.set()
 
 
+class ReleasableSuccessBody(httpx.AsyncByteStream):
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.allow_finish = asyncio.Event()
+        self.closed = asyncio.Event()
+
+    async def __aiter__(self):
+        self.started.set()
+        yield b'{"id":"'
+        await self.allow_finish.wait()
+        yield b'completed"}'
+
+    async def aclose(self) -> None:
+        self.closed.set()
+
+
 async def _wait_for(predicate, *, timeout: float = 1.0) -> None:
     async with asyncio.timeout(timeout):
         while not predicate():
@@ -113,6 +130,148 @@ def _two_nodes() -> tuple[NodeConfig, NodeConfig]:
             inference_token="infer-b",
         ),
     )
+
+
+async def test_deactivation_after_reservation_prevents_upstream_dispatch(
+    tmp_path,
+) -> None:
+    node = NodeConfig(
+        node_id="a",
+        url="http://a:1240",
+        fleet_token="fleet-a",
+        inference_token="infer-a",
+        source="paired",
+        enrollment_id="11111111-1111-4111-8111-111111111111",
+        locator_transport="trusted_lan_http",
+    )
+    seen_authorization: list[str] = []
+
+    def registry_handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=snapshot_payload("a"))
+
+    def proxy_handler(request: httpx.Request) -> httpx.Response:
+        seen_authorization.append(request.headers["authorization"])
+        return httpx.Response(200, json={"id": "completed"})
+
+    app = create_app(
+        fleet_config(tmp_path, nodes=(node,)),
+        registry_client=httpx.AsyncClient(
+            transport=httpx.MockTransport(registry_handler)
+        ),
+        proxy_client=httpx.AsyncClient(
+            transport=httpx.MockTransport(proxy_handler)
+        ),
+        start_polling=False,
+        pairing_locator_policy=LocatorPolicy(
+            cidr_allowlists={
+                "https": (),
+                "tailscale": (),
+                "trusted_lan_http": ("10.0.0.0/8",),
+            },
+            allowed_ports=(1240,),
+            resolver=lambda _host, _port: ("10.20.30.40",),
+        ),
+        paired_registry_client_factory=lambda locator, **_kwargs: (
+            httpx.AsyncClient(
+                base_url=locator.origin,
+                transport=httpx.MockTransport(registry_handler),
+            )
+        ),
+        paired_proxy_client_factory=lambda locator, **_kwargs: (
+            httpx.AsyncClient(
+                base_url=locator.origin,
+                transport=httpx.MockTransport(proxy_handler),
+            )
+        ),
+    )
+    async with app.router.lifespan_context(app):
+        await app.state.registry.poll_all_once()
+        original_acquire = app.state.scheduler.acquire
+
+        async def acquire_then_deactivate(**kwargs):
+            reservation = await original_acquire(**kwargs)
+            assert await app.state.registry.deactivate_enrollment(
+                reservation.enrollment_id,
+                expected=reservation.enrollment,
+            ) is reservation.enrollment
+            return reservation
+
+        app.state.scheduler.acquire = acquire_then_deactivate
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://fleet",
+        ) as client:
+            response = await client.post(
+                "/v1/responses",
+                headers={"Authorization": "Bearer client-key"},
+                json={"model": "qwen-coder", "input": "hello"},
+            )
+
+        assert response.status_code == 503
+        assert response.json()["error"]["code"] == "no_eligible_node"
+        assert seen_authorization == []
+        assert app.state.registry.node_count == 0
+        assert app.state.scheduler.status()["active_total"] == 0
+        assert await app.state.store.recent_routes(limit=10) == []
+
+
+async def test_deactivation_after_admission_allows_stream_to_finish(
+    tmp_path,
+) -> None:
+    node = NodeConfig(
+        node_id="a",
+        url="http://a",
+        fleet_token="fleet-a",
+        inference_token="infer-a",
+    )
+    body = ReleasableSuccessBody()
+
+    def registry_handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=snapshot_payload("a"))
+
+    def proxy_handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"Content-Type": "application/json"},
+            stream=body,
+        )
+
+    app = create_app(
+        fleet_config(tmp_path, nodes=(node,)),
+        registry_client=httpx.AsyncClient(
+            transport=httpx.MockTransport(registry_handler)
+        ),
+        proxy_client=httpx.AsyncClient(
+            transport=httpx.MockTransport(proxy_handler)
+        ),
+        start_polling=False,
+    )
+    async with app.router.lifespan_context(app):
+        await app.state.registry.poll_all_once()
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://fleet",
+        ) as client:
+            request = asyncio.create_task(
+                client.post(
+                    "/v1/responses",
+                    headers={"Authorization": "Bearer client-key"},
+                    json={"model": "qwen-coder", "input": "hello"},
+                )
+            )
+            await body.started.wait()
+            assert app.state.scheduler.status()["active_total"] == 1
+            assert await app.state.registry.deactivate_enrollment(
+                node.enrollment_id,
+                expected=node,
+            ) is node
+            body.allow_finish.set()
+            response = await request
+
+        assert response.status_code == 200
+        assert response.json() == {"id": "completed"}
+        assert body.closed.is_set()
+        assert app.state.scheduler.status()["active_total"] == 0
 
 
 async def test_broken_stream_after_headers_is_never_retried(tmp_path) -> None:

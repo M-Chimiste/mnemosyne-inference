@@ -12,12 +12,14 @@ from unittest.mock import patch
 from macos.packaging.collect_acceptance import (
     _app_runtime_links,
     _download_lifecycle_summary,
+    _exercise_fleet_participation,
     _exercise_launch_agent,
     _guided_setup_summary,
     _launch_agent,
     _login_cycle_summary,
     _lmstudio_adoption_summary,
     _packaged_engine_defaults,
+    _pilot_install_storage_summary,
     _postgres_drained,
     _protected_model_summary,
     _redact_text,
@@ -489,6 +491,301 @@ class AcceptanceEvidenceTests(unittest.TestCase):
             ],
         )
 
+    def test_fleet_participation_exercise_restores_joined_without_config_change(
+        self,
+    ) -> None:
+        state = {
+            "enabled": True,
+            "state": "joined",
+            "active_requests": 0,
+            "updated_at": 1_788_110_400.0,
+        }
+        configuration = {
+            "revision": "same",
+            "config": {
+                "storage": {
+                    "locations": [
+                        {
+                            "name": "athena",
+                            "path": "/Volumes/Athena/nested/models-link",
+                        }
+                    ]
+                },
+                "models": [{"alias": "existing"}],
+            },
+        }
+        mutations: list[bool] = []
+
+        def response(url: str, **kwargs: object) -> dict[str, object]:
+            if url.endswith("/manager/config"):
+                return {
+                    "ok": True,
+                    "status": 200,
+                    "payload": json.loads(json.dumps(configuration)),
+                }
+            payload = kwargs.get("payload")
+            if isinstance(payload, dict):
+                self.assertEqual(kwargs.get("method"), "PUT")
+                enabled = payload["enabled"]
+                self.assertIsInstance(enabled, bool)
+                mutations.append(enabled)
+                state.update(
+                    enabled=enabled,
+                    state="joined" if enabled else "paused",
+                )
+            return {
+                "ok": True,
+                "status": 200,
+                "payload": dict(state),
+            }
+
+        with patch(
+            "macos.packaging.collect_acceptance._json_request",
+            side_effect=response,
+        ):
+            result = _exercise_fleet_participation(
+                control_url="http://127.0.0.1:17321",
+                admin_password="secret",
+            )
+
+        self.assertTrue(result["accepted"])
+        self.assertTrue(all(result["checks"].values()))
+        self.assertEqual(result["initial_state"], "joined")
+        self.assertEqual(result["restored_state"], "joined")
+        self.assertEqual(mutations, [False, True, True])
+        self.assertNotIn("configuration", result)
+        self.assertNotIn("/Volumes/Athena", json.dumps(result))
+
+    def test_fleet_participation_exercise_refuses_active_work_without_mutation(
+        self,
+    ) -> None:
+        mutations: list[dict[str, object]] = []
+
+        def response(url: str, **kwargs: object) -> dict[str, object]:
+            payload = kwargs.get("payload")
+            if isinstance(payload, dict):
+                mutations.append(payload)
+            if url.endswith("/manager/config"):
+                body: object = {"revision": "same", "config": {}}
+            else:
+                body = {
+                    "enabled": True,
+                    "state": "joined",
+                    "active_requests": 1,
+                    "updated_at": 1_788_110_400.0,
+                }
+            return {"ok": True, "status": 200, "payload": body}
+
+        with patch(
+            "macos.packaging.collect_acceptance._json_request",
+            side_effect=response,
+        ):
+            result = _exercise_fleet_participation(
+                control_url="http://127.0.0.1:17321",
+                admin_password=None,
+            )
+
+        self.assertFalse(result["accepted"])
+        self.assertTrue(result["checks"]["baseline_reachable_and_valid"])
+        self.assertFalse(
+            result["checks"]["baseline_has_no_active_fleet_requests"]
+        )
+        self.assertEqual(mutations, [])
+
+    def test_fleet_participation_exercise_restores_paused_preference(
+        self,
+    ) -> None:
+        state = {
+            "enabled": False,
+            "state": "paused",
+            "active_requests": 0,
+            "updated_at": 1_788_110_400.0,
+        }
+        mutations: list[bool] = []
+
+        def response(url: str, **kwargs: object) -> dict[str, object]:
+            if url.endswith("/manager/config"):
+                return {"ok": True, "status": 200, "payload": {}}
+            payload = kwargs.get("payload")
+            if isinstance(payload, dict):
+                enabled = payload["enabled"]
+                assert isinstance(enabled, bool)
+                mutations.append(enabled)
+                state.update(
+                    enabled=enabled,
+                    state="joined" if enabled else "paused",
+                    updated_at=state["updated_at"] + 1,
+                )
+            return {"ok": True, "status": 200, "payload": dict(state)}
+
+        with patch(
+            "macos.packaging.collect_acceptance._json_request",
+            side_effect=response,
+        ):
+            result = _exercise_fleet_participation(
+                control_url="http://127.0.0.1:17321",
+                admin_password=None,
+            )
+
+        self.assertTrue(result["accepted"])
+        self.assertEqual(result["initial_state"], "paused")
+        self.assertEqual(result["restored_state"], "paused")
+        self.assertEqual(mutations, [False, True, False])
+
+    def test_fleet_participation_exercise_restores_after_rejoin_failure(
+        self,
+    ) -> None:
+        state = {
+            "enabled": True,
+            "state": "joined",
+            "active_requests": 0,
+            "updated_at": 1_788_110_400.0,
+        }
+        mutations: list[bool] = []
+        join_attempts = 0
+
+        def response(url: str, **kwargs: object) -> dict[str, object]:
+            nonlocal join_attempts
+            if url.endswith("/manager/config"):
+                return {"ok": True, "status": 200, "payload": {}}
+            payload = kwargs.get("payload")
+            if isinstance(payload, dict):
+                enabled = payload["enabled"]
+                assert isinstance(enabled, bool)
+                mutations.append(enabled)
+                if enabled:
+                    join_attempts += 1
+                    if join_attempts == 1:
+                        return {
+                            "ok": False,
+                            "status": 503,
+                            "diagnostic": "temporarily unavailable",
+                        }
+                state.update(
+                    enabled=enabled,
+                    state="joined" if enabled else "paused",
+                    updated_at=state["updated_at"] + 1,
+                )
+            return {"ok": True, "status": 200, "payload": dict(state)}
+
+        with patch(
+            "macos.packaging.collect_acceptance._json_request",
+            side_effect=response,
+        ):
+            result = _exercise_fleet_participation(
+                control_url="http://127.0.0.1:17321",
+                admin_password=None,
+            )
+
+        self.assertFalse(result["accepted"])
+        self.assertFalse(result["checks"]["rejoin_reached_joined_state"])
+        self.assertTrue(result["checks"]["baseline_preference_restored"])
+        self.assertEqual(result["restored_state"], "joined")
+        self.assertEqual(mutations, [False, True, True])
+
+    def test_fleet_participation_exercise_requires_config_before_mutation(
+        self,
+    ) -> None:
+        mutations: list[dict[str, object]] = []
+
+        def response(url: str, **kwargs: object) -> dict[str, object]:
+            payload = kwargs.get("payload")
+            if isinstance(payload, dict):
+                mutations.append(payload)
+            if url.endswith("/manager/config"):
+                return {
+                    "ok": False,
+                    "status": 503,
+                    "diagnostic": "configuration unavailable",
+                }
+            return {
+                "ok": True,
+                "status": 200,
+                "payload": {
+                    "enabled": True,
+                    "state": "joined",
+                    "active_requests": 0,
+                    "updated_at": 1_788_110_400.0,
+                },
+            }
+
+        with patch(
+            "macos.packaging.collect_acceptance._json_request",
+            side_effect=response,
+        ):
+            result = _exercise_fleet_participation(
+                control_url="http://127.0.0.1:17321",
+                admin_password=None,
+            )
+
+        self.assertFalse(result["accepted"])
+        self.assertFalse(
+            result["checks"]["baseline_configuration_snapshot_valid"]
+        )
+        self.assertEqual(mutations, [])
+
+    def test_fleet_participation_exercise_never_exports_invalid_state(
+        self,
+    ) -> None:
+        leaked_path = "/Volumes/Athena/private/models"
+
+        def response(url: str, **kwargs: object) -> dict[str, object]:
+            if url.endswith("/manager/config"):
+                return {"ok": True, "status": 200, "payload": {}}
+            return {
+                "ok": True,
+                "status": 200,
+                "payload": {
+                    "enabled": True,
+                    "state": leaked_path,
+                    "active_requests": 0,
+                    "updated_at": 1_788_110_400.0,
+                },
+            }
+
+        with patch(
+            "macos.packaging.collect_acceptance._json_request",
+            side_effect=response,
+        ):
+            result = _exercise_fleet_participation(
+                control_url="http://127.0.0.1:17321",
+                admin_password=None,
+            )
+
+        self.assertFalse(result["accepted"])
+        self.assertIsNone(result["initial_state"])
+        self.assertIsNone(result["restored_state"])
+        self.assertNotIn(leaked_path, json.dumps(result))
+
+    def test_fleet_participation_exercise_rejects_boolean_active_count(
+        self,
+    ) -> None:
+        def response(url: str, **kwargs: object) -> dict[str, object]:
+            if url.endswith("/manager/config"):
+                return {"ok": True, "status": 200, "payload": {}}
+            return {
+                "ok": True,
+                "status": 200,
+                "payload": {
+                    "enabled": True,
+                    "state": "joined",
+                    "active_requests": False,
+                    "updated_at": 1_788_110_400.0,
+                },
+            }
+
+        with patch(
+            "macos.packaging.collect_acceptance._json_request",
+            side_effect=response,
+        ):
+            result = _exercise_fleet_participation(
+                control_url="http://127.0.0.1:17321",
+                admin_password=None,
+            )
+
+        self.assertFalse(result["accepted"])
+        self.assertFalse(result["checks"]["baseline_reachable_and_valid"])
+
     def test_launch_agent_snapshot_includes_gui_audit_session(self) -> None:
         with patch(
             "macos.packaging.collect_acceptance._run",
@@ -621,6 +918,7 @@ class AcceptanceEvidenceTests(unittest.TestCase):
                     {
                         "alias": "vision",
                         "engine": "llama.cpp",
+                        "model": "/Volumes/Athena/models/owner/model/model.gguf",
                         "storage": "athena",
                         "load": {"projector_path": "/Volumes/Athena/mmproj.gguf"},
                     }
@@ -638,8 +936,12 @@ class AcceptanceEvidenceTests(unittest.TestCase):
                     "repo_id": "owner/model",
                     "engine": "llama.cpp",
                     "alias": "vision",
-                    "status": "deleted",
+                    "storage": "athena",
+                    "destination": "/Volumes/Athena/models/owner/model",
+                    "status": "installed",
                     "revision": "b" * 40,
+                    "bytes_downloaded": 100,
+                    "total_bytes": 100,
                     "dismissed": True,
                     "events": [
                         {"event": "status", "status": "cancelled"},
@@ -720,6 +1022,10 @@ class AcceptanceEvidenceTests(unittest.TestCase):
                     "state": "idle",
                     "diagnostic": None,
                     "startup_error": None,
+                    "resident_alias": None,
+                    "resident_engine": None,
+                    "in_flight_requests": 0,
+                    "queued": 0,
                 }
             elif url.endswith("/manager/models"):
                 payload = {"models": [{"alias": "vision"}]}
@@ -760,6 +1066,8 @@ class AcceptanceEvidenceTests(unittest.TestCase):
                     "usage": {"total_tokens": 7},
                     "usage_recorded": True,
                     "runtime_validation_recorded": True,
+                    "cold_start": True,
+                    "unloaded_after": True,
                 }
             else:
                 raise AssertionError(url)
@@ -814,6 +1122,8 @@ class AcceptanceEvidenceTests(unittest.TestCase):
                 exercise_reconcile=True,
                 require_protected_model=True,
                 require_download_lifecycle=True,
+                require_pilot_install_storage="athena",
+                require_cold_jit=True,
                 require_runtime_lifecycle="llama.cpp",
                 require_guided_setup=True,
             )
@@ -822,8 +1132,90 @@ class AcceptanceEvidenceTests(unittest.TestCase):
         self.assertTrue(all(result["checks"].values()))
         self.assertTrue(result["protected_model"]["accepted"])
         self.assertTrue(result["download_lifecycle"]["accepted"])
+        self.assertTrue(result["pilot_install_storage"]["accepted"])
+        self.assertTrue(result["checks"]["cold_jit_from_empty_residency"])
         self.assertTrue(result["runtime_lifecycle"]["accepted"])
         self.assertTrue(result["guided_setup"]["accepted"])
+
+    def test_pilot_install_storage_keeps_lexical_root_and_rejects_rebound(self) -> None:
+        root = "/Volumes/Athena/models-link/nested"
+        config = {
+            "config": {
+                "storage": {
+                    "locations": [
+                        {
+                            "name": "pilot-drive",
+                            "path": root,
+                            "volume_uuid": "volume-uuid",
+                            "scope_id": "a" * 64,
+                        }
+                    ]
+                },
+                "models": [
+                    {
+                        "alias": "pilot-model",
+                        "engine": "llama.cpp",
+                        "model": f"{root}/owner/model/model.gguf",
+                        "storage": "pilot-drive",
+                    }
+                ],
+            }
+        }
+        storage = {
+            "locations": [
+                {
+                    "name": "pilot-drive",
+                    "exists": True,
+                    "is_directory": True,
+                    "writable": True,
+                    "volume_matches": True,
+                }
+            ]
+        }
+        install = {
+            "installs": [
+                {
+                    "id": "install-id",
+                    "repo_id": "owner/model",
+                    "engine": "llama.cpp",
+                    "storage": "pilot-drive",
+                    "alias": "pilot-model",
+                    "destination": f"{root}/owner/model",
+                    "status": "installed",
+                    "revision": "b" * 40,
+                    "bytes_downloaded": 1024,
+                    "total_bytes": 1024,
+                    "events": [
+                        {"event": "status", "status": "registering"},
+                        {"event": "status", "status": "installed"},
+                    ],
+                }
+            ]
+        }
+
+        result = _pilot_install_storage_summary(
+            config,
+            storage,
+            install,
+            alias="pilot-model",
+            storage_name="pilot-drive",
+        )
+
+        self.assertTrue(result["accepted"])
+        self.assertEqual(result["storage"]["path"], root)
+        rebound = json.loads(json.dumps(install))
+        rebound["installs"][0]["destination"] = "/Volumes/Athena/other/model"
+        rejected = _pilot_install_storage_summary(
+            config,
+            storage,
+            rebound,
+            alias="pilot-model",
+            storage_name="pilot-drive",
+        )
+        self.assertFalse(rejected["accepted"])
+        self.assertFalse(
+            rejected["checks"]["install_destination_within_lexical_root"]
+        )
 
     def test_report_write_is_atomic_private_and_valid_json(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

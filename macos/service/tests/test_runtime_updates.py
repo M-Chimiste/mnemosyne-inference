@@ -4,10 +4,13 @@ import asyncio
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
+import re
 import signal
 import sys
 import tarfile
+import threading
 
 import httpx
 import pytest
@@ -243,6 +246,47 @@ def _ds4_source_archive(revision: str) -> bytes:
     return buffer.getvalue()
 
 
+def _ds4_glm53_preview_source_archive(
+    revision: str,
+    *,
+    branch_contract: bool = True,
+) -> bytes:
+    buffer = io.BytesIO()
+    root = f"ds4-{revision}"
+    contract = (
+        'GLM53_REPO="antirez/glm-5.3-flash-gguf"\n'
+        'GLM53_Q2_FILE="GLM-5.3-Flash-Q2.gguf"\n'
+        'GLM53_Q4_FILE="GLM-5.3-Flash-Q4_K.gguf"\n'
+        'case "$MODEL" in\n'
+        '    glm53-q2)\n'
+        '        REPO=$GLM53_REPO\n'
+        '        MODEL_FILE=$GLM53_Q2_FILE\n'
+        '        FORCE_HF_DOWNLOAD=1\n'
+        '        ;;\n'
+        + (
+            '    glm53-q4)\n'
+            '        REPO=$GLM53_REPO\n'
+            '        MODEL_FILE=$GLM53_Q4_FILE\n'
+            '        FORCE_HF_DOWNLOAD=1\n'
+            '        ;;\n'
+            if branch_contract
+            else ""
+        )
+        + "esac\n"
+    ).encode()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
+        for name, payload in (
+            (f"{root}/Makefile", b"ds4-server:\n\t@true\n"),
+            (f"{root}/ds4_server.c", b"/* official preview source fixture */\n"),
+            (f"{root}/download_model.sh", contract),
+        ):
+            info = tarfile.TarInfo(name)
+            info.size = len(payload)
+            info.mode = 0o755 if name.endswith(".sh") else 0o644
+            archive.addfile(info, io.BytesIO(payload))
+    return buffer.getvalue()
+
+
 def _llama_binary_archive(version: str) -> bytes:
     buffer = io.BytesIO()
     root = f"llama-{version}-bin-macos-arm64"
@@ -253,6 +297,351 @@ def _llama_binary_archive(version: str) -> bytes:
         info.mode = 0o755
         archive.addfile(info, io.BytesIO(payload))
     return buffer.getvalue()
+
+
+def _write_managed_llama_runtime(
+    root: Path,
+    *,
+    binary_payload: bytes = b"#!/bin/sh\nexit 0\n",
+) -> Path:
+    version = "b8123"
+    runtime_root = root / "llama.cpp" / version
+    runtime_files = runtime_root / "runtime"
+    runtime_files.mkdir(parents=True)
+    binary = runtime_files / "llama-server"
+    binary.write_bytes(binary_payload)
+    binary.chmod(0o755)
+    source_payload = b"verified official llama.cpp archive fixture"
+    source_digest = hashlib.sha256(source_payload).hexdigest()
+    release = runtime_updates.RuntimeRelease(
+        engine="llama.cpp",
+        version=version,
+        source_revision="main",
+        source_url=(
+            "https://github.com/ggml-org/llama.cpp/releases/download/"
+            f"{version}/llama-{version}-bin-macos-arm64.tar.gz"
+        ),
+        release_notes_url=(
+            f"https://github.com/ggml-org/llama.cpp/releases/tag/{version}"
+        ),
+        sha256=source_digest,
+        asset_size=len(source_payload),
+    )
+    evidence = runtime_updates._new_runtime_compatibility_evidence(
+        release,
+        source_sha256=f"sha256:{source_digest}",
+        source_size_bytes=len(source_payload),
+        executable=binary,
+    )
+    (runtime_root / "runtime.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "engine": "llama.cpp",
+                "version": version,
+                "source_revision": "main",
+                "source_sha256": source_digest,
+                "source_size_bytes": len(source_payload),
+                "core_protocol": 1,
+                "entrypoint": {
+                    "binary": "runtime/llama-server",
+                    "working_directory": "runtime",
+                },
+                "compatibility_evidence": evidence.to_manifest(),
+            }
+        ),
+        encoding="utf-8",
+    )
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "llama.cpp" / "current.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "version": version,
+                "previous_version": None,
+                "activated_at": "2026-08-30T00:00:00+00:00",
+                "local_integrity_fingerprint": (
+                    evidence.local_integrity_fingerprint
+                ),
+            }
+        ),
+        encoding="utf-8",
+    )
+    return runtime_root
+
+
+def test_runtime_compatibility_identity_is_path_and_mtime_independent(
+    tmp_path: Path,
+) -> None:
+    first_root = tmp_path / "first" / "runtimes"
+    second_root = tmp_path / "second" / "runtimes"
+    first_directory = _write_managed_llama_runtime(first_root)
+    second_directory = _write_managed_llama_runtime(second_root)
+    os.utime(first_directory / "runtime" / "llama-server", (1, 1))
+    os.utime(second_directory / "runtime" / "llama-server", (2_000_000, 2_000_000))
+
+    first = runtime_updates._load_runtime_directory(
+        first_directory,
+        expected_engine="llama.cpp",
+        verify_compatibility_evidence=True,
+    )
+    second = runtime_updates._load_runtime_directory(
+        second_directory,
+        expected_engine="llama.cpp",
+        verify_compatibility_evidence=True,
+    )
+
+    assert first.compatibility_evidence is not None
+    assert second.compatibility_evidence is not None
+    assert (
+        first.compatibility_evidence.compatibility_fingerprint
+        == second.compatibility_evidence.compatibility_fingerprint
+    )
+    assert (
+        first.compatibility_evidence.local_integrity_fingerprint
+        == second.compatibility_evidence.local_integrity_fingerprint
+    )
+    assert first.compatibility_evidence.features == (
+        "apple-metal",
+        "flash-attention",
+    )
+    serialized = json.dumps(first.compatibility_evidence.to_manifest())
+    assert str(first_root) not in serialized
+    assert str(second_root) not in serialized
+
+    revision = "d" * 40
+    source_payload = b"one exact official DS4 source archive"
+    source_digest = "sha256:" + hashlib.sha256(source_payload).hexdigest()
+    ds4_release = runtime_updates.RuntimeRelease(
+        engine="ds4",
+        version=revision[:12],
+        source_revision=revision,
+        source_url=f"https://codeload.github.com/antirez/ds4/tar.gz/{revision}",
+        release_notes_url=f"https://github.com/antirez/ds4/commit/{revision}",
+        channel="official",
+        source_branch="main",
+    )
+    first_binary = tmp_path / "first-ds4"
+    second_binary = tmp_path / "second-ds4"
+    first_binary.write_bytes(b"locally compiled DS4 binary A")
+    second_binary.write_bytes(b"locally compiled DS4 binary B")
+    first_ds4 = runtime_updates._new_runtime_compatibility_evidence(
+        ds4_release,
+        source_sha256=source_digest,
+        source_size_bytes=len(source_payload),
+        executable=first_binary,
+    )
+    second_ds4 = runtime_updates._new_runtime_compatibility_evidence(
+        ds4_release,
+        source_sha256=source_digest,
+        source_size_bytes=len(source_payload),
+        executable=second_binary,
+    )
+    assert first_ds4.compatibility_fingerprint == second_ds4.compatibility_fingerprint
+    assert first_ds4.executable_sha256 != second_ds4.executable_sha256
+    assert (
+        first_ds4.local_integrity_fingerprint
+        != second_ds4.local_integrity_fingerprint
+    )
+    assert first_ds4.features == second_ds4.features == ()
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    (
+        "binary",
+        "binary_and_manifest_seal",
+        "features",
+        "source_digest",
+        "fingerprint",
+    ),
+)
+def test_managed_runtime_compatibility_evidence_fails_closed_after_tamper(
+    tmp_path: Path,
+    tamper: str,
+) -> None:
+    runtime_directory = _write_managed_llama_runtime(tmp_path / tamper)
+    manifest_path = runtime_directory / "runtime.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if tamper in {"binary", "binary_and_manifest_seal"}:
+        binary = runtime_directory / "runtime" / "llama-server"
+        binary.write_bytes(
+            b"#!/bin/sh\nexit 1\n"
+        )
+        if tamper == "binary_and_manifest_seal":
+            executable_sha256 = "sha256:" + hashlib.sha256(
+                binary.read_bytes()
+            ).hexdigest()
+            manifest["compatibility_evidence"]["executable_sha256"] = (
+                executable_sha256
+            )
+            manifest["compatibility_evidence"][
+                "local_integrity_fingerprint"
+            ] = runtime_updates._runtime_local_integrity_fingerprint(
+                compatibility_fingerprint=manifest["compatibility_evidence"][
+                    "compatibility_fingerprint"
+                ],
+                executable_sha256=executable_sha256,
+            )
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    elif tamper == "features":
+        manifest["compatibility_evidence"]["features"].append("unverified")
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    elif tamper == "source_digest":
+        manifest["source_sha256"] = "0" * 64
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    else:
+        manifest["compatibility_evidence"]["compatibility_fingerprint"] = (
+            "sha256:" + "0" * 64
+        )
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    ordinary = resolve_active_runtime(
+        "llama.cpp",
+        root=runtime_directory.parents[1],
+    )
+    verified = resolve_active_runtime(
+        "llama.cpp",
+        root=runtime_directory.parents[1],
+        verify_compatibility_evidence=True,
+    )
+
+    # Compatibility authority fails closed without taking an otherwise usable
+    # legacy/local runtime out of the ordinary inference path.
+    assert ordinary is not None
+    assert ordinary.compatibility_evidence is None
+    assert ordinary.path("binary").is_file()
+    assert verified is not None
+    assert verified.compatibility_evidence is None
+
+
+def test_legacy_active_pointer_does_not_mint_compatibility_authority(
+    tmp_path: Path,
+) -> None:
+    runtime_root = tmp_path / "runtimes"
+    runtime_directory = _write_managed_llama_runtime(runtime_root)
+    pointer_path = runtime_root / "llama.cpp" / "current.json"
+    pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+    pointer.pop("local_integrity_fingerprint")
+    pointer_path.write_text(json.dumps(pointer), encoding="utf-8")
+
+    ordinary = resolve_active_runtime("llama.cpp", root=runtime_root)
+    verified = resolve_active_runtime(
+        "llama.cpp",
+        root=runtime_root,
+        verify_compatibility_evidence=True,
+    )
+
+    assert ordinary is not None
+    assert ordinary.root == runtime_directory
+    assert verified is not None
+    assert verified.compatibility_evidence is None
+
+
+@pytest.mark.asyncio
+async def test_ordinary_runtime_resolution_never_hashes_on_event_loop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime_root = tmp_path / "runtimes"
+    runtime_directory = _write_managed_llama_runtime(runtime_root)
+    binary = runtime_directory / "runtime" / "llama-server"
+    expected_digest = hashlib.sha256(binary.read_bytes()).hexdigest()
+    event_loop_thread = threading.get_ident()
+    hash_threads: list[int] = []
+    resolve_calls: list[tuple[str, int]] = []
+    original_resolve = runtime_updates.resolve_active_runtime
+
+    def observed_hash(path: Path) -> str:
+        assert path == binary
+        hash_threads.append(threading.get_ident())
+        return expected_digest
+
+    def observed_resolve(engine: str, **kwargs):
+        resolve_calls.append((engine, threading.get_ident()))
+        return original_resolve(engine, **kwargs)
+
+    monkeypatch.setattr(runtime_updates, "_sha256_file", observed_hash)
+    monkeypatch.setattr(
+        runtime_updates,
+        "resolve_active_runtime",
+        observed_resolve,
+    )
+
+    ordinary = observed_resolve("llama.cpp", root=runtime_root)
+    assert ordinary is not None
+    assert ordinary.compatibility_evidence is None
+    assert hash_threads == []
+    resolve_calls.clear()
+
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _request: httpx.Response(404))
+    )
+    manager = RuntimeUpdateManager(
+        llama_cpp=LlamaCppConfig(binary=str(tmp_path / "missing-llama")),
+        omlx=OMLXConfig(base_url="http://127.0.0.1:17322"),
+        mflux=MFluxConfig(),
+        ds4=DS4Config(binary=str(tmp_path / "missing-ds4")),
+        root=runtime_root,
+        client=client,
+    )
+    try:
+        status = await manager.installed_status()
+    finally:
+        await manager.aclose()
+        await client.aclose()
+
+    assert status["llama.cpp"]["compatibility_fingerprint"] is not None
+    assert len(hash_threads) == 1
+    assert event_loop_thread not in hash_threads
+    assert sorted(engine for engine, _thread in resolve_calls) == [
+        "ds4",
+        "llama.cpp",
+        "mflux",
+    ]
+    assert all(thread != event_loop_thread for _engine, thread in resolve_calls)
+
+
+@pytest.mark.asyncio
+async def test_legacy_external_and_omlx_compatibility_remain_unknown(
+    tmp_path: Path,
+) -> None:
+    runtime_root = tmp_path / "runtimes"
+    legacy_directory = _write_managed_llama_runtime(runtime_root)
+    manifest_path = legacy_directory / "runtime.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest.pop("compatibility_evidence")
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    external_ds4 = tmp_path / "external-ds4"
+    external_ds4.write_bytes(b"external DS4 build")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/health":
+            return httpx.Response(200, json={"version": "0.5.3"})
+        return httpx.Response(404)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    manager = RuntimeUpdateManager(
+        llama_cpp=LlamaCppConfig(binary=str(tmp_path / "external-llama")),
+        omlx=OMLXConfig(base_url="http://127.0.0.1:17322"),
+        mflux=MFluxConfig(),
+        ds4=DS4Config(binary=str(external_ds4)),
+        root=runtime_root,
+        client=client,
+    )
+    try:
+        status = await manager.installed_status()
+    finally:
+        await manager.aclose()
+        await client.aclose()
+
+    assert status["llama.cpp"]["installed"] is True
+    assert status["ds4"]["installed"] is True
+    assert status["omlx"]["installed"] is True
+    for engine in ("llama.cpp", "ds4", "omlx"):
+        assert status[engine]["compatibility_fingerprint"] is None
+        assert status[engine]["features"] == []
 
 
 def _llama_release_payload(
@@ -523,17 +912,7 @@ async def test_update_check_uses_only_official_upstreams(
         assert by_engine["omlx"]["release_tier"] == "stable"
         assert by_engine["mflux"]["release_tier"] == "preview"
         assert by_engine["ds4"]["release_tier"] == "preview"
-        assert by_engine["mlxcel"]["release_tier"] == "preview"
-        assert by_engine["mlxcel"]["ownership"] == "external"
-        assert by_engine["mlxcel"]["upgrade_strategy"] == "external_manual"
-        assert by_engine["mlxcel"]["official_installer_url"].startswith(
-            "https://github.com/lablup/mlxcel"
-        )
-        assert by_engine["mistral.rs"]["release_tier"] == "preview"
-        assert by_engine["mistral.rs"]["ownership"] == "external"
-        assert by_engine["mistral.rs"]["official_installer_url"].startswith(
-            "https://ericlbuehler.github.io/mistral.rs"
-        )
+        assert set(by_engine) == {"llama.cpp", "omlx", "mflux", "ds4"}
         assert by_engine["llama.cpp"]["available_version"] == "b7777"
         assert by_engine["llama.cpp"]["can_install"] is True
         assert "ggml-org/llama.cpp" in by_engine["llama.cpp"]["release_notes_url"]
@@ -581,13 +960,9 @@ async def test_installed_status_never_contacts_upstream(
             "omlx",
             "mflux",
             "ds4",
-            "mlxcel",
-            "mistral.rs",
         }
         assert status["llama.cpp"]["installed"] is False
         assert status["ds4"]["installed"] is False
-        assert status["mlxcel"]["installation_kind"] == "external_cli"
-        assert status["mistral.rs"]["installation_kind"] == "external_cli"
         # A bounded loopback oMLX probe is local runtime discovery, not an
         # upstream release query. Nothing may contact GitHub or PyPI.
         assert all(
@@ -865,25 +1240,307 @@ async def test_official_ds4_builds_activate_and_rollback_atomically(
     try:
         await manager.check()
         first = await manager.prepare("ds4")
+        assert first.runtime.compatibility_evidence is not None
+        assert first.runtime.compatibility_evidence.features == ()
+        first_fingerprint = (
+            first.runtime.compatibility_evidence.compatibility_fingerprint
+        )
         assert resolve_active_runtime("ds4", root=manager.root) is None
         manager.activate(first)
         assert resolve_active_runtime("ds4", root=manager.root).version == "a" * 12
+        pointer = json.loads((manager.root / "ds4" / "current.json").read_text())
+        assert pointer["local_integrity_fingerprint"] == (
+            first.runtime.compatibility_evidence.local_integrity_fingerprint
+        )
+        assert "previous_local_integrity_fingerprint" not in pointer
+        first_status = await manager.installed_status()
+        assert first_status["ds4"]["compatibility_fingerprint"] == first_fingerprint
+        assert first_status["ds4"]["features"] == []
 
         state["revision"] = "b" * 40
         await manager.check(refresh=True)
         second = await manager.prepare("ds4")
+        assert second.runtime.compatibility_evidence is not None
+        assert (
+            second.runtime.compatibility_evidence.compatibility_fingerprint
+            != first_fingerprint
+        )
         manager.activate(second)
         active = resolve_active_runtime("ds4", root=manager.root)
         assert active is not None and active.version == "b" * 12
+        pointer = json.loads((manager.root / "ds4" / "current.json").read_text())
+        assert pointer["local_integrity_fingerprint"] == (
+            second.runtime.compatibility_evidence.local_integrity_fingerprint
+        )
+        assert pointer["previous_local_integrity_fingerprint"] == (
+            first.runtime.compatibility_evidence.local_integrity_fingerprint
+        )
         assert manager._rollback_version("ds4") == "a" * 12
 
         rolled_back = manager.rollback("ds4")
         assert rolled_back.version == "a" * 12
+        assert rolled_back.compatibility_evidence is not None
+        assert (
+            rolled_back.compatibility_evidence.compatibility_fingerprint
+            == first_fingerprint
+        )
         pointer = json.loads((manager.root / "ds4" / "current.json").read_text())
         assert pointer["previous_version"] == "b" * 12
+        assert pointer["local_integrity_fingerprint"] == (
+            first.runtime.compatibility_evidence.local_integrity_fingerprint
+        )
+        assert pointer["previous_local_integrity_fingerprint"] == (
+            second.runtime.compatibility_evidence.local_integrity_fingerprint
+        )
     finally:
         await manager.aclose()
         await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_ds4_glm53_preview_channel_is_commit_and_source_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    revision = "c" * 40
+    requests: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(str(request.url))
+        if request.url.path.endswith("/jundot/omlx/releases"):
+            return httpx.Response(200, json=[])
+        if request.url.host == "pypi.org":
+            return httpx.Response(200, json={"info": {"version": "0.19.0"}})
+        if request.url.path.endswith("/antirez/ds4/commits/main"):
+            return httpx.Response(200, json={"sha": "a" * 40})
+        if request.url.path.endswith(
+            "/antirez/ds4/commits/glm-5.3-flash"
+        ):
+            return httpx.Response(200, json={"sha": revision})
+        if request.url.host == "codeload.github.com":
+            assert request.url.path.endswith(f"/{revision}")
+            return httpx.Response(
+                200,
+                content=_ds4_glm53_preview_source_archive(revision),
+            )
+        return httpx.Response(404)
+
+    async def fake_run_checked(
+        *argv: str,
+        cwd: Path | None = None,
+        env=None,
+        timeout: float = 3600,
+    ) -> str:
+        del env, timeout
+        if argv[:2] == ("/usr/bin/make", "ds4-server"):
+            assert cwd is not None
+            binary = cwd / "ds4-server"
+            binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            binary.chmod(0o755)
+        return "ok"
+
+    monkeypatch.setattr(runtime_updates, "_run_checked", fake_run_checked)
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    manager = RuntimeUpdateManager(
+        omlx=OMLXConfig(),
+        mflux=MFluxConfig(),
+        ds4=DS4Config(binary=str(tmp_path / "missing")),
+        root=tmp_path / "runtimes",
+        client=client,
+    )
+    try:
+        snapshot = await manager.check()
+        ds4 = next(item for item in snapshot["engines"] if item["engine"] == "ds4")
+        preview = ds4["managed_channels"][0]
+        assert preview == {
+            "channel": "glm-5.3-flash",
+            "source_branch": "glm-5.3-flash",
+            "release_tier": "experimental",
+            "available_version": revision[:12],
+            "available_revision": revision,
+            "release_notes_url": f"https://github.com/antirez/ds4/commit/{revision}",
+            "update_available": True,
+            "can_install": True,
+            "diagnostic": None,
+        }
+
+        prepared = await manager.prepare(
+            "ds4",
+            revision[:12],
+            channel=runtime_updates.DS4_GLM53_PREVIEW_CHANNEL,
+        )
+        assert prepared.release.source_revision == revision
+        assert prepared.release.source_branch == "glm-5.3-flash"
+        assert prepared.release.source_url.endswith(f"/tar.gz/{revision}")
+        metadata = json.loads(
+            (prepared.runtime.root / "runtime.json").read_text(encoding="utf-8")
+        )
+        assert metadata["channel"] == "glm-5.3-flash"
+        assert metadata["source_branch"] == "glm-5.3-flash"
+        assert re.fullmatch(r"[0-9a-f]{64}", metadata["source_contract_sha256"])
+        assert [item["target"] for item in metadata["capabilities"]] == [
+            "glm53-q2",
+            "glm53-q4",
+        ]
+        assert [item["filename"] for item in metadata["capabilities"]] == [
+            "GLM-5.3-Flash-Q2.gguf",
+            "GLM-5.3-Flash-Q4_K.gguf",
+        ]
+        assert all(
+            "fp8" not in item["filename"].casefold()
+            and "vision" not in item["filename"].casefold()
+            for item in metadata["capabilities"]
+        )
+
+        manager.activate(prepared)
+        active = resolve_active_runtime("ds4", root=manager.root)
+        assert active is not None
+        assert active.channel == "glm-5.3-flash"
+        assert len(runtime_updates.ds4_glm53_preview_capabilities(active)) == 2
+        activated_snapshot = await manager.check(refresh=False)
+        activated_ds4 = next(
+            item
+            for item in activated_snapshot["engines"]
+            if item["engine"] == "ds4"
+        )
+        assert activated_ds4["installed_channel"] == "glm-5.3-flash"
+        assert any(
+            url.endswith("/antirez/ds4/commits/glm-5.3-flash")
+            for url in requests
+        )
+    finally:
+        await manager.aclose()
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_ds4_glm53_preview_fails_closed_for_wrong_channel_commit_and_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    revision = "d" * 40
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/jundot/omlx/releases"):
+            return httpx.Response(200, json=[])
+        if request.url.host == "pypi.org":
+            return httpx.Response(200, json={"info": {"version": "0.19.0"}})
+        if request.url.path.endswith("/antirez/ds4/commits/main"):
+            return httpx.Response(200, json={"sha": "a" * 40})
+        if request.url.path.endswith(
+            "/antirez/ds4/commits/glm-5.3-flash"
+        ):
+            return httpx.Response(200, json={"sha": revision})
+        if request.url.host == "codeload.github.com":
+            return httpx.Response(
+                200,
+                content=_ds4_glm53_preview_source_archive(
+                    revision,
+                    branch_contract=False,
+                ),
+            )
+        return httpx.Response(404)
+
+    async def fake_run_checked(
+        *argv: str,
+        cwd: Path | None = None,
+        env=None,
+        timeout: float = 3600,
+    ) -> str:
+        del env, timeout
+        if argv[:2] == ("/usr/bin/make", "ds4-server"):
+            assert cwd is not None
+            binary = cwd / "ds4-server"
+            binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            binary.chmod(0o755)
+        return "ok"
+
+    monkeypatch.setattr(runtime_updates, "_run_checked", fake_run_checked)
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    manager = RuntimeUpdateManager(
+        omlx=OMLXConfig(),
+        mflux=MFluxConfig(),
+        ds4=DS4Config(binary=str(tmp_path / "missing")),
+        root=tmp_path / "runtimes",
+        client=client,
+    )
+    try:
+        with pytest.raises(RuntimeUpdateError, match="unsupported official DS4"):
+            await manager.prepare("ds4", channel="arbitrary-branch")
+        with pytest.raises(RuntimeUpdateError, match="does not bind glm53-q4"):
+            await manager.prepare("ds4", channel="glm-5.3-flash")
+    finally:
+        await manager.aclose()
+        await client.aclose()
+
+    invalid_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                200,
+                json={"sha": "moving-branch"},
+            )
+            if request.url.path.endswith(
+                "/antirez/ds4/commits/glm-5.3-flash"
+            )
+            else httpx.Response(404)
+        )
+    )
+    invalid_manager = RuntimeUpdateManager(
+        omlx=OMLXConfig(),
+        mflux=MFluxConfig(),
+        ds4=DS4Config(),
+        root=tmp_path / "invalid-runtimes",
+        client=invalid_client,
+    )
+    try:
+        with pytest.raises(RuntimeUpdateError, match="no compatible official ds4"):
+            await invalid_manager.prepare("ds4", channel="glm-5.3-flash")
+    finally:
+        await invalid_manager.aclose()
+        await invalid_client.aclose()
+
+
+def test_ds4_glm53_preview_runtime_rejects_wrong_manifest_branch(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "runtime"
+    source = root / "source"
+    source.mkdir(parents=True)
+    script = (
+        'GLM53_REPO="antirez/glm-5.3-flash-gguf"\n'
+        'GLM53_Q2_FILE="GLM-5.3-Flash-Q2.gguf"\n'
+        'GLM53_Q4_FILE="GLM-5.3-Flash-Q4_K.gguf"\n'
+        'case "$MODEL" in\n'
+        'glm53-q2)\nREPO=$GLM53_REPO\nMODEL_FILE=$GLM53_Q2_FILE\n'
+        'FORCE_HF_DOWNLOAD=1\n;;\n'
+        'glm53-q4)\nREPO=$GLM53_REPO\nMODEL_FILE=$GLM53_Q4_FILE\n'
+        'FORCE_HF_DOWNLOAD=1\n;;\nesac\n'
+    )
+    (source / "download_model.sh").write_text(script, encoding="utf-8")
+    binary = source / "ds4-server"
+    binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    binary.chmod(0o755)
+    capabilities, digest = runtime_updates._ds4_glm53_source_contract(source)
+    (root / "runtime.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "engine": "ds4",
+                "version": "e" * 12,
+                "source_revision": "e" * 40,
+                "channel": "glm-5.3-flash",
+                "source_branch": "main",
+                "source_contract_sha256": digest,
+                "core_protocol": 1,
+                "entrypoint": {
+                    "binary": "source/ds4-server",
+                    "working_directory": "source",
+                },
+                "capabilities": list(capabilities),
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeUpdateError, match="provenance is incomplete"):
+        runtime_updates._load_runtime_directory(root, expected_engine="ds4")
 
 
 @pytest.mark.asyncio
@@ -977,6 +1634,7 @@ async def test_official_llama_cpp_release_verifies_archive_and_records_integrity
                     "--embedding",
                     "--reranking",
                     "--no-webui",
+                    "--flash-attn",
                 )
             )
         raise AssertionError(f"unexpected command: {argv}")
@@ -1008,6 +1666,11 @@ async def test_official_llama_cpp_release_verifies_archive_and_records_integrity
         assert prepared.release.sha256 is not None
         assert prepared.release.asset_size is not None
         assert prepared.runtime.engine == "llama.cpp"
+        assert prepared.runtime.compatibility_evidence is not None
+        assert prepared.runtime.compatibility_evidence.features == (
+            "apple-metal",
+            "flash-attention",
+        )
         binary = prepared.runtime.path("binary")
         assert binary.name == "llama-server"
         assert binary.stat().st_mode & 0o111
@@ -1018,12 +1681,26 @@ async def test_official_llama_cpp_release_verifies_archive_and_records_integrity
         assert metadata["source_sha256"] == prepared.release.sha256
         assert metadata["source_revision"] == "main"
         assert metadata["entrypoint"]["working_directory"] == "runtime"
+        assert metadata["compatibility_evidence"] == (
+            prepared.runtime.compatibility_evidence.to_manifest()
+        )
+        assert str(manager.root) not in json.dumps(
+            metadata["compatibility_evidence"]
+        )
 
         manager.activate(prepared)
         active = resolve_active_runtime("llama.cpp", root=manager.root)
         assert active is not None
         assert active.version == "b8123"
         assert active.path("binary") == binary
+        installed = await manager.installed_status()
+        assert installed["llama.cpp"]["compatibility_fingerprint"] == (
+            prepared.runtime.compatibility_evidence.compatibility_fingerprint
+        )
+        assert installed["llama.cpp"]["features"] == [
+            "apple-metal",
+            "flash-attention",
+        ]
         assert any("llama-b8123-bin-macos-arm64.tar.gz" in url for url in requests)
     finally:
         await manager.aclose()
@@ -1058,6 +1735,57 @@ async def test_llama_cpp_prepare_rejects_archive_digest_mismatch(
         with pytest.raises(RuntimeUpdateError, match="SHA-256 verification failed"):
             await manager.prepare("llama.cpp")
         assert not (manager.root / "llama.cpp" / "b9000").exists()
+    finally:
+        await manager.aclose()
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_llama_cpp_compatibility_rejects_missing_flash_attention_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport, _requests = _official_handler(llama_version="b8124")
+    client = httpx.AsyncClient(transport=transport)
+
+    async def fake_run_checked(
+        *argv: str,
+        cwd: Path | None = None,
+        env=None,
+        timeout: float = 3600,
+    ) -> str:
+        del cwd, env, timeout
+        if argv[-1] == "--version":
+            return "version: 8124 (deadbeef)"
+        if argv[-1] == "--help":
+            return " ".join(
+                (
+                    "--model",
+                    "--alias",
+                    "--host",
+                    "--port",
+                    "--mmproj",
+                    "--embedding",
+                    "--reranking",
+                    "--no-webui",
+                )
+            )
+        raise AssertionError(f"unexpected command: {argv}")
+
+    monkeypatch.setattr(runtime_updates, "_run_checked", fake_run_checked)
+    manager = RuntimeUpdateManager(
+        llama_cpp=LlamaCppConfig(binary=str(tmp_path / "missing-llama-server")),
+        omlx=OMLXConfig(),
+        mflux=MFluxConfig(),
+        ds4=DS4Config(),
+        root=tmp_path / "runtimes",
+        client=client,
+    )
+    try:
+        await manager.check()
+        with pytest.raises(RuntimeUpdateError, match=r"missing flags: --flash-attn"):
+            await manager.prepare("llama.cpp")
+        assert not (manager.root / "llama.cpp" / "b8124").exists()
     finally:
         await manager.aclose()
         await client.aclose()

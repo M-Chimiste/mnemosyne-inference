@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -11,6 +12,10 @@ from mnemosyne_macos.config import MacConfig, OMLXConfig
 from mnemosyne_macos.coordinator import CoordinatorState, ResidencyCoordinator
 from mnemosyne_macos.engines.base import AdapterError, Deadline
 from mnemosyne_macos.engines.omlx import OMLXAdapter
+from mnemosyne_macos.install_launch import (
+    OMLXInstallLaunch,
+    with_omlx_target_launch,
+)
 from mnemosyne_macos.models import EngineName, ServiceState
 from mnemosyne_macos.runtime import NativeRuntime
 
@@ -66,6 +71,185 @@ async def test_omlx_load_unload_and_encoded_model_id() -> None:
     await adapter.unload(handle.instance, deadline=Deadline.after(5))
     assert b"mlx-community%2FGLM" in mutation_paths[0]
     assert b"mlx-community%2FGLM" in mutation_paths[1]
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_signed_omlx_launch_proof_is_exact_authenticated_get_only(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("OMLX_ADMIN_SESSION", "admin-session")
+    requests: list[tuple[str, str, str | None]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(
+            (request.method, request.url.path, request.headers.get("cookie"))
+        )
+        return httpx.Response(
+            200,
+            json={
+                "scheduler": {"max_concurrent_requests": 3},
+                "memory": {"prefill_memory_guard": True},
+            },
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    adapter = OMLXAdapter(OMLXConfig(), client=client)
+    evidence = await adapter.require_launch_contract(
+        OMLXInstallLaunch(
+            engine="omlx",
+            scheduler_slots=3,
+            memory_guard="required",
+        ),
+        deadline=Deadline.after(1),
+    )
+
+    assert evidence.scheduler_slots == 3
+    assert evidence.memory_guard_enabled is True
+    assert requests == [
+        (
+            "GET",
+            "/admin/api/global-settings",
+            "omlx_admin_session=admin-session",
+        )
+    ]
+    assert adapter.capacity_hint(_target()).limit == 3
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_fresh_signed_launch_proof_replaces_stale_capacity_hint() -> None:
+    scheduler_slots = 8
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/admin/api/models":
+            return httpx.Response(200, json={"models": []})
+        if request.url.path == "/admin/api/global-settings":
+            return httpx.Response(
+                200,
+                json={
+                    "scheduler": {"max_concurrent_requests": scheduler_slots},
+                    "memory": {"prefill_memory_guard": True},
+                },
+            )
+        return httpx.Response(404)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    adapter = OMLXAdapter(OMLXConfig(), client=client)
+    await adapter.validate_control(deadline=Deadline.after(1))
+    assert adapter.capacity_hint(_target()).limit == 8
+
+    scheduler_slots = 4
+    await adapter.require_launch_contract(
+        OMLXInstallLaunch(
+            engine="omlx",
+            scheduler_slots=4,
+            memory_guard="required",
+        ),
+        deadline=Deadline.after(1),
+    )
+
+    hint = adapter.capacity_hint(_target())
+    assert hint is not None
+    assert hint.limit == 4
+    coordinator = ResidencyCoordinator({EngineName.OMLX: adapter})
+    assert coordinator.capacity_for(_target()).effective_limit == 4
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_failed_fresh_signed_launch_proof_clears_stale_capacity_hint() -> None:
+    valid = True
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/admin/api/models":
+            return httpx.Response(200, json={"models": []})
+        if request.url.path == "/admin/api/global-settings":
+            return httpx.Response(
+                200,
+                json=(
+                    {
+                        "scheduler": {"max_concurrent_requests": 8},
+                        "memory": {"prefill_memory_guard": True},
+                    }
+                    if valid
+                    else {"scheduler": {}, "memory": {}}
+                ),
+            )
+        return httpx.Response(404)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    adapter = OMLXAdapter(OMLXConfig(), client=client)
+    await adapter.validate_control(deadline=Deadline.after(1))
+    assert adapter.capacity_hint(_target()).limit == 8
+
+    valid = False
+    with pytest.raises(AdapterError, match="omitted an exact scheduler"):
+        await adapter.require_launch_contract(
+            OMLXInstallLaunch(
+                engine="omlx",
+                scheduler_slots=8,
+                memory_guard="required",
+            ),
+            deadline=Deadline.after(1),
+        )
+
+    assert adapter.capacity_hint(_target()) is None
+    assert "omitted an exact scheduler" in (adapter.capacity_diagnostic or "")
+    assert ResidencyCoordinator({EngineName.OMLX: adapter}).capacity_for(
+        _target()
+    ).effective_limit == 1
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "settings",
+    [
+        {
+            "scheduler": {"max_concurrent_requests": 1},
+            "memory": {"prefill_memory_guard": True},
+        },
+        {
+            "scheduler": {"max_concurrent_requests": 2},
+            "memory": {"prefill_memory_guard": False},
+        },
+        {
+            "scheduler": {"max_concurrent_requests": 2},
+            "memory": {},
+        },
+    ],
+)
+async def test_signed_omlx_load_fails_before_inventory_or_mutation_on_drift(
+    settings: dict[str, object],
+) -> None:
+    requests: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append((request.method, request.url.path))
+        if request.url.path == "/admin/api/global-settings":
+            return httpx.Response(200, json=settings)
+        return httpx.Response(500)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    adapter = OMLXAdapter(OMLXConfig(), client=client)
+    baseline = _target()
+    target = replace(
+        baseline,
+        load_options=with_omlx_target_launch(
+            baseline.load_options,
+            OMLXInstallLaunch(
+                engine="omlx",
+                scheduler_slots=2,
+                memory_guard="required",
+            ),
+        ),
+    )
+
+    with pytest.raises(AdapterError):
+        await adapter.load(target, deadline=Deadline.after(1))
+
+    assert requests == [("GET", "/admin/api/global-settings")]
     await client.aclose()
 
 

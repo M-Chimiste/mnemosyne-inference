@@ -4,13 +4,23 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
 import signal
 import sys
-from typing import Any
+from typing import Any, Sequence
 
+from .install_provenance import (
+    MAX_OWNED_FILES,
+    MAX_PROVENANCE_JSON_BYTES,
+    DestinationStateBefore,
+    OwnedFile,
+    ProvenanceDataError,
+    canonical_owned_files_json,
+    owned_manifest_digest,
+)
 from .local_models import LocalModel, LocalProjector
 from .scoped_process import wrap_scoped_argv
 from .storage import StorageStatus
@@ -18,6 +28,30 @@ from .storage import StorageStatus
 
 class FilesystemProbeError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedManagedDestination:
+    """Immutable creation facts returned by the isolated filesystem helper."""
+
+    path: str
+    state_before: str
+    created: bool
+    directory_device: int
+    directory_inode: int
+    recovered_from_marker: bool = False
+    unowned_preexisting: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class CapturedManagedManifest:
+    """A bounded exact-file snapshot tied to one directory identity."""
+
+    path: str
+    directory_device: int
+    directory_inode: int
+    files: tuple[OwnedFile, ...]
+    total_bytes: int
 
 
 class FilesystemProbe:
@@ -45,6 +79,7 @@ class FilesystemProbe:
         scope_id: str | None = None,
         scope_path: str | None = None,
         timeout_seconds: float | None = None,
+        stdin_payload: bytes | None = None,
     ) -> dict[str, Any]:
         argv = [sys.executable, "-m", "mnemosyne_macos.fs_worker", *arguments]
         return await self._run_argv(
@@ -52,6 +87,7 @@ class FilesystemProbe:
             scope_id=scope_id,
             scope_path=scope_path,
             timeout_seconds=timeout_seconds,
+            stdin_payload=stdin_payload,
         )
 
     async def _run_argv(
@@ -61,6 +97,7 @@ class FilesystemProbe:
         scope_id: str | None = None,
         scope_path: str | None = None,
         timeout_seconds: float | None = None,
+        stdin_payload: bytes | None = None,
     ) -> dict[str, Any]:
         argv = wrap_scoped_argv(
             argv,
@@ -70,14 +107,21 @@ class FilesystemProbe:
         )
         process = await asyncio.create_subprocess_exec(
             *argv,
-            stdin=asyncio.subprocess.DEVNULL,
+            stdin=(
+                asyncio.subprocess.PIPE
+                if stdin_payload is not None
+                else asyncio.subprocess.DEVNULL
+            ),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             start_new_session=True,
         )
         timeout = timeout_seconds or self.timeout_seconds
         try:
-            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(stdin_payload),
+                timeout=timeout,
+            )
         except TimeoutError as exc:
             await _terminate(process)
             raise FilesystemProbeError(
@@ -207,6 +251,232 @@ class FilesystemProbe:
         )
         return str(payload["path"])
 
+    async def prepare_managed_destination(
+        self,
+        *,
+        root: str,
+        path: str,
+        expected_volume_uuid: str | None,
+        scope_id: str | None,
+        installation_id: str | None = None,
+        creation_transaction_id: str | None = None,
+        destination_binding_digest: str | None = None,
+        source_identity_digest: str | None = None,
+        allow_preexisting_unowned: bool = False,
+        timeout_seconds: float | None = None,
+    ) -> PreparedManagedDestination:
+        """Create one absent managed destination and retain its exact identity.
+
+        This is intentionally stricter than :meth:`ensure_directory`.  It is
+        evidence collection for a new exclusive-managed transaction, not a
+        general-purpose directory creation API.
+        """
+
+        arguments = ["prepare-managed-destination", "--root", root, "--path", path]
+        marker_values = (
+            installation_id,
+            creation_transaction_id,
+            destination_binding_digest,
+            source_identity_digest,
+        )
+        if any(value is not None for value in marker_values):
+            if not all(value is not None for value in marker_values):
+                raise FilesystemProbeError(
+                    "managed destination recovery marker authority is incomplete"
+                )
+            arguments.extend(
+                [
+                    "--installation-id",
+                    str(installation_id),
+                    "--creation-transaction-id",
+                    str(creation_transaction_id),
+                    "--destination-binding-digest",
+                    str(destination_binding_digest),
+                    "--source-identity-digest",
+                    str(source_identity_digest),
+                ]
+            )
+        if allow_preexisting_unowned:
+            arguments.append("--allow-preexisting-unowned")
+        if expected_volume_uuid is not None:
+            arguments.extend(["--expected-volume-uuid", expected_volume_uuid])
+        payload = await self._run(
+            *arguments,
+            scope_id=scope_id,
+            scope_path=root,
+            timeout_seconds=timeout_seconds,
+        )
+        lexical_path = os.path.abspath(os.path.expanduser(path))
+        if payload.get("path") != lexical_path:
+            raise FilesystemProbeError(
+                "managed destination helper returned an invalid path"
+            )
+        unowned_preexisting = payload.get("unowned_preexisting") is True
+        if unowned_preexisting:
+            if (
+                not allow_preexisting_unowned
+                or payload.get("destination_created_by_transaction") is not False
+            ):
+                raise FilesystemProbeError(
+                    "managed destination helper returned invalid preexisting facts"
+                )
+        elif (
+            payload.get("destination_state_before")
+            != DestinationStateBefore.ABSENT.value
+            or payload.get("destination_created_by_transaction") is not True
+        ):
+            raise FilesystemProbeError(
+                "managed destination helper returned invalid creation facts"
+            )
+        directory_device = _required_nonnegative_int(
+            payload.get("directory_device"),
+            label="directory device",
+        )
+        directory_inode = _required_positive_int(
+            payload.get("directory_inode"),
+            label="directory inode",
+        )
+        return PreparedManagedDestination(
+            path=lexical_path,
+            state_before=(
+                DestinationStateBefore.UNKNOWN.value
+                if unowned_preexisting
+                else DestinationStateBefore.ABSENT.value
+            ),
+            created=not unowned_preexisting,
+            directory_device=directory_device,
+            directory_inode=directory_inode,
+            recovered_from_marker=payload.get("recovered_from_marker") is True,
+            unowned_preexisting=unowned_preexisting,
+        )
+
+    async def capture_managed_manifest(
+        self,
+        *,
+        root: str,
+        path: str,
+        expected_volume_uuid: str | None,
+        scope_id: str | None,
+        expected_directory_device: int | None = None,
+        expected_directory_inode: int | None = None,
+        max_files: int = MAX_OWNED_FILES,
+        max_entries: int = MAX_OWNED_FILES * 2 + 1,
+        max_manifest_bytes: int = MAX_PROVENANCE_JSON_BYTES,
+        timeout_seconds: float | None = None,
+    ) -> CapturedManagedManifest:
+        """Hash an exact, bounded regular-file tree in a killable helper."""
+
+        if (expected_directory_device is None) != (
+            expected_directory_inode is None
+        ):
+            raise FilesystemProbeError(
+                "expected directory device and inode must be provided together"
+            )
+        arguments = [
+            "capture-managed-manifest",
+            "--root",
+            root,
+            "--path",
+            path,
+            "--max-files",
+            str(max_files),
+            "--max-entries",
+            str(max_entries),
+            "--max-manifest-bytes",
+            str(max_manifest_bytes),
+        ]
+        if expected_volume_uuid is not None:
+            arguments.extend(["--expected-volume-uuid", expected_volume_uuid])
+        if expected_directory_device is not None:
+            arguments.extend(
+                ["--expected-directory-device", str(expected_directory_device)]
+            )
+            arguments.extend(
+                ["--expected-directory-inode", str(expected_directory_inode)]
+            )
+        payload = await self._run(
+            *arguments,
+            scope_id=scope_id,
+            scope_path=root,
+            timeout_seconds=timeout_seconds,
+        )
+        lexical_path = os.path.abspath(os.path.expanduser(path))
+        if payload.get("path") != lexical_path:
+            raise FilesystemProbeError(
+                "managed manifest helper returned an invalid path"
+            )
+        raw_files = payload.get("files")
+        if not isinstance(raw_files, list):
+            raise FilesystemProbeError(
+                "managed manifest helper returned invalid files"
+            )
+        try:
+            files = tuple(
+                OwnedFile(
+                    path=item["path"],
+                    size_bytes=item["size_bytes"],
+                    sha256=item["sha256"],
+                )
+                for item in raw_files
+                if isinstance(item, dict)
+                and set(item) == {"path", "size_bytes", "sha256"}
+            )
+            if len(files) != len(raw_files):
+                raise ProvenanceDataError("owned_manifest_invalid")
+            canonical = json.loads(canonical_owned_files_json(files))
+        except (KeyError, TypeError, ProvenanceDataError) as exc:
+            raise FilesystemProbeError(
+                "managed manifest helper returned invalid files"
+            ) from exc
+        if canonical != raw_files:
+            raise FilesystemProbeError(
+                "managed manifest helper returned noncanonical files"
+            )
+        directory_device = _required_nonnegative_int(
+            payload.get("directory_device"),
+            label="directory device",
+        )
+        directory_inode = _required_positive_int(
+            payload.get("directory_inode"),
+            label="directory inode",
+        )
+        if (
+            expected_directory_device is not None
+            and (
+                directory_device != expected_directory_device
+                or directory_inode != expected_directory_inode
+            )
+        ):
+            raise FilesystemProbeError(
+                "managed destination directory identity changed"
+            )
+        file_count = _required_positive_int(
+            payload.get("file_count"),
+            label="file count",
+        )
+        total_bytes = _required_nonnegative_int(
+            payload.get("total_bytes"),
+            label="total bytes",
+        )
+        if file_count != len(files) or total_bytes != sum(
+            item.size_bytes for item in files
+        ):
+            raise FilesystemProbeError(
+                "managed manifest helper returned inconsistent totals"
+            )
+        digest = owned_manifest_digest(files)
+        if payload.get("manifest_digest") != digest:
+            raise FilesystemProbeError(
+                "managed manifest helper returned an invalid digest"
+            )
+        return CapturedManagedManifest(
+            path=lexical_path,
+            directory_device=directory_device,
+            directory_inode=directory_inode,
+            files=files,
+            total_bytes=total_bytes,
+        )
+
     async def validate_directory(
         self,
         *,
@@ -263,6 +533,61 @@ class FilesystemProbe:
         )
         return bool(payload["deleted"])
 
+    async def verify_exact_manifest(
+        self,
+        *,
+        root: str,
+        path: str,
+        files: Sequence[OwnedFile],
+        expected_volume_uuid: str | None,
+        scope_id: str | None,
+        expected_directory_device: int | None = None,
+        expected_directory_inode: int | None = None,
+        timeout_seconds: float | None = None,
+    ) -> bool:
+        """Freshly prove an exact regular-file tree in a killable helper."""
+
+        if (expected_directory_device is None) != (
+            expected_directory_inode is None
+        ):
+            raise FilesystemProbeError(
+                "expected directory device and inode must be provided together"
+            )
+        try:
+            manifest = canonical_owned_files_json(files).encode("utf-8")
+        except ProvenanceDataError as exc:
+            raise FilesystemProbeError("managed model manifest is invalid") from exc
+        arguments = ["verify-manifest", "--root", root, "--path", path]
+        if expected_volume_uuid is not None:
+            arguments.extend(["--expected-volume-uuid", expected_volume_uuid])
+        if expected_directory_device is not None:
+            arguments.extend(
+                ["--expected-directory-device", str(expected_directory_device)]
+            )
+            arguments.extend(
+                ["--expected-directory-inode", str(expected_directory_inode)]
+            )
+        payload = await self._run(
+            *arguments,
+            scope_id=scope_id,
+            scope_path=root,
+            timeout_seconds=timeout_seconds,
+            stdin_payload=manifest,
+        )
+        lexical_path = os.path.abspath(os.path.expanduser(path))
+        if payload.get("verified") is not True or payload.get("path") != lexical_path:
+            raise FilesystemProbeError(
+                "managed model manifest helper returned an invalid result"
+            )
+        if expected_directory_device is not None and (
+            payload.get("directory_device") != expected_directory_device
+            or payload.get("directory_inode") != expected_directory_inode
+        ):
+            raise FilesystemProbeError(
+                "managed destination directory identity changed"
+            )
+        return True
+
     async def trash_paths(
         self,
         *,
@@ -270,11 +595,34 @@ class FilesystemProbe:
         paths: list[str] | tuple[str, ...],
         expected_volume_uuid: str | None,
         scope_id: str | None,
+        exact_manifest: Sequence[OwnedFile] | None = None,
+        expected_directory_device: int | None = None,
+        expected_directory_inode: int | None = None,
+        timeout_seconds: float | None = None,
     ) -> bool:
         """Move exact, pre-discovered model paths to the macOS Trash."""
 
         if not paths:
             raise FilesystemProbeError("model cleanup did not identify any files")
+        if (expected_directory_device is None) != (
+            expected_directory_inode is None
+        ):
+            raise FilesystemProbeError(
+                "expected directory device and inode must be provided together"
+            )
+        if expected_directory_device is not None:
+            if exact_manifest is None:
+                raise FilesystemProbeError(
+                    "expected directory identity requires an exact managed manifest"
+                )
+            _required_nonnegative_int(
+                expected_directory_device,
+                label="directory device",
+            )
+            _required_positive_int(
+                expected_directory_inode,
+                label="directory inode",
+            )
         helper = self.trash_helper
         if (
             helper is None
@@ -302,12 +650,42 @@ class FilesystemProbe:
             )
         for path in paths:
             arguments.extend(["--path", path])
-        payload = await self._run_argv(
-            arguments,
-            scope_id=scope_id,
-            scope_path=root,
-            timeout_seconds=max(120.0, self.timeout_seconds),
-        )
+        stdin_payload: bytes | None = None
+        if exact_manifest is not None:
+            if len(paths) != 1:
+                raise FilesystemProbeError(
+                    "an exact managed manifest requires one destination"
+                )
+            try:
+                stdin_payload = canonical_owned_files_json(exact_manifest).encode(
+                    "utf-8"
+                )
+            except ProvenanceDataError as exc:
+                raise FilesystemProbeError(
+                    "managed model manifest is invalid"
+                ) from exc
+            arguments.append("--verify-manifest-stdin")
+            if expected_directory_device is not None:
+                arguments.extend(
+                    [
+                        "--expected-directory-device",
+                        str(expected_directory_device),
+                        "--expected-directory-inode",
+                        str(expected_directory_inode),
+                    ]
+                )
+        run_options: dict[str, Any] = {
+            "scope_id": scope_id,
+            "scope_path": root,
+            "timeout_seconds": max(
+                120.0,
+                self.timeout_seconds,
+                timeout_seconds or 0.0,
+            ),
+        }
+        if stdin_payload is not None:
+            run_options["stdin_payload"] = stdin_payload
+        payload = await self._run_argv(arguments, **run_options)
         trashed = payload.get("trashed")
         if not isinstance(trashed, list):
             raise FilesystemProbeError(
@@ -330,4 +708,26 @@ async def _terminate(process: asyncio.subprocess.Process) -> None:
         await process.wait()
 
 
-__all__ = ["FilesystemProbe", "FilesystemProbeError"]
+def _required_nonnegative_int(value: object, *, label: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise FilesystemProbeError(
+            f"managed filesystem helper returned an invalid {label}"
+        )
+    return value
+
+
+def _required_positive_int(value: object, *, label: str) -> int:
+    parsed = _required_nonnegative_int(value, label=label)
+    if parsed == 0:
+        raise FilesystemProbeError(
+            f"managed filesystem helper returned an invalid {label}"
+        )
+    return parsed
+
+
+__all__ = [
+    "CapturedManagedManifest",
+    "FilesystemProbe",
+    "FilesystemProbeError",
+    "PreparedManagedDestination",
+]

@@ -34,11 +34,12 @@ jobs:
 
       - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b
         with:
-          version: "0.8.17"
+          version: "0.11.32"
           enable-cache: true
           cache-dependency-glob: |
             macos/service/uv.lock
             macos/image-worker/uv.lock
+            fleet/uv.lock
 
       - name: Verify tag and release inputs
         env:
@@ -113,8 +114,17 @@ jobs:
 
       - name: Run release test gates
         run: |
-          uv run --project macos/service --extra dev python -m pytest -q macos/service/tests
-          uv run --project macos/image-worker --extra dev python -m pytest -q macos/image-worker/tests
+          uv run --project macos/service --frozen --extra dev python -m pytest -q macos/service/tests
+          uv run --project macos/image-worker --frozen --extra dev python -m pytest -q macos/image-worker/tests
+          uv run --project fleet --frozen --extra dev python -m pytest -q fleet/tests
+          # These pure contracts live under root tests; do not load the
+          # unrelated CUDA manager conftest into the Mac/Fleet environment.
+          uv run --project fleet --frozen --extra dev python -m pytest -q --noconftest \
+            tests/test_mac_pool_protocol.py \
+            tests/test_compatibility_catalog_contract.py \
+            tests/test_compatibility_catalog_ceremony.py \
+            tests/test_desired_install_cross_platform_contract.py \
+            tests/test_fleet_acceptance.py
           python3 -m unittest discover -s macos/packaging/tests -v
           cd macos/app
           swift package resolve

@@ -6,7 +6,7 @@ import uuid
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 
-from .config import ModelConfig, NodeConfig
+from .config import SERVICE_CLASSES, ModelConfig, NodeConfig
 from .protocol import Deployment
 from .registry import NodeRecord, NodeRegistry
 
@@ -29,7 +29,9 @@ class FleetBusyError(RuntimeError):
 @dataclass(frozen=True, slots=True)
 class Candidate:
     record: NodeRecord
+    enrollment: NodeConfig
     deployment: Deployment
+    service_class_rank: int
     tier: int
     load_score: float
 
@@ -39,10 +41,12 @@ class Reservation:
     route_id: str
     public_model: str
     capability: str
+    enrollment_id: str
     node_id: str
     instance_id: str
     deployment_id: str
     local_alias: str
+    enrollment: NodeConfig = field(repr=False)
     reserved_at: float
     queue_ms: float
     _scheduler: "Scheduler"
@@ -53,6 +57,10 @@ class Reservation:
         init=False,
         repr=False,
     )
+
+    @property
+    def reporting_node_id(self) -> str:
+        return self.node_id
 
     async def release(self) -> None:
         if self._released:
@@ -100,11 +108,11 @@ class _Ticket:
     ticket_id: str
     capability: str
     enqueued_at: float
-    excluded_nodes: frozenset[str]
+    excluded_enrollment_ids: frozenset[str]
 
 
 class Scheduler:
-    """Warm-first scheduler with bounded FIFO queues and local reservations."""
+    """Service-class-first scheduler with bounded FIFO queues and reservations."""
 
     def __init__(
         self,
@@ -115,7 +123,10 @@ class Scheduler:
     ) -> None:
         self._registry = registry
         self._models = {model.name: model for model in models}
-        self._nodes = {node.node_id: node for node in nodes}
+        # Membership is owned by NodeRegistry. Keep the argument temporarily
+        # for source compatibility with callers while dynamic enrollment is
+        # introduced, but never retain a second routing-authority snapshot.
+        del nodes
         self._condition = asyncio.Condition()
         self._queues: dict[str, deque[_Ticket]] = defaultdict(deque)
         self._reservations: dict[str, Reservation] = {}
@@ -136,7 +147,7 @@ class Scheduler:
         return sum(
             1
             for reservation in self._reservations.values()
-            if reservation.node_id == record.enrollment.node_id
+            if reservation.enrollment_id == record.enrollment.enrollment_id
             and reservation.instance_id == record.snapshot.node.instance_id
             and (
                 reservation.admitted_at is None
@@ -191,14 +202,17 @@ class Scheduler:
         *,
         model: ModelConfig,
         capability: str,
-        excluded_nodes: frozenset[str],
+        excluded_enrollment_ids: frozenset[str],
     ) -> Candidate | None:
         candidates: list[Candidate] = []
         for record in self._registry.live_records():
-            node_id = record.enrollment.node_id
+            enrollment_id = record.enrollment.enrollment_id
+            enrollment = self._registry.enrollment(enrollment_id)
+            if enrollment is None or record.enrollment is not enrollment:
+                continue
             snapshot = record.snapshot
             if (
-                node_id in excluded_nodes
+                enrollment_id in excluded_enrollment_ids
                 or not snapshot.health.accepting
                 or not snapshot.health.authoritative
                 or snapshot.health.state in {"degraded", "stopping"}
@@ -238,7 +252,7 @@ class Scheduler:
             else:
                 continue
 
-            configured_weight = self._nodes[node_id].routing_weight
+            configured_weight = enrollment.routing_weight
             weight = float(deployment.capacity.effective_limit)
             if configured_weight is not None:
                 weight = min(weight, configured_weight)
@@ -246,7 +260,11 @@ class Scheduler:
             candidates.append(
                 Candidate(
                     record=record,
+                    enrollment=enrollment,
                     deployment=deployment,
+                    service_class_rank=SERVICE_CLASSES.index(
+                        enrollment.service_class
+                    ),
                     tier=tier,
                     load_score=outstanding / max(weight, 1e-9),
                 )
@@ -256,10 +274,13 @@ class Scheduler:
         return min(
             candidates,
             key=lambda candidate: (
+                candidate.service_class_rank,
                 candidate.tier,
                 candidate.load_score,
-                self._last_selected[candidate.record.enrollment.node_id],
-                candidate.record.enrollment.node_id,
+                self._last_selected[
+                    candidate.record.enrollment.enrollment_id
+                ],
+                candidate.record.enrollment.enrollment_id,
             ),
         )
 
@@ -268,7 +289,7 @@ class Scheduler:
         *,
         public_model: str,
         capability: str,
-        excluded_nodes: frozenset[str] = frozenset(),
+        excluded_enrollment_ids: frozenset[str] = frozenset(),
     ) -> Reservation:
         model = self.model(public_model)
         if capability not in model.capabilities:
@@ -283,7 +304,7 @@ class Scheduler:
                 candidate = self._select(
                     model=model,
                     capability=capability,
-                    excluded_nodes=excluded_nodes,
+                    excluded_enrollment_ids=excluded_enrollment_ids,
                 )
                 if candidate is not None:
                     return self._reserve(candidate, model, capability, started, started)
@@ -293,7 +314,7 @@ class Scheduler:
                 ticket_id=uuid.uuid4().hex,
                 capability=capability,
                 enqueued_at=started,
-                excluded_nodes=excluded_nodes,
+                excluded_enrollment_ids=excluded_enrollment_ids,
             )
             queue.append(ticket)
             try:
@@ -302,7 +323,7 @@ class Scheduler:
                         candidate = self._select(
                             model=model,
                             capability=capability,
-                            excluded_nodes=excluded_nodes,
+                            excluded_enrollment_ids=excluded_enrollment_ids,
                         )
                         if candidate is not None:
                             queue.popleft()
@@ -341,17 +362,19 @@ class Scheduler:
             route_id=route_id,
             public_model=model.name,
             capability=capability,
-            node_id=record.enrollment.node_id,
+            enrollment_id=record.enrollment.enrollment_id,
+            node_id=record.enrollment.reporting_node_id,
             instance_id=record.snapshot.node.instance_id,
             deployment_id=model.deployment_id,
             local_alias=candidate.deployment.alias,
+            enrollment=candidate.enrollment,
             reserved_at=reserved_at,
             queue_ms=max(0.0, (reserved_at - queued_at) * 1000.0),
             _scheduler=self,
         )
         self._reservations[route_id] = reservation
         self._selection_counter += 1
-        self._last_selected[reservation.node_id] = self._selection_counter
+        self._last_selected[reservation.enrollment_id] = self._selection_counter
         return reservation
 
     async def release(self, reservation: Reservation) -> None:
@@ -359,22 +382,43 @@ class Scheduler:
             self._reservations.pop(reservation.route_id, None)
             self._condition.notify_all()
 
-    def enrollment(self, node_id: str) -> NodeConfig:
-        return self._nodes[node_id]
+    def dispatch_is_current(self, reservation: Reservation) -> bool:
+        """Check the enrollment generation immediately before dispatch.
+
+        A reservation already owns scheduler capacity, but revocation between
+        acquire and the upstream send must still stop pre-work dispatch. Once
+        upstream headers are accepted, ordinary route ownership holds the
+        response and reservation through full-stream cleanup instead.
+        """
+
+        return (
+            self._reservations.get(reservation.route_id) is reservation
+            and self._registry.enrollment(reservation.enrollment_id)
+            is reservation.enrollment
+        )
+
+    def enrollment(self, enrollment_id: str) -> NodeConfig:
+        enrollment = self._registry.enrollment(enrollment_id)
+        if enrollment is None:
+            raise KeyError(enrollment_id)
+        return enrollment
 
     @property
     def node_count(self) -> int:
-        return len(self._nodes)
+        return self._registry.node_count
 
     def status(self) -> dict[str, object]:
         active_by_node: dict[str, int] = defaultdict(int)
+        active_by_enrollment: dict[str, int] = defaultdict(int)
         active_by_model: dict[str, int] = defaultdict(int)
         for reservation in self._reservations.values():
             active_by_node[reservation.node_id] += 1
+            active_by_enrollment[reservation.enrollment_id] += 1
             active_by_model[reservation.public_model] += 1
         return {
             "active_total": len(self._reservations),
             "active_by_node": dict(active_by_node),
+            "active_by_enrollment": dict(active_by_enrollment),
             "active_by_model": dict(active_by_model),
             "queues": {
                 model: {
@@ -390,13 +434,19 @@ class Scheduler:
         rows: list[dict[str, object]] = []
         for model in self._models.values():
             nodes: list[dict[str, object]] = []
-            for node_id in self._nodes:
-                record = self._registry.record(node_id)
-                snapshot_error_code = self._registry.error_code(node_id)
+            for enrollment in self._registry.enrollments():
+                enrollment_id = enrollment.enrollment_id
+                reporting_node_id = enrollment.reporting_node_id
+                record = self._registry.record(enrollment_id)
+                snapshot_error_code = self._registry.error_code(enrollment_id)
                 if record is None:
                     nodes.append(
                         {
-                            "node_id": node_id,
+                            "node_id": reporting_node_id,
+                            "reporting_node_id": reporting_node_id,
+                            "enrollment_id": enrollment_id,
+                            "source": enrollment.source,
+                            "service_class": enrollment.service_class,
                             "online": False,
                             "eligible": False,
                             "strict_match": False,
@@ -464,7 +514,11 @@ class Scheduler:
                 )
                 nodes.append(
                     {
-                        "node_id": node_id,
+                        "node_id": reporting_node_id,
+                        "reporting_node_id": reporting_node_id,
+                        "enrollment_id": enrollment_id,
+                        "source": enrollment.source,
+                        "service_class": enrollment.service_class,
                         "online": online,
                         "eligible": bool(routable) and online and schedulable_health,
                         "strict_match": bool(strict_deployments),

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from dataclasses import dataclass
 import hashlib
 import math
 import os
@@ -14,6 +15,11 @@ import httpx
 from .base import AdapterError, CapacityHint, Deadline
 from .http import HttpAdapterError, HttpEngineAdapter, JsonObjectResponse
 from ..config import OMLXConfig
+from ..install_launch import (
+    InstallLaunchError,
+    OMLXInstallLaunch,
+    omlx_target_launch,
+)
 from ..models import (
     ContextWindowHint,
     ContextWindowProfileResult,
@@ -26,6 +32,14 @@ from ..models import (
     ResolvedTarget,
     ServiceState,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class OMLXLaunchContractEvidence:
+    """Exact, content-free service-global settings reported by oMLX."""
+
+    scheduler_slots: int
+    memory_guard_enabled: bool
 
 
 class OMLXAdapter(HttpEngineAdapter):
@@ -56,10 +70,23 @@ class OMLXAdapter(HttpEngineAdapter):
         self.admin_session_env = config.admin_session_env
         self._capacity_hint: CapacityHint | None = None
         self._capacity_diagnostic: str | None = None
+        self._capacity_observation_lock = asyncio.Lock()
 
     def capacity_hint(self, target: ResolvedTarget) -> CapacityHint | None:
         del target
         return self._capacity_hint
+
+    def _set_authoritative_capacity(self, slots: int) -> None:
+        self._capacity_hint = CapacityHint(
+            limit=slots,
+            source="omlx-admin-settings",
+            confidence="authoritative",
+        )
+        self._capacity_diagnostic = None
+
+    def _clear_capacity(self, diagnostic: str) -> None:
+        self._capacity_hint = None
+        self._capacity_diagnostic = diagnostic
 
     async def runtime_fingerprint(self, *, deadline: Deadline) -> str | None:
         """Fingerprint the authoritative running oMLX version when exposed."""
@@ -543,41 +570,122 @@ class OMLXAdapter(HttpEngineAdapter):
         if not snapshot.authoritative or snapshot.service_state != ServiceState.READY:
             self._capacity_hint = None
             return snapshot
-        try:
-            payload = await self._request_json(
-                "GET",
-                "/admin/api/global-settings",
-                operation="inspect scheduler capacity",
-                deadline=deadline,
-                headers=self._admin_headers(),
-            )
-            scheduler = payload.get("scheduler")
-            value = (
-                scheduler.get("max_concurrent_requests")
-                if isinstance(scheduler, dict)
-                else None
-            )
-            if (
-                not isinstance(value, int)
-                or isinstance(value, bool)
-                or not 1 <= value <= 1024
-            ):
-                raise ValueError(
-                    "oMLX global settings omitted a valid scheduler.max_concurrent_requests"
+        async with self._capacity_observation_lock:
+            try:
+                payload = await self._request_json(
+                    "GET",
+                    "/admin/api/global-settings",
+                    operation="inspect scheduler capacity",
+                    deadline=deadline,
+                    headers=self._admin_headers(),
                 )
-            self._capacity_hint = CapacityHint(
-                limit=value,
-                source="omlx-admin-settings",
-                confidence="authoritative",
-            )
-            self._capacity_diagnostic = None
-        except (AdapterError, ValueError) as exc:
-            # Scheduler discovery is an optimization contract. Inventory and
-            # unload authority remain valid, so keep the engine callable at a
-            # conservative single request and expose the reason in diagnostics.
-            self._capacity_hint = None
-            self._capacity_diagnostic = str(exc)
+                scheduler = payload.get("scheduler")
+                value = (
+                    scheduler.get("max_concurrent_requests")
+                    if isinstance(scheduler, dict)
+                    else None
+                )
+                if (
+                    not isinstance(value, int)
+                    or isinstance(value, bool)
+                    or not 1 <= value <= 1024
+                ):
+                    raise ValueError(
+                        "oMLX global settings omitted a valid "
+                        "scheduler.max_concurrent_requests"
+                    )
+                self._set_authoritative_capacity(value)
+            except (AdapterError, ValueError) as exc:
+                # Scheduler discovery is an optimization contract. Inventory and
+                # unload authority remain valid, so keep the engine callable at a
+                # conservative single request and expose the reason in diagnostics.
+                self._clear_capacity(str(exc))
         return snapshot
+
+    async def inspect_launch_contract(
+        self,
+        *,
+        deadline: Deadline,
+    ) -> OMLXLaunchContractEvidence:
+        """Read the two official globals used by signed install recipes.
+
+        This is deliberately GET-only. ``max_concurrent_requests`` is a
+        service-global, restart-required oMLX setting, and the prefill memory
+        guard is also global. Mnemosyne may prove them but must never change
+        either as a side effect of installing or loading one model.
+        """
+
+        async with self._capacity_observation_lock:
+            try:
+                payload = await self._request_json(
+                    "GET",
+                    "/admin/api/global-settings",
+                    operation="inspect signed launch contract",
+                    deadline=deadline,
+                    headers=self._admin_headers(),
+                )
+                scheduler = payload.get("scheduler")
+                memory = payload.get("memory")
+                scheduler_slots = (
+                    scheduler.get("max_concurrent_requests")
+                    if isinstance(scheduler, dict)
+                    else None
+                )
+                memory_guard_enabled = (
+                    memory.get("prefill_memory_guard")
+                    if isinstance(memory, dict)
+                    else None
+                )
+                if (
+                    not isinstance(scheduler_slots, int)
+                    or isinstance(scheduler_slots, bool)
+                    or not 1 <= scheduler_slots <= 1024
+                    or not isinstance(memory_guard_enabled, bool)
+                ):
+                    raise AdapterError(
+                        self.engine,
+                        "inspect signed launch contract",
+                        "oMLX global settings omitted an exact scheduler or "
+                        "memory-guard state",
+                    )
+            except AdapterError as exc:
+                self._clear_capacity(exc.detail)
+                raise
+            self._set_authoritative_capacity(scheduler_slots)
+        return OMLXLaunchContractEvidence(
+            scheduler_slots=scheduler_slots,
+            memory_guard_enabled=memory_guard_enabled,
+        )
+
+    async def require_launch_contract(
+        self,
+        contract: OMLXInstallLaunch,
+        *,
+        deadline: Deadline,
+    ) -> OMLXLaunchContractEvidence:
+        """Fail closed unless the running external service already matches."""
+
+        if not isinstance(contract, OMLXInstallLaunch):
+            self._clear_capacity("signed oMLX launch contract has an invalid type")
+            raise AdapterError(
+                self.engine,
+                "verify signed launch contract",
+                "signed oMLX launch contract has an invalid type",
+            )
+        evidence = await self.inspect_launch_contract(deadline=deadline)
+        if evidence.scheduler_slots != contract.scheduler_slots:
+            raise AdapterError(
+                self.engine,
+                "verify signed launch contract",
+                "oMLX scheduler capacity does not match the signed model contract",
+            )
+        if contract.memory_guard == "required" and not evidence.memory_guard_enabled:
+            raise AdapterError(
+                self.engine,
+                "verify signed launch contract",
+                "oMLX prefill memory guard is disabled but the signed model contract requires it",
+            )
+        return evidence
 
     async def register_model_directories(
         self,
@@ -680,6 +788,19 @@ class OMLXAdapter(HttpEngineAdapter):
     async def load(self, target: ResolvedTarget, *, deadline: Deadline) -> LoadedHandle:
         if target.key.engine != self.engine:
             raise AdapterError(self.engine, "load", "target belongs to another engine")
+        try:
+            signed_launch = omlx_target_launch(target.load_options)
+        except InstallLaunchError as exc:
+            raise AdapterError(
+                self.engine,
+                "verify signed launch contract",
+                "managed target contains an invalid signed oMLX launch contract",
+            ) from exc
+        if signed_launch is not None:
+            # Keep this check in the adapter so coordinator-owned benchmark,
+            # profiling, and JIT paths cannot bypass the runtime's public
+            # request preflight.
+            await self.require_launch_contract(signed_launch, deadline=deadline)
         requested_context = target.requested_context_length
         if requested_context is not None:
             observed = await self.context_window(target, deadline=deadline)

@@ -49,17 +49,13 @@ def test_ds4_parallel_slots_drive_capacity_but_not_deployment_identity() -> None
 
 
 @pytest.mark.parametrize(
-    ("engine", "engine_config", "artifact_format"),
-    [
-        ("mlxcel", "mlxcel", "mlx-snapshot"),
-        ("mistral.rs", "mistral_rs", "safetensors-snapshot"),
-    ],
+    ("engine", "engine_config"),
+    [("mlxcel", "mlxcel"), ("mistral.rs", "mistral_rs")],
 )
-def test_preview_native_engine_fleet_identity_is_exact_and_path_free(
+def test_retired_native_engines_are_not_fleet_deployments(
     tmp_path,
     engine: str,
     engine_config: str,
-    artifact_format: str,
 ) -> None:
     destination = tmp_path / engine_config
     config = MacConfig.model_validate(
@@ -75,29 +71,9 @@ def test_preview_native_engine_fleet_identity_is_exact_and_path_free(
             ],
         }
     )
-    install = InstallRecord(
-        id=f"install-{engine_config}",
-        repo_id="publisher/qwen",
-        engine=engine,
-        storage="internal",
-        alias="qwen",
-        destination=str(destination),
-        status="installed",
-        revision="a" * 40,
-    )
-
-    deployment_id, identity, eligible = _fleet_deployment_identity(
-        node_id="mac-node",
-        profile=config.models[0],
-        target=config.profiles()["qwen"],
-        install=install,
-    )
-
-    assert eligible is True
-    assert deployment_id.startswith("sha256:")
-    assert identity["engine"] == engine
-    assert identity["artifact"]["format"] == artifact_format
-    assert str(tmp_path) not in canonical_json(identity)
+    assert config.models[0].engine.value == engine
+    assert config.profiles() == {}
+    assert config.profile_candidates() == {}
 
 
 def test_native_identity_matches_cross_platform_golden_vectors() -> None:

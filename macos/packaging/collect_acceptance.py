@@ -8,6 +8,7 @@ import base64
 from datetime import datetime, timezone
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import plistlib
@@ -440,6 +441,7 @@ def _json_request(
     *,
     admin_password: str | None = None,
     payload: dict[str, Any] | None = None,
+    method: str | None = None,
     timeout: float = 5,
 ) -> dict[str, Any]:
     headers = {"Accept": "application/json"}
@@ -454,7 +456,7 @@ def _json_request(
         url,
         data=data,
         headers=headers,
-        method="POST" if payload is not None else "GET",
+        method=method or ("POST" if payload is not None else "GET"),
     )
     opener = request.build_opener(request.ProxyHandler({}))
     try:
@@ -483,6 +485,168 @@ def _json_request(
             "status": None,
             "diagnostic": _redact_text(str(exc)),
         }
+
+
+def _exercise_fleet_participation(
+    *,
+    control_url: str,
+    admin_password: str | None,
+) -> dict[str, Any]:
+    """Exercise the local pool toggle and restore its exact prior preference.
+
+    The exercise refuses to begin while Fleet work is active.  Configuration
+    is sampled before and after because participation is deliberately stored
+    outside model/runtime/storage configuration.  The report retains only
+    fixed state and equality checks, never the configuration or local paths.
+    """
+
+    endpoint = f"{control_url.rstrip('/')}/manager/fleet/participation"
+    config_endpoint = f"{control_url.rstrip('/')}/manager/config"
+    baseline = _json_request(endpoint, admin_password=admin_password)
+    baseline_config = _json_request(
+        config_endpoint,
+        admin_password=admin_password,
+    )
+
+    def valid_status(value: Any) -> bool:
+        if not isinstance(value, dict):
+            return False
+        enabled = value.get("enabled")
+        state = value.get("state")
+        active_requests = value.get("active_requests")
+        updated_at = value.get("updated_at")
+        if (
+            type(enabled) is not bool
+            or state not in {"joined", "draining", "paused"}
+            or type(active_requests) is not int
+            or active_requests < 0
+            or type(updated_at) not in {int, float}
+            or not math.isfinite(updated_at)
+            or updated_at < 0
+        ):
+            return False
+        expected_state = (
+            "joined"
+            if enabled
+            else ("draining" if active_requests > 0 else "paused")
+        )
+        return state == expected_state
+
+    def valid_idle_status(value: Any, *, enabled: bool) -> bool:
+        return bool(
+            valid_status(value)
+            and value.get("enabled") is enabled
+            and value.get("active_requests") == 0
+        )
+
+    baseline_payload = baseline.get("payload")
+    baseline_valid = bool(
+        baseline.get("ok") is True and valid_status(baseline_payload)
+    )
+    baseline_config_valid = bool(
+        baseline_config.get("ok") is True
+        and isinstance(baseline_config.get("payload"), dict)
+    )
+    baseline_idle = bool(
+        baseline_valid and baseline_payload.get("active_requests") == 0
+    )
+    initial_enabled = (
+        bool(baseline_payload["enabled"])
+        if baseline_valid and isinstance(baseline_payload, dict)
+        else None
+    )
+
+    paused: dict[str, Any] | None = None
+    joined: dict[str, Any] | None = None
+    restored: dict[str, Any] | None = None
+    final: dict[str, Any] | None = None
+    final_config: dict[str, Any] | None = None
+    if baseline_idle and initial_enabled is not None and baseline_config_valid:
+        try:
+            paused = _json_request(
+                endpoint,
+                admin_password=admin_password,
+                payload={"enabled": False},
+                method="PUT",
+            )
+            paused_payload = paused.get("payload")
+            if paused.get("ok") is True and valid_idle_status(
+                paused_payload,
+                enabled=False,
+            ):
+                joined = _json_request(
+                    endpoint,
+                    admin_password=admin_password,
+                    payload={"enabled": True},
+                    method="PUT",
+                )
+        finally:
+            restored = _json_request(
+                endpoint,
+                admin_password=admin_password,
+                payload={"enabled": initial_enabled},
+                method="PUT",
+            )
+            final = _json_request(endpoint, admin_password=admin_password)
+            final_config = _json_request(
+                config_endpoint,
+                admin_password=admin_password,
+            )
+
+    paused_payload = paused.get("payload") if isinstance(paused, dict) else None
+    joined_payload = joined.get("payload") if isinstance(joined, dict) else None
+    restored_payload = (
+        restored.get("payload") if isinstance(restored, dict) else None
+    )
+    final_payload = final.get("payload") if isinstance(final, dict) else None
+    expected_state = "joined" if initial_enabled else "paused"
+    checks = {
+        "baseline_reachable_and_valid": baseline_valid,
+        "baseline_configuration_snapshot_valid": baseline_config_valid,
+        "baseline_has_no_active_fleet_requests": baseline_idle,
+        "pause_reached_closed_idle_state": bool(
+            isinstance(paused, dict)
+            and paused.get("ok") is True
+            and valid_idle_status(paused_payload, enabled=False)
+        ),
+        "rejoin_reached_joined_state": bool(
+            isinstance(joined, dict)
+            and joined.get("ok") is True
+            and valid_idle_status(joined_payload, enabled=True)
+        ),
+        "baseline_preference_restored": bool(
+            isinstance(restored, dict)
+            and restored.get("ok") is True
+            and initial_enabled is not None
+            and valid_idle_status(restored_payload, enabled=initial_enabled)
+            and restored_payload.get("state") == expected_state
+            and isinstance(final, dict)
+            and final.get("ok") is True
+            and valid_idle_status(final_payload, enabled=initial_enabled)
+            and final_payload.get("state") == expected_state
+        ),
+        "model_runtime_storage_configuration_unchanged": bool(
+            baseline_config_valid
+            and isinstance(final_config, dict)
+            and final_config.get("ok") is True
+            and isinstance(final_config.get("payload"), dict)
+            and baseline_config.get("payload") == final_config.get("payload")
+        ),
+    }
+    return {
+        "initial_state": (
+            baseline_payload.get("state")
+            if baseline_valid and isinstance(baseline_payload, dict)
+            else None
+        ),
+        "restored_state": (
+            final_payload.get("state")
+            if valid_status(final_payload)
+            else None
+        ),
+        "checks": checks,
+        "accepted": all(checks.values()),
+    }
 
 
 def _launch_agent() -> dict[str, Any]:
@@ -746,6 +910,180 @@ def _download_lifecycle_summary(payload: Any) -> dict[str, Any]:
         "accepted": all(checks.values()),
         "checks": checks,
         "evidence": summary,
+    }
+
+
+def _pilot_install_storage_summary(
+    config_payload: Any,
+    storage_payload: Any,
+    install_payload: Any,
+    *,
+    alias: str | None,
+    storage_name: str,
+) -> dict[str, Any]:
+    """Prove one non-destructive pilot download, registration, and binding.
+
+    The check deliberately follows lexical strings and never resolves a path.
+    This makes a Finder-selected nested or symlink-spelled root part of the
+    evidence rather than silently replacing it with its physical target.
+    """
+
+    config = (
+        config_payload.get("config")
+        if isinstance(config_payload, dict)
+        and isinstance(config_payload.get("config"), dict)
+        else {}
+    )
+    locations = (
+        config.get("storage", {}).get("locations", [])
+        if isinstance(config.get("storage"), dict)
+        else []
+    )
+    profiles = config.get("models") if isinstance(config.get("models"), list) else []
+    status_locations = (
+        storage_payload.get("locations", [])
+        if isinstance(storage_payload, dict)
+        and isinstance(storage_payload.get("locations"), list)
+        else []
+    )
+    installs = (
+        install_payload.get("installs", [])
+        if isinstance(install_payload, dict)
+        and isinstance(install_payload.get("installs"), list)
+        else []
+    )
+    profile = next(
+        (
+            item
+            for item in profiles
+            if isinstance(item, dict) and item.get("alias") == alias
+        ),
+        None,
+    )
+    location = next(
+        (
+            item
+            for item in locations
+            if isinstance(item, dict) and item.get("name") == storage_name
+        ),
+        None,
+    )
+    storage_status = next(
+        (
+            item
+            for item in status_locations
+            if isinstance(item, dict) and item.get("name") == storage_name
+        ),
+        None,
+    )
+    # Evidence is newest-first. Selecting the newest row for the alias ensures
+    # an older successful download cannot hide a current failed/rebound one.
+    install = next(
+        (
+            item
+            for item in installs
+            if isinstance(item, dict) and item.get("alias") == alias
+        ),
+        None,
+    )
+    events = (
+        install.get("events", [])
+        if isinstance(install, dict) and isinstance(install.get("events"), list)
+        else []
+    )
+    statuses = [
+        event.get("status")
+        for event in events
+        if isinstance(event, dict) and event.get("event") == "status"
+    ]
+    registration_transition = any(
+        status == "registering" and "installed" in statuses[index + 1 :]
+        for index, status in enumerate(statuses)
+    )
+    lexical_root = location.get("path") if isinstance(location, dict) else None
+    destination = install.get("destination") if isinstance(install, dict) else None
+    profile_model = profile.get("model") if isinstance(profile, dict) else None
+    engine = install.get("engine") if isinstance(install, dict) else None
+    profile_registration_matches = bool(
+        isinstance(profile, dict)
+        and isinstance(install, dict)
+        and profile.get("engine") == engine
+        and (
+            (
+                engine == "omlx"
+                and profile_model == install.get("repo_id")
+            )
+            or (
+                engine != "omlx"
+                and _path_is_within(profile_model, destination)
+            )
+        )
+    )
+    bytes_downloaded = (
+        install.get("bytes_downloaded") if isinstance(install, dict) else None
+    )
+    total_bytes = install.get("total_bytes") if isinstance(install, dict) else None
+    checks = {
+        "profile_found": profile is not None,
+        "selected_storage_found": location is not None,
+        "selected_storage_healthy": bool(
+            storage_status is not None
+            and storage_status.get("exists")
+            and storage_status.get("is_directory")
+            and storage_status.get("writable")
+            and storage_status.get("volume_matches")
+        ),
+        "latest_alias_install_found": install is not None,
+        "latest_alias_install_completed": bool(
+            isinstance(install, dict) and install.get("status") == "installed"
+        ),
+        "install_storage_matches_selection": bool(
+            isinstance(install, dict) and install.get("storage") == storage_name
+        ),
+        "install_destination_within_lexical_root": bool(
+            _path_is_within(destination, lexical_root)
+        ),
+        "registered_profile_matches_install": profile_registration_matches,
+        "exact_revision_pinned": bool(
+            isinstance(install, dict) and install.get("revision")
+        ),
+        "download_bytes_complete": bool(
+            isinstance(bytes_downloaded, int)
+            and not isinstance(bytes_downloaded, bool)
+            and isinstance(total_bytes, int)
+            and not isinstance(total_bytes, bool)
+            and total_bytes > 0
+            and bytes_downloaded >= total_bytes
+        ),
+        "registration_transition_recorded": registration_transition,
+    }
+    return {
+        "alias": alias,
+        "storage": (
+            {
+                "name": location.get("name"),
+                "path": lexical_root,
+                "volume_uuid_configured": bool(location.get("volume_uuid")),
+                "scope_configured": bool(location.get("scope_id")),
+            }
+            if isinstance(location, dict)
+            else None
+        ),
+        "install": (
+            {
+                "id": install.get("id"),
+                "repo_id": install.get("repo_id"),
+                "engine": engine,
+                "status": install.get("status"),
+                "revision_pinned": bool(install.get("revision")),
+                "bytes_downloaded": bytes_downloaded,
+                "total_bytes": total_bytes,
+            }
+            if isinstance(install, dict)
+            else None
+        ),
+        "checks": checks,
+        "accepted": all(checks.values()),
     }
 
 
@@ -1400,10 +1738,13 @@ def collect_live(
     exercise_reconcile: bool = False,
     require_protected_model: bool = False,
     require_download_lifecycle: bool = False,
+    require_pilot_install_storage: str | None = None,
+    require_cold_jit: bool = False,
     require_lmstudio_adoption: str | None = None,
     require_omlx_recovery: bool = False,
     require_runtime_lifecycle: str | None = None,
     require_guided_setup: bool = False,
+    exercise_fleet_participation: bool = False,
     login_cycle_baseline: Path | None = None,
 ) -> dict[str, Any]:
     control = control_url.rstrip("/")
@@ -1452,6 +1793,14 @@ def collect_live(
         f"{control}/manager/model-library/local-sources",
         admin_password=admin_password,
     )
+    fleet_participation = (
+        _exercise_fleet_participation(
+            control_url=control,
+            admin_password=admin_password,
+        )
+        if exercise_fleet_participation
+        else None
+    )
     reconcile = (
         _json_request(
             f"{control}/manager/reconcile",
@@ -1475,6 +1824,8 @@ def collect_live(
         )
     self_test = None
     self_test_started: float | None = None
+    pre_self_test_status = status
+    post_self_test_status: dict[str, Any] | None = None
     if self_test_model:
         self_test_started = time.time()
         self_test = _json_request(
@@ -1487,6 +1838,11 @@ def collect_live(
             },
             timeout=180,
         )
+        if require_cold_jit:
+            post_self_test_status = _json_request(
+                f"{control}/manager/status",
+                admin_password=admin_password,
+            )
     runtime_evidence = _json_request(
         f"{control}/manager/runtime-updates/evidence",
         admin_password=admin_password,
@@ -1569,6 +1925,17 @@ def collect_live(
     download_lifecycle = (
         _download_lifecycle_summary(install_payload)
         if require_download_lifecycle
+        else None
+    )
+    pilot_install_storage = (
+        _pilot_install_storage_summary(
+            config_payload,
+            storage_payload,
+            install_payload,
+            alias=self_test_model,
+            storage_name=require_pilot_install_storage,
+        )
+        if require_pilot_install_storage is not None
         else None
     )
     lmstudio_adoption = (
@@ -1682,6 +2049,34 @@ def collect_live(
         checks["durable_download_lifecycle"] = bool(
             download_lifecycle["accepted"]
         )
+    if pilot_install_storage is not None:
+        checks["pilot_download_registered_at_selected_storage"] = bool(
+            pilot_install_storage["accepted"] and self_test_accepted
+        )
+    if require_cold_jit:
+        pre_payload = pre_self_test_status.get("payload")
+        post_payload = (
+            post_self_test_status.get("payload")
+            if isinstance(post_self_test_status, dict)
+            else None
+        )
+        checks["cold_jit_from_empty_residency"] = bool(
+            isinstance(pre_payload, dict)
+            and pre_payload.get("resident_alias") is None
+            and pre_payload.get("resident_engine") is None
+            and pre_payload.get("in_flight_requests") == 0
+            and pre_payload.get("queued") == 0
+            and isinstance(self_test_payload, dict)
+            and self_test_payload.get("cold_start") is True
+            and self_test_payload.get("unloaded_after") is True
+            and isinstance(post_self_test_status, dict)
+            and post_self_test_status.get("ok")
+            and isinstance(post_payload, dict)
+            and post_payload.get("resident_alias") is None
+            and post_payload.get("resident_engine") is None
+            and post_payload.get("in_flight_requests") == 0
+            and post_payload.get("queued") == 0
+        )
     if lmstudio_adoption is not None:
         checks["lmstudio_directory_adopted_without_engine"] = bool(
             lmstudio_adoption["accepted"]
@@ -1714,6 +2109,10 @@ def collect_live(
     if guided_setup is not None:
         checks["guided_clean_install_completed"] = bool(
             guided_setup["accepted"] and self_test_accepted
+        )
+    if fleet_participation is not None:
+        checks["fleet_participation_pause_rejoin_restored"] = bool(
+            fleet_participation["accepted"]
         )
     if login_cycle is not None:
         checks["login_cycle_launchagent_recovery"] = bool(
@@ -1776,12 +2175,18 @@ def collect_live(
         "reconcile": reconcile,
         "protected_model": protected_model,
         "download_lifecycle": download_lifecycle,
+        "pilot_install_storage": pilot_install_storage,
         "lmstudio_adoption": lmstudio_adoption,
         "runtime_lifecycle": runtime_lifecycle,
         "guided_setup": guided_setup,
+        "fleet_participation": fleet_participation,
         "login_cycle": login_cycle,
         "postgres_drain": postgres_drain,
         "self_test": self_test,
+        "pre_self_test_status": (
+            pre_self_test_status if require_cold_jit else None
+        ),
+        "post_self_test_status": post_self_test_status,
         "checks": checks,
     }
     result["accepted"] = all(result["checks"].values())
@@ -1903,6 +2308,22 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--require-pilot-install-storage",
+        metavar="STORAGE",
+        help=(
+            "require the self-tested alias to have a completed, revision-pinned "
+            "download and registration at this exact configured storage name"
+        ),
+    )
+    parser.add_argument(
+        "--require-cold-jit",
+        action="store_true",
+        help=(
+            "require empty residency before the self-test, an authoritative "
+            "cold admission, and empty residency after its requested unload"
+        ),
+    )
+    parser.add_argument(
         "--require-lmstudio-adoption",
         metavar="ALIAS",
         help=(
@@ -1936,6 +2357,14 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--exercise-fleet-participation",
+        action="store_true",
+        help=(
+            "require an idle local pause/rejoin cycle, restore the exact prior "
+            "preference, and prove model/runtime/storage configuration unchanged"
+        ),
+    )
+    parser.add_argument(
         "--require-login-cycle-baseline",
         type=Path,
         metavar="REPORT",
@@ -1960,10 +2389,13 @@ def main() -> int:
         or args.require_vision
         or args.require_protected_model
         or args.require_download_lifecycle
+        or args.require_pilot_install_storage
+        or args.require_cold_jit
         or args.require_lmstudio_adoption
         or args.require_omlx_recovery
         or args.require_runtime_lifecycle
         or args.require_guided_setup
+        or args.exercise_fleet_participation
         or args.require_login_cycle_baseline
     ):
         args.require_live = True
@@ -1974,6 +2406,10 @@ def main() -> int:
     if args.require_postgres_drain:
         if not args.self_test:
             parser.error("--require-postgres-drain requires --self-test")
+    if args.require_pilot_install_storage is not None and not args.self_test:
+        parser.error("--require-pilot-install-storage requires --self-test")
+    if args.require_cold_jit and not args.self_test:
+        parser.error("--require-cold-jit requires --self-test")
     if (args.expected_engine or args.require_vision) and not args.self_test:
         parser.error("--expected-engine and --require-vision require --self-test")
     if args.text_only and args.require_vision:
@@ -2079,10 +2515,13 @@ def main() -> int:
                 exercise_reconcile=args.exercise_reconcile,
                 require_protected_model=args.require_protected_model,
                 require_download_lifecycle=args.require_download_lifecycle,
+                require_pilot_install_storage=args.require_pilot_install_storage,
+                require_cold_jit=args.require_cold_jit,
                 require_lmstudio_adoption=args.require_lmstudio_adoption,
                 require_omlx_recovery=args.require_omlx_recovery,
                 require_runtime_lifecycle=args.require_runtime_lifecycle,
                 require_guided_setup=args.require_guided_setup,
+                exercise_fleet_participation=args.exercise_fleet_participation,
                 login_cycle_baseline=args.require_login_cycle_baseline,
             )
             if args.live

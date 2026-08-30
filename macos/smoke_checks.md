@@ -60,6 +60,7 @@ python3 macos/packaging/collect_acceptance.py \
   --require-vision \
   --require-protected-model \
   --require-download-lifecycle \
+  --exercise-fleet-participation \
   --require-postgres-drain \
   --output "$HOME/Desktop/unified-inference-restart-acceptance.json"
 ```
@@ -98,6 +99,14 @@ downloaded-weight registration retry without another download, completed
 history dismissal, exact revision pinning, and managed deletion. An upgraded
 database receives only a `snapshot` event, which is deliberately insufficient
 to clear transitions that were not observed by this candidate.
+The participation exercise refuses to mutate an active node, performs an idle
+pause/rejoin cycle, restores the exact initial joined/paused preference, and
+proves the model/runtime/storage configuration did not change. The later
+stream-drain scenario remains necessary because an idle exercise cannot prove
+lease preservation during a live response. Disable Hub dispatch to this Mac or
+otherwise quiesce it before running the collector: the baseline read and pause
+are separate requests, so a request racing between them makes the exercise
+fail while its ordinary drain lease remains intact.
 
 ## 1. Configuration and listeners
 
@@ -107,7 +116,7 @@ uv run --project macos/service mnemosyne-macos --check-config \
   --env "$HOME/Library/Application Support/Mnemosyne/.env"
 lsof -nP \
   -iTCP:1240 -iTCP:17321 -iTCP:17322 -iTCP:17323 \
-  -iTCP:17324 -iTCP:17325 -iTCP:17326 -iTCP:17327 \
+  -iTCP:17324 -iTCP:17325 \
   -sTCP:LISTEN
 ```
 
@@ -116,8 +125,9 @@ loopback-only. In the default **This Mac only** mode, `1240` is loopback-only;
 with **Allow connections from the local network** enabled, only `1240` may
 listen on `0.0.0.0`. The control listener on `17321` stays loopback-only. oMLX
 owns `17322` when that optional engine is enabled.
-Manager-owned DS4, MFLUX, llama.cpp, mlxcel, and mistral.rs should be absent
-from `17323` through `17327` while unloaded. LM Studio is not part of the inference
+Manager-owned DS4, MFLUX, and llama.cpp should be absent from `17323` through
+`17325` while unloaded. Ports `17326` and `17327` are no longer engine
+listeners. LM Studio is not part of the inference
 topology. The previous token sidecar is not required in the inference path.
 
 With every configured engine empty, confirm both status and the aggregate model
@@ -150,8 +160,10 @@ Preview rather than Stable.
 
 ### Fleet snapshot and bounded admission
 
-Set different values for `INFERENCE_API_KEY` and `FLEET_API_KEY` in the private
-`.env`, restart the service, and verify the fleet credential boundary:
+Set different values for `INFERENCE_API_KEY`, `FLEET_API_KEY`, and
+`FLEET_INFERENCE_API_KEY` in the private `.env`, restart the service, and
+verify the Fleet credential boundary. Use a canonical test route UUID for the
+dispatch-only checks:
 
 ```bash
 curl -si http://127.0.0.1:1240/fleet/v1/snapshot
@@ -159,15 +171,54 @@ curl -si http://127.0.0.1:1240/fleet/v1/snapshot \
   -H "Authorization: Bearer $INFERENCE_API_KEY"
 curl -s http://127.0.0.1:1240/fleet/v1/snapshot \
   -H "Authorization: Bearer $FLEET_API_KEY" | jq
+curl -si http://127.0.0.1:1240/v1/models \
+  -H "Authorization: Bearer $FLEET_INFERENCE_API_KEY"
+curl -si http://127.0.0.1:1240/v1/models \
+  -H "Authorization: Bearer $FLEET_INFERENCE_API_KEY" \
+  -H 'X-Mnemosyne-Fleet-Route: aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
 ```
 
 The first two calls must return `401`; the third must return schema version 1
 without a credential, DSN, absolute model path, storage root, or bookmark.
+The unmarked dispatch-key request must return `401`, while the marked request
+must authenticate. Repeat the marked request with `INFERENCE_API_KEY` and
+confirm it returns `401` when the dedicated dispatch key is configured.
 Successive snapshots must retain `node.node_id` and `node.instance_id` while
 increasing `snapshot_sequence`. Restarting the service must change only the
 instance ID. A managed install pinned to a 40–64 hex Hub revision must be
 `fleet_eligible`; a Finder/manual profile or symbolic revision must be
 `unverified` and ineligible.
+
+Check the durable local participation surface before and after a service
+restart:
+
+```bash
+curl -s -u "admin:${ADMIN_PASSWORD}" \
+  http://127.0.0.1:17321/manager/fleet/participation | jq
+curl -s -u "admin:${ADMIN_PASSWORD}" \
+  -X PUT http://127.0.0.1:17321/manager/fleet/participation \
+  -H 'Content-Type: application/json' \
+  -d '{"enabled":false}' | jq
+```
+
+The initial state for an existing installation must be `joined`; after the
+PUT it must be `paused` when no Fleet work is active. The authenticated v1
+snapshot must retain its exact schema while reporting `health.accepting=false`,
+`diagnostic_code=fleet_participation_paused`, root/deployment available
+capacity zero, and every deployment `loadable=false`. Restart the service and
+confirm the preference remains paused.
+
+While paused, send one request with the node inference credential and a valid
+canonical UUID `X-Mnemosyne-Fleet-Route`; it must receive the pre-work
+`429 node_busy` proof without loading a model. Send the same request without
+that internal header; local inference must still succeed. Resume with
+`{"enabled":true}` and confirm the snapshot becomes accepting again without a
+model download or storage/configuration change.
+
+Repeat the pause while a long Fleet stream is active. State must become
+`draining`, the existing stream must finish with its model lease intact, a new
+Fleet-marked request must be refused, and state must become `paused` only after
+`active_requests` reaches zero. Usage-outbox delivery must continue throughout.
 
 For the Nyx rollout, change only `server.inference_bind` from loopback to the
 Mac's trusted LAN or Tailscale address, leave `server.control_bind` on
@@ -293,7 +344,7 @@ fail-closed ownership/port error and never signals that process.
 ## 4. Managed Hugging Face downloads
 
 In **Settings → Model Library**, search once and confirm llama.cpp, oMLX, DS4,
-MFLUX, mlxcel, and mistral.rs candidates share one result list with explicit engine-support badges;
+and MFLUX candidates share one result list with explicit engine-support badges;
 there must be no engine tabs or picker. Choose a llama.cpp GGUF repository and
 confirm Download remains disabled until an exact quant/shard set is selected.
 Confirm Hugging Face YAML front matter is absent, Markdown headings/lists/links

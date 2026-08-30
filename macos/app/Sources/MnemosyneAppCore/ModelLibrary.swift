@@ -72,6 +72,7 @@ public struct LibraryModel: Codable, Equatable, Identifiable, Sendable {
     public let resolvedRevision: String?
     public let requiresFileSelection: Bool?
     public let family: String?
+    public let releaseTier: String?
     public let recommendedMemoryGb: Int?
     public let installable: Bool?
     public let suggestedRole: ModelRole?
@@ -132,11 +133,14 @@ public struct ModelInstall: Codable, Equatable, Identifiable, Sendable {
     public let updatedAt: Double
 
     public var isActive: Bool {
-        status == "queued" || status == "downloading" || status == "registering"
+        status == "preparing"
+            || status == "queued"
+            || status == "downloading"
+            || status == "registering"
     }
 
     public var canRetry: Bool {
-        ["failed", "cancelled", "partial", "downloaded"].contains(status)
+        ["preparing", "failed", "cancelled", "partial", "downloaded"].contains(status)
     }
 
     public var canDismiss: Bool {

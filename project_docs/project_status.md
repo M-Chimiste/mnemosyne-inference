@@ -1,6 +1,6 @@
 # Mnemosyne Inference — Project Status
 
-**Last updated:** 2026-08-27
+**Last updated:** 2026-08-30
 
 ## Current state
 
@@ -33,6 +33,208 @@ are present. LAN/Tailscale deployment on Nyx and representative simultaneous
 Mac/CUDA hardware evidence remain release gates; see
 [fleet acceptance](fleet_acceptance.md).
 
+Mac-first pool hardening is now an active follow-on milestone. Several
+non-breaking foundations are implemented:
+
+- each Mac has a durable local **Contribute this Mac to the pool** join/pause
+  control whose Fleet-only leases drain complete streams while local inference,
+  downloads, JIT residency policy, usage delivery, and exact storage choices
+  remain unchanged;
+- Nyx enrollments have Hub-owned `primary`, `opportunistic`, and `overflow`
+  service classes evaluated before warm/cold tiers, so an independently
+  isolated limited Nyx worker can remain overflow-only instead of winning
+  merely because it is warm;
+- optional Hub-side pairing APIs now cover bounded invitation, claim,
+  approval/rejection, claim-bound credential provisioning, pinned non-loading
+  activation, explicit enable/disable, revocation, encrypted private secrets,
+  restart reconciliation, and paired dynamic registry membership while
+  preserving static-node compatibility; and
+- the Mac service has a durable pairing journal, atomic private credential
+  ownership, staged-versus-active Fleet authentication, a secret-free status
+  route, and a path-free Fleet-marked activation catalog. Pairing-state failure
+  leaves ordinary local inference available.
+
+Pairing stays disabled by default and its routes are absent in that mode. The
+production ceremony starts a new enrollment Hub-disabled and requires a
+separate admin enable after activation. The current Swift app drives the
+invitation/claim/provisioning/activation begin/resume ceremony with a
+memory-only invitation secret, shows secret-free status, protects pairing-owned
+credential fields, controls temporary participation, and now provides a
+separately confirmed **Remove this Mac from Hub** action plus exact-request
+**Retry Removal** recovery. Routine rotation, remote administrator-to-Mac
+notification, adopt-static cutover, signed-artifact evidence, and multi-host
+acceptance remain open.
+
+Mac-initiated self-revocation now commits a secret-free fence for the exact
+client attempt, invitation, pairing, generation, credential-bundle fingerprint,
+and request ID before contacting Nyx. That fence closes snapshot and dispatch
+admission immediately and after restart. Once Nyx has committed the revoke,
+retries finish the local tombstone and removal of only the exact pairing-owned
+snapshot, dispatch, and management credentials without contacting Nyx again;
+changed or static credentials are refused rather than deleted. Malformed,
+oversized, redirected, and otherwise ambiguous post-dispatch responses retain
+the exact retry ID and denial fence. A proven terminal rejection retires that
+request before reopening unchanged authority.
+
+The completed reset accepts only the exact credential-free `REVOKED` tombstone
+bound to the prior `COMPLETE` client attempt and endpoint fingerprints; missing
+or corrupt tombstone fields and the impossible combination of a pending revoke
+journal with local `REVOKED` state fail closed. A bounded retired-authority
+history prevents stale request IDs, the old invitation or pairing ID, and the
+exact old credential bundle from being restored by a later ceremony. It stores
+only the credential fingerprint, never bearer values, and checks capacity
+before latching or sending. The loopback control route and Swift confirmation
+never invoke model cleanup or lifecycle execution: local models, exact
+configured weight paths, inference profiles, local inference, token history,
+and the durable usage outbox remain unchanged. A completed revoke can be
+re-enrolled only through a different invitation; the reset preserves the
+stable reporting identity and prior per-device accounting continuity.
+
+The separate `MacInventory`/`DesiredInstall` v1 schemas and cross-component
+golden fixtures have landed without changing frozen snapshot v1. Native Macs
+now produce path-free inventory with durable opaque storage/installation IDs
+and send exact retryable observations through the pairing-management role;
+Nyx persists them behind restart/replay/generation/revocation fences and
+exposes an authenticated administrative inventory view. A signed catalog
+verifier/last-known-good store, strict HTTPS update client, failure-isolated
+Fleet lifecycle, bounded admin metadata API, and deterministic explainable
+Mac-by-storage placement API are implemented behind independent default-off
+switches. The placement caller supplies only intent; Nyx stamps identity/time,
+resolves signed recipe facts, returns every inventory-backed Mac/storage
+candidate, and never selects a target or issues a job. Route-correlated
+exactly-once accounting reuses Fleet's route UUID as the serving Mac's durable
+event ID.
+
+The Hub-side DesiredInstall v1 authority is implemented behind that same
+hard-default-off switch. An administrator must submit one exact advisory
+Mac×storage basis; Nyx re-resolves the signed recipe and recomputes current
+placement before creating a path-free job in a separate bounded private SQLite
+journal. Exact idempotency replay/conflict, restart recovery, expiry,
+revision-fenced cancellation, authenticated outbound-sync delivery, monotonic
+acknowledgements, and pairing/catalog/service-instance/storage-generation
+fences are covered by Fleet tests. The unified Fleet dashboard now exposes
+bounded, escaped, secret-free Mac hardware, participation/service class,
+opaque storage inventory, installed/cold/warm model state, signed recipes,
+placement explanations, explicit Mac/storage selection, and job progress.
+Nyx still has no path, bookmark, downloader, runtime, cleanup, or inference
+authority.
+
+The selected-Mac executor is integrated with the existing native installer. It
+independently revalidates the current pairing generation, service instance,
+catalog digest and signature, recipe/artifact contract, opaque storage binding,
+free space, cancellation, and exact destination before downloading. It
+preserves the owner's lexical nested/symlink storage folder, volume UUID,
+scope/bookmark, engine-specific destination, and provenance; downloads remain
+residency-neutral and completed registrations enter the existing cold-model/JIT
+path. Hidden-inclusive install rows retain exact signed launch contracts.
+Catalog artifact roles support one exact GGUF primary, a complete shard set,
+and one optional selected vision projector; missing, extra, mixed, duplicated,
+or ambiguous layouts fail closed. DS4 remains projector-free and single-node.
+
+Exact lexical weight location is also a tested registration invariant, not
+just a placement preference. Automated coverage carries a user-selected nested
+symlink spelling through opaque storage resolution, the download destination,
+cold registration, JIT inference/accounting, and in-place legacy adoption
+without resolving it to the physical target, copying weights, or falling back
+to the default model folder. Registration reloads current Settings and requires
+the same storage name, lexical root and destination, volume UUID, scope ID, and
+revision recorded by the durable creation authority or current download
+attempt. Rebinding any of them leaves the bytes at the original lexical
+location, registers no profile, launches no fallback download, and remains
+fail-closed across restart. A legacy post-download row with neither a durable
+creation claim nor the originating process's binding snapshot also fails
+closed on registration retry; it cannot infer authority from current Settings
+or adopt a replacement volume/scope, and its downloaded weights are retained.
+
+For signed managed oMLX recipes, the native manager uses authenticated GET-only
+inspection to prove the externally owned service's exact scheduler slots and
+required prefill memory guard before registration, request resolution, adapter
+load/benchmark work, and every fresh Fleet snapshot. It never changes those
+service-global settings as an install side effect. Post-install drift leaves
+the alias visible but unverified, non-loadable, zero-capacity, and Fleet-
+ineligible while unrelated models and node health remain available.
+The binding is recovered from hidden install history on restart. If a later
+install-journal index read fails, the runtime reuses only its last successful
+classification for each exact unchanged oMLX target; unknown/changed targets
+fail closed, and a signed target cannot become an unconstrained ordinary one.
+
+The native installer also has additive local-only asset provenance keyed by
+its immutable installation UUID. Historical rows and downloads into a
+pre-existing unowned destination remain `managed_download` / `unknown`. A new
+download into an absent app-created exact destination can become
+`exclusive_managed` only after a separate complete canonical manifest proves
+the creation claim, selected payload, directory identity, and live storage
+binding. Native model cleanup now accepts an optional canonical installation
+ID and grants managed cleanup only to the exact eligible row after profile,
+live opaque storage binding, overlap, and exact regular-file manifest checks.
+It revalidates that manifest in the bundled helper immediately before moving
+the exact destination to macOS Trash, preserves provenance, and marks only that
+row `trashed`; it never permanently removes the directory. Legacy payloads
+retain fresh-scan imported llama.cpp/oMLX cleanup but cannot downgrade matching
+hidden-inclusive managed history into that path. Per-model cleanup now uses a
+crash-resume journal across Trash, SQLite, and config commits.
+
+The native **Migration & Removal** page provides all three retention previews
+and fresh-confirmation journal-only preparation. Exact paths exist only in a
+private mode-0600 manifest; API/UI responses expose fixed component
+dispositions and counts. Pending usage outbox state blocks state-removing
+modes. A separate primitive-free lifecycle executor core models observed,
+restart-safe uninstall/migration/rollback phases, exact exclusive-weight Trash
+proofs, a product-wide execution claim, monotonic rollback intent, and durable
+manual recovery. An expired or abandoned claim is never stolen: it blocks all
+lifecycle work pending authenticated recovery. Production execution remains
+inert until a signed authenticated bundled helper implements the closed effect
+and recovery protocol and passes credentialed Mac acceptance.
+
+Production catalog signing/publication, live model entries and trust anchors,
+the authenticated lifecycle helper and execution ceremony, routine pairing
+rotation/static-adoption cutover, remote revocation notification, Developer
+ID/notarized distribution, and representative multi-Mac Apple Silicon
+acceptance are not release-complete.
+No catalog entry for a frontier model may ship until its exact weights, runtime
+fingerprint, hardware class, context/capacity contract, and post-install
+inference evidence pass. None of those remaining paths may centralize or
+relocate weights:
+existing exact lexical folders, nested external volumes, volume identities,
+bookmarks, imported/shared ownership, and explicit per-install destinations
+remain release-blocking non-regression surfaces. The complete target and gates
+are tracked in [Mac pool architecture](mac_pool_architecture.md),
+[pairing protocol](fleet_pairing_protocol.md), and
+[Mac pool acceptance](mac_pool_acceptance.md).
+
+The Mac-first setup and release-evidence surface now has four additional
+bounded pieces. Model Library derives an advisory runtime preparation plan
+from the selected model and exact DS4 channel, can hand off only to the
+official oMLX DMG or the fixed Apple Command Line Tools dialog, and requires a
+draft engine-enable change to be saved before offering restart. Those Apple
+tool probes have a 15-second deadline and terminate/reap only their exact child.
+Weight downloads remain separate, cold, residency-neutral, and bound to the
+unchanged Download-to storage key. The compatibility catalog has an offline
+encrypted-Ed25519 key/sign/assemble/verify ceremony with multi-signer rotation
+and prior-sequence fencing, but no production key, anchor, endpoint, or live
+recipe was added. Lifecycle owner authorization is now requested only through
+the authenticated service `/authorization/perform` route; the obsolete menu
+socketpair launcher is removed and the bootstrap pins the bundled helper path.
+Because no OS-backed proof authority or effects runner exists, production
+fails before helper spawn and execution remains unavailable. Finally, the live
+acceptance collector can exercise an idle participation pause/rejoin, restore
+the exact prior joined/paused preference, and prove the model/runtime/storage
+configuration is unchanged without exporting local paths. It must run while
+Hub dispatch is quiesced because the baseline read and update are separate
+requests.
+
+The lifecycle preparation audit now also binds a migration candidate to the
+exact installed predecessor identity, signing Team, independently enumerated
+candidate bundle inventory, and a non-overlapping lexical tree. The durable
+effect journal validates one closed forward/rollback graph in order across
+restart, but this is only a fail-closed validation fence: the production
+helper cannot emit an owner proof and the runner implements no OS effect. The
+credentialed design therefore requires a nested app-like helper with its own
+profile-authorized Keychain identity and a non-exportable Secure Enclave P-256
+key gated by macOS user presence. No migration/uninstall authority may move,
+rewrite, or delete a retained model path; full removal may eventually Trash
+only an explicitly selected, freshly re-proved exclusive-managed payload.
+
 An isolated native macOS track is implemented, with frontier text-engine,
 protected-storage, and migration-soak acceptance still pending. It lives
 entirely below `macos/`, replaces the previous sidecar on `1240`, uses
@@ -46,10 +248,11 @@ the CUDA image or its `8000-8002` topology. The first implementation includes:
   manager-owned DS4/MFLUX subprocesses; LM Studio engine, credential, and
   inventory support has been removed, leaving only read-only model-directory
   migration hints;
-- packaged MFLUX discovery, installation, smoke checks, and worker launch retain
-  the relocatable image interpreter's required `PYTHONHOME` only when that
-  exact bundled interpreter is selected, while continuing to strip inherited
-  Python paths from external runtimes;
+- packaged MFLUX discovery, installation, smoke checks, and worker launch use
+  the exact relocatable image interpreter. The production bootstrap discards
+  all ambient `PYTHON*` controls, installs only its bundled `PYTHONHOME` and
+  closed source paths, disables user-site/unsafe-path loading, and ignores the
+  development interpreter override whenever an embedded runtime exists;
 - fresh native configuration starts with an empty model catalog so profiles
   come only from Model Library downloads or Finder-confirmed exact locations;
 - OpenAI/Responses/Anthropic usage normalization plus an atomic SQLite
@@ -90,9 +293,10 @@ the CUDA image or its `8000-8002` topology. The first implementation includes:
   retaining exception text; and
 - independent setup, architecture, and Apple Silicon smoke documentation.
 
-The native track now also has additive Preview adapters for mlxcel and
-mistral.rs. Both reuse strict manager-owned process identity and keep their
-upstream installation external. Schema-v5 model profiles retain their original
+The native track previously added Preview adapters for mlxcel and mistral.rs.
+They are now retired from the product surface: legacy schema-v6 engine and
+profile values remain readable but are always inert, and upgrades retain their
+external installations and model weights. Schema-v5 model profiles retain their original
 engine as the fixed fallback, may attach one exact candidate per additional
 engine, can pin a user-selected engine when quality should override speed, and
 can opt into durable content-free benchmark selection. Automatic routing
@@ -119,8 +323,8 @@ a guided Setup & Health flow, bounded secret-redacted readiness, real public
 listener self-tests with durable usage verification, Stable/Preview engine
 tiers, Sparkle integration, and separate CI/signed-release workflows. The
 Python schema, packaged YAML, and Swift defaults now agree: llama.cpp is
-enabled, external oMLX remains off until configured, and Preview DS4, MFLUX,
-mlxcel, and mistral.rs are opt-in. The build-47 private DMG was rejected after
+enabled, external oMLX remains off until configured, and Preview DS4 and MFLUX
+are opt-in. The build-47 private DMG was rejected after
 installation because dyld
 could not resolve its packaged Sparkle framework. Corrected build 50 adds the
 `Contents/Frameworks` rpath and is independently verified against the
@@ -279,15 +483,14 @@ see
 - The native app bundle contains separate `framework-mnemosyne-base` and
   `framework-mnemosyne-image` export layers plus separate service/worker
   source trees. No MLX runtime is added to Docker.
-- The native Runtime Updates page detects llama.cpp, oMLX, MFLUX, DS4, mlxcel,
-  and mistral.rs versions. For oMLX it selects the official DMG matching the host macOS
+- The native Runtime Updates page detects llama.cpp, oMLX, MFLUX, and DS4
+  versions. For oMLX it selects the official DMG matching the host macOS
   version, detects the app, CLI shim, conventional Homebrew paths, or running
   server, and delegates updates to oMLX. A missing oMLX runtime can instead be
   installed through an approval-gated, argument-bounded stable Homebrew
   action. llama.cpp comes from its official
   GitHub arm64 artifact, MFLUX installs from its official PyPI project, and DS4
-  builds from an exact official GitHub commit. mlxcel and mistral.rs retain
-  externally owned official upgrade paths. Managed updates stage
+  builds from an exact official GitHub commit. Managed updates stage
   independently, activate through the global-empty maintenance barrier, and
   retain the previous version for rollback without a repository-owned feed.
 - The native coordinator now reads oMLX's authoritative concurrent-request
@@ -377,7 +580,9 @@ see
   retried without downloading the model again. The native GUI renders
   transferred/total bytes, percentage, progress, and smoothed transfer speed.
   Hiding completed history preserves internal managed-download provenance.
-  Managed cleanup is restricted to the exact app-owned destination. A
+  Managed cleanup requires the exact installation UUID plus immutable
+  exclusive-ownership and current storage-binding proof, revalidates the exact
+  regular-file manifest, and moves the whole destination to Trash. A
   llama.cpp or oMLX import can be cleaned up only after a fresh bounded scan
   uniquely rediscovers its payload under the registered storage, at which
   point the exact imported paths move to the macOS Trash. Root, escape,
@@ -707,23 +912,69 @@ see
 
 ## Verification
 
-Latest host verification on 2026-07-23:
+Latest Mac-first host verification on 2026-08-30:
 
-- CUDA manager regression suite: `393 passed` with one dependency deprecation
-  warning.
-- Native service suite: `261 passed` on the target host; the two real-bookmark
-  checks skip rather than fail in restricted runners.
-- Isolated MFLUX worker suite: `23 passed` with native Metal access.
-- Runtime-packaging suite: `7 passed` plus 3 subtests; the committed locks
-  validate 27 exact service pins and 107 exact image-worker pins for the
-  relocatable CPython 3.12 runtime.
-- CUDA admin UI: `11 passed`; the production Vite build completed.
-- All `50` Swift tests passed. The production targets built, the complete
-  `Unified Inference.app` staged with
-  that runtime, all three plists passed `plutil`, and deep strict code-signing
-  verification passed for the ad-hoc development bundle.
-- Native and CUDA Python modules passed bytecode compilation, both shell
-  entrypoints passed `bash -n`, and `git diff --check` passed.
+- Native service suite: `1130 passed, 2 skipped`, including all adapters, routes, JIT
+  residency, full-stream leasing, usage accounting, pairing, inventory,
+  selected-node installs, exact storage bindings, and inert lifecycle work.
+- Dedicated inference/storage non-regression slice: `29 passed`, including all
+  six current Mac engines and nested external/symlink lexical destinations
+  with no default-location fallback, storage-rebind laundering, or stale retry
+  transition.
+- Nyx Fleet suite: `381 passed`; cross-component catalog, inventory,
+  DesiredInstall, catalog-ceremony, and live-acceptance contracts: `127 passed`.
+- Isolated MFLUX worker suite: `23 passed`; Swift app suite: `152 passed`;
+  packaging logic: `72 passed` (plus 3 subtests).
+- The complete ad-hoc `Unified Inference 0.9.0 (66)` app was rebuilt from the
+  final sources. The isolated packaged verifier and secret-redacted acceptance
+  collector passed and it contains zero `.pyc` or `.pyo` files. The canonical
+  arm64 pilot DMG passed disk-image and artifact acceptance with SHA-256
+  `edbc25194c1432fd4146451790f9332fec0132e1893d92d0e2940a5a9a9f0724`.
+  The mounted image also proves both executable pilot lifecycle assistants are
+  present and syntactically valid.
+  The nested lifecycle-helper wrapper is present, but no provisioning profile,
+  OS-backed proof authority, or effects runner is enabled. This is development
+  evidence only: it has no Team Identifier, hardened runtime, or timestamp and
+  does not satisfy Developer ID, notarization, LocalAuthentication, update, or
+  representative-hardware gates. The bounded Mac pilot scope is documented in
+  [macOS pilot](../macos/PILOT.md).
+- Release version/lock checks passed for 35 exact service pins and 107 exact
+  image-worker pins; `git diff --check` passed.
+- A real existing-Mac upgrade on Theseus moved the ad-hoc build 61 app to
+  Trash, installed build 66 at the canonical path, refreshed the exact
+  Service Management registration to build 66 on a new PID, and retained the
+  exact `.env` inode and SHA-256 plus the existing config, SQLite database,
+  storage/model locations, and usage history. The first attempt exposed an
+  incompatible incomplete lifecycle-v2 journal; build 66 now reads that
+  legacy recovery record without allowing the current planner to emit its old
+  destructive retention contract. The accepted post-upgrade live report then
+  cold-loaded oMLX, returned 110 tokens, unloaded, committed exactly one new
+  local usage row under node `theseus`, and drained the Postgres outbox to
+  zero. The recoverable uninstall assistant was also proved to refuse while
+  the exact service remains registered; no uninstall or weight removal was
+  performed on Theseus.
+- The acceptance collector now has a separate pilot install/storage gate. It
+  proves that the self-tested alias's newest install completed at the named
+  configured storage, stayed beneath the exact lexical root without resolving
+  symlinks, pinned a revision, recorded complete bytes and the registration
+  transition, and rejects a rebound destination. It does not require the
+  destructive download-lifecycle/deletion exercise.
+- Strict pilot evidence also requires a genuinely cold coordinator admission:
+  the self-test reports the actual bounded performance sample's `cold_start`
+  classification, while the collector independently proves empty residency
+  before the request and again after the requested unload.
+- The earlier staged build-64 embedded Python/service runtime was also launched
+  directly on Theseus with isolated temporary state, every engine disabled,
+  and alternate loopback ports. Both HTTP planes returned version 0.9.0, the
+  coordinator was initialized, idle, and accepting with zero leases/queue, and
+  the temporary process and state were removed afterward. This proves packaged
+  runtime bootability without modifying the installed build 61, but it is not
+  a substitute for build-64 clean-install or real-model evidence.
+
+The most recent CUDA-only host verification remains the 2026-07-23 baseline:
+the manager suite had `393 passed` with one dependency deprecation warning, the
+CUDA admin UI had `11 passed`, and its production Vite build completed. CUDA
+workstation validation is deliberately outside the current Mac-first scope.
 
 Workstation/GPU smoke validation is still outstanding:
 

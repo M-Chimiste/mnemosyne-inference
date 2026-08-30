@@ -17,10 +17,19 @@ read-only discovery hint.
 - llama.cpp and oMLX are the V1 Stable language engines. DS4 and MFLUX remain
   clearly labeled Preview while their remaining hardware acceptance checks are
   completed.
-- Preview mlxcel and mistral.rs adapters add two isolated native Apple Silicon
-  language paths without changing existing fixed profiles. They use strict
-  manager-owned child-process identity while their official Homebrew/installer
-  binaries remain externally owned and independently upgradeable.
+- The macOS engine surface is consolidated to llama.cpp, oMLX, DS4, and MFLUX.
+  Existing mlxcel and mistral.rs settings and profiles remain upgrade-readable
+  but inert; the app does not launch them, advertise them, or delete their
+  external installations or model weights.
+- The reusable Mac product calls its pooling coordinator the **Hub** throughout
+  enrollment, invitations, approval, removal, routing, downloads, and
+  credential guidance. Nyx remains only the name of this deployment's host;
+  it is not baked into the operator-facing pairing experience.
+- The menu-bar pool participation control uses the native macOS switch style
+  while retaining the same durable join, drain, pause, and rejoin behavior.
+- Fresh installations request both the inference LaunchAgent and menu-app login
+  registrations on first launch. Existing installations retain their choices,
+  and a later explicit disable is never automatically reversed.
 - A profile can attach one exact candidate per engine and opt into durable
   cross-engine selection. Repeated streamed samples rank first-token latency,
   throughput, or a balanced objective; stale, failed, marginal, or unapproved

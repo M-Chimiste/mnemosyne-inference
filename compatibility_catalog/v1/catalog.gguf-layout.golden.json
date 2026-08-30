@@ -1,0 +1,168 @@
+{
+  "schema_version": 1,
+  "catalog_digest": "sha256:4107f41778ceca58d980366cf53b4b9234f87263d1bfbc857bc601c554e654c8",
+  "catalog": {
+    "catalog_id": "mnemosyne-apple-silicon",
+    "catalog_version": "test-2026.08.2",
+    "catalog_sequence": 43,
+    "issued_at": 1787961600,
+    "expires_at": 1819497600,
+    "publisher": "mnemosyne",
+    "build_revision": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "logical_models": [
+      {
+        "logical_model_id": "example-flash-vnext",
+        "display_name": "Example Flash vNext",
+        "family": "example-flash",
+        "kind": "generation",
+        "capabilities": [
+          "chat/completions",
+          "messages",
+          "responses"
+        ],
+        "declared_max_context_tokens": 32768
+      }
+    ],
+    "artifacts": [
+      {
+        "artifact_id": "example-flash-vnext-gguf-q4",
+        "logical_model_id": "example-flash-vnext",
+        "format": "gguf",
+        "quantization": "Q4_K_M",
+        "source": {
+          "kind": "huggingface",
+          "transport": "https",
+          "registry": "huggingface.co",
+          "repository_id": "mnemosyne-tests/example-flash-vnext-GGUF",
+          "revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "files": [
+          {
+            "path": "example-flash-vnext-Q4_K_M-00001-of-00002.gguf",
+            "size_bytes": 450,
+            "sha256": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+          },
+          {
+            "path": "example-flash-vnext-Q4_K_M-00002-of-00002.gguf",
+            "size_bytes": 450,
+            "sha256": "sha256:5555555555555555555555555555555555555555555555555555555555555555"
+          },
+          {
+            "path": "mmproj-example-flash-vnext-f16.gguf",
+            "size_bytes": 100,
+            "sha256": "sha256:6666666666666666666666666666666666666666666666666666666666666666"
+          }
+        ],
+        "manifest_digest": "sha256:9061528462bf6e109cdd4937c3dfb68807255a41fda37ce1c0f64ed3ecb228bb",
+        "total_size_bytes": 1000,
+        "gguf_layout": {
+          "kind": "gguf-file-set",
+          "primary_file": "example-flash-vnext-Q4_K_M-00001-of-00002.gguf",
+          "required_shards": [
+            "example-flash-vnext-Q4_K_M-00002-of-00002.gguf"
+          ],
+          "selected_projector_file": "mmproj-example-flash-vnext-f16.gguf"
+        }
+      }
+    ],
+    "recipes": [
+      {
+        "recipe_id": "example-flash-vnext-llamacpp-q4",
+        "logical_model_id": "example-flash-vnext",
+        "artifact_id": "example-flash-vnext-gguf-q4",
+        "engine": "llama.cpp",
+        "capabilities": [
+          "chat/completions",
+          "messages",
+          "responses"
+        ],
+        "compatibility_tier": "experimental",
+        "context": {
+          "guaranteed_tokens": 8192,
+          "native_max_tokens": 32768,
+          "evidence": {
+            "evidence_class": "catalog_tested",
+            "evidence_id": "test-evidence-1",
+            "evidence_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+            "observed_at": 1787961600,
+            "expires_at": 1819497600
+          }
+        },
+        "memory": {
+          "weights_bytes": 1200,
+          "runtime_overhead_bytes": 200,
+          "activation_overhead_bytes": 300,
+          "kv_bytes_per_token_per_slot": 64,
+          "safety_headroom_bytes": 1024,
+          "max_recommended_concurrency": 2,
+          "estimate_class": "conservative",
+          "evidence": {
+            "evidence_class": "conservative",
+            "evidence_id": "test-memory-1",
+            "evidence_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+            "observed_at": 1787961600,
+            "expires_at": 1819497600
+          }
+        },
+        "hardware": {
+          "architecture": "arm64",
+          "soc_families": [
+            "apple-m1",
+            "apple-m2-pro"
+          ],
+          "minimum_gpu_cores": 8,
+          "minimum_unified_memory_bytes": 17179869184,
+          "minimum_macos": {
+            "major": 15,
+            "minor": 0
+          },
+          "maximum_macos_exclusive": {
+            "major": 27,
+            "minor": 0
+          },
+          "required_features": [
+            "metal",
+            "unified-memory"
+          ]
+        },
+        "runtime": {
+          "engine": "llama.cpp",
+          "release_tier": "preview",
+          "minimum_version": "b6000",
+          "maximum_version_exclusive": "b9000",
+          "known_bad_versions": [
+            "b6123"
+          ],
+          "allowed_runtime_fingerprints": [],
+          "known_bad_runtime_fingerprints": [
+            "sha256:4444444444444444444444444444444444444444444444444444444444444444"
+          ],
+          "required_features": [
+            "apple-metal",
+            "flash-attention"
+          ]
+        },
+        "launch": {
+          "engine": "llama.cpp",
+          "parallel_slots": 2,
+          "gpu_offload": "all",
+          "flash_attention": "automatic"
+        },
+        "evidence": {
+          "evidence_class": "catalog_tested",
+          "evidence_id": "test-evidence-1",
+          "evidence_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+          "observed_at": 1787961600,
+          "expires_at": 1819497600
+        }
+      }
+    ]
+  },
+  "signatures": [
+    {
+      "key_id": "test-catalog-2026-a",
+      "algorithm": "Ed25519",
+      "signature": "d5GwYINVIxusY3uLQnoGJMJOPYfhLjcxwbZxUiAS9OOUfE4VNzM2015VkZjNUer0y_oyoQYNm1hZR5FBURPSAw"
+    }
+  ]
+}

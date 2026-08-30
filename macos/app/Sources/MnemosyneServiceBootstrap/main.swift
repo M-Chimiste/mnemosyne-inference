@@ -53,16 +53,6 @@ private func outerContents(startingAt executable: URL) throws -> URL {
 
 private func bundledPython(in resources: URL) throws -> PythonRuntime {
     let fileManager = FileManager.default
-    if let override = ProcessInfo.processInfo.environment["MNEMOSYNE_PYTHON_OVERRIDE"] {
-        let url = URL(fileURLWithPath: override).standardizedFileURL
-        if fileManager.isExecutableFile(atPath: url.path) {
-            // A development override is commonly a virtualenv interpreter.
-            // Setting PYTHONHOME to a virtualenv breaks stdlib discovery, so
-            // leave its environment under the caller's control.
-            return PythonRuntime(executable: url, home: nil)
-        }
-    }
-
     let pythonRoot = resources.appending(path: "Python", directoryHint: .isDirectory)
     let direct = pythonRoot.appending(path: "bin/python3")
     if fileManager.isExecutableFile(atPath: direct.path) {
@@ -80,6 +70,18 @@ private func bundledPython(in resources: URL) throws -> PythonRuntime {
         let candidate = child.appending(path: "bin/python3")
         if fileManager.isExecutableFile(atPath: candidate.path) {
             return PythonRuntime(executable: candidate, home: child)
+        }
+    }
+
+    // A complete app must always select its sealed runtime, regardless of the
+    // caller's shell or launchctl environment. The override exists only so an
+    // intentionally bare development bundle can point at a virtualenv.
+    if let override = ProcessInfo.processInfo.environment["MNEMOSYNE_PYTHON_OVERRIDE"] {
+        let url = URL(fileURLWithPath: override).standardizedFileURL
+        if fileManager.isExecutableFile(atPath: url.path) {
+            // Setting PYTHONHOME to a virtualenv breaks stdlib discovery, so
+            // leave its environment under the development caller's control.
+            return PythonRuntime(executable: url, home: nil)
         }
     }
     throw BootstrapError.pythonNotFound(resources)
@@ -164,10 +166,22 @@ private func execPython() throws -> Never {
     let python = try bundledPython(in: resources)
     let paths = try prepareApplicationSupport(resources: resources)
     var environment = ProcessInfo.processInfo.environment
-    if environment["PYTHONHOME"] == nil, let pythonHome = python.home {
+    let usesBundledRuntime = python.home != nil
+    if let pythonHome = python.home {
+        // A signed production bundle must be independent of a user's shell,
+        // pyenv, Homebrew, or previous Mnemosyne installation. Remove every
+        // ambient Python control before defining the app-owned runtime below.
+        let ambientPythonKeys = environment.keys.filter { $0.hasPrefix("PYTHON") }
+        for key in ambientPythonKeys {
+            environment.removeValue(forKey: key)
+        }
+        environment.removeValue(forKey: "MNEMOSYNE_PYTHON_OVERRIDE")
         environment["PYTHONHOME"] = pythonHome.path
     }
     environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    environment["PYTHONNOUSERSITE"] = "1"
+    environment["PYTHONSAFEPATH"] = "1"
+    environment["PYTHONUTF8"] = "1"
     environment["MNEMOSYNE_MACOS_CONFIG_PATH"] =
         environment["MNEMOSYNE_MACOS_CONFIG_PATH"] ?? paths.config.path
     environment["MNEMOSYNE_MACOS_ENV_PATH"] =
@@ -175,6 +189,14 @@ private func execPython() throws -> Never {
     environment["MNEMOSYNE_FILE_TRASH_HELPER"] =
         environment["MNEMOSYNE_FILE_TRASH_HELPER"]
             ?? contents.appending(path: "MacOS/mnemosyne-file-trash").path
+    // Lifecycle authorization is service-mediated: never let an ambient
+    // LaunchAgent or shell value select a different helper peer. The helper
+    // independently verifies this sealed service Python through the bundled
+    // peer manifest before it reads the challenge.
+    environment["MNEMOSYNE_LIFECYCLE_HELPER"] =
+        contents.appending(
+            path: "Helpers/MnemosyneLifecycleAuthorization.app/Contents/MacOS/mnemosyne-lifecycle-helper"
+        ).path
     environment["PATH"] = environment["PATH"]
         ?? "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
@@ -183,7 +205,10 @@ private func execPython() throws -> Never {
         in: resources,
         layerName: "framework-mnemosyne-base"
     ))
-    if let existing = environment["PYTHONPATH"], !existing.isEmpty {
+    if !usesBundledRuntime,
+       let existing = environment["PYTHONPATH"],
+       !existing.isEmpty
+    {
         pythonPath.append(existing)
     }
     environment["PYTHONPATH"] = pythonPath.joined(separator: ":")
@@ -194,16 +219,21 @@ private func execPython() throws -> Never {
         .appending(path: "framework-mnemosyne-image", directoryHint: .isDirectory)
         .appending(path: "bin/python3")
     if fileManager.fileExists(atPath: imageSource.appending(path: "mnemosyne_mflux_worker").path) {
-        environment["MNEMOSYNE_MFLUX_PYTHONPATH"] =
-            environment["MNEMOSYNE_MFLUX_PYTHONPATH"] ?? imageSource.path
+        environment["MNEMOSYNE_MFLUX_PYTHONPATH"] = usesBundledRuntime
+            ? imageSource.path
+            : (environment["MNEMOSYNE_MFLUX_PYTHONPATH"] ?? imageSource.path)
     }
     if fileManager.isExecutableFile(atPath: imagePython.path) {
-        environment["MNEMOSYNE_MFLUX_PYTHON"] =
-            environment["MNEMOSYNE_MFLUX_PYTHON"] ?? imagePython.path
+        environment["MNEMOSYNE_MFLUX_PYTHON"] = usesBundledRuntime
+            ? imagePython.path
+            : (environment["MNEMOSYNE_MFLUX_PYTHON"] ?? imagePython.path)
     }
 
     var arguments = [
         python.executable.path,
+        "-B",
+        "-P",
+        "-s",
         "-m",
         "mnemosyne_macos.cli",
         "serve",

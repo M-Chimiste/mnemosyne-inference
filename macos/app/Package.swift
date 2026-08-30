@@ -17,6 +17,14 @@ let package = Package(
             name: "mnemosyne-file-trash",
             targets: ["MnemosyneFileTrash"]
         ),
+        .executable(
+            name: "mnemosyne-lifecycle-helper",
+            targets: ["MnemosyneLifecycleHelper"]
+        ),
+        .executable(
+            name: "mnemosyne-lifecycle-runner",
+            targets: ["MnemosyneLifecycleRunner"]
+        ),
     ],
     dependencies: [
         .package(
@@ -44,6 +52,23 @@ let package = Package(
         .executableTarget(
             name: "MnemosyneFileTrash",
             path: "Sources/MnemosyneFileTrash"
+        ),
+        .executableTarget(
+            name: "MnemosyneLifecycleHelper",
+            dependencies: ["MnemosyneAppCore"],
+            path: "Sources/MnemosyneLifecycleHelper",
+            linkerSettings: [
+                .linkedFramework("LocalAuthentication"),
+                .linkedFramework("Security"),
+            ]
+        ),
+        .executableTarget(
+            name: "MnemosyneLifecycleRunner",
+            dependencies: ["MnemosyneAppCore"],
+            path: "Sources/MnemosyneLifecycleRunner",
+            linkerSettings: [
+                .linkedFramework("Security"),
+            ]
         ),
         .testTarget(
             name: "MnemosyneAppCoreTests",

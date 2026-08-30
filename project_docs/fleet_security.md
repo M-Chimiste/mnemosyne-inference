@@ -1,15 +1,25 @@
 # Mnemosyne Fleet Security Review
 
-Status: implementation review checklist for Fleet protocol version 1.
+Status: implementation review checklist for Fleet snapshot/routing protocol
+version 1 and the implemented Hub-side pairing foundation. Production pairing
+still requires the signed Mac ceremony and multi-host acceptance identified in
+the pairing contract.
 
 ## Trust boundaries
 
-Fleet has four distinct trust boundaries:
+Static Fleet has four distinct trust boundaries:
 
 1. A client authenticates to the Nyx inference endpoint.
 2. Nyx authenticates separately to each node's read-only snapshot endpoint.
 3. Nyx authenticates separately to each node's inference endpoint.
 4. Nyx reads the token ledger through a read-only Postgres role.
+
+Optional dynamic pairing adds two more without collapsing the original four:
+
+5. A Mac claims and manages only its own pairing through the verified Hub
+   origin and its claim/management credential.
+6. A Fleet administrator approves, enables/disables, and revokes enrollments
+   through the existing admin-authenticated boundary.
 
 The browser talks only to Nyx. It never receives a node URL or credential and
 never connects directly to a node. Nyx does not receive node administrative
@@ -30,25 +40,76 @@ through DNS or MagicDNS is never enrolled automatically.
 - Accurate deployment identity, capacity, residency, and per-node token
   attribution.
 - Availability of each independently managed inference workstation.
+- Pairing invitation, locator, enrollment/generation, replay, and revocation
+  integrity, plus the encrypted Hub pairing store and its master key.
 
 ## Controls
 
 ### Enrollment and authentication
 
-- Nodes are enrolled explicitly by stable `node_id`, private base URL, and two
-  environment-backed credentials.
+- Static nodes are enrolled explicitly by stable reporting `node_id`, private
+  base URL, and two environment-backed credentials. Enabling pairing does not
+  rewrite or disable those records.
+- Paired Macs use an opaque Hub `pairing_id` for enrollment and revocation
+  ownership while preserving the reporting `node_id` used by snapshot v1 and
+  token history. They receive distinct snapshot, Fleet-only dispatch, and
+  pairing-management bearers from a claim-bound provisioning transaction.
 - `FLEET_API_KEY` protects only `GET /fleet/v1/snapshot`.
-- `INFERENCE_API_KEY` protects node `/v1/*` traffic.
-- A CUDA or native Mac node with Fleet discovery enabled but no
-  `INFERENCE_API_KEY` fails
+- On native Mac nodes, `FLEET_INFERENCE_API_KEY` protects Nyx-dispatched
+  `/v1/*` traffic and is accepted only with Nyx's canonical Fleet route
+  marker. The ordinary `INFERENCE_API_KEY` remains the local-client policy.
+  Existing static Mac enrollments and the deferred CUDA worker continue to use
+  the current `INFERENCE_API_KEY` contract until their explicit migration.
+- A node with Fleet discovery enabled but no effective enrolled inference
+  credential fails
   snapshot discovery closed with `fleet_inference_auth_unconfigured`; it
   never advertises capacity whose enrolled inference credential is ignored.
 - Nyx uses separate client and admin credentials.
 - Credential values must be unique across public, admin, and every enrolled
-  node role so compromise of one trust channel cannot authorize another.
-- Secrets are absent from TOML/YAML, SQLite route history, snapshot documents,
-  logs, dashboard payloads, and browser state returned by the service.
+  node role, plus the pairing master key, so compromise of one trust channel
+  cannot authorize another.
+- Paired locator and credential material is stored under authenticated
+  encryption in a private database separate from pairing metadata and Fleet
+  route history. The master key is environment-backed and never appears in
+  TOML or either database.
+- Secrets are absent from TOML/YAML, pairing metadata, SQLite route history,
+  snapshot documents, logs, dashboard/status payloads, and browser state
+  returned by the service. The one-time invitation response and exact
+  claim-bound provisioning response are the only intentional delivery
+  surfaces and are never returned by an admin listing.
 - Comparisons use constant-time helpers where the runtime provides them.
+
+### Pairing activation and dynamic membership
+
+- Pairing is disabled by default; when disabled its routes are not mounted and
+  static scheduling is unchanged.
+- Pairing payloads are strict, versioned, size-bounded, idempotent, and return
+  fixed public error codes without reflecting caller-controlled secrets or
+  topology.
+- Invitation claims are single-use, expire without restart extension, require
+  the exact admin-authorized normalized locator, and consume a bounded failed-
+  secret attempt budget.
+- Locator policy allows only configured transports, CIDRs, and ports and
+  rejects credentials, paths, query/fragment data, loopback/link-local/
+  multicast/unspecified targets, mixed allowed/denied DNS results, and changed
+  resolution. Redirect and ambient-proxy use is disabled.
+- Paired node clients connect only to a freshly policy-approved numeric peer.
+  HTTPS retains the original hostname for SNI and certificate verification,
+  and the socket peer must match the approved address before HTTP data is
+  written.
+- Activation uses only the candidate snapshot bearer and a reduced, path-free
+  Fleet-marked `GET /v1/models` probe. It rejects any residency change and
+  performs no download, load, or control-plane mutation.
+- The production flow activates Hub-disabled and requires a later explicit
+  admin enable. Pending, disabled, revoked, unreconciled, or stale paired
+  records are absent from new scheduling.
+- Dynamic registry replacement/deactivation is generation-fenced. Late polls
+  cannot republish a removed enrollment, and a restart requires a fresh
+  authenticated snapshot rather than trusting persisted observations.
+- The Mac pairing journal and private environment fail Fleet credentials
+  closed on inconsistent state without disabling local inference. Pairing-
+  owned Fleet credential fields are status-only in the current Swift settings
+  surface.
 
 ### Discovery and snapshots
 
@@ -135,6 +196,36 @@ through DNS or MagicDNS is never enrolled automatically.
 - Plain HTTP on an untrusted LAN exposes bearer tokens and inference content.
   Use Tailscale ACLs, a trusted isolated LAN, or TLS termination on both Nyx
   and nodes.
+- The implemented pairing slice is still bearer-based. It does not yet prove a
+  non-exportable device key or signed pairing transcript, and an unreachable
+  Mac may continue accepting an already-provisioned bearer until it receives
+  revocation or network policy blocks it. The signed app ceremony, recovery,
+  rotation, and representative hardware evidence remain release gates.
+- Enabling the Hub pairing API does not make the product workflow complete.
+  The Swift begin/resume ceremony is implemented but has not passed signed-
+  artifact and representative multi-host acceptance; keep new pairings Hub-
+  disabled until activation is proven and a separate administrator explicitly
+  enables routing.
+- Mac inventory production/sync and Hub persistence are implemented through
+  the distinct pairing-management credential. Signed-catalog update and
+  advisory placement are also implemented behind separate default-off
+  switches, local public-key trust anchors, strict HTTPS update coordinates,
+  admin authentication, no-store responses, and path-free protocol shapes.
+  They do not grant inference authority or filesystem access. The default-off
+  Hub DesiredInstall journal now issues only after an administrator supplies an
+  exact eligible advisory basis and Nyx recomputes every authority fence. Its
+  separate private database and outbound management-sync delivery retain only
+  fixed path-free identities, TTL/revision, delivery, and acknowledgement
+  state. Same-key/different-intent requests conflict; changed pairing
+  generation, service instance, catalog/recipe/artifact, or opaque storage
+  generation never retarget. Cancellation is stop-only and cannot request
+  cleanup or delete. The Hub inventory/placement UI and selected-Mac executor
+  are now present, but the Mac independently revalidates every path-free fence
+  and maps the opaque storage ID to its own exact local authority before using
+  the existing durable downloader. Nyx still cannot approve a runtime
+  mutation, observe a path/bookmark, register a profile directly, load a
+  model, or clean up files; do not expose a node control credential or raw path
+  as a shortcut.
 - Bearer credentials do not provide user-level attribution. Rotate them after
   suspected disclosure and use Nyx access logs outside this application when
   individual audit identity is required.
@@ -153,6 +244,16 @@ through DNS or MagicDNS is never enrolled automatically.
 
 ## Release checks
 
+- With pairing disabled, verify every pairing route is absent and existing
+  static nodes retain byte-for-byte scheduling/authentication behavior.
+- With pairing enabled, verify invitation/claim/provisioning secrecy,
+  idempotency, expiry and attempt bounds, encrypted-store reconciliation,
+  wrong-key/tamper failure, locator/peer pinning, Hub-disabled activation, and
+  generation-fenced dynamic registry removal.
+- Verify a pending credential can access only snapshot and the reduced
+  Fleet-marked non-loading model probe; normal Fleet inference requires an
+  active pairing, and ordinary local inference remains available in every
+  pairing/participation denial state.
 - Search every snapshot/dashboard fixture for absolute paths, credential
   values, DSNs, prompts, and outputs.
 - Verify snapshot access fails when `FLEET_API_KEY` is absent or wrong.
@@ -164,4 +265,9 @@ through DNS or MagicDNS is never enrolled automatically.
   refresh routable liveness.
 - Verify queue-full retry occurs only for the fixed pre-work error.
 - Verify a midstream disconnect produces no second node request.
+- Pairing, pause/join, disable, revoke, update, and uninstall-retention tests
+  must preserve every engine and inference route plus the exact selected model
+  folder spelling, nested/external volume binding, security-scope reference,
+  bookmark, install destination, and managed/imported/shared ownership. No
+  pairing or inventory operation may copy, move, centralize, or delete weights.
 - Run dependency and container/image scanning in the deployment environment.

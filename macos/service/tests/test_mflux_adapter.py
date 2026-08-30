@@ -147,6 +147,7 @@ async def test_official_pypi_runtime_layers_over_explicit_interpreter(
 
 @pytest.mark.asyncio
 async def test_worker_environment_isolated_from_service_python(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("PYTHONHOME", "/service/runtime")
@@ -154,7 +155,11 @@ async def test_worker_environment_isolated_from_service_python(
     monkeypatch.setenv("MNEMOSYNE_MFLUX_PYTHONPATH", "/image/worker/source")
 
     client = httpx.AsyncClient()
-    adapter = MFluxAdapter(MFluxConfig(enabled=True), client=client)
+    adapter = MFluxAdapter(
+        MFluxConfig(enabled=True),
+        client=client,
+        runtime_root=tmp_path / "runtimes",
+    )
     try:
         environment = adapter._environment()
         assert "PYTHONHOME" not in environment
@@ -165,6 +170,7 @@ async def test_worker_environment_isolated_from_service_python(
 
 @pytest.mark.asyncio
 async def test_packaged_worker_retains_bundled_pythonhome(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     image_python = "/Applications/Unified/Python/framework-mnemosyne-image/bin/python3"
@@ -174,7 +180,11 @@ async def test_packaged_worker_retains_bundled_pythonhome(
     monkeypatch.setenv("MNEMOSYNE_MFLUX_PYTHONPATH", "/image/worker/source")
 
     client = httpx.AsyncClient()
-    adapter = MFluxAdapter(MFluxConfig(enabled=True), client=client)
+    adapter = MFluxAdapter(
+        MFluxConfig(enabled=True),
+        client=client,
+        runtime_root=tmp_path / "runtimes",
+    )
     try:
         environment = adapter._environment()
         assert adapter._python() == image_python
@@ -257,6 +267,7 @@ async def test_scoped_worker_uses_service_launcher_then_isolated_image_python(
         MFluxConfig(enabled=True, python="/image/python"),
         client=client,
         spawn_process=spawn,
+        runtime_root=tmp_path / "runtimes",
         security_scope_root=tmp_path / "scopes",
         poll_interval_seconds=0,
     )

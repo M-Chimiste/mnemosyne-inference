@@ -16,6 +16,21 @@ class EngineName(StrEnum):
     MISTRAL_RS = "mistral.rs"
 
 
+ACTIVE_ENGINE_NAMES: tuple[EngineName, ...] = (
+    EngineName.LLAMA_CPP,
+    EngineName.OMLX,
+    EngineName.DS4,
+    EngineName.MFLUX,
+)
+"""The engines offered by current macOS installs and allowed to execute."""
+
+
+RETIRED_ENGINE_NAMES = frozenset(
+    {EngineName.MLXCEL, EngineName.MISTRAL_RS}
+)
+"""Legacy config values accepted only so an existing Mac can still upgrade."""
+
+
 ENGINE_RELEASE_TIER: dict[EngineName, str] = {
     EngineName.LLAMA_CPP: "stable",
     EngineName.OMLX: "stable",

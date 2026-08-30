@@ -8,10 +8,13 @@ import signal
 import stat
 import struct
 import sys
+import threading
+import time
 
 import httpx
 import pytest
 
+import mnemosyne_macos.runtime_updates as runtime_updates
 from mnemosyne_macos.config import DS4Config, MacConfig
 from mnemosyne_macos.engines.base import AdapterError, Deadline
 from mnemosyne_macos.engines.ds4 import (
@@ -29,6 +32,36 @@ async def test_default_ds4_client_ignores_ambient_proxies(tmp_path: Path) -> Non
     )
     try:
         assert adapter._client._trust_env is False
+    finally:
+        await adapter.aclose()
+
+
+@pytest.mark.asyncio
+async def test_glm53_load_requires_exact_managed_preview_runtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    adapter = DS4Adapter(
+        DS4Config(process_state_path=str(tmp_path / "ds4.json")),
+        runtime_root=tmp_path / "runtimes",
+    )
+    try:
+        target = _glm53_target()
+        assert await adapter.target_contract_eligible(target) is False
+        with pytest.raises(AdapterError, match="managed DS4 glm-5.3-flash"):
+            await adapter.load(target, deadline=Deadline.after(1))
+
+        managed = _glm53_managed_runtime(tmp_path / "managed")
+        monkeypatch.setattr(
+            "mnemosyne_macos.engines.ds4.resolve_active_runtime",
+            lambda _engine, root=None: managed,
+        )
+        assert await adapter.target_contract_eligible(target) is True
+        assert (
+            await adapter.target_contract_eligible(
+                _glm53_target("GLM-5.3-Flash-FP8.gguf")
+            )
+            is False
+        )
     finally:
         await adapter.aclose()
 
@@ -53,6 +86,196 @@ def _target():
             ]
         }
     ).profiles()["deepseek-v4-flash"]
+
+
+def _glm53_target(filename: str = "GLM-5.3-Flash-Q2.gguf"):
+    return MacConfig.model_validate(
+        {
+            "engines": {"ds4": {"enabled": True}},
+            "models": [
+                {
+                    "alias": "glm-5.3-flash",
+                    "engine": "ds4",
+                    "model": f"/models/{filename}",
+                }
+            ],
+        }
+    ).profiles()["glm-5.3-flash"]
+
+
+def _glm53_managed_runtime(tmp_path: Path):
+    source = tmp_path / "source"
+    source.mkdir(parents=True)
+    (source / "download_model.sh").write_text(
+        'GLM53_REPO="antirez/glm-5.3-flash-gguf"\n'
+        'GLM53_Q2_FILE="GLM-5.3-Flash-Q2.gguf"\n'
+        'GLM53_Q4_FILE="GLM-5.3-Flash-Q4_K.gguf"\n'
+        'case "$MODEL" in\n'
+        'glm53-q2)\nREPO=$GLM53_REPO\nMODEL_FILE=$GLM53_Q2_FILE\n'
+        'FORCE_HF_DOWNLOAD=1\n;;\n'
+        'glm53-q4)\nREPO=$GLM53_REPO\nMODEL_FILE=$GLM53_Q4_FILE\n'
+        'FORCE_HF_DOWNLOAD=1\n;;\nesac\n',
+        encoding="utf-8",
+    )
+    capabilities, digest = runtime_updates._ds4_glm53_source_contract(source)
+    return runtime_updates.ActiveRuntime(
+        engine="ds4",
+        version="a" * 12,
+        source_revision="a" * 40,
+        root=tmp_path,
+        entrypoint={
+            "binary": "source/ds4-server",
+            "working_directory": "source",
+        },
+        capabilities=capabilities,
+        channel="glm-5.3-flash",
+        source_branch="glm-5.3-flash",
+        source_contract_sha256=digest,
+    )
+
+
+def _write_glm53_runtime_root(tmp_path: Path) -> Path:
+    runtime_root = tmp_path / "runtimes"
+    runtime_directory = runtime_root / "ds4" / ("a" * 12)
+    managed = _glm53_managed_runtime(runtime_directory)
+    binary = managed.path("binary")
+    binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    binary.chmod(0o755)
+    (runtime_directory / "runtime.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "engine": "ds4",
+                "version": managed.version,
+                "source_revision": managed.source_revision,
+                "channel": managed.channel,
+                "source_branch": managed.source_branch,
+                "source_contract_sha256": managed.source_contract_sha256,
+                "core_protocol": 1,
+                "entrypoint": dict(managed.entrypoint),
+                "capabilities": list(managed.capabilities),
+            }
+        ),
+        encoding="utf-8",
+    )
+    (runtime_root / "ds4" / "current.json").write_text(
+        json.dumps({"schema_version": 1, "version": managed.version}),
+        encoding="utf-8",
+    )
+    return runtime_root
+
+
+@pytest.mark.asyncio
+async def test_glm53_contract_eligibility_validates_once_off_event_loop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime_root = _write_glm53_runtime_root(tmp_path)
+    event_loop_thread = threading.get_ident()
+    validation_threads: list[int] = []
+    validation_started = threading.Event()
+    release_validation = threading.Event()
+    original = runtime_updates._ds4_glm53_source_contract
+
+    def observed_validation(source: Path):
+        validation_threads.append(threading.get_ident())
+        validation_started.set()
+        if not release_validation.wait(0.25):
+            raise AssertionError("event loop did not release contract validation")
+        return original(source)
+
+    monkeypatch.setattr(
+        runtime_updates,
+        "_ds4_glm53_source_contract",
+        observed_validation,
+    )
+    adapter = DS4Adapter(
+        DS4Config(process_state_path=str(tmp_path / "ds4.json")),
+        runtime_root=runtime_root,
+    )
+    timer = threading.Timer(0.2, release_validation.set)
+    timer.start()
+    try:
+        started_at = time.monotonic()
+        eligibility = asyncio.create_task(
+            adapter.target_contract_eligible(_glm53_target())
+        )
+        while not validation_started.is_set():
+            await asyncio.sleep(0)
+        assert time.monotonic() - started_at < 0.1
+        assert eligibility.done() is False
+        release_validation.set()
+        assert await eligibility is True
+    finally:
+        release_validation.set()
+        timer.cancel()
+        timer.join()
+        await adapter.aclose()
+
+    assert len(validation_threads) == 1
+    assert validation_threads[0] != event_loop_thread
+
+
+@pytest.mark.asyncio
+async def test_glm53_load_preflight_reuses_one_off_thread_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime_root = _write_glm53_runtime_root(tmp_path)
+    event_loop_thread = threading.get_ident()
+    validation_threads: list[int] = []
+    validation_started = threading.Event()
+    release_validation = threading.Event()
+    original = runtime_updates._ds4_glm53_source_contract
+
+    def observed_validation(source: Path):
+        validation_threads.append(threading.get_ident())
+        validation_started.set()
+        if not release_validation.wait(0.25):
+            raise AssertionError("event loop did not release contract validation")
+        return original(source)
+
+    async def fail_spawn(*_argv, **_kwargs):
+        raise OSError("expected spawn stop")
+
+    monkeypatch.setattr(
+        runtime_updates,
+        "_ds4_glm53_source_contract",
+        observed_validation,
+    )
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _request: httpx.Response(404))
+    )
+    adapter = DS4Adapter(
+        DS4Config(process_state_path=str(tmp_path / "ds4.json")),
+        client=client,
+        spawn_process=fail_spawn,
+        runtime_root=runtime_root,
+    )
+    adapter._port_accepting_connections = lambda: False  # type: ignore[method-assign]
+    timer = threading.Timer(0.2, release_validation.set)
+    timer.start()
+    try:
+        started_at = time.monotonic()
+        loading = asyncio.create_task(
+            adapter.load(_glm53_target(), deadline=Deadline.after(1))
+        )
+        while not validation_started.is_set():
+            await asyncio.sleep(0)
+        assert time.monotonic() - started_at < 0.1
+        assert loading.done() is False
+        release_validation.set()
+        with pytest.raises(AdapterError, match="failed to start DS4"):
+            await loading
+    finally:
+        release_validation.set()
+        timer.cancel()
+        timer.join()
+        await adapter.aclose()
+        await client.aclose()
+
+    assert len(validation_threads) == 1
+    assert validation_threads[0] != event_loop_thread
 
 
 @pytest.mark.asyncio

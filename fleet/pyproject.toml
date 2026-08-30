@@ -4,7 +4,9 @@ version = "0.1.0"
 description = "Nyx-hosted routing and observability plane for Mnemosyne inference nodes"
 requires-python = ">=3.11"
 dependencies = [
+  "cryptography>=50,<51",
   "fastapi>=0.115,<1",
+  "httpcore>=1.0.9,<1.1",
   "httpx>=0.27,<1",
   "jsonschema>=4.23,<5",
   "pydantic>=2.8,<3",
@@ -27,6 +29,12 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/mnemosyne_fleet"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"../mac_pool_protocol/v1/mac_inventory.schema.json" = "mnemosyne_fleet/schemas/mac_inventory.schema.json"
+"../mac_pool_protocol/v1/desired_install.schema.json" = "mnemosyne_fleet/schemas/desired_install.schema.json"
+"../mac_pool_protocol/v1/placement_recommendation.schema.json" = "mnemosyne_fleet/schemas/placement_recommendation.schema.json"
+"../compatibility_catalog/v1/catalog.schema.json" = "mnemosyne_fleet/schemas/compatibility_catalog.schema.json"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

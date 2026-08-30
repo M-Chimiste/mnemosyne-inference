@@ -17,8 +17,14 @@ from .model_metadata import (
     metadata_from_gguf_stream,
     recommended_projector,
 )
-from .models import EngineName
-from .runtime_updates import resolve_active_runtime
+from .models import ACTIVE_ENGINE_NAMES, EngineName
+from .runtime_updates import (
+    DS4_GLM53_PREVIEW_CHANNEL,
+    DS4_GLM53_PREVIEW_REPO,
+    RuntimeUpdateError,
+    ds4_glm53_preview_capabilities,
+    resolve_active_runtime,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,6 +57,7 @@ class LibraryModel:
     architecture: str | None = None
     context_length: int | None = None
     parameter_count: int | None = None
+    release_tier: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -493,8 +500,58 @@ def _managed_mflux_models() -> list[LibraryModel]:
     return models
 
 
+def _managed_ds4_glm53_preview_models() -> list[LibraryModel]:
+    """Expose only source-bound models from the active official preview runtime."""
+
+    runtime = resolve_active_runtime("ds4")
+    if (
+        runtime is None
+        or getattr(runtime, "channel", "official")
+        != DS4_GLM53_PREVIEW_CHANNEL
+    ):
+        return []
+    try:
+        capabilities = ds4_glm53_preview_capabilities(runtime)
+    except RuntimeUpdateError:
+        return []
+    models: list[LibraryModel] = []
+    for item in capabilities:
+        target = item["target"]
+        quantization = item["quantization"]
+        minimum_memory_gb = item["minimum_memory_gb"]
+        models.append(
+            LibraryModel(
+                repo_id=DS4_GLM53_PREVIEW_REPO,
+                engine=EngineName.DS4.value,
+                display_name=(
+                    "GLM 5.3 Flash — Q2 (Experimental Preview)"
+                    if target == "glm53-q2"
+                    else "GLM 5.3 Flash — Q4_K (Experimental Preview)"
+                ),
+                model_kind="language",
+                compatibility="experimental",
+                compatibility_reason=(
+                    "Experimental Mac-only preview declared by the active managed "
+                    f"DS4 {runtime.source_branch} runtime at exact commit "
+                    f"{runtime.source_revision}. Resident inference only; no FP8, "
+                    "vision, SSD-streaming automation, CUDA, or cross-Mac tensor "
+                    "parallelism is enabled by this recipe."
+                ),
+                quantization=str(quantization),
+                filename=str(item["filename"]),
+                download_files=(str(item["filename"]),),
+                recommended_memory_gb=int(minimum_memory_gb),
+                suggested_role="generation",
+                family="glm-5.3-flash",
+                release_tier="experimental",
+            )
+        )
+    return models
+
+
 def recommended_models(engine: EngineName | None = None) -> list[LibraryModel]:
     models = list((*_DS4_VARIANTS, *_MFLUX_MODELS))
+    models.extend(_managed_ds4_glm53_preview_models())
     for managed in _managed_mflux_models():
         models = [
             item
@@ -766,6 +823,17 @@ def _managed_ds4_declares(model: LibraryModel) -> bool | None:
         script = script_path.read_text(encoding="utf-8")
     except (OSError, UnicodeError, ValueError, RuntimeError):
         return None
+    if model.repo_id == DS4_GLM53_PREVIEW_REPO:
+        try:
+            capabilities = ds4_glm53_preview_capabilities(runtime)
+        except RuntimeUpdateError:
+            return False
+        return any(
+            item.get("repo_id") == model.repo_id
+            and item.get("filename") == model.filename
+            and item.get("family") == model.family
+            for item in capabilities
+        )
     if model.repo_id == _DS4_GLM_UNSLOTH_REPO:
         return all(
             marker in script
@@ -790,6 +858,11 @@ def _hydrate_ds4_models(
     repo_info: dict[str, Any] = {}
     results: list[LibraryModel] = []
     for model in models:
+        preview = (
+            model.repo_id == DS4_GLM53_PREVIEW_REPO
+            and model.release_tier == "experimental"
+            and model.family == "glm-5.3-flash"
+        )
         info = repo_info.get(model.repo_id)
         if info is None:
             info = api.model_info(model.repo_id, files_metadata=True)
@@ -798,12 +871,29 @@ def _hydrate_ds4_models(
         required = _candidate_files(model)
         missing = tuple(filename for filename in required if filename not in inventory)
         resolved = getattr(info, "sha", None)
-        if missing or not resolved:
+        sizes = [inventory.get(filename) for filename in required]
+        incomplete_preview_metadata = preview and (
+            not isinstance(resolved, str)
+            or re.fullmatch(r"[0-9a-fA-F]{40}", resolved) is None
+            or not sizes
+            or any(
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or value <= 0
+                for value in sizes
+            )
+        )
+        if missing or not resolved or incomplete_preview_metadata:
             reason = (
                 "The exact file set declared by current DS4 is not published at this "
                 "Hugging Face revision. Update DS4 and refresh the catalog."
                 if missing
-                else "Hugging Face did not return an immutable revision for this model."
+                else (
+                    "The experimental GLM 5.3 preview requires an immutable Hub "
+                    "revision and complete positive file-size metadata."
+                    if incomplete_preview_metadata
+                    else "Hugging Face did not return an immutable revision for this model."
+                )
             )
             results.append(
                 replace(
@@ -829,7 +919,6 @@ def _hydrate_ds4_models(
                 )
             )
             continue
-        sizes = [inventory[filename] for filename in required]
         size_bytes = (
             sum(int(value) for value in sizes)
             if sizes and all(value is not None for value in sizes)
@@ -859,6 +948,9 @@ def search_models(
     token: str | None = None,
 ) -> list[LibraryModel]:
     """Search only the portion of the Hub that the selected engine can use."""
+
+    if engine not in ACTIVE_ENGINE_NAMES:
+        return []
 
     normalized = query.strip().casefold()
     if engine == EngineName.LLAMA_CPP:
@@ -993,6 +1085,8 @@ def validate_install_candidate(
     revision: str | None = None,
     token: str | None = None,
 ) -> LibraryModel:
+    if engine not in ACTIVE_ENGINE_NAMES:
+        raise ValueError(f"{engine.value} is retired on macOS")
     verified = verified_model(engine=engine, repo_id=repo_id, filename=filename)
     if verified is not None:
         info = HfApi(token=token or _hf_token()).model_info(
@@ -1000,7 +1094,13 @@ def validate_install_candidate(
             revision=revision,
             files_metadata=True,
         )
-        resolved_revision = getattr(info, "sha", None) or revision
+        preview = (
+            verified.repo_id == DS4_GLM53_PREVIEW_REPO
+            and verified.release_tier == "experimental"
+            and verified.family == "glm-5.3-flash"
+        )
+        hub_revision = getattr(info, "sha", None)
+        resolved_revision = hub_revision or revision
         if not resolved_revision:
             raise ValueError(
                 "the selected model did not resolve to an immutable Hub revision"
@@ -1019,6 +1119,21 @@ def validate_install_candidate(
                 "model target; update DS4 before downloading it"
             )
         sizes = [inventory[value] for value in required]
+        if preview and (
+            not isinstance(hub_revision, str)
+            or re.fullmatch(r"[0-9a-fA-F]{40}", hub_revision) is None
+            or not sizes
+            or any(
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or value <= 0
+                for value in sizes
+            )
+        ):
+            raise ValueError(
+                "the experimental GLM 5.3 preview requires an immutable Hub "
+                "revision and complete positive file-size metadata"
+            )
         size_bytes = (
             sum(int(value) for value in sizes)
             if sizes and all(value is not None for value in sizes)

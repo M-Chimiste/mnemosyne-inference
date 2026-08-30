@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import hashlib
 import hmac
@@ -35,8 +35,6 @@ from .config import (
     DS4Config,
     LlamaCppConfig,
     MFluxConfig,
-    MLXcelConfig,
-    MistralRSConfig,
     OMLXConfig,
 )
 from .models import ENGINE_RELEASE_TIER, EngineName
@@ -50,6 +48,13 @@ MFLUX_PYPI_JSON_URL = "https://pypi.org/pypi/mflux/json"
 MFLUX_PYPI_INDEX_URL = "https://pypi.org/simple"
 OMLX_RELEASES_API_URL = "https://api.github.com/repos/jundot/omlx/releases?per_page=20"
 DS4_COMMIT_API_URL = "https://api.github.com/repos/antirez/ds4/commits/main"
+DS4_GLM53_PREVIEW_BRANCH = "glm-5.3-flash"
+DS4_GLM53_PREVIEW_CHANNEL = "glm-5.3-flash"
+DS4_GLM53_PREVIEW_COMMIT_API_URL = (
+    "https://api.github.com/repos/antirez/ds4/commits/"
+    f"{DS4_GLM53_PREVIEW_BRANCH}"
+)
+DS4_GLM53_PREVIEW_REPO = "antirez/glm-5.3-flash-gguf"
 LLAMA_CPP_RELEASE_API_URL = (
     "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest"
 )
@@ -63,11 +68,8 @@ LLAMA_CPP_STABLE_POINTER_NAME = "nightly-tag.txt"
 MAX_LLAMA_CPP_STABLE_POINTER_BYTES = 32
 MAX_SOURCE_ARCHIVE_BYTES = 2 * 1024**3
 _VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$")
-_ENGINES = ("llama.cpp", "omlx", "mflux", "ds4")
-_EXTERNAL_PREVIEW_ENGINES = ("mlxcel", "mistral.rs")
+_ENGINES = ("llama.cpp", "omlx", "ds4", "mflux")
 _OMLX_RELEASES_URL = "https://github.com/jundot/omlx/releases"
-_MLXCEL_INSTALL_URL = "https://github.com/lablup/mlxcel#install-with-homebrew-macoslinux"
-_MISTRAL_RS_INSTALL_URL = "https://ericlbuehler.github.io/mistral.rs/quickstart/"
 _LIFECYCLE_LIMIT = 256
 _LIFECYCLE_ACTION_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _LIFECYCLE_EVENT_ID_RE = re.compile(
@@ -84,6 +86,25 @@ _LIFECYCLE_FAILURE_CODES = {
     "unsafe_archive",
 }
 _SOURCE_REVISION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:+/=@-]{0,159}$")
+_GIT_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
+_SHA256_ID_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+_RUNTIME_COMPATIBILITY_SCHEMA_VERSION = 2
+_LLAMA_CPP_COMPATIBILITY_CONTRACT = "official-llama.cpp-macos-arm64-v1"
+_DS4_COMPATIBILITY_CONTRACT = "official-ds4-source-build-v1"
+_RUNTIME_COMPATIBILITY_FEATURES: Mapping[str, tuple[str, ...]] = {
+    _LLAMA_CPP_COMPATIBILITY_CONTRACT: (
+        "apple-metal",
+        "flash-attention",
+    ),
+    # DS4's exact commit/build provenance is useful compatibility evidence,
+    # but the current source build does not yet prove a portable feature list.
+    # Keep it empty rather than deriving capabilities from a catalog claim.
+    _DS4_COMPATIBILITY_CONTRACT: (),
+}
+_DS4_GLM53_SOURCE_CONTRACT: tuple[tuple[str, str, str, int], ...] = (
+    ("glm53-q2", "GLM53_Q2_FILE", "Q2", 128),
+    ("glm53-q4", "GLM53_Q4_FILE", "Q4_K", 256),
+)
 
 
 class RuntimeUpdateError(RuntimeError):
@@ -241,6 +262,8 @@ class RuntimeRelease:
     maximum_core_protocol: int = 1
     sha256: str | None = None
     asset_size: int | None = None
+    channel: str = "official"
+    source_branch: str | None = None
 
     @property
     def compatible(self) -> bool:
@@ -263,6 +286,56 @@ class RuntimeRelease:
 
 
 @dataclass(frozen=True)
+class RuntimeCompatibilityEvidence:
+    """Immutable, path-free proof used only for signed compatibility checks.
+
+    ``compatibility_fingerprint`` is intentionally distinct from
+    ``EngineAdapter``'s local benchmark fingerprint.  It is built from verified
+    source provenance and a closed verification contract, so relocating a
+    runtime or restoring file mtimes cannot change it.  The executable digest
+    is deliberately excluded from that cross-Mac identity: DS4 is compiled
+    locally, so equivalent exact source builds need one catalog-checkable
+    provenance identity even when their Mach-O bytes differ.
+
+    ``local_integrity_fingerprint`` binds that portable identity to the exact
+    executable installed on this Mac.  Active pointers retain an independent
+    copy of the local value, so changing both a runtime binary and its adjacent
+    manifest seal does not preserve local compatibility authority.  It is
+    never exported as a portable catalog fingerprint.
+    """
+
+    engine: str
+    version: str
+    source_revision: str | None
+    channel: str
+    source_branch: str | None
+    source_sha256: str
+    source_size_bytes: int
+    executable_sha256: str
+    verification_contract: str
+    features: tuple[str, ...]
+    compatibility_fingerprint: str
+    local_integrity_fingerprint: str
+
+    def to_manifest(self) -> dict[str, Any]:
+        return {
+            "schema_version": _RUNTIME_COMPATIBILITY_SCHEMA_VERSION,
+            "engine": self.engine,
+            "version": self.version,
+            "source_revision": self.source_revision,
+            "channel": self.channel,
+            "source_branch": self.source_branch,
+            "source_sha256": self.source_sha256,
+            "source_size_bytes": self.source_size_bytes,
+            "executable_sha256": self.executable_sha256,
+            "verification_contract": self.verification_contract,
+            "features": list(self.features),
+            "compatibility_fingerprint": self.compatibility_fingerprint,
+            "local_integrity_fingerprint": self.local_integrity_fingerprint,
+        }
+
+
+@dataclass(frozen=True)
 class ActiveRuntime:
     engine: str
     version: str
@@ -270,6 +343,10 @@ class ActiveRuntime:
     root: Path
     entrypoint: Mapping[str, str]
     capabilities: tuple[Mapping[str, Any], ...] = ()
+    channel: str = "official"
+    source_branch: str | None = None
+    source_contract_sha256: str | None = None
+    compatibility_evidence: RuntimeCompatibilityEvidence | None = None
 
     def path(self, key: str) -> Path:
         relative = self.entrypoint.get(key)
@@ -405,7 +482,453 @@ def _active_pointer(root: Path, engine: str) -> Path:
     return root / engine / "current.json"
 
 
-def _load_runtime_directory(directory: Path, *, expected_engine: str) -> ActiveRuntime:
+def _pointer_integrity_fingerprint(
+    payload: object,
+    key: str,
+) -> str | None:
+    if not isinstance(payload, Mapping):
+        return None
+    value = payload.get(key)
+    return value if isinstance(value, str) and _SHA256_ID_RE.fullmatch(value) else None
+
+
+def _runtime_compatibility_fingerprint(
+    *,
+    engine: str,
+    version: str,
+    source_revision: str | None,
+    channel: str,
+    source_branch: str | None,
+    source_sha256: str,
+    source_size_bytes: int,
+    verification_contract: str,
+    features: tuple[str, ...],
+) -> str:
+    material = {
+        "schema_version": _RUNTIME_COMPATIBILITY_SCHEMA_VERSION,
+        "engine": engine,
+        "version": version,
+        "source_revision": source_revision,
+        "channel": channel,
+        "source_branch": source_branch,
+        "source_sha256": source_sha256,
+        "source_size_bytes": source_size_bytes,
+        "verification_contract": verification_contract,
+        "features": list(features),
+    }
+    encoded = json.dumps(
+        material,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("ascii")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def _runtime_local_integrity_fingerprint(
+    *,
+    compatibility_fingerprint: str,
+    executable_sha256: str,
+) -> str:
+    """Bind portable provenance to one exact local executable."""
+
+    material = {
+        "schema_version": _RUNTIME_COMPATIBILITY_SCHEMA_VERSION,
+        "compatibility_fingerprint": compatibility_fingerprint,
+        "executable_sha256": executable_sha256,
+    }
+    encoded = json.dumps(
+        material,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("ascii")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def _new_runtime_compatibility_evidence(
+    release: RuntimeRelease,
+    *,
+    source_sha256: str,
+    source_size_bytes: int,
+    executable: Path,
+) -> RuntimeCompatibilityEvidence:
+    """Create evidence only for the two closed managed-runtime contracts."""
+
+    engine = _validate_engine(release.engine)
+    version = _validate_version(release.version)
+    digest = source_sha256.casefold()
+    if not _SHA256_ID_RE.fullmatch(digest):
+        raise RuntimeUpdateError("managed runtime source SHA-256 is invalid")
+    if (
+        isinstance(source_size_bytes, bool)
+        or not isinstance(source_size_bytes, int)
+        or not 0 < source_size_bytes <= MAX_SOURCE_ARCHIVE_BYTES
+    ):
+        raise RuntimeUpdateError("managed runtime source size is invalid")
+
+    if engine == "llama.cpp":
+        expected_name = f"llama-{version}-bin-macos-arm64.tar.gz"
+        expected_url = (
+            f"{LLAMA_CPP_RELEASE_DOWNLOAD_PREFIX}{version}/{expected_name}"
+        )
+        if (
+            release.channel != "official"
+            or release.source_branch is not None
+            or release.architecture != "arm64"
+            or release.source_url != expected_url
+            or release.sha256 is None
+            or digest != f"sha256:{release.sha256.casefold()}"
+            or release.asset_size != source_size_bytes
+        ):
+            raise RuntimeUpdateError(
+                "llama.cpp compatibility provenance is incomplete"
+            )
+        contract = _LLAMA_CPP_COMPATIBILITY_CONTRACT
+    elif engine == "ds4":
+        revision = release.source_revision
+        allowed_source = bool(
+            isinstance(revision, str)
+            and _GIT_COMMIT_RE.fullmatch(revision)
+            and version == revision[:12]
+            and release.source_url
+            == f"https://codeload.github.com/antirez/ds4/tar.gz/{revision}"
+            and (
+                (
+                    release.channel == "official"
+                    and release.source_branch == "main"
+                )
+                or (
+                    release.channel == DS4_GLM53_PREVIEW_CHANNEL
+                    and release.source_branch == DS4_GLM53_PREVIEW_BRANCH
+                )
+            )
+        )
+        if not allowed_source:
+            raise RuntimeUpdateError("DS4 compatibility provenance is incomplete")
+        contract = _DS4_COMPATIBILITY_CONTRACT
+    else:
+        raise RuntimeUpdateError(
+            f"managed compatibility evidence is unavailable for {engine}"
+        )
+
+    try:
+        executable_digest = "sha256:" + _sha256_file(executable)
+    except OSError as exc:
+        raise RuntimeUpdateError(
+            "managed runtime executable could not be sealed"
+        ) from exc
+    features = _RUNTIME_COMPATIBILITY_FEATURES[contract]
+    fingerprint = _runtime_compatibility_fingerprint(
+        engine=engine,
+        version=version,
+        source_revision=release.source_revision,
+        channel=release.channel,
+        source_branch=release.source_branch,
+        source_sha256=digest,
+        source_size_bytes=source_size_bytes,
+        verification_contract=contract,
+        features=features,
+    )
+    local_integrity_fingerprint = _runtime_local_integrity_fingerprint(
+        compatibility_fingerprint=fingerprint,
+        executable_sha256=executable_digest,
+    )
+    return RuntimeCompatibilityEvidence(
+        engine=engine,
+        version=version,
+        source_revision=release.source_revision,
+        channel=release.channel,
+        source_branch=release.source_branch,
+        source_sha256=digest,
+        source_size_bytes=source_size_bytes,
+        executable_sha256=executable_digest,
+        verification_contract=contract,
+        features=features,
+        compatibility_fingerprint=fingerprint,
+        local_integrity_fingerprint=local_integrity_fingerprint,
+    )
+
+
+def _load_runtime_compatibility_evidence(
+    value: object,
+    *,
+    engine: str,
+    version: str,
+    source_revision: str | None,
+    channel: str,
+    source_branch: str | None,
+    outer_source_sha256: object,
+    outer_source_size_bytes: object,
+    executable: Path,
+) -> RuntimeCompatibilityEvidence | None:
+    """Validate optional proof without making a legacy runtime unusable."""
+
+    if not isinstance(value, dict):
+        return None
+    expected_keys = {
+        "schema_version",
+        "engine",
+        "version",
+        "source_revision",
+        "channel",
+        "source_branch",
+        "source_sha256",
+        "source_size_bytes",
+        "executable_sha256",
+        "verification_contract",
+        "features",
+        "compatibility_fingerprint",
+        "local_integrity_fingerprint",
+    }
+    if set(value) != expected_keys:
+        return None
+    try:
+        contract = value["verification_contract"]
+        features_value = value["features"]
+        source_digest = value["source_sha256"]
+        executable_digest = value["executable_sha256"]
+        source_size = value["source_size_bytes"]
+        fingerprint = value["compatibility_fingerprint"]
+        local_integrity_fingerprint = value["local_integrity_fingerprint"]
+        normalized_outer_source = (
+            outer_source_sha256.casefold()
+            if isinstance(outer_source_sha256, str)
+            and _SHA256_ID_RE.fullmatch(outer_source_sha256.casefold())
+            else (
+                "sha256:" + outer_source_sha256.casefold()
+                if isinstance(outer_source_sha256, str)
+                and re.fullmatch(r"[0-9a-fA-F]{64}", outer_source_sha256)
+                else None
+            )
+        )
+        if (
+            value["schema_version"] != _RUNTIME_COMPATIBILITY_SCHEMA_VERSION
+            or value["engine"] != engine
+            or value["version"] != version
+            or value["source_revision"] != source_revision
+            or value["channel"] != channel
+            or value["source_branch"] != source_branch
+            or not isinstance(contract, str)
+            or contract not in _RUNTIME_COMPATIBILITY_FEATURES
+            or not isinstance(features_value, list)
+            or not all(isinstance(item, str) for item in features_value)
+            or tuple(features_value) != _RUNTIME_COMPATIBILITY_FEATURES[contract]
+            or not isinstance(source_digest, str)
+            or not _SHA256_ID_RE.fullmatch(source_digest)
+            or normalized_outer_source != source_digest
+            or isinstance(source_size, bool)
+            or not isinstance(source_size, int)
+            or not 0 < source_size <= MAX_SOURCE_ARCHIVE_BYTES
+            or isinstance(outer_source_size_bytes, bool)
+            or not isinstance(outer_source_size_bytes, int)
+            or outer_source_size_bytes != source_size
+            or not isinstance(executable_digest, str)
+            or not _SHA256_ID_RE.fullmatch(executable_digest)
+            or not isinstance(fingerprint, str)
+            or not _SHA256_ID_RE.fullmatch(fingerprint)
+            or not isinstance(local_integrity_fingerprint, str)
+            or not _SHA256_ID_RE.fullmatch(local_integrity_fingerprint)
+        ):
+            return None
+        if engine == "llama.cpp":
+            if (
+                contract != _LLAMA_CPP_COMPATIBILITY_CONTRACT
+                or channel != "official"
+                or source_branch is not None
+                or (
+                    source_revision is not None
+                    and _SOURCE_REVISION_RE.fullmatch(source_revision) is None
+                )
+            ):
+                return None
+        elif engine == "ds4":
+            if (
+                contract != _DS4_COMPATIBILITY_CONTRACT
+                or not isinstance(source_revision, str)
+                or _GIT_COMMIT_RE.fullmatch(source_revision) is None
+                or version != source_revision[:12]
+                or not (
+                    (channel == "official" and source_branch == "main")
+                    or (
+                        channel == DS4_GLM53_PREVIEW_CHANNEL
+                        and source_branch == DS4_GLM53_PREVIEW_BRANCH
+                    )
+                )
+            ):
+                return None
+        else:
+            return None
+        expected_fingerprint = _runtime_compatibility_fingerprint(
+            engine=engine,
+            version=version,
+            source_revision=source_revision,
+            channel=channel,
+            source_branch=source_branch,
+            source_sha256=source_digest,
+            source_size_bytes=source_size,
+            verification_contract=contract,
+            features=tuple(features_value),
+        )
+        if not hmac.compare_digest(expected_fingerprint, fingerprint):
+            return None
+        expected_local_integrity_fingerprint = (
+            _runtime_local_integrity_fingerprint(
+                compatibility_fingerprint=fingerprint,
+                executable_sha256=executable_digest,
+            )
+        )
+        if not hmac.compare_digest(
+            expected_local_integrity_fingerprint,
+            local_integrity_fingerprint,
+        ):
+            return None
+        current_executable_digest = "sha256:" + _sha256_file(executable)
+        if not hmac.compare_digest(current_executable_digest, executable_digest):
+            return None
+    except (OSError, TypeError, ValueError):
+        return None
+    return RuntimeCompatibilityEvidence(
+        engine=engine,
+        version=version,
+        source_revision=source_revision,
+        channel=channel,
+        source_branch=source_branch,
+        source_sha256=source_digest,
+        source_size_bytes=source_size,
+        executable_sha256=executable_digest,
+        verification_contract=contract,
+        features=tuple(features_value),
+        compatibility_fingerprint=fingerprint,
+        local_integrity_fingerprint=local_integrity_fingerprint,
+    )
+
+
+def _ds4_glm53_source_contract(
+    source: Path,
+) -> tuple[tuple[Mapping[str, Any], ...], str]:
+    """Derive the closed preview model contract from one exact DS4 source tree."""
+
+    script_path = source / "download_model.sh"
+    try:
+        script_bytes = script_path.read_bytes()
+    except OSError as exc:
+        raise RuntimeUpdateError(
+            "DS4 GLM 5.3 preview source is missing download_model.sh"
+        ) from exc
+    if not script_bytes or len(script_bytes) > 512 * 1024:
+        raise RuntimeUpdateError(
+            "DS4 GLM 5.3 preview download_model.sh has an invalid size"
+        )
+    try:
+        script = script_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise RuntimeUpdateError(
+            "DS4 GLM 5.3 preview download_model.sh is not UTF-8"
+        ) from exc
+
+    def assignment(name: str) -> str:
+        matches = re.findall(
+            rf'(?m)^{re.escape(name)}="([^"\r\n]+)"\s*$',
+            script,
+        )
+        if len(matches) != 1:
+            raise RuntimeUpdateError(
+                f"DS4 GLM 5.3 preview source must declare exactly one {name}"
+            )
+        return matches[0]
+
+    if assignment("GLM53_REPO") != DS4_GLM53_PREVIEW_REPO:
+        raise RuntimeUpdateError(
+            "DS4 GLM 5.3 preview source declared an unsupported model repository"
+        )
+
+    capabilities: list[Mapping[str, Any]] = []
+    for target, variable, quantization, minimum_memory_gb in (
+        _DS4_GLM53_SOURCE_CONTRACT
+    ):
+        filename = assignment(variable)
+        if (
+            len(filename) > 255
+            or filename != Path(filename).name
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]*\.gguf", filename)
+            or "glm-5.3-flash" not in filename.casefold()
+            or (quantization == "Q2" and "q2" not in filename.casefold())
+            or (quantization == "Q4_K" and "q4" not in filename.casefold())
+            or "fp8" in filename.casefold()
+            or "vision" in filename.casefold()
+        ):
+            raise RuntimeUpdateError(
+                f"DS4 GLM 5.3 preview source declared an invalid {target} filename"
+            )
+        block_match = re.search(
+            rf"(?ms)^\s*{re.escape(target)}\)\s*(.*?)^\s*;;\s*$",
+            script,
+        )
+        block = block_match.group(1) if block_match else ""
+        if not all(
+            re.search(marker, block, flags=re.MULTILINE)
+            for marker in (
+                r"^\s*REPO=\$GLM53_REPO\s*$",
+                rf"^\s*MODEL_FILE=\${re.escape(variable)}\s*$",
+                r"^\s*FORCE_HF_DOWNLOAD=1\s*$",
+            )
+        ):
+            raise RuntimeUpdateError(
+                f"DS4 GLM 5.3 preview source does not bind {target} to its official file"
+            )
+        capabilities.append(
+            {
+                "kind": "language-model",
+                "family": "glm-5.3-flash",
+                "target": target,
+                "repo_id": DS4_GLM53_PREVIEW_REPO,
+                "filename": filename,
+                "quantization": quantization,
+                "minimum_memory_gb": minimum_memory_gb,
+                "release_tier": "experimental",
+            }
+        )
+    return tuple(capabilities), hashlib.sha256(script_bytes).hexdigest()
+
+
+def ds4_glm53_preview_capabilities(
+    runtime: ActiveRuntime,
+) -> tuple[Mapping[str, Any], ...]:
+    """Validate and return a managed preview runtime's source-bound model list."""
+
+    if runtime.engine != "ds4" or runtime.channel != DS4_GLM53_PREVIEW_CHANNEL:
+        return ()
+    if (
+        runtime.source_branch != DS4_GLM53_PREVIEW_BRANCH
+        or not isinstance(runtime.source_revision, str)
+        or not _GIT_COMMIT_RE.fullmatch(runtime.source_revision)
+        or not isinstance(runtime.source_contract_sha256, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", runtime.source_contract_sha256)
+    ):
+        raise RuntimeUpdateError(
+            "managed DS4 GLM 5.3 preview provenance is incomplete"
+        )
+    capabilities, digest = _ds4_glm53_source_contract(
+        runtime.path("working_directory")
+    )
+    if not hmac.compare_digest(digest, runtime.source_contract_sha256):
+        raise RuntimeUpdateError(
+            "managed DS4 GLM 5.3 preview source contract changed after preparation"
+        )
+    if tuple(runtime.capabilities) != capabilities:
+        raise RuntimeUpdateError(
+            "managed DS4 GLM 5.3 preview manifest does not match its source contract"
+        )
+    return capabilities
+
+
+def _load_runtime_directory(
+    directory: Path,
+    *,
+    expected_engine: str,
+    verify_compatibility_evidence: bool = False,
+) -> ActiveRuntime:
     manifest_path = directory / "runtime.json"
     try:
         payload = _read_json(manifest_path)
@@ -439,6 +962,20 @@ def _load_runtime_directory(directory: Path, *, expected_engine: str) -> ActiveR
         isinstance(item, dict) for item in capabilities_value
     ):
         raise RuntimeUpdateError("runtime capabilities must be a list of objects")
+    channel = payload.get("channel", "official")
+    source_branch = payload.get("source_branch")
+    source_contract_sha256 = payload.get("source_contract_sha256")
+    outer_source_sha256 = payload.get("source_sha256")
+    outer_source_size_bytes = payload.get("source_size_bytes")
+    compatibility_value = payload.get("compatibility_evidence")
+    if not isinstance(channel, str) or not channel:
+        raise RuntimeUpdateError("runtime channel must be a non-empty string")
+    if source_branch is not None and not isinstance(source_branch, str):
+        raise RuntimeUpdateError("runtime source_branch must be a string")
+    if source_contract_sha256 is not None and not isinstance(
+        source_contract_sha256, str
+    ):
+        raise RuntimeUpdateError("runtime source_contract_sha256 must be a string")
     runtime = ActiveRuntime(
         engine=engine,
         version=version,
@@ -446,6 +983,9 @@ def _load_runtime_directory(directory: Path, *, expected_engine: str) -> ActiveR
         root=directory,
         entrypoint=dict(entrypoint),
         capabilities=tuple(dict(item) for item in capabilities_value),
+        channel=channel,
+        source_branch=source_branch,
+        source_contract_sha256=source_contract_sha256,
     )
     if engine == "mflux":
         worker = runtime.path("worker_path")
@@ -471,6 +1011,12 @@ def _load_runtime_directory(directory: Path, *, expected_engine: str) -> ActiveR
             raise RuntimeUpdateError(
                 f"DS4 working directory is missing: {working_directory}"
             )
+        if runtime.channel == DS4_GLM53_PREVIEW_CHANNEL:
+            ds4_glm53_preview_capabilities(runtime)
+        elif runtime.channel != "official":
+            raise RuntimeUpdateError(
+                f"unsupported managed DS4 runtime channel '{runtime.channel}'"
+            )
     elif engine == "llama.cpp":
         binary = runtime.path("binary")
         working_directory = runtime.path("working_directory")
@@ -480,13 +1026,36 @@ def _load_runtime_directory(directory: Path, *, expected_engine: str) -> ActiveR
             raise RuntimeUpdateError(
                 f"llama.cpp working directory is missing: {working_directory}"
             )
+    if engine in {"llama.cpp", "ds4"} and verify_compatibility_evidence:
+        runtime = replace(
+            runtime,
+            compatibility_evidence=_load_runtime_compatibility_evidence(
+                compatibility_value,
+                engine=runtime.engine,
+                version=runtime.version,
+                source_revision=runtime.source_revision,
+                channel=runtime.channel,
+                source_branch=runtime.source_branch,
+                outer_source_sha256=outer_source_sha256,
+                outer_source_size_bytes=outer_source_size_bytes,
+                executable=binary,
+            ),
+        )
     return runtime
 
 
 def resolve_active_runtime(
-    engine: str, *, root: str | Path | None = None
+    engine: str,
+    *,
+    root: str | Path | None = None,
+    verify_compatibility_evidence: bool = False,
 ) -> ActiveRuntime | None:
-    """Resolve the active managed runtime, returning no override if invalid."""
+    """Resolve the active managed runtime, returning no override if invalid.
+
+    Ordinary engine and catalog lookups deliberately skip executable hashing.
+    Signed compatibility authority opts into the more expensive integrity
+    proof and runs that lookup off the asyncio event loop.
+    """
 
     normalized = _validate_engine(engine)
     runtime_root = _runtime_root(root)
@@ -497,7 +1066,25 @@ def resolve_active_runtime(
             return None
         version = _validate_version(payload.get("version"))
         directory = runtime_root / normalized / version
-        runtime = _load_runtime_directory(directory, expected_engine=normalized)
+        runtime = _load_runtime_directory(
+            directory,
+            expected_engine=normalized,
+            verify_compatibility_evidence=verify_compatibility_evidence,
+        )
+        if (
+            verify_compatibility_evidence
+            and runtime.compatibility_evidence is not None
+        ):
+            pointer_integrity = payload.get("local_integrity_fingerprint")
+            if (
+                not isinstance(pointer_integrity, str)
+                or not _SHA256_ID_RE.fullmatch(pointer_integrity)
+                or not hmac.compare_digest(
+                    pointer_integrity,
+                    runtime.compatibility_evidence.local_integrity_fingerprint,
+                )
+            ):
+                runtime = replace(runtime, compatibility_evidence=None)
         return runtime if runtime.version == version else None
     except (OSError, ValueError, json.JSONDecodeError, RuntimeUpdateError):
         return None
@@ -666,8 +1253,6 @@ class RuntimeUpdateManager:
         mflux: MFluxConfig,
         ds4: DS4Config,
         llama_cpp: LlamaCppConfig | None = None,
-        mlxcel: MLXcelConfig | None = None,
-        mistral_rs: MistralRSConfig | None = None,
         root: str | Path | None = None,
         client: httpx.AsyncClient | None = None,
     ) -> None:
@@ -675,13 +1260,12 @@ class RuntimeUpdateManager:
         self.omlx = omlx
         self.mflux = mflux
         self.ds4 = ds4
-        self.mlxcel = mlxcel or MLXcelConfig()
-        self.mistral_rs = mistral_rs or MistralRSConfig()
         self.root = _runtime_root(root)
         self.channel = "official"
         self._client = client or httpx.AsyncClient(timeout=30, follow_redirects=True)
         self._owns_client = client is None
         self._releases: dict[str, RuntimeRelease] = {}
+        self._ds4_glm53_preview_release: RuntimeRelease | None = None
         self._upstream_omlx: tuple[str | None, str | None, str | None] = (
             None,
             None,
@@ -909,6 +1493,22 @@ class RuntimeUpdateManager:
     def active_version(self, engine: str) -> str | None:
         runtime = resolve_active_runtime(engine, root=self.root)
         return runtime.version if runtime is not None else None
+
+    def runtime_compatibility_evidence(
+        self,
+        engine: str,
+    ) -> RuntimeCompatibilityEvidence | None:
+        """Return only validated managed provenance, never local path identity."""
+
+        normalized = engine.casefold()
+        if normalized not in {"llama.cpp", "ds4"}:
+            return None
+        runtime = resolve_active_runtime(
+            normalized,
+            root=self.root,
+            verify_compatibility_evidence=True,
+        )
+        return runtime.compatibility_evidence if runtime is not None else None
 
     def record_validation(self, engine: str) -> dict[str, Any] | None:
         normalized = _validate_engine(engine)
@@ -1144,37 +1744,54 @@ class RuntimeUpdateManager:
             release_notes_url=f"https://pypi.org/project/mflux/{version}/",
         )
 
-    async def _official_ds4(self) -> RuntimeRelease:
-        payload = await self._fetch_json(DS4_COMMIT_API_URL)
+    async def _official_ds4(
+        self,
+        *,
+        branch: str = "main",
+        channel: str = "official",
+    ) -> RuntimeRelease:
+        if (branch, channel) == ("main", "official"):
+            commit_api_url = DS4_COMMIT_API_URL
+        elif (branch, channel) == (
+            DS4_GLM53_PREVIEW_BRANCH,
+            DS4_GLM53_PREVIEW_CHANNEL,
+        ):
+            commit_api_url = DS4_GLM53_PREVIEW_COMMIT_API_URL
+        else:
+            raise RuntimeUpdateError("unsupported official DS4 runtime channel")
+        payload = await self._fetch_json(commit_api_url)
         if not isinstance(payload, dict) or not isinstance(payload.get("sha"), str):
             raise RuntimeUpdateError("official DS4 commit response was invalid")
-        revision = str(payload["sha"])
-        if not re.fullmatch(r"[0-9a-fA-F]{40}", revision):
+        revision = str(payload["sha"]).casefold()
+        if not _GIT_COMMIT_RE.fullmatch(revision):
             raise RuntimeUpdateError("official DS4 commit SHA was invalid")
         version = revision[:12].casefold()
-        commit_url = str(
-            payload.get("html_url")
-            or f"https://github.com/antirez/ds4/commit/{revision}"
-        )
         return RuntimeRelease(
             engine="ds4",
             version=version,
-            source_revision=revision.casefold(),
+            source_revision=revision,
             source_url=f"https://codeload.github.com/antirez/ds4/tar.gz/{revision}",
-            release_notes_url=commit_url,
+            release_notes_url=f"https://github.com/antirez/ds4/commit/{revision}",
+            channel=channel,
+            source_branch=branch,
         )
 
     async def _refresh_releases(self) -> None:
         results = await asyncio.gather(
             self._official_llama_cpp(),
             self._official_omlx(),
-            self._official_mflux(),
             self._official_ds4(),
+            self._official_mflux(),
+            self._official_ds4(
+                branch=DS4_GLM53_PREVIEW_BRANCH,
+                channel=DS4_GLM53_PREVIEW_CHANNEL,
+            ),
             return_exceptions=True,
         )
         self._diagnostics.clear()
         self._releases.clear()
-        for engine, result in zip(_ENGINES, results, strict=True):
+        self._ds4_glm53_preview_release = None
+        for engine, result in zip(_ENGINES, results[: len(_ENGINES)], strict=True):
             if isinstance(result, BaseException):
                 self._diagnostics[engine] = f"official upstream check failed: {result}"
             elif engine == "omlx":
@@ -1182,6 +1799,14 @@ class RuntimeUpdateManager:
             else:
                 assert isinstance(result, RuntimeRelease)
                 self._releases[engine] = result
+        preview_result = results[-1]
+        if isinstance(preview_result, BaseException):
+            self._diagnostics[DS4_GLM53_PREVIEW_CHANNEL] = (
+                f"official preview check failed: {preview_result}"
+            )
+        else:
+            assert isinstance(preview_result, RuntimeRelease)
+            self._ds4_glm53_preview_release = preview_result
         self._last_checked_at = time.time()
 
     async def _installed_omlx(self) -> tuple[str | None, str | None, str | None]:
@@ -1255,8 +1880,8 @@ class RuntimeUpdateManager:
 
     async def _installed_llama_cpp(
         self,
+        managed: ActiveRuntime | None,
     ) -> tuple[str | None, str | None, str | None]:
-        managed = resolve_active_runtime("llama.cpp", root=self.root)
         if managed is not None:
             return managed.version, managed.source_revision, str(managed.root)
         binary = Path(self.llama_cpp.binary).expanduser()
@@ -1292,8 +1917,10 @@ class RuntimeUpdateManager:
             return source
         return None
 
-    async def _installed_mflux(self) -> tuple[str | None, str | None, str | None]:
-        managed = resolve_active_runtime("mflux", root=self.root)
+    async def _installed_mflux(
+        self,
+        managed: ActiveRuntime | None,
+    ) -> tuple[str | None, str | None, str | None]:
         if managed is not None:
             return managed.version, managed.source_revision, str(managed.root)
         python = self._mflux_python()
@@ -1324,8 +1951,10 @@ class RuntimeUpdateManager:
         except (KeyError, TypeError, ValueError, json.JSONDecodeError):
             return None, None, str(python)
 
-    async def _installed_ds4(self) -> tuple[str | None, str | None, str | None]:
-        managed = resolve_active_runtime("ds4", root=self.root)
+    async def _installed_ds4(
+        self,
+        managed: ActiveRuntime | None,
+    ) -> tuple[str | None, str | None, str | None]:
         if managed is not None:
             return managed.version, managed.source_revision, str(managed.root)
         binary = Path(self.ds4.binary).expanduser()
@@ -1357,29 +1986,32 @@ class RuntimeUpdateManager:
     async def installed_status(self) -> dict[str, dict[str, Any]]:
         """Inspect local runtimes without contacting any upstream service."""
 
-        async def external_binary(config: MLXcelConfig | MistralRSConfig):
-            binary = Path(config.binary).expanduser()
-            if not binary.is_file() or not os.access(binary, os.X_OK):
-                return None, None, str(binary)
-            try:
-                output = await _run_version_command(str(binary), "--version")
-            except RuntimeUpdateError:
-                output = None
-            match = re.search(
-                r"\d+(?:\.\d+)+(?:[-+._A-Za-z0-9]*)?",
-                output or "",
-            )
-            return match.group(0) if match else "unknown", None, str(binary)
-
-        installed_values = await asyncio.gather(
-            self._installed_llama_cpp(),
-            self._installed_omlx(),
-            self._installed_mflux(),
-            self._installed_ds4(),
-            external_binary(self.mlxcel),
-            external_binary(self.mistral_rs),
+        managed_llama, managed_mflux, managed_ds4 = await asyncio.gather(
+            asyncio.to_thread(
+                resolve_active_runtime,
+                "llama.cpp",
+                root=self.root,
+                verify_compatibility_evidence=True,
+            ),
+            asyncio.to_thread(
+                resolve_active_runtime,
+                "mflux",
+                root=self.root,
+            ),
+            asyncio.to_thread(
+                resolve_active_runtime,
+                "ds4",
+                root=self.root,
+                verify_compatibility_evidence=True,
+            ),
         )
-        return {
+        installed_values = await asyncio.gather(
+            self._installed_llama_cpp(managed_llama),
+            self._installed_omlx(),
+            self._installed_ds4(managed_ds4),
+            self._installed_mflux(managed_mflux),
+        )
+        statuses = {
             engine: {
                 "installed": version is not None,
                 "version": version,
@@ -1388,17 +2020,33 @@ class RuntimeUpdateManager:
                 "installation_kind": (
                     _omlx_installation_kind(path)
                     if engine == "omlx"
-                    else "external_cli"
-                    if engine in _EXTERNAL_PREVIEW_ENGINES
                     else "managed_or_configured"
                 ),
+                "compatibility_fingerprint": None,
+                "features": [],
             }
             for engine, (version, revision, path) in zip(
-                (*_ENGINES, *_EXTERNAL_PREVIEW_ENGINES),
+                _ENGINES,
                 installed_values,
                 strict=True,
             )
         }
+        statuses["ds4"]["managed_channel"] = (
+            managed_ds4.channel if managed_ds4 is not None else None
+        )
+        for engine, managed in (
+            ("llama.cpp", managed_llama),
+            ("ds4", managed_ds4),
+        ):
+            evidence = (
+                managed.compatibility_evidence if managed is not None else None
+            )
+            if evidence is not None:
+                statuses[engine]["compatibility_fingerprint"] = (
+                    evidence.compatibility_fingerprint
+                )
+                statuses[engine]["features"] = list(evidence.features)
+        return statuses
 
     async def check(self, *, refresh: bool = True) -> dict[str, Any]:
         async with self._check_lock:
@@ -1406,24 +2054,11 @@ class RuntimeUpdateManager:
                 await self._refresh_releases()
             local_status = await self.installed_status()
             statuses: list[dict[str, Any]] = []
-            for engine in (*_ENGINES, *_EXTERNAL_PREVIEW_ENGINES):
+            for engine in _ENGINES:
                 installed_version = local_status[engine]["version"]
                 installed_revision = local_status[engine]["revision"]
                 installed_path = local_status[engine]["path"]
-                if engine in _EXTERNAL_PREVIEW_ENGINES:
-                    release = None
-                    upstream_version = None
-                    upstream_url = (
-                        _MLXCEL_INSTALL_URL
-                        if engine == "mlxcel"
-                        else _MISTRAL_RS_INSTALL_URL
-                    )
-                    official_installer_url = upstream_url
-                    # These binaries remain externally owned. Do not claim an
-                    # available version without querying and validating their
-                    # distinct upstream release contracts.
-                    update_available = False
-                elif engine == "omlx":
+                if engine == "omlx":
                     (
                         upstream_version,
                         upstream_url,
@@ -1460,19 +2095,19 @@ class RuntimeUpdateManager:
                             "omlx": "oMLX",
                             "mflux": "MFLUX",
                             "ds4": "DS4",
-                            "mlxcel": "mlxcel",
-                            "mistral.rs": "mistral.rs",
                         }[engine],
                         "ownership": (
                             "external"
                             if engine == "omlx"
-                            or engine in _EXTERNAL_PREVIEW_ENGINES
                             else "managed_or_external"
                         ),
                         "installed": installed_version is not None,
                         "installed_version": installed_version,
                         "installed_revision": installed_revision,
                         "installed_path": installed_path,
+                        "installed_channel": local_status[engine].get(
+                            "managed_channel"
+                        ),
                         "installation_kind": local_status[engine].get(
                             "installation_kind"
                         ),
@@ -1495,9 +2130,7 @@ class RuntimeUpdateManager:
                         )
                         and update_available,
                         "can_rollback": (
-                            False
-                            if engine in _EXTERNAL_PREVIEW_ENGINES
-                            else self._rollback_version(engine) is not None
+                            self._rollback_version(engine) is not None
                         ),
                         "management_note": (
                             "Version and Apple Silicon binaries come directly from official ggml-org/llama.cpp GitHub releases."
@@ -1508,15 +2141,7 @@ class RuntimeUpdateManager:
                                 else (
                                     "Version and dependencies come directly from the official MFLUX package on PyPI."
                                     if engine == "mflux"
-                                    else (
-                                        "Version and source come directly from the official antirez/ds4 repository."
-                                        if engine == "ds4"
-                                        else (
-                                            "Install and update the official Homebrew formula with brew upgrade mlxcel. Unified Inference owns only its child server process."
-                                            if engine == "mlxcel"
-                                            else "Use the official installer and mistralrs update. Unified Inference owns only its child server process."
-                                        )
-                                    )
+                                    else "Version and source come directly from the official antirez/ds4 repository."
                                 )
                             )
                         ),
@@ -1527,12 +2152,7 @@ class RuntimeUpdateManager:
                             and local_status[engine].get("installation_kind")
                             == "homebrew_stable"
                             and not self.omlx.enabled
-                            else (
-                                "Install the official external CLI, then check again."
-                                if engine in _EXTERNAL_PREVIEW_ENGINES
-                                and installed_version is None
-                                else self._diagnostics.get(engine)
-                            )
+                            else self._diagnostics.get(engine)
                         ),
                         "upgrade_strategy": (
                             {
@@ -1552,9 +2172,58 @@ class RuntimeUpdateManager:
                                 "managed",
                             )
                             if engine == "omlx"
-                            else "external_manual"
-                            if engine in _EXTERNAL_PREVIEW_ENGINES
                             else "managed"
+                        ),
+                        "managed_channels": (
+                            [
+                                {
+                                    "channel": DS4_GLM53_PREVIEW_CHANNEL,
+                                    "source_branch": DS4_GLM53_PREVIEW_BRANCH,
+                                    "release_tier": "experimental",
+                                    "available_version": (
+                                        self._ds4_glm53_preview_release.version
+                                        if self._ds4_glm53_preview_release
+                                        else None
+                                    ),
+                                    "available_revision": (
+                                        self._ds4_glm53_preview_release.source_revision
+                                        if self._ds4_glm53_preview_release
+                                        else None
+                                    ),
+                                    "release_notes_url": (
+                                        self._ds4_glm53_preview_release.release_notes_url
+                                        if self._ds4_glm53_preview_release
+                                        else None
+                                    ),
+                                    "update_available": bool(
+                                        self._ds4_glm53_preview_release
+                                        and (
+                                            local_status["ds4"].get(
+                                                "managed_channel"
+                                            )
+                                            != DS4_GLM53_PREVIEW_CHANNEL
+                                            or installed_revision
+                                            != self._ds4_glm53_preview_release.source_revision
+                                        )
+                                    ),
+                                    "can_install": bool(
+                                        self._ds4_glm53_preview_release
+                                        and (
+                                            local_status["ds4"].get(
+                                                "managed_channel"
+                                            )
+                                            != DS4_GLM53_PREVIEW_CHANNEL
+                                            or installed_revision
+                                            != self._ds4_glm53_preview_release.source_revision
+                                        )
+                                    ),
+                                    "diagnostic": self._diagnostics.get(
+                                        DS4_GLM53_PREVIEW_CHANNEL
+                                    ),
+                                }
+                            ]
+                            if engine == "ds4"
+                            else []
                         ),
                     }
                 )
@@ -1765,10 +2434,22 @@ class RuntimeUpdateManager:
         extracted.mkdir(parents=True)
         try:
             await self._download_source(release.source_url, archive)
+            source_size = archive.stat().st_size
+            source_sha256 = "sha256:" + await asyncio.to_thread(
+                _sha256_file,
+                archive,
+            )
             await asyncio.to_thread(_safe_extract, archive, extracted)
             roots = [item for item in extracted.iterdir() if item.is_dir()]
             if len(roots) != 1:
                 raise RuntimeUpdateError("official DS4 archive had an unexpected layout")
+            if (
+                release.channel == DS4_GLM53_PREVIEW_CHANNEL
+                and roots[0].name != f"ds4-{release.source_revision}"
+            ):
+                raise RuntimeUpdateError(
+                    "official DS4 preview archive did not match its resolved commit"
+                )
             os.replace(roots[0], source)
             shutil.rmtree(extracted)
             await _run_checked("/usr/bin/make", "ds4-server", cwd=source)
@@ -1776,6 +2457,31 @@ class RuntimeUpdateManager:
             if not binary.is_file() or not os.access(binary, os.X_OK):
                 raise RuntimeUpdateError("official DS4 build did not produce ds4-server")
             await _run_checked(str(binary), "--help", cwd=source, timeout=30)
+            capabilities: tuple[Mapping[str, Any], ...] = ()
+            source_contract_sha256: str | None = None
+            if release.channel == DS4_GLM53_PREVIEW_CHANNEL:
+                if (
+                    release.source_branch != DS4_GLM53_PREVIEW_BRANCH
+                    or not isinstance(release.source_revision, str)
+                    or not _GIT_COMMIT_RE.fullmatch(release.source_revision)
+                ):
+                    raise RuntimeUpdateError(
+                        "DS4 GLM 5.3 preview release provenance is invalid"
+                    )
+                capabilities, source_contract_sha256 = (
+                    _ds4_glm53_source_contract(source)
+                )
+            elif release.channel != "official":
+                raise RuntimeUpdateError(
+                    f"unsupported managed DS4 runtime channel '{release.channel}'"
+                )
+            compatibility_evidence = await asyncio.to_thread(
+                _new_runtime_compatibility_evidence,
+                release,
+                source_sha256=source_sha256,
+                source_size_bytes=source_size,
+                executable=binary,
+            )
             _atomic_json(
                 staging / "runtime.json",
                 {
@@ -1783,14 +2489,26 @@ class RuntimeUpdateManager:
                     "engine": "ds4",
                     "version": release.version,
                     "source_revision": release.source_revision,
+                    "channel": release.channel,
+                    "source_branch": release.source_branch,
+                    "source_contract_sha256": source_contract_sha256,
+                    "source_sha256": source_sha256,
+                    "source_size_bytes": source_size,
                     "core_protocol": CORE_RUNTIME_PROTOCOL,
                     "entrypoint": {
                         "binary": "source/ds4-server",
                         "working_directory": "source",
                     },
+                    "capabilities": list(capabilities),
+                    "compatibility_evidence": compatibility_evidence.to_manifest(),
                 },
             )
-            return _load_runtime_directory(staging, expected_engine="ds4")
+            return await asyncio.to_thread(
+                _load_runtime_directory,
+                staging,
+                expected_engine="ds4",
+                verify_compatibility_evidence=True,
+            )
         finally:
             with contextlib.suppress(FileNotFoundError):
                 archive.unlink()
@@ -1845,6 +2563,7 @@ class RuntimeUpdateManager:
                 "--embedding",
                 "--reranking",
                 "--no-webui",
+                "--flash-attn",
             )
             missing = [flag for flag in required_flags if flag not in help_text]
             if missing:
@@ -1852,6 +2571,13 @@ class RuntimeUpdateManager:
                     "llama.cpp server contract changed; missing flags: "
                     + ", ".join(missing)
                 )
+            compatibility_evidence = await asyncio.to_thread(
+                _new_runtime_compatibility_evidence,
+                release,
+                source_sha256=f"sha256:{digest.casefold()}",
+                source_size_bytes=stat_size,
+                executable=binary,
+            )
             _atomic_json(
                 staging / "runtime.json",
                 {
@@ -1860,14 +2586,21 @@ class RuntimeUpdateManager:
                     "version": release.version,
                     "source_revision": release.source_revision,
                     "source_sha256": release.sha256,
+                    "source_size_bytes": stat_size,
                     "core_protocol": CORE_RUNTIME_PROTOCOL,
                     "entrypoint": {
                         "binary": str(binary.relative_to(staging)),
                         "working_directory": str(binary.parent.relative_to(staging)),
                     },
+                    "compatibility_evidence": compatibility_evidence.to_manifest(),
                 },
             )
-            return _load_runtime_directory(staging, expected_engine="llama.cpp")
+            return await asyncio.to_thread(
+                _load_runtime_directory,
+                staging,
+                expected_engine="llama.cpp",
+                verify_compatibility_evidence=True,
+            )
         finally:
             with contextlib.suppress(FileNotFoundError):
                 archive.unlink()
@@ -1891,17 +2624,57 @@ class RuntimeUpdateManager:
             timeout=120,
         )
 
-    async def prepare(self, engine: str, version: str | None = None) -> PreparedRuntime:
+    async def prepare(
+        self,
+        engine: str,
+        version: str | None = None,
+        *,
+        channel: str | None = None,
+    ) -> PreparedRuntime:
         normalized = _validate_engine(engine)
         if normalized == "omlx":
             raise RuntimeUpdateError("oMLX must be updated through its official updater")
+        requested_channel = channel or "official"
+        if normalized != "ds4" and requested_channel != "official":
+            raise RuntimeUpdateError(
+                f"runtime channel '{requested_channel}' is not available for {normalized}"
+            )
+        if normalized == "ds4" and requested_channel not in {
+            "official",
+            DS4_GLM53_PREVIEW_CHANNEL,
+        }:
+            raise RuntimeUpdateError(
+                f"unsupported official DS4 runtime channel '{requested_channel}'"
+            )
         async with self._install_lock:
-            if normalized not in self._releases:
+            if (
+                normalized not in self._releases
+                or (
+                    requested_channel == DS4_GLM53_PREVIEW_CHANNEL
+                    and self._ds4_glm53_preview_release is None
+                )
+            ):
                 await self._refresh_releases()
-            release = self._releases.get(normalized)
+            release = (
+                self._ds4_glm53_preview_release
+                if normalized == "ds4"
+                and requested_channel == DS4_GLM53_PREVIEW_CHANNEL
+                else self._releases.get(normalized)
+            )
             if release is None or not release.compatible:
-                detail = self._diagnostics.get(normalized, "official release unavailable")
-                raise RuntimeUpdateError(f"no compatible official {normalized} update: {detail}")
+                detail = self._diagnostics.get(
+                    requested_channel
+                    if requested_channel == DS4_GLM53_PREVIEW_CHANNEL
+                    else normalized,
+                    "official release unavailable",
+                )
+                raise RuntimeUpdateError(
+                    f"no compatible official {normalized} {requested_channel} update: {detail}"
+                )
+            if release.channel != requested_channel:
+                raise RuntimeUpdateError(
+                    "resolved runtime release did not match the requested channel"
+                )
             if version is not None and version != release.version:
                 raise RuntimeUpdateError(
                     f"{version} is not the current official {normalized} version"
@@ -1909,10 +2682,31 @@ class RuntimeUpdateManager:
             engine_root = self.root / normalized
             final = engine_root / release.version
             if final.exists():
-                runtime = _load_runtime_directory(final, expected_engine=normalized)
-                if runtime.source_revision != release.source_revision:
+                runtime = await asyncio.to_thread(
+                    _load_runtime_directory,
+                    final,
+                    expected_engine=normalized,
+                    verify_compatibility_evidence=(
+                        normalized in {"llama.cpp", "ds4"}
+                    ),
+                )
+                if (
+                    runtime.source_revision != release.source_revision
+                    or runtime.channel != release.channel
+                    or (
+                        release.channel == DS4_GLM53_PREVIEW_CHANNEL
+                        and runtime.source_branch != release.source_branch
+                    )
+                ):
                     raise RuntimeUpdateError(
-                        "existing runtime folder does not match the official source revision"
+                        "existing runtime folder does not match the official source provenance"
+                    )
+                if (
+                    normalized in {"llama.cpp", "ds4"}
+                    and runtime.compatibility_evidence is None
+                ):
+                    raise RuntimeUpdateError(
+                        "existing runtime folder lacks verified compatibility evidence"
                     )
                 return PreparedRuntime(release=release, runtime=runtime)
 
@@ -1933,7 +2727,14 @@ class RuntimeUpdateManager:
                 os.replace(staging, final)
                 return PreparedRuntime(
                     release=release,
-                    runtime=_load_runtime_directory(final, expected_engine=normalized),
+                    runtime=await asyncio.to_thread(
+                        _load_runtime_directory,
+                        final,
+                        expected_engine=normalized,
+                        verify_compatibility_evidence=(
+                            normalized in {"llama.cpp", "ds4"}
+                        ),
+                    ),
                 )
             finally:
                 if staging.exists():
@@ -1941,20 +2742,62 @@ class RuntimeUpdateManager:
 
     def activate(self, prepared: PreparedRuntime) -> ActiveRuntime:
         engine = _validate_engine(prepared.release.engine)
-        runtime = _load_runtime_directory(prepared.runtime.root, expected_engine=engine)
+        managed_compatibility = engine in {"llama.cpp", "ds4"}
+        runtime = _load_runtime_directory(
+            prepared.runtime.root,
+            expected_engine=engine,
+            verify_compatibility_evidence=managed_compatibility,
+        )
+        if managed_compatibility:
+            prepared_evidence = prepared.runtime.compatibility_evidence
+            runtime_evidence = runtime.compatibility_evidence
+            if (
+                prepared_evidence is None
+                or runtime_evidence is None
+                or not hmac.compare_digest(
+                    prepared_evidence.local_integrity_fingerprint,
+                    runtime_evidence.local_integrity_fingerprint,
+                )
+            ):
+                raise RuntimeUpdateError(
+                    "prepared runtime local integrity changed before activation"
+                )
         current = resolve_active_runtime(engine, root=self.root)
+        try:
+            current_pointer = _read_json(_active_pointer(self.root, engine))
+        except (OSError, ValueError, json.JSONDecodeError):
+            current_pointer = None
+        current_integrity = (
+            _pointer_integrity_fingerprint(
+                current_pointer,
+                "local_integrity_fingerprint",
+            )
+            if current is not None
+            and isinstance(current_pointer, Mapping)
+            and current_pointer.get("version") == current.version
+            else None
+        )
+        pointer_value: dict[str, Any] = {
+            "schema_version": 1,
+            "version": runtime.version,
+            "previous_version": current.version if current else None,
+            "activated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        if runtime.compatibility_evidence is not None:
+            pointer_value["local_integrity_fingerprint"] = (
+                runtime.compatibility_evidence.local_integrity_fingerprint
+            )
+        if current is not None and current_integrity is not None:
+            pointer_value["previous_local_integrity_fingerprint"] = (
+                current_integrity
+            )
         _atomic_json(
             _active_pointer(self.root, engine),
-            {
-                "schema_version": 1,
-                "version": runtime.version,
-                "previous_version": current.version if current else None,
-                "activated_at": datetime.now(timezone.utc).isoformat(),
-            },
+            pointer_value,
         )
         return runtime
 
-    def _rollback_version(self, engine: str) -> str | None:
+    def _rollback_pointer(self, engine: str) -> tuple[str, str | None] | None:
         if engine == "omlx":
             return None
         pointer = _active_pointer(self.root, engine)
@@ -1965,29 +2808,93 @@ class RuntimeUpdateManager:
             version = payload.get("previous_version")
             if not isinstance(version, str):
                 return None
-            _load_runtime_directory(self.root / engine / version, expected_engine=engine)
-            return version
+            _load_runtime_directory(
+                self.root / engine / version,
+                expected_engine=engine,
+                verify_compatibility_evidence=False,
+            )
+            if (
+                "previous_local_integrity_fingerprint" in payload
+                and _pointer_integrity_fingerprint(
+                    payload,
+                    "previous_local_integrity_fingerprint",
+                )
+                is None
+            ):
+                return None
+            return (
+                version,
+                _pointer_integrity_fingerprint(
+                    payload,
+                    "previous_local_integrity_fingerprint",
+                ),
+            )
         except (OSError, ValueError, json.JSONDecodeError, RuntimeUpdateError):
             return None
 
+    def _rollback_version(self, engine: str) -> str | None:
+        target = self._rollback_pointer(engine)
+        return target[0] if target is not None else None
+
     def rollback(self, engine: str) -> ActiveRuntime:
         normalized = _validate_engine(engine)
-        version = self._rollback_version(normalized)
-        if version is None:
+        target = self._rollback_pointer(normalized)
+        if target is None:
             raise RuntimeUpdateError(f"no previous {normalized} runtime is available")
+        version, expected_integrity = target
         current = resolve_active_runtime(normalized, root=self.root)
-        runtime = _load_runtime_directory(
-            self.root / normalized / version, expected_engine=normalized
+        try:
+            current_pointer = _read_json(_active_pointer(self.root, normalized))
+        except (OSError, ValueError, json.JSONDecodeError):
+            current_pointer = None
+        current_integrity = (
+            _pointer_integrity_fingerprint(
+                current_pointer,
+                "local_integrity_fingerprint",
+            )
+            if current is not None
+            and isinstance(current_pointer, Mapping)
+            and current_pointer.get("version") == current.version
+            else None
         )
+        managed_compatibility = normalized in {"llama.cpp", "ds4"}
+        runtime = _load_runtime_directory(
+            self.root / normalized / version,
+            expected_engine=normalized,
+            verify_compatibility_evidence=managed_compatibility,
+        )
+        if managed_compatibility:
+            evidence = runtime.compatibility_evidence
+            if expected_integrity is None:
+                # A legacy pointer may still restore ordinary inference, but it
+                # cannot mint fresh signed-catalog authority during rollback.
+                runtime = replace(runtime, compatibility_evidence=None)
+            elif (
+                evidence is None
+                or not hmac.compare_digest(
+                    expected_integrity,
+                    evidence.local_integrity_fingerprint,
+                )
+            ):
+                raise RuntimeUpdateError(
+                    "rollback runtime local integrity no longer matches its activation"
+                )
+        pointer_value: dict[str, Any] = {
+            "schema_version": 1,
+            "version": runtime.version,
+            "previous_version": current.version if current else None,
+            "activated_at": datetime.now(timezone.utc).isoformat(),
+            "rollback": True,
+        }
+        if expected_integrity is not None:
+            pointer_value["local_integrity_fingerprint"] = expected_integrity
+        if current is not None and current_integrity is not None:
+            pointer_value["previous_local_integrity_fingerprint"] = (
+                current_integrity
+            )
         _atomic_json(
             _active_pointer(self.root, normalized),
-            {
-                "schema_version": 1,
-                "version": runtime.version,
-                "previous_version": current.version if current else None,
-                "activated_at": datetime.now(timezone.utc).isoformat(),
-                "rollback": True,
-            },
+            pointer_value,
         )
         return runtime
 
@@ -1995,9 +2902,14 @@ class RuntimeUpdateManager:
 __all__ = [
     "ActiveRuntime",
     "CORE_RUNTIME_PROTOCOL",
+    "DS4_GLM53_PREVIEW_BRANCH",
+    "DS4_GLM53_PREVIEW_CHANNEL",
+    "DS4_GLM53_PREVIEW_REPO",
     "PreparedRuntime",
+    "RuntimeCompatibilityEvidence",
     "RuntimeRelease",
     "RuntimeUpdateError",
     "RuntimeUpdateManager",
+    "ds4_glm53_preview_capabilities",
     "resolve_active_runtime",
 ]

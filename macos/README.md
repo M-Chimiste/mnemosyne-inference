@@ -5,11 +5,9 @@ API while moving the single resident model between a manager-owned
 [llama.cpp](https://github.com/ggml-org/llama.cpp) process for GGUF models,
 [oMLX](https://github.com/jundot/omlx) for MLX models, and
 [DwarfStar/DS4](https://github.com/antirez/ds4), plus a manager-owned
-[MFLUX](https://github.com/filipstrand/mflux) image worker. Preview adapters
-also support [mlxcel](https://github.com/lablup/mlxcel) for native MLX
-generation/VLM serving and [mistral.rs](https://github.com/EricLBuehler/mistral.rs)
-for pinned Safetensors models. The engines remain upstream projects; Mnemosyne
-coordinates and proxies them without modifying their model runtimes.
+[MFLUX](https://github.com/filipstrand/mflux) image worker. The engines remain
+upstream projects; Mnemosyne coordinates and proxies them without modifying
+their model runtimes.
 
 For a fresh workstation, begin with the
 [end-user installation guide](INSTALL.md). It covers the Unified Inference
@@ -21,8 +19,8 @@ The runtime is deliberately not a Docker image. Docker Desktop runs ordinary
 containers in a Linux VM, so it is not the right boundary for arbitrary
 MLX/Metal processes. Mnemosyne Core and all engines run natively.
 
-The [V1 scope](V1_SCOPE.md) makes llama.cpp and oMLX Stable and keeps DS4,
-MFLUX, mlxcel, and mistral.rs explicitly Preview. The [acceptance ledger](acceptance/v1.json) is the
+The [V1 scope](V1_SCOPE.md) makes llama.cpp and oMLX Stable and keeps DS4 and
+MFLUX explicitly Preview. The [acceptance ledger](acceptance/v1.json) is the
 release truth; a 0.9 candidate is not V1 while any required gate remains
 pending. See [release and recovery](RELEASE.md) for versioning, signing,
 notarization, signed updates, and rollback.
@@ -63,10 +61,7 @@ on-disk model directory remains as a migration hint.
 | `17323` | `ds4-server` | Mnemosyne-owned model process |
 | `17324` | MFLUX worker | Mnemosyne-owned image process |
 | `17325` | `llama-server` | Unified Inference-owned GGUF process |
-| `17326` | `mlxcel-server` | Unified Inference-owned Preview MLX model process |
-| `17327` | `mistralrs serve` | Unified Inference-owned Preview Safetensors model process |
-
-All listeners default to loopback. Ports `17328` and `17329` remain reserved
+All listeners default to loopback. Ports `17326` through `17329` remain reserved
 for future local engines and diagnostics.
 
 Mnemosyne Core is a per-user LaunchAgent. `Unified Inference.app` is only a controller,
@@ -167,7 +162,7 @@ and throughput. Omit `--compare-base-url` to measure Unified Inference alone.
 - Python 3.11–3.13 and `uv` for service development.
 - Swift 6 for menu development. Full Xcode is required for final app signing,
   `SMAppService` integration testing, and source builds of custom Metal kernels.
-- oMLX, DS4, MFLUX, mlxcel, and mistral.rs are optional. An unavailable engine should be disabled;
+- oMLX, DS4, and MFLUX are optional. An unavailable engine should be disabled;
   its profiles are retained but omitted from the callable model catalog until
   the engine is enabled again.
 
@@ -190,7 +185,8 @@ runtime. The current upstream split is:
 | MLX directories | oMLX | Continuous batching, tiered persistent KV cache, multi-model admin lifecycle, native app, and a stable Homebrew service |
 | GGUF | llama.cpp | Official Metal-enabled server, broad quant/model support, continuous batching, and explicit parallel slots |
 | Curated image checkpoints | MFLUX | Native Apple Silicon image pipeline isolated from language dependencies |
-| Exact DeepSeek V4 and GLM 5.2 GGUF layouts | DS4 Preview | Purpose-built upstream path retained only for models tested by DS4 |
+| Exact DeepSeek V4 and GLM 5.2 GGUF layouts | DS4 Preview | Purpose-built upstream path retained only for models tested by the installed exact DS4 revision |
+| GLM 5.3 Flash Q2/Q4_K GGUF layouts | DS4 Experimental Preview | An explicit opt-in resolves the official `antirez/ds4` `glm-5.3-flash` branch to an immutable commit and exposes only that source revision's exact official model contract |
 
 The official
 [`mlx_lm.server`](https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/server.py)
@@ -279,6 +275,20 @@ translate into the upstream `--batched-session` setting. Admission uses that
 exact slot count; leaving it unset preserves the safest one-session memory
 profile because every extra session allocates another KV state.
 
+The official DS4 repository now also has an unmerged `glm-5.3-flash` preview
+branch with Q2/Q4 Metal support. Unified Inference deliberately does not infer
+support from a model name or arbitrary GGUF. The explicit Experimental Preview
+action first resolves that official branch to an immutable 40-character commit,
+builds only that commit, and binds the managed runtime manifest to a digest of
+its exact Q2/Q4 downloader contract. Only then does Model Library expose the
+official `antirez/glm-5.3-flash-gguf` Q2 and Q4_K files; install rechecks a
+40-character Hub revision and positive file sizes. Q2 has a conservative
+128-GB floor and Q4_K a 256-GB floor. FP8 execution, vision, automatic SSD
+streaming, CUDA, and cross-Mac tensor parallelism remain excluded. Local load
+and Fleet advertisement fail closed if the active runtime or filename no
+longer matches the recorded contract. A future signed compatibility recipe
+can add narrower hardware/context evidence without weakening those checks.
+
 An existing LM Studio installation is not required. Version-1 configurations
 are upgraded without starting or contacting LM Studio: legacy LM Studio
 profiles become inert alias/load-setting records and disappear from the
@@ -348,8 +358,6 @@ The selected root is then organized by engine:
   omlx/<owner>/<repository>/
   ds4/<owner>/<repository>/
   mflux/<owner>/<repository>/
-  mlxcel/<owner>/<repository>/
-  mistral.rs/<owner>/<repository>/
 ```
 
 Use **Settings → Model Library** to search one unified catalog across all
@@ -366,6 +374,18 @@ same-directory vision projector exists, the highest-fidelity option is selected
 automatically; the user can choose another or opt out for text-only use. The
 resolved Hub revision and exact file list are persisted so retries cannot
 silently change weights.
+
+The selected-model pane keeps runtime preparation next to the model choice. It
+can install the verified managed llama.cpp or DS4 runtime, hand off to the
+official oMLX DMG, stage an engine-enable setting, and show when a service
+restart or health check is still required. DS4 main and the experimental GLM
+5.3 source channel are never treated as interchangeable. If Apple's compiler
+tools are missing, the app can open only Apple's fixed system installer after
+confirmation and continues to report the prerequisite as unverified until a
+later fixed toolchain/compiler probe succeeds. These actions are independent of weight download: the
+chosen Download-to folder remains unchanged, downloads stay cold, and normal
+lease-based JIT loading still begins with the first inference request.
+
 DS4 results are restricted to the exact current DeepSeek V4 and GLM 5.2 GGUF
 files published and tested for DS4. They are hydrated from Hugging Face file
 metadata so missing files, incomplete shard groups, or an unresolvable revision
@@ -425,11 +445,19 @@ Removing a model profile keeps its files by default. The separate
 **Delete Files** confirmation can also clean up a llama.cpp or oMLX model
 previously imported from a registered folder. Cleanup drains residency and
 freshly scans that exact storage grant. A unique imported match is moved to the
-macOS Trash; a completed Unified Inference download still deletes only its
-ledger-owned destination. Bounded helpers refuse roots, escapes, symlinks,
-ambiguous matches, and files shared by another profile before the profile is
-removed. oMLX cleanup also refreshes its authoritative directory inventory
-inside the same all-engines-empty barrier.
+macOS Trash. A managed download can gain the same recoverable cleanup authority
+only when the request names its exact installation UUID and complete immutable
+evidence proves exclusive ownership, the current storage generation/path/
+volume/scope, the absent-and-created directory identity, and the exact hashed
+regular-file manifest. New managed downloads capture that proof only when the
+destination was absent and this exact transaction created it; a pre-existing
+destination, legacy/migrated row, unavailable proof helper, changed storage
+binding, or ambiguous tree remains ownership-unknown and is retained. Bounded
+helpers recheck directory identity, every file digest, and the complete tree
+immediately before Trash and refuse roots, escapes, descendant symlinks,
+special or extra entries, ambiguous matches, and files shared by any primary,
+alternative, or projector consumer. oMLX cleanup also refreshes its
+authoritative directory inventory inside the same all-engines-empty barrier.
 
 Set `HF_TOKEN` in the private environment file for gated or private Hub repos.
 The token is write-only in Settings and is inherited only by the download
@@ -438,7 +466,7 @@ worker; it is not stored in YAML or SQLite.
 ## Engine runtime updates
 
 Open **Settings → Runtime Updates** to inspect installed and upstream versions
-of llama.cpp, oMLX, MFLUX, DS4, mlxcel, and mistral.rs. oMLX owns its own installation: Unified
+of llama.cpp, oMLX, MFLUX, and DS4. oMLX owns its own installation: Unified
 Inference selects the official DMG matching this Mac, detects the installed
 app, CLI shim, conventional Homebrew paths, or running server, and links to
 the official stable release without overwriting it. For a missing runtime, an
@@ -467,14 +495,6 @@ MFLUX imports and the DS4 binary are also validated before activation. Download
 and validation do not affect residency. The final switch runs inside the
 coordinator's all-engines-empty maintenance barrier and atomically updates a
 small pointer below:
-
-mlxcel and mistral.rs remain externally installed Preview binaries. The menu
-app detects their configured executables without claiming ownership of the
-installation: use the official `lablup/tap` Homebrew formula for mlxcel and
-the official mistral.rs installer plus `mistralrs update` for mistral.rs.
-Unified Inference owns only the exact child server process and requires Model
-Library to pin and download weights before load, so neither engine performs an
-implicit Hub download in the inference path.
 
 ```text
 ~/Library/Application Support/Mnemosyne/runtimes/
@@ -635,9 +655,13 @@ on a non-loopback address, the variable named by
 `server.control_password_env` (`ADMIN_PASSWORD` by default) is still required
 and clients authenticate as Basic user `admin`.
 
-For enrollment in the Nyx fleet gateway, set distinct `FLEET_API_KEY` and
-`INFERENCE_API_KEY` values in the private `.env`. The default inference bind
-is loopback-only and cannot be reached from Nyx: change `server.inference_bind`
+For enrollment in a Fleet Hub, set distinct `FLEET_API_KEY` and
+`FLEET_INFERENCE_API_KEY` values in the private `.env`. The former protects
+only snapshot reads; the latter is accepted only on `/v1/*` requests carrying
+the Hub's canonical Fleet route marker. Existing static enrollments that omit the
+new dispatch-only key retain their `INFERENCE_API_KEY` fallback, so upgrades
+do not strand a configured Hub. The default inference bind is loopback-only
+and cannot be reached from the Hub: change `server.inference_bind`
 to this Mac's trusted LAN or Tailscale address, restrict that address with the
 host firewall or Tailscale ACLs, keep `server.control_bind` on loopback, and
 restart Mnemosyne Core. The read-only `GET /fleet/v1/snapshot` endpoint then
@@ -650,16 +674,85 @@ curl -s http://127.0.0.1:1240/fleet/v1/snapshot \
   -H "Authorization: Bearer $FLEET_API_KEY" | jq
 ```
 
-Then enroll `http://<trusted-mac-address>:1240` on Nyx and verify that Nyx can
+Then enroll `http://<trusted-mac-address>:1240` on the Hub and verify that it can
 reach it. Never expose the inference listener on an untrusted LAN; bearer
 credentials protect access but do not encrypt requests or responses.
 
-The inference bearer is deliberately not accepted for this endpoint, and an
-unset fleet credential makes it unavailable. If Fleet discovery is enabled
-while `INFERENCE_API_KEY` is empty, snapshot discovery fails closed with `503`
-and `fleet_inference_auth_unconfigured`. Snapshots never expose secrets or
-local model paths. Managed Hugging Face installs with an immutable resolved
-revision and exact selected files are eligible for strict cross-node routing.
+Enrollment and participation are deliberately separate. Existing enrolled
+Macs start joined for backward compatibility. The menu bar's **Contribute this
+Mac to the pool** toggle changes a durable local preference without unpairing
+the Mac, stopping local inference, unloading a model, cancelling downloads, or
+changing any model-storage folder. Turning it off immediately closes new Fleet
+admission, reports **Draining** while already admitted Fleet response streams
+finish, and then reports **Paused**. A stale Fleet reservation is rejected
+before model resolution or loading with `429`, `Retry-After: 1`, and
+`X-Mnemosyne-Error: node_busy`; ordinary local requests remain callable.
+
+Permanent removal is a different, destructive pairing action. For a dynamically
+paired Mac, **Settings → Inference Pool → Remove this Mac from Hub** explicitly
+confirms and revokes only the current Hub enrollment. It does not delete or
+relocate model weights, change any exact configured storage folder, edit an
+inference profile, stop local inference, or remove local analytics, token
+history, or the durable usage outbox. A removed Mac cannot rejoin with the
+participation toggle; it must complete a new Hub invitation ceremony. That
+safe re-pair creates a new pairing while preserving the Mac's reporting
+identity and per-device accounting continuity.
+
+The loopback control API exposes the same state:
+
+```bash
+curl -s -u "admin:${ADMIN_PASSWORD}" \
+  http://127.0.0.1:17321/manager/fleet/participation | jq
+
+curl -s -u "admin:${ADMIN_PASSWORD}" \
+  -X PUT http://127.0.0.1:17321/manager/fleet/participation \
+  -H 'Content-Type: application/json' \
+  -d '{"enabled":false}' | jq
+```
+
+The response contains only `enabled`, `state`, `active_requests`, and
+`updated_at`. `X-Mnemosyne-Fleet-Route` is an internal canonical UUID marker
+created by the Hub; local clients should not send it. Missing markers are local,
+while malformed or duplicate markers fail closed.
+
+The corresponding loopback removal route is
+`POST /manager/fleet/pairing/revoke`. Its closed body is
+`{"schema_version":1,"request_id":"<new-lowercase-canonical-uuid>"}`. The
+service writes that exact request ID, pairing ID, and credential generation to
+its durable journal before contacting the Hub, so new Fleet admission is denied
+immediately and after restart. If the response is ambiguous, the optional
+`self_revoke` field from `GET /manager/fleet/pairing` exposes only the secret-
+free pending request ID and its fixed `pending` or `hub_committed` phase;
+**Retry Removal** replays that exact ID. Once the Hub has committed, a retry
+completes only local cleanup, without a second Hub call. Completion retains a
+non-secret revoked tombstone and removes only the exact fingerprint-matching
+pairing-owned snapshot, dispatch, and management credentials; changed or
+static credentials are never guessed at or deleted.
+
+A proven terminal Hub rejection retires that request ID before reopening the
+unchanged pairing, and the old ID can never target a later generation.
+Ambiguous transport, `429`, `5xx`, redirect, oversized, or malformed-success
+outcomes remain fenced for exact-ID retry. After completion, a new invitation
+transitions directly from the credential-free revoked tombstone; no hidden
+clear operation can restore the old keys.
+
+This uses the existing native control-plane authentication policy. When the
+variable named by `server.control_password_env` (`ADMIN_PASSWORD` by default)
+is set, callers must use Basic user `admin`. When it is unset on the default
+loopback listener, the route relies on the existing same-user/local-process
+trust boundary and has no separate pairing authorization token; the Settings
+confirmation is a UI safeguard, not an authorization receipt. A non-loopback
+control listener still refuses to start unless the password is configured.
+
+The local inference and Fleet-dispatch bearers are deliberately not accepted
+for the snapshot endpoint, and an unset snapshot credential makes it
+unavailable. If Fleet discovery is enabled while both
+`FLEET_INFERENCE_API_KEY` and the backward-compatible `INFERENCE_API_KEY`
+fallback are empty, snapshot discovery fails closed with `503` and
+`fleet_inference_auth_unconfigured`. The dispatch-only key never authorizes an
+unmarked local request. Snapshots never expose secrets or local model paths.
+Managed Hugging Face installs with an immutable resolved revision and exact
+selected files are eligible for strict cross-node routing.
 Finder imports, hand-authored paths, symbolic revisions, and unverifiable
 legacy installs remain visible only as node-scoped `unverified` deployments
 and cannot be grouped automatically.
@@ -786,6 +879,112 @@ from the private `.env`. Process environment values take precedence for
 command-line development. `MNEMOSYNE_CONTROL_URL` is an explicit fixture
 override; wildcard service binds are translated to a loopback connect address.
 
+### Signed compatibility catalog
+
+The optional `catalog` updater is disabled by default. When deliberately
+enabled, it accepts only one exact canonical HTTPS origin/path and catalogs
+signed by an Ed25519 public key pinned through the private `.env`. The
+repository test key is never a release trust anchor. Catalog state lives in
+`state/compatibility-catalog` beside the active YAML configuration; changing a
+model-storage folder or the SQLite path cannot move it.
+
+Startup first loads the still-valid signed last-known-good catalog, otherwise
+it uses an empty offline catalog. Network, signature, expiry, rollback, and
+private-state failures affect only advisory catalog status: local inference,
+JIT loading, existing downloads, exact storage selections, and token
+accounting continue unchanged. A successful activation asks the existing Mac
+inventory publisher to send a fresh path-free observation. It does not edit a
+profile, install or update a runtime, start a download, load a model, or move
+weights. The authenticated no-store control surface is `GET /manager/catalog`,
+`GET /manager/catalog/models`, and `POST /manager/catalog/check`; it never
+returns the update endpoint, trust bytes, or private state path.
+
+### Inference Pool and selected-Mac installs
+
+Pool enrollment and local participation are separate. After this Mac is paired
+once, **Settings → Inference Pool** can join or pause it without deleting its
+pairing. Pause drains complete Fleet-routed streams and rejects only new
+Fleet-marked work; local inference, model downloads, JIT policy, exact storage
+folders, inference profiles, token history, and usage delivery continue. The
+separately confirmed **Remove this Mac from Hub** action permanently revokes
+that pairing and requires a new invitation; it still leaves all of those local
+assets unchanged. The Hub can classify a lower-capability Mac
+or its colocated worker as `overflow`, so it is considered only after primary and
+opportunistic workers even when it is already warm.
+
+The Mac publishes a path-free inventory containing hardware capability,
+participation, opaque storage IDs/generations/free space, and authoritative
+installed/cold/warm model identities. The Hub never receives a filesystem path,
+volume mount, bookmark, scope, or credential. Its dashboard can show which Mac
+has each model, explain hardware-aware placement, and let the administrator
+choose one exact Mac and opaque storage location. That approval creates a
+revisioned `DesiredInstall`; the chosen Mac independently revalidates its
+pairing generation, service instance, signed catalog, recipe/artifact, storage
+generation, capacity, and cancellation before using the ordinary durable
+native downloader.
+
+Remote selection does not change storage semantics. The destination is derived
+only from the chosen Mac's existing exact lexical folder and engine-specific
+layout; nested/symlink spelling, containing-volume UUID, receiver-owned scope,
+per-install provenance, and ownership stay local and authoritative. There is no
+fallback to a default directory, relocation, consolidation, or hidden copy.
+Downloading does not load a model. Successful registration leaves it cold and
+the existing coordinator performs JIT load, full-stream leasing, engine-local
+batching, swaps, and idle unloading when a request arrives.
+
+Signed GGUF artifacts can declare one exact primary file, its complete ordered
+shard set, and one optional selected vision projector. The Mac downloads and
+proves every declared member; missing, extra, mixed, duplicated, or ambiguous
+layouts fail closed. Projectors are supplied only to llama.cpp and are never
+treated as primary models; DS4 recipes cannot carry one.
+
+For a signed managed oMLX recipe, Mnemosyne retains the immutable scheduler and
+memory-guard launch contract in its hidden install journal. It uses the
+authenticated official GET-only global-settings API before registration,
+local/JIT load, benchmark work, and Fleet advertisement. It never changes
+oMLX's service-global scheduler or memory guard as an install side effect. If
+those settings drift, the model remains visible but is non-loadable,
+zero-capacity, and Fleet-ineligible until the external service again proves the
+signed contract; unrelated local models remain available.
+The binding is recovered from hidden install history after restart. A later
+install-journal read fault preserves the last exact signed/ordinary
+classification, so a signed profile cannot silently become unconstrained and
+an already-proved ordinary local profile is not needlessly fenced.
+
+### Migration and removal
+
+**Settings → Migration & Removal** offers previews for app-only removal,
+state/runtime removal while retaining all weights, and full removal of only
+freshly proven exclusive managed weights. The control API and UI expose only
+fixed counts and component dispositions. Exact lexical paths remain solely in
+a private mode-`0600` retention manifest below the native lifecycle state
+directory. Imported/shared models are retained, an unavailable or changed
+storage binding fails closed, and pending token-delivery rows block any mode
+that would remove their durable state.
+
+The current 0.9 surface can prepare a fresh, journal-only transaction; it does
+not stop the service, unregister the LaunchAgent, remove the app, delete state,
+or move weights. A primitive-free executor core models restart-safe observed
+effects, durable rollback intent, a product-wide execution claim, exact Trash
+authority, and manual recovery. An expired or abandoned claim is never stolen;
+it blocks later lifecycle work until an authenticated recovery ceremony. The
+menu now requests owner authorization only through the authenticated loopback
+service, which is the direct peer allowed by the helper's sealed manifest and
+launches only the bootstrap-pinned bundled helper over a one-shot socketpair.
+That transport does not create proof authority: the production journal has no
+per-install OS-backed verifier and the helper emits no receipt without one, so
+authorization fails closed before launch and execution remains disabled.
+Effects and recovery still require the signed helper/runner implementation and
+the corresponding Developer ID/notarized real-Mac acceptance. This distinction
+is a release boundary: a successful preview or prepare response is never
+evidence that an uninstall or migration executed.
+Pairing revoke is independently confirmed on the Inference Pool page and is
+not triggered by migration/removal preview or preparation. Conversely, pairing
+revoke cannot invoke model cleanup or lifecycle execution. Migration and every
+retained-data removal mode preserve all local models, exact configured weight
+paths, inference profiles, and token history unless a later executable flow
+receives a separate, explicit, proven-exclusive model-deletion authorization.
+
 ## Usage delivery
 
 Every successful response with backend-provided usage is written to the local
@@ -794,7 +993,29 @@ SQLite `request_usage` table. Reporting defaults on; when
 transaction adds a durable `pg_usage_outbox` row. A background writer retries
 delivery to the existing `public.token_usage` Postgres ledger using stable
 event IDs and `ON CONFLICT DO NOTHING`; a network outage does not discard the
-local event.
+local event. Fleet-routed requests reuse Fleet's authenticated route UUID as
+that stable event ID, so route history and the serving Mac's ledger row can be
+correlated without storing request content. If the configured durable outbox
+cap is reached, new language inference fails before model loading with the
+fixed `usage_outbox_full` condition; Mnemosyne never makes room by deleting an
+undelivered event. Image generation is unchanged because it does not emit
+token-usage events.
+
+Fleet dispatch additionally reserves its authenticated route UUID before JIT
+or coordinator admission. The reservation and optional final outbox slot are
+one SQLite `BEGIN IMMEDIATE` decision, so overlapping service processes cannot
+both accept the last slot or execute a replayed route. Pre-work failures release
+the reservation; once request bytes may have reached an engine, a content-free
+replay fence remains. Accounted language success consumes the reservation into
+the durable analytics/outbox event. A non-streaming Fleet 2xx response without
+normalized usage is withheld and becomes a fixed 502 `usage_missing` response.
+For live SSE, content events may already be visible; Mnemosyne withholds the
+recognized success terminal and aborts the body with internal `usage_missing`
+instead of pretending it can rewrite the already-sent HTTP status. Neither
+path invents a zero-count event, and both retain the route replay fence.
+Standalone missing-usage compatibility is unchanged. Completed no-usage/image/
+error fences retain only the newest 10,000 rows; active work and durable
+usage/outbox evidence are never pruned by that bound.
 
 The Postgres writer migrates the previous token sidecar's stable machine
 identity when available and persists that identity plus the DSN into Unified

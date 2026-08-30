@@ -8,11 +8,13 @@ final class SettingsViewModel: ObservableObject {
     enum Section: String, CaseIterable, Identifiable {
         case setup = "Setup & Health"
         case general = "General"
+        case pool = "Inference Pool"
         case engines = "Engines"
         case updates = "Runtime Updates"
         case storage = "Storage"
         case library = "Model Library"
         case models = "Models"
+        case lifecycle = "Migration & Removal"
         case usage = "Usage"
         case credentials = "Credentials"
 
@@ -22,11 +24,13 @@ final class SettingsViewModel: ObservableObject {
             switch self {
             case .setup: "checklist"
             case .general: "gearshape"
+            case .pool: "point.3.connected.trianglepath.dotted"
             case .engines: "cpu"
             case .updates: "arrow.triangle.2.circlepath.circle"
             case .storage: "externaldrive"
             case .library: "square.and.arrow.down"
             case .models: "shippingbox"
+            case .lifecycle: "shippingbox.and.arrow.backward"
             case .usage: "chart.bar"
             case .credentials: "key"
             }
@@ -40,6 +44,28 @@ final class SettingsViewModel: ObservableObject {
         case error
     }
 
+    private enum DesiredInstallMutationAction {
+        case approve
+        case refuse
+        case cancel
+
+        var description: String {
+            switch self {
+            case .approve: "approve the download"
+            case .refuse: "refuse the download"
+            case .cancel: "stop the download"
+            }
+        }
+
+        func isPermitted(for item: DesiredInstallItem) -> Bool {
+            switch self {
+            case .approve: item.canApprove
+            case .refuse: item.canRefuse
+            case .cancel: item.canCancel
+            }
+        }
+    }
+
     @Published var selectedSection: Section = .setup
     @Published var settings = NativeSettings()
     @Published var selectedModelIndex: Int?
@@ -49,7 +75,11 @@ final class SettingsViewModel: ObservableObject {
     @Published var confirmRemoveModel = false
     @Published var confirmHomebrewOMLXInstall = false
     @Published var confirmHomebrewOMLXUpgrade = false
+    @Published var confirmDS4GLM53PreviewInstall = false
+    @Published var confirmAppleDeveloperToolsInstall = false
     @Published var confirmOMLXCacheReset = false
+    @Published var confirmRevokeFleetPairing = false
+    @Published var confirmPrepareNativeLifecycle = false
     @Published var pendingOMLXUpgrade: EngineRuntimeUpdate?
     @Published var showLocalModelImporter = false
     @Published var selectedLocalModelIDs: Set<String> = []
@@ -60,12 +90,11 @@ final class SettingsViewModel: ObservableObject {
     @Published var selectedLibraryFileID: String?
     @Published var selectedLibraryProjector = ""
     @Published var selectedLibraryRole: ModelRole = .generation
-    @Published var selectedLibraryStorage = "internal"
-    @Published private(set) var storageStatuses: [String: StorageStatus] = [:]
-    @Published private(set) var libraryModels: [LibraryModel] = []
+    @Published private var modelLibraryDownload = ModelLibraryDownloadViewModel()
     @Published private(set) var libraryFileOptions: [LibraryModel] = []
-    @Published private(set) var libraryDetails: LibraryModelDetails?
     @Published private(set) var modelInstalls: [ModelInstall] = []
+    @Published private(set) var modelCleanupDecision: ModelCleanupDecision =
+        .refused(.preparationRequired)
     @Published private(set) var runtimeUpdateSnapshot: RuntimeUpdateSnapshot?
     @Published private(set) var benchmarkSnapshot: EngineBenchmarkSnapshot?
     @Published private(set) var benchmarkingAlias: String?
@@ -73,7 +102,34 @@ final class SettingsViewModel: ObservableObject {
     @Published private(set) var profilingContextAlias: String?
     @Published private(set) var omlxCacheHealth: OMLXCacheHealth?
     @Published private(set) var readinessSnapshot: ReadinessSnapshot?
+    @Published private(set) var appleDeveloperToolsInstalled: Bool?
     @Published private(set) var lastSelfTest: ModelSelfTestResult?
+    @Published private(set) var fleetPairing: FleetPairingSnapshot?
+    @Published var fleetPairingCeremony = FleetPairingCeremonyState()
+    @Published private(set) var desiredInstalls = DesiredInstallViewModel()
+    @Published private(set) var desiredInstallInFlightJobIDs: Set<String> = []
+    @Published private(set) var desiredInstallError = ""
+    @Published private(set) var nativeLifecycleStatus:
+        NativeLifecycleStatusSnapshot?
+    @Published private(set) var nativeMigrationPreview:
+        NativeLifecycleMigrationPreview?
+    @Published private(set) var nativeUninstallPreviews:
+        [NativeLifecycleRetentionMode: NativeLifecycleUninstallPreview] = [:]
+    @Published private(set) var nativeUninstallPreviewErrors:
+        [NativeLifecycleRetentionMode: String] = [:]
+    @Published private(set) var preparedNativeLifecycleTransaction:
+        NativeLifecycleTransaction?
+    @Published private(set) var authorizedNativeLifecycleTransaction:
+        NativeLifecycleTransaction?
+    @Published private(set) var nativeLifecycleAuthorizationStatuses:
+        [String: NativeLifecycleAuthorizationStatus] = [:]
+    @Published private(set) var nativeLifecycleMessage = ""
+    @Published private(set) var isAdvancingFleetPairing = false
+    @Published private(set) var isRevokingFleetPairing = false
+    @Published private(set) var isRefreshingDesiredInstalls = false
+    @Published private(set) var isRefreshingNativeLifecycle = false
+    @Published private(set) var isPreparingNativeLifecycle = false
+    @Published private(set) var isAuthorizingNativeLifecycle = false
     @Published private(set) var isRefreshingReadiness = false
     @Published private(set) var isReconciling = false
     @Published private(set) var isRunningSelfTest = false
@@ -82,6 +138,7 @@ final class SettingsViewModel: ObservableObject {
     @Published private(set) var isCheckingRuntimeUpdates = false
     @Published private(set) var updatingRuntimeEngine: InferenceEngine?
     @Published private(set) var isInstallingOMLXWithHomebrew = false
+    @Published private(set) var isRequestingAppleDeveloperTools = false
     @Published private(set) var isResettingOMLXCache = false
     @Published private(set) var isSearchingLibrary = false
     @Published private(set) var isLoadingLibraryFiles = false
@@ -110,7 +167,12 @@ final class SettingsViewModel: ObservableObject {
     private var libraryFileRequestID: UUID?
     private var libraryDetailsRequestID: UUID?
     private var installMonitorTask: Task<Void, Never>?
+    private var pendingModelCleanupProfile: ModelProfileSettings?
+    private var fleetPairingTask: Task<Void, Never>?
+    private var fleetPairingTaskGeneration = 0
+    private var fleetSelfRevokeRequestID: String?
     private var configurationRefreshPending = false
+    private var pendingNativeLifecyclePreview: NativeLifecycleUninstallPreview?
 
     init(
         configuration: ControlConnectionConfiguration = .load(),
@@ -147,6 +209,109 @@ final class SettingsViewModel: ObservableObject {
         return configuredCredentials.contains(.inferenceAPIKey)
     }
 
+    var pairingOwnsFleetCredentials: Bool {
+        fleetPairing?.ownsFleetCredentials == true
+    }
+
+    var pendingNativeLifecycleMode: NativeLifecycleRetentionMode? {
+        pendingNativeLifecyclePreview?.plan.retentionMode
+    }
+
+    var nativeMigrationIncompleteCount: Int {
+        nativeLifecycleStatus?.incomplete.filter { $0.kind == .migration }.count
+            ?? 0
+    }
+
+    var nativeUninstallIncompleteCount: Int {
+        nativeLifecycleStatus?.incomplete.filter { $0.kind == .uninstall }.count
+            ?? 0
+    }
+
+    var selectedLibraryStorage: String {
+        get { modelLibraryDownload.selectedStorageKey }
+        set { modelLibraryDownload.selectStorage(newValue) }
+    }
+
+    var libraryModels: [LibraryModel] {
+        get { modelLibraryDownload.searchResults }
+        set { modelLibraryDownload.applySearchResults(newValue) }
+    }
+
+    var ds4RuntimeUpdate: EngineRuntimeUpdate? {
+        runtimeUpdateSnapshot?.engines.first { $0.engine == .ds4 }
+    }
+
+    var ds4GLM53FlashPreview: ManagedRuntimeChannel? {
+        ds4RuntimeUpdate?.ds4GLM53FlashPreview
+    }
+
+    var shouldOfferGLM53PreviewRuntimeInstall: Bool {
+        GLM53PreviewPresentation.shouldOfferRuntimeInstall(
+            query: libraryQuery,
+            models: libraryModels,
+            ds4Update: ds4RuntimeUpdate
+        )
+    }
+
+    var selectedModelRuntimePreparation: ModelRuntimePreparation? {
+        guard let model = selectedLibraryModel ?? selectedLibrarySearchResult else {
+            return nil
+        }
+        return ModelRuntimePreparationPlanner.plan(
+            engine: model.engine,
+            family: model.family,
+            engineEnabled: engineIsEnabled(model.engine),
+            runtimeUpdates: runtimeUpdateSnapshot,
+            readiness: readinessSnapshot?.engines.first {
+                $0.engine == model.engine
+            },
+            restartRequired: requiresRestart,
+            engineEnablePendingSave: engineIsEnabled(model.engine)
+                && !engineIsEnabled(model.engine, in: savedSettings),
+            appleDeveloperToolsInstalled: appleDeveloperToolsInstalled
+        )
+    }
+
+    var libraryDetails: LibraryModelDetails? {
+        get { modelLibraryDownload.details }
+        set { modelLibraryDownload.applyDetails(newValue) }
+    }
+
+    var libraryStorageBinding: Binding<String> {
+        Binding(
+            get: { self.selectedLibraryStorage },
+            set: { self.selectedLibraryStorage = $0 }
+        )
+    }
+
+    var fleetPairingInvitationIDBinding: Binding<String> {
+        Binding(
+            get: { self.fleetPairingCeremony.invitationID },
+            set: { self.fleetPairingCeremony.setInvitationID($0) }
+        )
+    }
+
+    var fleetPairingSecretBinding: Binding<String> {
+        Binding(
+            get: { self.fleetPairingCeremony.pairingSecretForSecureEntry },
+            set: { self.fleetPairingCeremony.setPairingSecret($0) }
+        )
+    }
+
+    var fleetPairingHubOriginBinding: Binding<String> {
+        Binding(
+            get: { self.fleetPairingCeremony.hubOrigin },
+            set: { self.fleetPairingCeremony.setHubOrigin($0) }
+        )
+    }
+
+    var fleetPairingLocatorBinding: Binding<String> {
+        Binding(
+            get: { self.fleetPairingCeremony.locator },
+            set: { self.fleetPairingCeremony.setLocator($0) }
+        )
+    }
+
     var statusColor: Color {
         switch statusTone {
         case .normal: .secondary
@@ -175,19 +340,24 @@ final class SettingsViewModel: ObservableObject {
         do {
             async let configurationRequest = client.configuration()
             async let statusRequest = client.status()
+            async let pairingRequest = try? client.fleetPairing()
             let snapshot = try await configurationRequest
             let loaded = snapshot.config
             let serviceStatus = try? await statusRequest
+            let pairingStatus = await pairingRequest
             let credentialStatus = try credentialStore.status()
             settings = loaded
             savedSettings = loaded
             configurationRevision = snapshot.revision
             appliedConfigurationRevision = snapshot.appliedRevision
             configurationRefreshPending = false
-            selectedLibraryStorage = loaded.storage.default
+            modelLibraryDownload.initialize(
+                defaultStorageKey: loaded.storage.default
+            )
             configuredCredentials = credentialStatus.configured
             credentialDrafts = [:]
             credentialsToClear = []
+            updateFleetPairing(pairingStatus)
             selectedModelIndex = loaded.models.isEmpty ? nil : 0
             requiresRestart = snapshot.restartRequired
             isLoaded = true
@@ -215,6 +385,7 @@ final class SettingsViewModel: ObservableObject {
             Task { await refreshReadiness() }
             Task { await refreshBenchmarks() }
             Task { await refreshContexts() }
+            Task { await refreshDesiredInstalls() }
         } catch {
             isLoaded = false
             setStatus("Could not load settings: \(error.localizedDescription)", tone: .error)
@@ -332,6 +503,19 @@ final class SettingsViewModel: ObservableObject {
         setStatus("Validating and saving settings…", tone: .normal)
         defer { isWorking = false }
 
+        // Refresh this authority boundary immediately before saving. Pairing
+        // may have completed while the Settings window was already open.
+        if let pairingStatus = try? await client.fleetPairing() {
+            updateFleetPairing(pairingStatus)
+        }
+        guard hasUnsavedChanges else {
+            setStatus(
+                "Hub pairing now manages the Fleet credentials; their stale drafts were discarded.",
+                tone: .normal
+            )
+            return
+        }
+
         normalizeProfiles()
         do {
             let result = try await client.saveConfiguration(
@@ -374,6 +558,522 @@ final class SettingsViewModel: ObservableObject {
         } catch {
             setStatus("Could not save settings: \(error.localizedDescription)", tone: .error)
         }
+    }
+
+    func refreshFleetPairing() async {
+        do {
+            let snapshot = try await client.fleetPairing()
+            updateFleetPairing(snapshot)
+            setPairingStatusMessage()
+            if snapshot.state == "paired" {
+                await refreshDesiredInstalls()
+            }
+        } catch {
+            fleetPairingCeremony.recordFailure(.localServiceUnavailable)
+            setPairingStatusMessage(tone: .error)
+        }
+    }
+
+    func revokeFleetPairing() async {
+        guard !isRevokingFleetPairing,
+              let pairing = fleetPairing,
+              pairing.legacyCredentialsPresent != true,
+              pairing.state == "paired" || pairing.selfRevoke != nil
+        else { return }
+
+        isRevokingFleetPairing = true
+        let requestID = pairing.selfRevoke?.requestID
+            ?? fleetSelfRevokeRequestID
+            ?? UUID().uuidString.lowercased()
+        fleetSelfRevokeRequestID = requestID
+        setStatus(
+            pairing.selfRevoke == nil
+                ? "Removing this Mac from Hub…"
+                : "Resuming this Mac's pending Hub removal…",
+            tone: .normal
+        )
+        defer { isRevokingFleetPairing = false }
+
+        do {
+            let response = try await client.revokeFleetPairing(
+                requestID: requestID
+            )
+            fleetSelfRevokeRequestID = nil
+            updateFleetPairing(response.pairing)
+            setStatus(
+                "This Mac was removed from Hub. Local inference, model files, storage locations, and token history were not changed.",
+                tone: .success
+            )
+        } catch {
+            // The Hub may have committed even if the local HTTP response was
+            // lost. Refreshing recovers the durable service-owned request ID;
+            // the next button press must replay it rather than allocate a new
+            // revocation intent.
+            if let refreshed = try? await client.fleetPairing() {
+                updateFleetPairing(refreshed)
+            }
+            setStatus(
+                "Could not confirm removal from Hub. Pooled routing is denied locally; use Retry Removal to resume the exact request.",
+                tone: .warning
+            )
+        }
+    }
+
+    func advanceFleetPairing() {
+        guard !isAdvancingFleetPairing else { return }
+        let submission: FleetPairingCeremonySubmission
+        do {
+            submission = try fleetPairingCeremony.prepareSubmission()
+        } catch {
+            setStatus(
+                FleetPairingCeremonyInputError.incompleteInvitation
+                    .localizedDescription,
+                tone: .warning
+            )
+            return
+        }
+
+        fleetPairingTaskGeneration += 1
+        let generation = fleetPairingTaskGeneration
+        isAdvancingFleetPairing = true
+        setPairingStatusMessage()
+        fleetPairingTask = Task { [weak self] in
+            await self?.performFleetPairing(
+                submission,
+                generation: generation
+            )
+        }
+    }
+
+    private func performFleetPairing(
+        _ submission: FleetPairingCeremonySubmission,
+        generation: Int
+    ) async {
+        defer {
+            if fleetPairingTaskGeneration == generation {
+                isAdvancingFleetPairing = false
+                fleetPairingTask = nil
+            }
+        }
+        do {
+            let response: FleetPairingOperationResponse
+            switch submission.operation {
+            case .begin:
+                response = try await client.beginFleetPairing(
+                    submission.request
+                )
+            case .resume:
+                response = try await client.resumeFleetPairing(
+                    submission.request
+                )
+            }
+            guard !Task.isCancelled,
+                  fleetPairingTaskGeneration == generation
+            else { return }
+            fleetPairingCeremony.apply(response)
+            if let returnedPairing = response.pairing {
+                updateFleetPairing(returnedPairing)
+            }
+            if let refreshed = try? await client.fleetPairing() {
+                guard !Task.isCancelled,
+                      fleetPairingTaskGeneration == generation
+                else { return }
+                updateFleetPairing(refreshed)
+            }
+            setPairingStatusMessage(
+                tone: fleetPairingCeremony.stage == .paired
+                    ? .success : .warning
+            )
+            if fleetPairingCeremony.stage == .paired {
+                await refreshDesiredInstalls()
+            }
+        } catch is CancellationError {
+            return
+        } catch {
+            guard !Task.isCancelled,
+                  fleetPairingTaskGeneration == generation
+            else { return }
+            fleetPairingCeremony.recordFailure(
+                fleetPairingFailure(for: error)
+            )
+            setPairingStatusMessage(tone: .error)
+        }
+    }
+
+    func clearFleetPairingCeremony() {
+        cancelFleetPairingTask()
+        fleetPairingCeremony.cancel()
+        setStatus(
+            "Pairing invitation details were cleared from this app.",
+            tone: .normal
+        )
+    }
+
+    func fleetPairingViewDidDisappear() {
+        cancelFleetPairingTask()
+        fleetPairingCeremony.viewDidDisappear()
+    }
+
+    private func cancelFleetPairingTask() {
+        fleetPairingTaskGeneration += 1
+        fleetPairingTask?.cancel()
+        fleetPairingTask = nil
+        isAdvancingFleetPairing = false
+    }
+
+    func refreshDesiredInstalls() async {
+        guard !isRefreshingDesiredInstalls,
+              desiredInstallInFlightJobIDs.isEmpty
+        else { return }
+        isRefreshingDesiredInstalls = true
+        defer { isRefreshingDesiredInstalls = false }
+        do {
+            let snapshot = try await client.desiredInstalls(
+                offset: 0,
+                // The local journal admits at most 256 active jobs and sorts
+                // them before terminal history, so one bounded fetch cannot
+                // hide a request that still needs this Mac owner's action.
+                limit: 256
+            )
+            var updated = desiredInstalls
+            updated.apply(snapshot)
+            desiredInstalls = updated
+            desiredInstallError = ""
+        } catch {
+            desiredInstallError = desiredInstallFailureMessage(
+                action: "refresh requests",
+                error: error
+            )
+        }
+    }
+
+    func refreshNativeLifecycle() async {
+        guard !isRefreshingNativeLifecycle,
+              !isPreparingNativeLifecycle,
+              !isAuthorizingNativeLifecycle
+        else {
+            return
+        }
+        isRefreshingNativeLifecycle = true
+        nativeLifecycleMessage = "Inspecting current local lifecycle evidence…"
+        defer { isRefreshingNativeLifecycle = false }
+
+        do {
+            let status = try await client.nativeLifecycleStatus()
+            nativeLifecycleStatus = status
+            guard status.available else {
+                nativeMigrationPreview = nil
+                nativeUninstallPreviews = [:]
+                nativeUninstallPreviewErrors = [:]
+                nativeLifecycleAuthorizationStatuses = [:]
+                nativeLifecycleMessage = nativeLifecycleFailureMessage(
+                    fallback: "Lifecycle planning is unavailable.",
+                    code: status.errorCode
+                )
+                return
+            }
+
+            var previews: [
+                NativeLifecycleRetentionMode: NativeLifecycleUninstallPreview
+            ] = [:]
+            var errors: [NativeLifecycleRetentionMode: String] = [:]
+            for mode in NativeLifecycleRetentionMode.allCases {
+                do {
+                    previews[mode] = try await client.previewNativeUninstall(
+                        retentionMode: mode
+                    )
+                } catch {
+                    errors[mode] = nativeLifecycleFailureMessage(error)
+                }
+            }
+            nativeUninstallPreviews = previews
+            nativeUninstallPreviewErrors = errors
+
+            var authorizationStatuses: [
+                String: NativeLifecycleAuthorizationStatus
+            ] = [:]
+            if status.authorizationAvailable {
+                for transaction in status.incomplete
+                where transaction.contractVersion == 2
+                    && [
+                        NativeLifecyclePhase.helperStaged,
+                        NativeLifecyclePhase.authorized,
+                    ].contains(transaction.phase)
+                {
+                    do {
+                        authorizationStatuses[transaction.transactionID] =
+                            try await client.nativeLifecycleAuthorizationStatus(
+                                transactionID: transaction.transactionID
+                            )
+                    } catch {
+                        // Authorization is failure-isolated from previews and
+                        // cannot make lifecycle inventory disappear.
+                    }
+                }
+            }
+            nativeLifecycleAuthorizationStatuses = authorizationStatuses
+
+            if status.migrationPreviewAvailable {
+                do {
+                    nativeMigrationPreview = try await client.previewNativeMigration()
+                } catch {
+                    nativeMigrationPreview = nil
+                    nativeLifecycleMessage = nativeLifecycleFailureMessage(error)
+                    return
+                }
+            } else {
+                nativeMigrationPreview = nil
+            }
+
+            nativeLifecycleMessage = errors.isEmpty
+                ? "Current path-free lifecycle previews are ready."
+                : "Some retention previews are blocked by current local evidence."
+        } catch {
+            nativeLifecycleStatus = nil
+            nativeMigrationPreview = nil
+            nativeUninstallPreviews = [:]
+            nativeUninstallPreviewErrors = [:]
+            nativeLifecycleAuthorizationStatuses = [:]
+            nativeLifecycleMessage = nativeLifecycleFailureMessage(error)
+        }
+    }
+
+    func requestNativeLifecyclePreparation(
+        _ mode: NativeLifecycleRetentionMode
+    ) {
+        guard !isRefreshingNativeLifecycle,
+              !isPreparingNativeLifecycle,
+              let preview = nativeUninstallPreviews[mode],
+              preview.preparable
+        else { return }
+        pendingNativeLifecyclePreview = preview
+        confirmPrepareNativeLifecycle = true
+    }
+
+    func cancelNativeLifecyclePreparation() {
+        pendingNativeLifecyclePreview = nil
+    }
+
+    func prepareConfirmedNativeLifecycle() async {
+        guard !isRefreshingNativeLifecycle,
+              !isPreparingNativeLifecycle,
+              let confirmed = pendingNativeLifecyclePreview
+        else { return }
+        pendingNativeLifecyclePreview = nil
+        isPreparingNativeLifecycle = true
+        nativeLifecycleMessage =
+            "Rechecking the exact local plan before recording it…"
+        defer { isPreparingNativeLifecycle = false }
+
+        let mode = confirmed.plan.retentionMode
+        do {
+            // The visible confirmation is fenced against a fresh path-free
+            // preview. A changed private-manifest receipt forces another
+            // owner review instead of silently preparing stale effects.
+            let fresh = try await client.previewNativeUninstall(
+                retentionMode: mode
+            )
+            nativeUninstallPreviews[mode] = fresh
+            nativeUninstallPreviewErrors.removeValue(forKey: mode)
+            guard confirmed.plan.hasSamePreparedEffects(as: fresh.plan) else {
+                throw NativeLifecycleRequestError.changedBeforePreparation
+            }
+
+            let prepared = try await client.prepareNativeUninstall(
+                transactionID: fresh.plan.transactionID,
+                retentionMode: mode
+            )
+            let reread = try await client.nativeLifecycleTransaction(
+                transactionID: fresh.plan.transactionID
+            )
+            guard prepared.prepared,
+                  prepared.transaction.transactionID == fresh.plan.transactionID,
+                  prepared.transaction.phase == .prepared,
+                  prepared.transaction.plan.uninstall == fresh.plan,
+                  reread == prepared.transaction
+            else {
+                throw NativeLifecycleRequestError.invalidPreparedTransaction
+            }
+            preparedNativeLifecycleTransaction = reread
+            nativeLifecycleStatus = try await client.nativeLifecycleStatus()
+            nativeLifecycleMessage =
+                "Plan prepared and re-read from the private journal. Execution remains unavailable; inference, the background service, the app, and all model files are unchanged."
+        } catch {
+            nativeLifecycleMessage = nativeLifecycleFailureMessage(error)
+        }
+    }
+
+    func authorizeNativeLifecycle(
+        _ transaction: NativeLifecycleTransaction
+    ) async {
+        guard !isRefreshingNativeLifecycle,
+              !isPreparingNativeLifecycle,
+              !isAuthorizingNativeLifecycle,
+              transaction.contractVersion == 2,
+              transaction.phase == .helperStaged
+        else { return }
+        isAuthorizingNativeLifecycle = true
+        nativeLifecycleMessage =
+            "Waiting for device-owner authorization from the signed helper…"
+        defer { isAuthorizingNativeLifecycle = false }
+
+        do {
+            let accepted = try await NativeLifecycleAuthorizationSession(
+                service: client
+            ).authorize(transactionID: transaction.transactionID)
+            let reread = try await client.nativeLifecycleTransaction(
+                transactionID: transaction.transactionID
+            )
+            guard accepted.authorized,
+                  accepted.transaction == reread,
+                  reread.phase == .authorized,
+                  reread.transactionID == transaction.transactionID
+            else {
+                throw NativeLifecycleRequestError.invalidAuthorizationResponse
+            }
+            authorizedNativeLifecycleTransaction = reread
+            nativeLifecycleStatus = try await client.nativeLifecycleStatus()
+            nativeLifecycleAuthorizationStatuses[transaction.transactionID] =
+                try await client.nativeLifecycleAuthorizationStatus(
+                    transactionID: transaction.transactionID
+                )
+            nativeLifecycleMessage =
+                "Owner authorization was recorded for the exact staged helper and private manifest. Effects remain disabled; inference, storage, runtimes, and every model weight are unchanged."
+        } catch {
+            // A submit failure may be an ambiguous successful commit. Never
+            // cancel or replay blindly; refresh the durable status instead.
+            if let durable = try? await client.nativeLifecycleTransaction(
+                transactionID: transaction.transactionID
+            ), durable.phase == .authorized {
+                authorizedNativeLifecycleTransaction = durable
+                nativeLifecycleMessage =
+                    "Owner authorization is durably recorded. Effects remain disabled."
+            } else {
+                nativeLifecycleMessage = nativeLifecycleFailureMessage(error)
+            }
+        }
+    }
+
+    private func nativeLifecycleFailureMessage(_ error: Error) -> String {
+        if let lifecycleError = error as? NativeLifecycleAPIError {
+            return lifecycleError.localizedDescription
+        }
+        if let requestError = error as? NativeLifecycleRequestError {
+            return requestError.localizedDescription
+        }
+        if let controlError = error as? ControlAPIError {
+            switch controlError {
+            case .invalidResponse:
+                return "The local service returned an invalid lifecycle response."
+            case let .unexpectedStatus(status), let .rejected(status, _):
+                return "Lifecycle planning is unavailable (HTTP \(status))."
+            case .unsupportedConfigurationSchema:
+                return "Update Unified Inference before using lifecycle planning."
+            }
+        }
+        return "The local lifecycle planning service is unavailable."
+    }
+
+    private func nativeLifecycleFailureMessage(
+        fallback: String,
+        code: String?
+    ) -> String {
+        guard let code else { return fallback }
+        return NativeLifecycleAPIError(statusCode: 503, code: code)
+            .localizedDescription
+    }
+
+    func approveDesiredInstall(_ item: DesiredInstallItem) async {
+        await mutateDesiredInstall(item, action: .approve)
+    }
+
+    func refuseDesiredInstall(_ item: DesiredInstallItem) async {
+        await mutateDesiredInstall(item, action: .refuse)
+    }
+
+    func cancelDesiredInstall(_ item: DesiredInstallItem) async {
+        await mutateDesiredInstall(item, action: .cancel)
+    }
+
+    func isDesiredInstallInFlight(_ item: DesiredInstallItem) -> Bool {
+        desiredInstallInFlightJobIDs.contains(item.job.jobID)
+    }
+
+    private func mutateDesiredInstall(
+        _ item: DesiredInstallItem,
+        action: DesiredInstallMutationAction
+    ) async {
+        guard !isRefreshingDesiredInstalls else { return }
+        guard let current = desiredInstalls.item(
+            jobID: item.job.jobID,
+            jobRevision: item.job.jobRevision
+        ), action.isPermitted(for: current)
+        else {
+            desiredInstallError =
+                "This request changed. Refresh the list before trying again."
+            return
+        }
+
+        let jobID = current.job.jobID
+        let jobRevision = current.job.jobRevision
+        guard desiredInstallInFlightJobIDs.insert(jobID).inserted else { return }
+        defer { desiredInstallInFlightJobIDs.remove(jobID) }
+
+        do {
+            let snapshot: DesiredInstallDetailSnapshot
+            switch action {
+            case .approve:
+                snapshot = try await client.approveDesiredInstall(
+                    jobID: jobID,
+                    jobRevision: jobRevision
+                )
+            case .refuse:
+                snapshot = try await client.refuseDesiredInstall(
+                    jobID: jobID,
+                    jobRevision: jobRevision
+                )
+            case .cancel:
+                snapshot = try await client.cancelDesiredInstall(
+                    jobID: jobID,
+                    jobRevision: jobRevision
+                )
+            }
+            var updated = desiredInstalls
+            updated.apply(snapshot)
+            desiredInstalls = updated
+            desiredInstallError = ""
+        } catch {
+            let message = desiredInstallFailureMessage(
+                action: action.description,
+                error: error
+            )
+            if let refreshed = try? await client.desiredInstall(jobID: jobID) {
+                var updated = desiredInstalls
+                updated.apply(refreshed)
+                desiredInstalls = updated
+            }
+            desiredInstallError = message
+        }
+    }
+
+    private func desiredInstallFailureMessage(
+        action: String,
+        error: Error
+    ) -> String {
+        if let requestError = error as? DesiredInstallRequestError {
+            return requestError.localizedDescription
+        }
+        if let controlError = error as? ControlAPIError {
+            switch controlError {
+            case .invalidResponse:
+                return "Could not \(action): the local control service returned an invalid response."
+            case let .unexpectedStatus(status), let .rejected(status, _):
+                return "Could not \(action): the local control service returned HTTP \(status). Refresh the request before trying again."
+            case .unsupportedConfigurationSchema:
+                return "Could not \(action): update Unified Inference before managing Hub downloads."
+            }
+        }
+        return "Could not \(action): the local control service is unavailable."
     }
 
     func serviceRestartStarted() -> Bool {
@@ -481,7 +1181,7 @@ final class SettingsViewModel: ObservableObject {
             } else {
                 settings.storage.locations.append(location)
             }
-            storageStatuses[name] = StorageStatus(
+            modelLibraryDownload.setStorageStatus(StorageStatus(
                 name: name,
                 path: status.path,
                 exists: status.exists,
@@ -495,7 +1195,7 @@ final class SettingsViewModel: ObservableObject {
                 totalBytes: status.totalBytes,
                 freeBytes: status.freeBytes,
                 diagnostic: status.diagnostic
-            )
+            ), for: name)
             settings.storage.default = name
             selectedLibraryStorage = name
             setStatus("Model folder selected. Save settings before downloading models.", tone: .normal)
@@ -511,23 +1211,20 @@ final class SettingsViewModel: ObservableObject {
             return
         }
         settings.storage.locations.removeAll { $0.name == name }
-        storageStatuses.removeValue(forKey: name)
+        modelLibraryDownload.removeStorageStatus(for: name)
         if settings.storage.default == name {
             settings.storage.default = settings.storage.locations[0].name
-        }
-        if selectedLibraryStorage == name {
-            selectedLibraryStorage = settings.storage.default
         }
     }
 
     func refreshStorageStatuses() async {
         do {
             let snapshot = try await client.storageLocations()
-            storageStatuses = Dictionary(
+            modelLibraryDownload.applyStorageStatuses(Dictionary(
                 uniqueKeysWithValues: snapshot.locations.compactMap { status in
                     status.name.map { ($0, status) }
                 }
-            )
+            ))
         } catch {
             setStatus("Could not inspect model storage: \(error.localizedDescription)", tone: .warning)
         }
@@ -540,7 +1237,11 @@ final class SettingsViewModel: ObservableObject {
         do {
             async let found = client.searchLibrary(query: libraryQuery)
             async let installs = client.modelInstalls()
-            libraryModels = try await found
+            let foundModels = try await found
+            libraryModels = GLM53PreviewPresentation.visibleModels(
+                query: libraryQuery,
+                models: foundModels
+            )
             modelInstalls = try await installs
             if modelInstalls.contains(where: \.isActive) {
                 beginInstallMonitoring()
@@ -595,6 +1296,24 @@ final class SettingsViewModel: ObservableObject {
             )
             return
         }
+        guard settings.storage.locations.contains(where: {
+            $0.name == selectedLibraryStorage
+        }), modelLibraryDownload.selectedStorageIsAvailable else {
+            setStatus(
+                "The selected Download-to folder is unavailable. Choose an available folder explicitly before downloading.",
+                tone: .warning
+            )
+            return
+        }
+        guard availableLibraryRoles.contains(selectedLibraryRole),
+              model.isInstallable
+        else {
+            setStatus(
+                "This model and role cannot be installed with the current selection.",
+                tone: .warning
+            )
+            return
+        }
         isWorking = true
         setStatus("Starting \(model.displayName)…", tone: .normal)
         defer { isWorking = false }
@@ -614,6 +1333,78 @@ final class SettingsViewModel: ObservableObject {
             beginInstallMonitoring()
         } catch {
             setStatus("Could not start download: \(error.localizedDescription)", tone: .error)
+        }
+    }
+
+    func performSelectedModelRuntimePreparation() async {
+        guard let preparation = selectedModelRuntimePreparation else { return }
+        switch preparation.action {
+        case .none, .restartService:
+            return
+        case .refresh:
+            await refreshRuntimeUpdates(force: true)
+            await refreshReadiness()
+        case let .installManaged(engine, version):
+            guard
+                let update = runtimeUpdateSnapshot?.engines.first(where: {
+                    $0.engine == engine
+                }),
+                update.canInstall,
+                update.availableVersion == version
+            else {
+                setStatus(
+                    "Runtime availability changed. Checking the current official release…",
+                    tone: .warning
+                )
+                await refreshRuntimeUpdates(force: true)
+                return
+            }
+            await installRuntimeUpdate(update)
+            await refreshReadiness()
+        case let .installDS4GLM53Preview(version, channel):
+            guard
+                channel == ManagedRuntimeChannel.ds4GLM53FlashChannel,
+                ds4GLM53FlashPreview?.availableVersion == version,
+                ds4GLM53FlashPreview?.canInstall == true
+            else {
+                setStatus(
+                    "Preview runtime availability changed. Checking the exact official channel…",
+                    tone: .warning
+                )
+                await refreshRuntimeUpdates(force: true)
+                return
+            }
+            requestDS4GLM53PreviewInstall()
+        case .installAppleDeveloperTools:
+            confirmAppleDeveloperToolsInstall = true
+        case let .downloadOfficialOMLX(installerURL):
+            guard let url = URL(string: installerURL) else { return }
+            if NSWorkspace.shared.open(url) {
+                setStatus(
+                    "Opened the official oMLX installer. Return here and check runtime health after starting its loopback server.",
+                    tone: .normal
+                )
+            } else {
+                setStatus("Could not open the official oMLX installer.", tone: .error)
+            }
+        case .enableEngine:
+            guard let model = selectedLibraryModel ?? selectedLibrarySearchResult
+            else { return }
+            setEngineEnabled(model.engine, true)
+            setStatus(
+                "\(model.engine.displayName) is staged to be enabled. Save changes and restart the background service; model weights and storage remain unchanged.",
+                tone: .normal
+            )
+        case .saveSettings:
+            await save()
+        case let .openOMLXApplication(path):
+            guard
+                let update = runtimeUpdateSnapshot?.engines.first(where: {
+                    $0.engine == .omlx
+                }),
+                update.installedPath == path
+            else { return }
+            openOMLXApplication(update)
         }
     }
 
@@ -693,6 +1484,8 @@ final class SettingsViewModel: ObservableObject {
         else { return }
         isCheckingRuntimeUpdates = true
         defer { isCheckingRuntimeUpdates = false }
+        appleDeveloperToolsInstalled =
+            await AppleDeveloperToolsInstaller.isInstalled()
         do {
             runtimeUpdateSnapshot = force
                 ? try await client.checkRuntimeUpdates()
@@ -707,6 +1500,33 @@ final class SettingsViewModel: ObservableObject {
             }
         } catch {
             setStatus("Could not check runtime updates: \(error.localizedDescription)", tone: .warning)
+        }
+    }
+
+    func requestAppleDeveloperToolsInstallation() async {
+        guard !isRequestingAppleDeveloperTools else { return }
+        isRequestingAppleDeveloperTools = true
+        defer { isRequestingAppleDeveloperTools = false }
+        if await AppleDeveloperToolsInstaller.isInstalled() {
+            appleDeveloperToolsInstalled = true
+            setStatus("Apple's developer tools are already installed.", tone: .success)
+            return
+        }
+        do {
+            try await AppleDeveloperToolsInstaller.requestInstallation()
+            // xcode-select only confirms that Apple's GUI was requested. It
+            // does not prove that the user completed the system installation.
+            // Return to unknown until a later --print-path probe succeeds.
+            appleDeveloperToolsInstalled = nil
+            setStatus(
+                "Apple's Command Line Tools installer opened. Finish the system installation, then choose Check Prerequisites on the model card.",
+                tone: .normal
+            )
+        } catch {
+            setStatus(
+                "Could not open Apple's developer-tools installer: \(error.localizedDescription)",
+                tone: .error
+            )
         }
     }
 
@@ -832,6 +1652,74 @@ final class SettingsViewModel: ObservableObject {
         }
     }
 
+    func requestDS4GLM53PreviewInstall() {
+        guard ds4GLM53FlashPreview?.canInstall == true else {
+            setStatus(
+                "The official DS4 GLM 5.3 preview runtime is not currently installable. Check runtime updates and try again.",
+                tone: .warning
+            )
+            return
+        }
+        confirmDS4GLM53PreviewInstall = true
+    }
+
+    func installDS4GLM53PreviewRuntime() async {
+        guard
+            let channel = ds4GLM53FlashPreview,
+            channel.channel == ManagedRuntimeChannel.ds4GLM53FlashChannel,
+            channel.sourceBranch == ManagedRuntimeChannel.ds4GLM53FlashChannel,
+            channel.releaseTier == "experimental",
+            channel.canInstall,
+            let version = channel.availableVersion,
+            !version.isEmpty,
+            updatingRuntimeEngine == nil,
+            !isResettingOMLXCache
+        else {
+            setStatus(
+                "The exact DS4 GLM 5.3 preview release is not available. Check runtime updates and try again.",
+                tone: .warning
+            )
+            return
+        }
+
+        updatingRuntimeEngine = .ds4
+        setStatus(
+            "Preparing the experimental DS4 GLM 5.3 Flash runtime…",
+            tone: .normal
+        )
+        defer { updatingRuntimeEngine = nil }
+        do {
+            runtimeUpdateSnapshot = try await client.installRuntimeUpdate(
+                engine: .ds4,
+                version: version,
+                channel: channel.channel
+            )
+            await refreshModelLibrary()
+            setStatus(
+                "The DS4 GLM 5.3 Flash preview runtime is active. Choose Q2 or Q4_K in Model Library; downloading remains a separate explicit action.",
+                tone: .success
+            )
+        } catch {
+            setStatus(
+                "Could not install the DS4 GLM 5.3 Flash preview runtime: \(error.localizedDescription)",
+                tone: .error
+            )
+        }
+    }
+
+    func openGLM53PreviewRuntimeUpdates() {
+        selectedSection = .updates
+        if runtimeUpdateSnapshot == nil {
+            Task { await refreshRuntimeUpdates(force: true) }
+        }
+    }
+
+    func searchGLM53PreviewModels() {
+        libraryQuery = "GLM 5.3 Flash"
+        selectedSection = .library
+        Task { await refreshModelLibrary() }
+    }
+
     func rollbackRuntimeUpdate(_ update: EngineRuntimeUpdate) async {
         guard
             update.canRollback,
@@ -885,12 +1773,37 @@ final class SettingsViewModel: ObservableObject {
         case .mflux:
             return [.image]
         case .mlxcel, .mistralRs:
-            return [.generation]
+            return []
         }
     }
 
+    var canInstallSelectedLibraryModel: Bool {
+        guard let model = selectedLibraryModel else { return false }
+        return !isWorking
+            && !hasUnsavedChanges
+            && !requiresRestart
+            && model.isInstallable
+            && availableLibraryRoles.contains(selectedLibraryRole)
+            && settings.storage.locations.contains(where: {
+                $0.name == selectedLibraryStorage
+            })
+            && modelLibraryDownload.selectedStorageIsAvailable
+    }
+
     func storageStatus(for name: String) -> StorageStatus? {
-        storageStatuses[name]
+        guard settings.storage.locations.contains(where: { $0.name == name })
+        else { return nil }
+        return modelLibraryDownload.storageStatuses[name]
+    }
+
+    private func setEngineEnabled(_ engine: InferenceEngine, _ enabled: Bool) {
+        switch engine {
+        case .llamaCpp: settings.engines.llamaCpp.enabled = enabled
+        case .omlx: settings.engines.omlx.enabled = enabled
+        case .ds4: settings.engines.ds4.enabled = enabled
+        case .mflux: settings.engines.mflux.enabled = enabled
+        case .mlxcel, .mistralRs: break
+        }
     }
 
     func refreshLocalModelSources() async {
@@ -1050,7 +1963,6 @@ final class SettingsViewModel: ObservableObject {
             if !result.restartRequired {
                 appliedConfigurationRevision = result.revision
             }
-            selectedLibraryStorage = result.config.storage.default
             requiresRestart = result.restartRequired
             if let firstAlias = result.imported.first?.alias {
                 selectedModelIndex = settings.models.firstIndex { $0.alias == firstAlias }
@@ -1075,11 +1987,46 @@ final class SettingsViewModel: ObservableObject {
     func removeSelectedModel() {
         guard let index = selectedModelIndex, settings.models.indices.contains(index) else { return }
         settings.models.remove(at: index)
+        pendingModelCleanupProfile = nil
+        modelCleanupDecision = .refused(.preparationRequired)
         if settings.models.isEmpty {
             selectedModelIndex = nil
         } else {
             selectedModelIndex = min(index, settings.models.count - 1)
         }
+    }
+
+    func prepareSelectedModelRemoval() async {
+        guard
+            let index = selectedModelIndex,
+            settings.models.indices.contains(index),
+            !isWorking
+        else {
+            return
+        }
+        let profile = settings.models[index]
+        pendingModelCleanupProfile = profile
+
+        guard !hasUnsavedChanges else {
+            modelCleanupDecision = .refused(.unsavedSettings)
+            confirmRemoveModel = true
+            return
+        }
+
+        isWorking = true
+        setStatus("Verifying \(profile.alias)'s install identity…", tone: .normal)
+        defer { isWorking = false }
+        do {
+            let installHistory = try await client.modelInstallHistory()
+            modelCleanupDecision = ModelCleanupResolver.resolve(
+                profile: profile,
+                storageLocations: settings.storage.locations,
+                installs: installHistory
+            )
+        } catch {
+            modelCleanupDecision = .refused(.installHistoryUnavailable)
+        }
+        confirmRemoveModel = true
     }
 
     func deleteSelectedModelFiles() async {
@@ -1097,14 +2044,27 @@ final class SettingsViewModel: ObservableObject {
             return
         }
 
-        let alias = settings.models[index].alias
+        let profile = settings.models[index]
+        guard pendingModelCleanupProfile == profile,
+              modelCleanupDecision.permitsFileCleanup
+        else {
+            setStatus(
+                "File cleanup was refused because the selected profile does not have one current, verified cleanup identity.",
+                tone: .warning
+            )
+            return
+        }
+
+        let alias = profile.alias
+        let cleanupDecision = modelCleanupDecision
         isWorking = true
         setStatus("Cleaning up \(alias) and its model files…", tone: .normal)
         defer { isWorking = false }
         do {
             let result = try await client.deleteManagedModel(
                 alias: alias,
-                revision: configurationRevision
+                revision: configurationRevision,
+                installationID: cleanupDecision.installationID
             )
             settings = result.config
             savedSettings = result.config
@@ -1112,16 +2072,23 @@ final class SettingsViewModel: ObservableObject {
             appliedConfigurationRevision = result.revision
             requiresRestart = result.restartRequired
             configurationRefreshPending = false
-            modelInstalls.removeAll { $0.alias == alias }
+            modelInstalls = cleanupDecision.retainingUnrelatedInstalls(
+                from: modelInstalls
+            )
+            pendingModelCleanupProfile = nil
+            modelCleanupDecision = .refused(.preparationRequired)
             if settings.models.isEmpty {
                 selectedModelIndex = nil
             } else {
                 selectedModelIndex = min(index, settings.models.count - 1)
             }
-            let action = result.filesDisposition == "trashed"
-                ? "Moved \(alias)'s imported model files to Trash"
-                : "Deleted \(alias)'s managed download"
-            setStatus("\(action) and removed its profile.", tone: .success)
+            setStatus(
+                ModelCleanupDecision.successMessage(
+                    alias: alias,
+                    filesDisposition: result.filesDisposition
+                ),
+                tone: .success
+            )
         } catch {
             setStatus(
                 "Could not delete \(alias): \(error.localizedDescription)",
@@ -1179,13 +2146,19 @@ final class SettingsViewModel: ObservableObject {
     }
 
     private func engineIsEnabled(_ engine: InferenceEngine) -> Bool {
+        engineIsEnabled(engine, in: settings)
+    }
+
+    private func engineIsEnabled(
+        _ engine: InferenceEngine,
+        in candidate: NativeSettings
+    ) -> Bool {
         switch engine {
-        case .llamaCpp: settings.engines.llamaCpp.enabled
-        case .omlx: settings.engines.omlx.enabled
-        case .ds4: settings.engines.ds4.enabled
-        case .mflux: settings.engines.mflux.enabled
-        case .mlxcel: settings.engines.mlxcel.enabled
-        case .mistralRs: settings.engines.mistralRs.enabled
+        case .llamaCpp: candidate.engines.llamaCpp.enabled
+        case .omlx: candidate.engines.omlx.enabled
+        case .ds4: candidate.engines.ds4.enabled
+        case .mflux: candidate.engines.mflux.enabled
+        case .mlxcel, .mistralRs: false
         }
     }
 
@@ -1349,6 +2322,9 @@ final class SettingsViewModel: ObservableObject {
         Binding(
             get: { self.credentialDrafts[credential, default: ""] },
             set: {
+                guard !self.pairingOwnsFleetCredentials
+                    || !credential.isFleetPairingCredential
+                else { return }
                 self.credentialDrafts[credential] = $0
                 if !$0.isEmpty { self.credentialsToClear.remove(credential) }
             }
@@ -1356,12 +2332,88 @@ final class SettingsViewModel: ObservableObject {
     }
 
     func clearCredential(_ credential: ManagedCredential) {
+        guard !pairingOwnsFleetCredentials
+            || !credential.isFleetPairingCredential
+        else { return }
         credentialDrafts[credential] = ""
         credentialsToClear.insert(credential)
     }
 
     func undoCredentialClear(_ credential: ManagedCredential) {
         credentialsToClear.remove(credential)
+    }
+
+    private func updateFleetPairing(_ snapshot: FleetPairingSnapshot?) {
+        fleetPairing = snapshot
+        if let requestID = snapshot?.selfRevoke?.requestID {
+            fleetSelfRevokeRequestID = requestID
+        } else if snapshot?.state == "revoked" {
+            fleetSelfRevokeRequestID = nil
+        }
+        if let snapshot {
+            fleetPairingCeremony.synchronize(with: snapshot)
+        }
+        guard pairingOwnsFleetCredentials else { return }
+        for credential in ManagedCredential.allCases
+        where credential.isFleetPairingCredential {
+            credentialDrafts.removeValue(forKey: credential)
+            credentialsToClear.remove(credential)
+        }
+    }
+
+    private func setPairingStatusMessage(
+        tone: StatusTone = .normal
+    ) {
+        setStatus(
+            "\(fleetPairingCeremony.statusText). "
+                + fleetPairingCeremony.nextActionText,
+            tone: tone
+        )
+    }
+
+    private func fleetPairingFailure(
+        for error: Error
+    ) -> FleetPairingCeremonyFailure {
+        if let pairingError = error as? FleetPairingAPIError {
+            switch pairingError.code {
+            case "pairing_static_credentials_present":
+                return .staticCredentialsPresent
+            case "pairing_expired":
+                return .invitationExpired
+            case "pairing_claim_rejected", "pairing_activation_rejected",
+                 "pairing_payload_mismatch", "pairing_local_identity_invalid":
+                return .invitationRejected
+            case "pairing_state_conflict", "pairing_no_attempt":
+                return .stateConflict
+            case "pairing_invalid_response", "pairing_hub_response_invalid",
+                 "pairing_hub_response_too_large":
+                return .invalidResponse
+            default:
+                return .localServiceUnavailable
+            }
+        }
+        guard let controlError = error as? ControlAPIError else {
+            return .localServiceUnavailable
+        }
+        let status: Int
+        switch controlError {
+        case let .unexpectedStatus(value), let .rejected(value, _):
+            status = value
+        case .invalidResponse, .unsupportedConfigurationSchema:
+            return .invalidResponse
+        }
+        switch status {
+        case 401, 403:
+            return .invitationRejected
+        case 409:
+            return .stateConflict
+        case 410:
+            return .invitationExpired
+        case 422:
+            return .staticCredentialsPresent
+        default:
+            return .localServiceUnavailable
+        }
     }
 
     private func synchronizeLibraryRole() {
@@ -1569,7 +2621,6 @@ final class SettingsViewModel: ObservableObject {
             configurationRevision = snapshot.revision
             appliedConfigurationRevision = snapshot.appliedRevision
             requiresRestart = snapshot.restartRequired
-            selectedLibraryStorage = snapshot.config.storage.default
             configurationRefreshPending = false
 
             selectedModelIndex = selectedAlias.flatMap { alias in

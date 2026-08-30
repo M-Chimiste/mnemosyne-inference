@@ -38,20 +38,22 @@ uv run --directory fleet --frozen \
   python ../scripts/fleet_acceptance.py \
   --url http://nyx:17400 \
   --model qwen-coder \
-  --require-node metis \
-  --require-node cuda-box \
-  --require-platform macos \
-  --require-platform cuda
+  --require-node-service-class mac-primary=primary \
+  --require-node-service-class nyx-worker=overflow \
+  --require-platform macos
 ```
 
 The script:
 
 1. verifies the model is discoverable, has at least two live strict replicas,
-   and has an eligible replica on each required platform;
+   has an eligible replica on each required platform, and proves each named
+   required node still has its expected `primary`, `opportunistic`, or
+   `overflow` service class;
 2. launches simultaneous requests through the single Fleet endpoint;
 3. consumes each complete response without printing its body;
 4. proves metadata-only route rows completed on every required node and
-   platform, as well as on at least the configured minimum node count; and
+   platform, as well as on at least the configured minimum node count (a node
+   named by `--require-node-service-class` is implicitly required to route);
 5. waits for exactly one serving-node token event per completed language
    request to appear through Nyx's read-only aggregate view.
 

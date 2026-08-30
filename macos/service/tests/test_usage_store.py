@@ -3,11 +3,17 @@ from __future__ import annotations
 import json
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 
 import pytest
 
 from mnemosyne_macos.usage import NormalizedUsage, UsageEvent
-from mnemosyne_macos.usage_store import PersistResult, UsageStore
+from mnemosyne_macos.usage_store import (
+    PersistResult,
+    UsageEventDuplicate,
+    UsageOutboxFull,
+    UsageStore,
+)
 
 
 def _event(
@@ -117,6 +123,192 @@ def test_replay_is_idempotent_and_can_heal_missing_outbox(store: UsageStore) -> 
     # this discrepancy is limited to deliberate analytics-only recovery.
     assert store.list_request_usage(limit=1)[0]["prompt_tokens"] == 3
     assert store.peek_outbox(limit=1)[0]["prompt_tokens"] == 999
+
+
+def test_outbox_capacity_fails_before_mutation_and_never_prunes(store: UsageStore) -> None:
+    store.record_batch(
+        [_event("retained")],
+        enqueue_outbox=True,
+        max_outbox_rows=1,
+    )
+
+    with pytest.raises(UsageOutboxFull, match="configured capacity"):
+        store.record_batch(
+            [_event("refused")],
+            enqueue_outbox=True,
+            max_outbox_rows=1,
+        )
+
+    assert [row["event_id"] for row in store.peek_outbox(limit=10)] == [
+        "retained"
+    ]
+    assert [row["event_id"] for row in store.list_request_usage(limit=10)] == [
+        "retained"
+    ]
+    assert store.outbox_has_capacity(maximum=1) is False
+
+
+def test_exact_replay_at_outbox_capacity_remains_idempotent(store: UsageStore) -> None:
+    event = _event("stable")
+    first = store.record_batch(
+        [event],
+        enqueue_outbox=True,
+        max_outbox_rows=1,
+    )
+    replay = store.record_batch(
+        [event],
+        enqueue_outbox=True,
+        max_outbox_rows=1,
+    )
+
+    assert first == PersistResult(analytics_inserted=1, outbox_inserted=1)
+    assert replay == PersistResult(analytics_inserted=0, outbox_inserted=0)
+    assert store.count_request_usage() == 1
+    assert store.count_outbox() == 1
+
+
+def test_last_outbox_slot_is_atomically_reserved_across_connections(tmp_path) -> None:
+    path = tmp_path / "shared.db"
+    first = UsageStore.open(path)
+    second = UsageStore.open(path)
+    barrier = Barrier(2)
+
+    def contend(owner: UsageStore, event_id: str):
+        barrier.wait(timeout=5)
+        try:
+            return owner.reserve_event(
+                event_id,
+                fleet_route=True,
+                reserve_outbox=True,
+                max_outbox_rows=1,
+            )
+        except UsageOutboxFull:
+            return None
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(
+                pool.map(
+                    lambda item: contend(*item),
+                    ((first, "route-a"), (second, "route-b")),
+                )
+            )
+
+        admitted = [result for result in results if result is not None]
+        assert len(admitted) == 1
+        assert first.count_active_reservations() == 1
+        assert first.outbox_capacity_status(maximum=1) == (0, 1, False)
+    finally:
+        first.close()
+        second.close()
+
+
+def test_fleet_reservation_rejects_active_and_completed_replay(
+    store: UsageStore,
+) -> None:
+    reservation = store.reserve_event(
+        "fleet-route",
+        fleet_route=True,
+        reserve_outbox=True,
+        max_outbox_rows=1,
+    )
+
+    with pytest.raises(UsageEventDuplicate) as active:
+        store.reserve_event(
+            "fleet-route",
+            fleet_route=True,
+            reserve_outbox=True,
+            max_outbox_rows=1,
+        )
+    assert active.value.state == "active"
+
+    store.mark_event_started(reservation)
+    result = store.finalize_reserved_event(reservation, _event("fleet-route"))
+
+    assert result == PersistResult(analytics_inserted=1, outbox_inserted=1)
+    assert store.count_active_reservations() == 0
+    # Successful usage is permanently fenced by request_usage, so the
+    # redundant bounded no-usage tombstone is removed.
+    assert store.reservation_state("fleet-route") is None
+    with pytest.raises(UsageEventDuplicate) as completed:
+        store.reserve_event(
+            "fleet-route",
+            fleet_route=True,
+            reserve_outbox=True,
+            max_outbox_rows=1,
+        )
+    assert completed.value.state == "completed"
+
+
+def test_finish_releases_prework_but_fences_started_fleet_work(
+    store: UsageStore,
+) -> None:
+    prework = store.reserve_event(
+        "prework",
+        fleet_route=True,
+        reserve_outbox=True,
+        max_outbox_rows=2,
+    )
+    store.finish_reserved_event(prework)
+    assert store.reservation_state("prework") is None
+
+    started = store.reserve_event(
+        "started",
+        fleet_route=True,
+        reserve_outbox=True,
+        max_outbox_rows=2,
+    )
+    store.mark_event_started(started)
+    store.finish_reserved_event(started)
+    assert store.reservation_state("started") == "completed"
+    assert store.outbox_capacity_status(maximum=2) == (0, 0, True)
+
+    standalone = store.reserve_event(
+        "standalone",
+        fleet_route=False,
+        reserve_outbox=True,
+        max_outbox_rows=2,
+    )
+    store.mark_event_started(standalone)
+    store.finish_reserved_event(standalone)
+    assert store.reservation_state("standalone") is None
+
+
+def test_completed_no_usage_tombstones_are_bounded_without_pruning_active(
+    tmp_path,
+) -> None:
+    store = UsageStore.open(
+        tmp_path / "bounded.db",
+        completed_fleet_route_limit=2,
+    )
+    try:
+        active = store.reserve_event(
+            "active",
+            fleet_route=True,
+            reserve_outbox=False,
+            max_outbox_rows=None,
+        )
+        assert active.event_id == "active"
+
+        for index in range(4):
+            reservation = store.reserve_event(
+                f"completed-{index}",
+                fleet_route=True,
+                reserve_outbox=False,
+                max_outbox_rows=None,
+            )
+            store.mark_event_started(reservation)
+            store.finish_reserved_event(reservation)
+
+        assert store.count_completed_reservations() == 2
+        assert store.reservation_state("completed-0") is None
+        assert store.reservation_state("completed-1") is None
+        assert store.reservation_state("completed-2") == "completed"
+        assert store.reservation_state("completed-3") == "completed"
+        assert store.reservation_state("active") == "reserved"
+        assert store.count_active_reservations() == 1
+    finally:
+        store.close()
 
 
 def test_peek_is_non_destructive_and_ack_is_idempotent(store: UsageStore) -> None:

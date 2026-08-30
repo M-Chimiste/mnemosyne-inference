@@ -13,10 +13,14 @@ final class MenuViewModel: ObservableObject {
     @Published private(set) var connection: ConnectionState = .checking
     @Published private(set) var snapshot: ServiceSnapshot?
     @Published private(set) var models: [ModelSummary] = []
+    @Published private(set) var fleetPairing: FleetPairingSnapshot?
+    @Published private(set) var fleetParticipation: FleetParticipationSnapshot?
     @Published var selectedAlias = ""
     @Published private(set) var mutationInProgress = false
+    @Published private(set) var participationMutationInProgress = false
 
     private let client: any ControlAPI
+    private var participationMutationGeneration = 0
     let controlBaseURL: URL
 
     init(
@@ -39,18 +43,49 @@ final class MenuViewModel: ObservableObject {
         if snapshot == nil {
             connection = .checking
         }
+        let participationGeneration = participationMutationGeneration
         do {
             async let status = client.status()
             async let catalog = client.models()
-            let (newSnapshot, newCatalog) = try await (status, catalog)
+            async let pairing = try? client.fleetPairing()
+            async let participation = try? client.fleetParticipation()
+            let (newSnapshot, newCatalog, newPairing, newParticipation) = try await (
+                status,
+                catalog,
+                pairing,
+                participation
+            )
             snapshot = newSnapshot
             models = newCatalog.models.sorted { $0.id < $1.id }
+            fleetPairing = newPairing
+            // A GET started before a pause/join mutation must not overwrite
+            // the newer result when it eventually returns.
+            if participationGeneration == participationMutationGeneration {
+                fleetParticipation = newParticipation
+            }
             let availableAliases = Set(models.map(\.id))
             if !availableAliases.contains(selectedAlias) {
                 selectedAlias = newCatalog.residentAlias.flatMap {
                     availableAliases.contains($0) ? $0 : nil
                 } ?? models.first?.id ?? ""
             }
+            connection = .online
+        } catch {
+            connection = .offline(error.localizedDescription)
+        }
+    }
+
+    func setFleetParticipation(enabled: Bool) async {
+        guard !participationMutationInProgress, connection == .online else {
+            return
+        }
+        participationMutationGeneration += 1
+        participationMutationInProgress = true
+        defer { participationMutationInProgress = false }
+        do {
+            fleetParticipation = try await client.setFleetParticipation(
+                enabled: enabled
+            )
             connection = .online
         } catch {
             connection = .offline(error.localizedDescription)

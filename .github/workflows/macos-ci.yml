@@ -4,12 +4,24 @@ on:
   pull_request:
     paths:
       - ".github/workflows/macos-*.yml"
+      - "compatibility_catalog/**"
+      - "fleet/**"
+      - "fleet_protocol.py"
+      - "fleet_protocol/**"
+      - "mac_pool_protocol/**"
       - "macos/**"
+      - "tests/**"
   push:
     branches: ["main"]
     paths:
       - ".github/workflows/macos-*.yml"
+      - "compatibility_catalog/**"
+      - "fleet/**"
+      - "fleet_protocol.py"
+      - "fleet_protocol/**"
+      - "mac_pool_protocol/**"
       - "macos/**"
+      - "tests/**"
 
 concurrency:
   group: macos-ci-${{ github.ref }}
@@ -20,19 +32,20 @@ permissions:
 
 jobs:
   native:
-    name: Native service, app, and package
+    name: Mac pool, native app, and package
     runs-on: macos-15
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v6
 
       - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b
         with:
-          version: "0.8.17"
+          version: "0.11.32"
           enable-cache: true
           cache-dependency-glob: |
             macos/service/uv.lock
             macos/image-worker/uv.lock
+            fleet/uv.lock
 
       - name: Verify locked native version and runtime inputs
         run: |
@@ -41,10 +54,22 @@ jobs:
           python3 macos/packaging/build_runtime.py --print-resolved
 
       - name: Test native Python service
-        run: uv run --project macos/service --extra dev python -m pytest -q macos/service/tests
+        run: uv run --project macos/service --frozen --extra dev python -m pytest -q macos/service/tests
 
       - name: Test isolated MFLUX worker
-        run: uv run --project macos/image-worker --extra dev python -m pytest -q macos/image-worker/tests
+        run: uv run --project macos/image-worker --frozen --extra dev python -m pytest -q macos/image-worker/tests
+
+      - name: Test Nyx Fleet and cross-component protocols
+        run: |
+          uv run --project fleet --frozen --extra dev python -m pytest -q fleet/tests
+          # These pure contracts live under root tests; do not load the
+          # unrelated CUDA manager conftest into the Mac/Fleet environment.
+          uv run --project fleet --frozen --extra dev python -m pytest -q --noconftest \
+            tests/test_mac_pool_protocol.py \
+            tests/test_compatibility_catalog_contract.py \
+            tests/test_compatibility_catalog_ceremony.py \
+            tests/test_desired_install_cross_platform_contract.py \
+            tests/test_fleet_acceptance.py
 
       - name: Test packaging logic
         run: python3 -m unittest discover -s macos/packaging/tests -v
@@ -56,22 +81,24 @@ jobs:
           swift build
           swift test
 
-      - name: Stage and verify ad-hoc app
+      - name: Build relocatable runtime and verify full ad-hoc app
         env:
           MNEMOSYNE_BUILD_NUMBER: ${{ github.run_number }}
         run: |
-          macos/packaging/build_app.sh release --bare
+          python3 macos/packaging/build_runtime.py
+          macos/packaging/build_app.sh release
+          python3 macos/packaging/verify_release.py \
+            --app "macos/app/build/Stage/Unified Inference.app"
           python3 macos/packaging/collect_acceptance.py \
             --app "macos/app/build/Stage/Unified Inference.app" \
-            --allow-bare \
-            --output macos/app/build/Stage/bare-acceptance.json
+            --output macos/app/build/Stage/acceptance.json
 
-      - name: Upload verified bare app
+      - name: Upload verified full app
         uses: actions/upload-artifact@v6
         with:
-          name: Unified-Inference-bare-${{ github.sha }}
+          name: Unified-Inference-full-${{ github.sha }}
           path: |
             macos/app/build/Stage/Unified Inference.app
-            macos/app/build/Stage/bare-acceptance.json
+            macos/app/build/Stage/acceptance.json
           if-no-files-found: error
           retention-days: 7

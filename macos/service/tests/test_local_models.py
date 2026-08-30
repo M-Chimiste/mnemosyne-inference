@@ -41,6 +41,49 @@ def test_scan_local_models_groups_shards_and_offers_nearby_projectors(
     ]
 
 
+def test_scan_projects_models_below_exact_selected_symlink_spelling(
+    tmp_path: Path,
+) -> None:
+    physical = tmp_path / "Volumes" / "Athena" / "models"
+    model = _gguf(physical / "publisher" / "vision" / "model-Q4.gguf")
+    projector = _gguf(
+        physical / "publisher" / "vision" / "mmproj-model-f16.gguf"
+    )
+    selected = tmp_path / "selected-models"
+    selected.symlink_to(physical, target_is_directory=True)
+
+    discovered = scan_local_models(selected)[0]
+
+    assert discovered.model_path == str(selected / model.relative_to(physical))
+    assert discovered.all_paths == (
+        str(selected / model.relative_to(physical)),
+    )
+    assert discovered.projector_options[0].path == str(
+        selected / projector.relative_to(physical)
+    )
+
+
+def test_scan_refuses_descendant_symlink_model_candidates(tmp_path: Path) -> None:
+    root = tmp_path / "Models"
+    root.mkdir()
+    outside = _gguf(tmp_path / "outside" / "model-Q4.gguf")
+    linked = root / "publisher" / "model-Q4.gguf"
+    linked.parent.mkdir()
+    linked.symlink_to(outside)
+
+    assert scan_local_models(root) == []
+
+
+def test_scan_rejects_mismatched_lexical_projection_root(tmp_path: Path) -> None:
+    physical = tmp_path / "physical"
+    _gguf(physical / "model-Q4.gguf")
+    unrelated = tmp_path / "unrelated"
+    unrelated.mkdir()
+
+    with pytest.raises(LocalModelError, match="lexical projection"):
+        scan_local_models(physical, lexical_root=unrelated)
+
+
 def test_scan_local_models_marks_incomplete_shards_and_bad_headers_unavailable(
     tmp_path: Path,
 ) -> None:

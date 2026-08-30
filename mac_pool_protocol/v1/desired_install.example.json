@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "job_id": "77777777-7777-4777-8777-777777777777",
+  "job_revision": 1,
+  "idempotency_key": "88888888-8888-4888-8888-888888888888",
+  "desired_state": "run",
+  "created_at": 1785528050.0,
+  "expires_at": 1785528950.0,
+  "valid_for_seconds": 900,
+  "pairing_id": "28bfef6e-ce8d-4cd7-828e-79a3c99642eb",
+  "credential_generation": 3,
+  "recommendation_basis": {
+    "inventory_instance_id": "4ea23b26-b02f-45bc-be1d-be47e40c1e76",
+    "inventory_sequence": 42
+  },
+  "catalog_version": "2026.08.1",
+  "catalog_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+  "logical_model_id": "model:glm-5.3-flash",
+  "recipe_id": "recipe:omlx-glm-5.3-flash-mlx-4bit",
+  "artifact_id": "artifact:glm-5.3-flash-mlx-4bit",
+  "engine": "omlx",
+  "capabilities": [
+    "chat/completions",
+    "completions",
+    "messages",
+    "responses"
+  ],
+  "guaranteed_context_tokens": 131072,
+  "alias": "glm-5.3-flash",
+  "storage_location_id": "22222222-2222-4222-8222-222222222222",
+  "storage_binding_generation": 2
+}

@@ -30,6 +30,7 @@ server:
   # every /v1/* request must send Authorization: Bearer <key>.
   inference_api_key_env: INFERENCE_API_KEY
   fleet_api_key_env: FLEET_API_KEY
+  fleet_inference_api_key_env: FLEET_INFERENCE_API_KEY
   control_password_env: ADMIN_PASSWORD
 
 engines:
@@ -83,35 +84,31 @@ engines:
     request_timeout_seconds: 30
     shutdown_grace_seconds: 30
 
-  # Preview: native Rust/MLX server. Install and upgrade the official Homebrew
-  # formula separately (`brew tap lablup/tap && brew install mlxcel`). Unified
-  # Inference owns only an exact model server process and never its formula.
-  mlxcel:
-    enabled: false
-    host: 127.0.0.1
-    port: 17326
-    binary: /opt/homebrew/bin/mlxcel-server
-    working_directory: ~/Library/Application Support/Mnemosyne
-    process_state_path: ~/Library/Application Support/Mnemosyne/state/mlxcel-process.json
-    request_timeout_seconds: 30
-    shutdown_grace_seconds: 30
-
-  # Preview: broad Safetensors runtime. The official mistral.rs installer owns
-  # ~/.local/bin/mistralrs and its `mistralrs update` flow. Model Library still
-  # pins and downloads every served snapshot before this process is launched.
-  mistral_rs:
-    enabled: false
-    host: 127.0.0.1
-    port: 17327
-    binary: ~/.local/bin/mistralrs
-    working_directory: ~/Library/Application Support/Mnemosyne
-    process_state_path: ~/Library/Application Support/Mnemosyne/state/mistral-rs-process.json
-    request_timeout_seconds: 30
-    shutdown_grace_seconds: 30
-
 paths:
   state_database: ~/Library/Application Support/Mnemosyne/state/mnemosyne.db
   log_directory: ~/Library/Application Support/Mnemosyne/logs
+
+# Signed compatibility metadata is optional and disabled in the shipped
+# configuration. Enabling it requires one exact canonical HTTPS origin/path
+# and at least one locally pinned Ed25519 public key. Public-key bytes belong
+# in the private .env named below; never use the repository's test key.
+catalog:
+  enabled: false
+  update_origin: null
+  update_path: null
+  update_interval_seconds: 3600
+  total_timeout_seconds: 20
+  connect_timeout_seconds: 5
+  max_attempts: 2
+  retry_delay_seconds: 0
+  trusted_keys: []
+  # trusted_keys:
+  #   - key_id: mnemosyne-catalog-2026-a
+  #     public_key_env: MNEMOSYNE_CATALOG_PUBLIC_KEY_2026_A
+  #     valid_from: 0
+  #     valid_until: 4102444800
+  #     minimum_catalog_sequence: 1
+  #     maximum_catalog_sequence: 9007199254740991
 
 # Model downloads use these exact folders. The menu app's native folder
 # chooser records the containing volume UUID for removable drives, so a
@@ -151,17 +148,15 @@ models: []
 #       # Use mode: native to request the advertised maximum without profiling,
 #       # or mode: fixed plus fixed_tokens for an explicit user-owned limit.
 #     alternatives:
-#       - engine: mlxcel
-#         model: ~/Library/Application Support/Mnemosyne/models/mlxcel/mlx-community/Qwen-4bit
+#       - engine: llama.cpp
+#         model: ~/Library/Application Support/Mnemosyne/models/llama.cpp/publisher/Qwen-GGUF/model-Q4_K_M.gguf
 #         storage: internal
 #         context:
 #           mode: automatic
 #           native_tokens: 262144
-#         load:
-#           parallel: 4
 #     selection:
 #       mode: pinned
-#       pinned_engine: mlxcel
+#       pinned_engine: llama.cpp
 #       # Change mode to benchmark to use the ranking controls below instead.
 #       objective: balanced
 #       allow_preview: true

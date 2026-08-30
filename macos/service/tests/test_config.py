@@ -1,15 +1,19 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
+import stat
 
 import pytest
 import yaml
 
+import mnemosyne_macos.config as config_module
 from mnemosyne_macos.config import (
     ConfigError,
     ImageProfileConfig,
     MacConfig,
     ModelProfile,
+    StorageLocationConfig,
     load_config,
     parse_config,
     save_config,
@@ -56,7 +60,70 @@ def test_defaults_replace_the_legacy_sidecar_port() -> None:
     assert config.server.max_concurrency is None
     assert config.server.max_queue_depth == 128
     assert config.server.idle_unload_seconds is None
+    assert config.catalog.enabled is False
+    assert config.catalog.trusted_keys == []
     assert config.server.fleet_api_key_env == "FLEET_API_KEY"
+    assert (
+        config.server.fleet_inference_api_key_env
+        == "FLEET_INFERENCE_API_KEY"
+    )
+
+
+def test_catalog_policy_is_strict_complete_and_bounded() -> None:
+    key = {
+        "key_id": "release-2026-a",
+        "public_key_env": "MNEMOSYNE_CATALOG_PUBLIC_KEY_2026_A",
+    }
+    enabled = MacConfig.model_validate(
+        {
+            "catalog": {
+                "enabled": True,
+                "update_origin": "https://catalog.mnemosyne.example",
+                "update_path": "/v1/apple-silicon/catalog.json",
+                "trusted_keys": [key],
+            }
+        }
+    )
+    assert enabled.catalog.enabled is True
+    assert enabled.catalog.update_interval_seconds == 3600
+
+    invalid_policies = [
+        {"enabled": True},
+        {
+            "enabled": True,
+            "update_origin": "http://catalog.mnemosyne.example",
+            "update_path": "/v1/catalog.json",
+            "trusted_keys": [key],
+        },
+        {
+            "enabled": True,
+            "update_origin": "https://Catalog.mnemosyne.example",
+            "update_path": "/v1/catalog.json",
+            "trusted_keys": [key],
+        },
+        {
+            "enabled": True,
+            "update_origin": "https://catalog.mnemosyne.example",
+            "update_path": "/v1/../catalog.json",
+            "trusted_keys": [key],
+        },
+        {
+            "enabled": True,
+            "update_origin": "https://catalog.mnemosyne.example",
+            "update_path": "/v1/catalog.json",
+            "update_interval_seconds": 299,
+            "trusted_keys": [key],
+        },
+        {
+            "enabled": True,
+            "update_origin": "https://catalog.mnemosyne.example",
+            "update_path": "/v1/catalog.json",
+            "trusted_keys": [key, key],
+        },
+    ]
+    for policy in invalid_policies:
+        with pytest.raises(ValueError):
+            MacConfig.model_validate({"catalog": policy})
 
 
 def test_interactive_context_defaults_bound_extreme_model_metadata() -> None:
@@ -165,6 +232,10 @@ def test_omlx_context_policy_uses_the_manager_contract_not_load_options() -> Non
     assert target.native_context_length == 262_144
     assert "context_length" not in target.load_options
     assert config.server.fleet_api_key_env == "FLEET_API_KEY"
+    assert (
+        config.server.fleet_inference_api_key_env
+        == "FLEET_INFERENCE_API_KEY"
+    )
 
 
 @pytest.mark.parametrize(
@@ -218,6 +289,56 @@ def test_parse_config_reports_source_for_invalid_yaml() -> None:
         parse_config("models: [", source="in-memory configuration")
 
 
+def test_omlx_model_directory_round_trip_preserves_nested_symlink_spelling(
+    tmp_path,
+) -> None:
+    physical_root = tmp_path / "physical-volume"
+    (physical_root / "deep" / "models").mkdir(parents=True)
+    selected_alias = tmp_path / "selected-volume"
+    selected_alias.symlink_to(physical_root, target_is_directory=True)
+    lexical_directory = str(selected_alias / "deep" / "models")
+    path = tmp_path / "settings" / "config.yaml"
+    config = MacConfig.model_validate(
+        {
+            "engines": {
+                "omlx": {
+                    "enabled": True,
+                    "model_directories": [lexical_directory],
+                }
+            }
+        }
+    )
+
+    assert config.engines.omlx.model_directories == [lexical_directory]
+    assert lexical_directory != str(Path(lexical_directory).resolve())
+    save_config(config, path)
+    restored = load_config(path)
+    assert restored.engines.omlx.model_directories == [lexical_directory]
+
+
+def test_omlx_model_directories_reject_distinct_lexical_aliases_of_one_target(
+    tmp_path,
+) -> None:
+    physical_root = tmp_path / "physical-volume"
+    target = physical_root / "deep" / "models"
+    target.mkdir(parents=True)
+    selected_alias = tmp_path / "selected-volume"
+    selected_alias.symlink_to(physical_root, target_is_directory=True)
+    lexical_alias = str(selected_alias / "deep" / "models")
+
+    with pytest.raises(ValueError, match="model directories must be unique"):
+        MacConfig.model_validate(
+            {
+                "engines": {
+                    "omlx": {
+                        "enabled": True,
+                        "model_directories": [str(target), lexical_alias],
+                    }
+                }
+            }
+        )
+
+
 def test_save_config_is_atomic_private_and_round_trips(tmp_path) -> None:
     path = tmp_path / "settings" / "config.yaml"
     config = MacConfig.model_validate(
@@ -242,6 +363,68 @@ def test_save_config_is_atomic_private_and_round_trips(tmp_path) -> None:
     assert not list(path.parent.glob(".*.tmp"))
 
 
+def test_save_config_fsyncs_file_then_replaces_then_fsyncs_parent(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "settings" / "config.yaml"
+    events: list[str] = []
+    real_fsync = config_module.os.fsync
+    real_replace = config_module.os.replace
+
+    def tracked_fsync(descriptor: int) -> None:
+        kind = (
+            "directory_fsync"
+            if stat.S_ISDIR(os.fstat(descriptor).st_mode)
+            else "file_fsync"
+        )
+        events.append(kind)
+        real_fsync(descriptor)
+
+    def tracked_replace(source, destination) -> None:
+        events.append("replace")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(config_module.os, "fsync", tracked_fsync)
+    monkeypatch.setattr(config_module.os, "replace", tracked_replace)
+
+    config = MacConfig()
+    save_config(config, path)
+
+    assert events == ["file_fsync", "replace", "directory_fsync"]
+    assert load_config(path) == config
+
+
+def test_save_config_closes_parent_descriptor_and_reports_directory_fsync_error(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "settings" / "config.yaml"
+    real_fsync = config_module.os.fsync
+    failed_descriptor: int | None = None
+
+    def fail_directory_fsync(descriptor: int) -> None:
+        nonlocal failed_descriptor
+        if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            failed_descriptor = descriptor
+            raise OSError("parent directory fsync failed")
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(config_module.os, "fsync", fail_directory_fsync)
+
+    config = MacConfig()
+    with pytest.raises(OSError, match="parent directory fsync failed"):
+        save_config(config, path)
+
+    assert failed_descriptor is not None
+    with pytest.raises(OSError):
+        os.fstat(failed_descriptor)
+    # The atomic replace already completed, but the caller correctly receives
+    # the durability failure and no temporary file is stranded.
+    assert load_config(path) == config
+    assert not list(path.parent.glob(".*.tmp"))
+
+
 def test_ds4_process_state_path_is_configurable(tmp_path) -> None:
     state_path = tmp_path / "owned-ds4.json"
     config = MacConfig.model_validate(
@@ -256,6 +439,7 @@ def test_ds4_process_state_path_is_configurable(tmp_path) -> None:
         ("DeepSeek-V4-Flash-IQ2XXS-0731.gguf", "deepseek-v4-flash"),
         ("DeepSeek-V4-Pro-IQ2XXS-imatrix.gguf", "deepseek-v4-pro"),
         ("GLM-5.2-UD-Q2_K_RoutedQ2K.gguf", "glm-5.2"),
+        ("GLM-5.3-Flash-Q2.gguf", "glm-5.3-flash"),
     ],
 )
 def test_ds4_uses_upstream_canonical_wire_model(
@@ -416,18 +600,25 @@ def test_duplicate_or_conflicting_ports_are_rejected() -> None:
 
 
 @pytest.mark.parametrize("engine", ["mlxcel", "mistral_rs"])
-def test_preview_engine_ports_cannot_collide_with_existing_planes(engine: str) -> None:
-    with pytest.raises(ValueError, match="ports must be distinct"):
-        MacConfig.model_validate(
-            {
-                "engines": {
-                    engine: {
-                        "enabled": True,
-                        "port": 17321,
-                    }
+def test_retired_engine_settings_are_parseable_but_inert(engine: str) -> None:
+    config = MacConfig.model_validate(
+        {
+            "engines": {
+                engine: {
+                    "enabled": True,
+                    "port": 17321,
                 }
             }
-        )
+        }
+    )
+
+    parsed = EngineName.MLXCEL if engine == "mlxcel" else EngineName.MISTRAL_RS
+    assert config.engine_enabled(parsed) is False
+    legacy = config.engines.mlxcel if engine == "mlxcel" else config.engines.mistral_rs
+    assert legacy.enabled is False
+    dumped_engines = config.model_dump(mode="json")["engines"]
+    assert "mlxcel" not in dumped_engines
+    assert "mistral_rs" not in dumped_engines
 
 
 def test_omlx_rejects_process_load_options() -> None:
@@ -560,13 +751,11 @@ def test_v4_profile_candidates_migrate_to_v6_and_remain_fixed_by_default(
     assert config.schema_version == 6
     assert config.profiles()["qwen"].key.engine == EngineName.OMLX
     candidates = config.profile_candidates()["qwen"]
-    assert [candidate.key.engine for candidate in candidates] == [
-        EngineName.OMLX,
+    assert [candidate.key.engine for candidate in candidates] == [EngineName.OMLX]
+    assert [alternative.engine for alternative in config.models[0].alternatives] == [
         EngineName.MLXCEL,
         EngineName.MISTRAL_RS,
     ]
-    assert candidates[1].load_options["parallel"] == 4
-    assert candidates[2].wire_model == "default"
 
 
 def test_benchmark_selection_requires_an_alternative() -> None:
@@ -761,6 +950,31 @@ def test_storage_scope_uses_only_an_opaque_sha256_identifier() -> None:
                 }
             }
         )
+
+
+def test_storage_path_expands_to_absolute_without_resolving_selected_symlink(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    physical = tmp_path / "Volumes" / "Athena" / "models"
+    physical.mkdir(parents=True)
+    home.mkdir()
+    selected = home / "selected-models"
+    selected.symlink_to(physical, target_is_directory=True)
+    monkeypatch.setenv("HOME", str(home))
+
+    location = StorageLocationConfig(
+        name="athena-models",
+        path="~/selected-models/nested",
+        volume_uuid="volume-uuid-exact",
+        scope_id="A" * 64,
+    )
+
+    assert location.path == str(selected / "nested")
+    assert location.path != str((physical / "nested").resolve())
+    assert location.volume_uuid == "volume-uuid-exact"
+    assert location.scope_id == "a" * 64
 
 
 def test_app_owned_internal_storage_discards_an_obsolete_bookmark() -> None:

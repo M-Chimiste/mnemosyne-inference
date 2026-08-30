@@ -14,6 +14,8 @@ struct MenuContentView: View {
         VStack(alignment: .leading, spacing: 12) {
             header
             Divider()
+            poolParticipation
+            Divider()
             modelController
             usageDelivery
             loadedModel
@@ -29,6 +31,59 @@ struct MenuContentView: View {
             while !Task.isCancelled {
                 await viewModel.refresh()
                 try? await Task.sleep(for: .seconds(5))
+            }
+        }
+    }
+
+    private var poolParticipation: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Toggle(
+                "Contribute this Mac to the pool",
+                isOn: Binding(
+                    get: { viewModel.fleetParticipation?.enabled ?? false },
+                    set: { enabled in
+                        Task {
+                            await viewModel.setFleetParticipation(enabled: enabled)
+                        }
+                    }
+                )
+            )
+            .toggleStyle(.switch)
+            .disabled(
+                viewModel.fleetParticipation == nil
+                    || viewModel.fleetPairing?.permitsParticipationControl != true
+                    || viewModel.participationMutationInProgress
+                    || viewModel.connection != .online
+            )
+
+            if let pairing = viewModel.fleetPairing {
+                LabeledContent("Hub enrollment", value: pairingLabel(pairing))
+                    .font(.caption)
+                    .foregroundStyle(
+                        pairing.state == "recovery_required"
+                            ? Color.orange : Color.secondary
+                    )
+            }
+
+            if let participation = viewModel.fleetParticipation {
+                HStack {
+                    Text(participationStateLabel(participation.state))
+                    Spacer()
+                    Text(
+                        "\(participation.activeRequests) active Fleet "
+                            + "request\(participation.activeRequests == 1 ? "" : "s")"
+                    )
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+                Text(participationExplanation(participation.state))
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else if viewModel.participationMutationInProgress {
+                ProgressView()
+                    .controlSize(.small)
             }
         }
     }
@@ -143,6 +198,24 @@ struct MenuContentView: View {
         return "\(Int(milliseconds.rounded()))ms"
     }
 
+    private func pairingLabel(_ pairing: FleetPairingSnapshot) -> String {
+        if pairing.legacyCredentialsPresent == true {
+            return "Static configuration"
+        }
+        switch pairing.state {
+        case "paired":
+            return "Paired"
+        case "pending":
+            return "Pairing pending"
+        case "revoked":
+            return "Revoked"
+        case "recovery_required":
+            return "Needs attention"
+        default:
+            return "Not paired"
+        }
+    }
+
     private var backgroundService: some View {
         VStack(alignment: .leading, spacing: 8) {
             LabeledContent(
@@ -173,7 +246,7 @@ struct MenuContentView: View {
             }
 
             Toggle(
-                "Show menu app at login",
+                "Open Unified Inference at login",
                 isOn: Binding(
                     get: {
                         registration.menuLoginStatus == .enabled
@@ -188,6 +261,7 @@ struct MenuContentView: View {
                     }
                 )
             )
+            .toggleStyle(.switch)
             .disabled(registration.isChangingRegistration)
 
             if registration.menuLoginStatus == .requiresApproval {
@@ -330,5 +404,31 @@ struct MenuContentView: View {
     private func modelLabel(_ model: ModelSummary) -> String {
         guard let engine = model.engine, !engine.isEmpty else { return model.id }
         return "\(model.id) · \(engine)"
+    }
+
+    private func participationStateLabel(_ state: String) -> String {
+        switch state {
+        case "joined":
+            "Joined"
+        case "draining":
+            "Draining"
+        case "paused":
+            "Paused"
+        default:
+            state.capitalized
+        }
+    }
+
+    private func participationExplanation(_ state: String) -> String {
+        switch state {
+        case "joined":
+            "The Hub can route eligible pooled requests to this Mac."
+        case "draining":
+            "Finishing current pooled requests before pausing; local inference remains available."
+        case "paused":
+            "Paused only for pooled requests; this Mac stays registered and local inference remains available."
+        default:
+            "Pool participation does not change local inference or model storage."
+        }
     }
 }

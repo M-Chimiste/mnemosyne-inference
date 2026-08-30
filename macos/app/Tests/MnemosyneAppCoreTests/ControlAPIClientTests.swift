@@ -19,7 +19,21 @@ func defaultControlPort() {
     #expect(NativeSettings().server.maxQueueDepth == 128)
     #expect(NativeSettings().server.idleUnloadSeconds == nil)
     #expect(NativeSettings().server.fleetApiKeyEnv == "FLEET_API_KEY")
+    #expect(
+        NativeSettings().server.fleetInferenceApiKeyEnv
+            == "FLEET_INFERENCE_API_KEY"
+    )
     #expect(NativeSettings().tokenSidecar.enabled)
+}
+
+@Test("The default model destination is an expanded absolute lexical path")
+func defaultModelDestinationIsExpanded() {
+    let expected = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/Application Support/Mnemosyne/models")
+        .path
+    #expect(StorageLocationSettings.internalDefault.path == expected)
+    #expect(StorageLocationSettings.internalDefault.path.hasPrefix("/"))
+    #expect(!StorageLocationSettings.internalDefault.path.contains("~"))
 }
 
 @Test("Endpoint paths are resolved below the control origin")
@@ -72,6 +86,237 @@ func loadRequestEncoding() throws {
     let body = try #require(request.httpBody)
     let payload = try JSONDecoder().decode(LoadModelRequest.self, from: body)
     #expect(payload == LoadModelRequest(model: "glm-5-2"))
+}
+
+@Test("Fleet participation reads use the authenticated control endpoint")
+func fleetParticipationRequestEncoding() {
+    let client = ControlAPIClient(
+        baseURL: URL(string: "http://localhost:17321")!,
+        adminPassword: "secret"
+    )
+    let request = client.fleetParticipationRequest()
+
+    #expect(
+        request.url?.absoluteString
+            == "http://localhost:17321/manager/fleet/participation"
+    )
+    #expect(request.httpMethod == "GET")
+    #expect(request.value(forHTTPHeaderField: "Accept") == "application/json")
+    #expect(
+        request.value(forHTTPHeaderField: "Authorization")
+            == "Basic YWRtaW46c2VjcmV0"
+    )
+}
+
+@Test("Fleet pairing status uses the authenticated secret-free control endpoint")
+func fleetPairingRequestEncoding() {
+    let client = ControlAPIClient(
+        baseURL: URL(string: "http://localhost:17321")!,
+        adminPassword: "secret"
+    )
+    let request = client.fleetPairingRequest()
+
+    #expect(
+        request.url?.absoluteString
+            == "http://localhost:17321/manager/fleet/pairing"
+    )
+    #expect(request.httpMethod == "GET")
+    #expect(request.value(forHTTPHeaderField: "Accept") == "application/json")
+    #expect(
+        request.value(forHTTPHeaderField: "Authorization")
+            == "Basic YWRtaW46c2VjcmV0"
+    )
+}
+
+@Test("Fleet self-revocation carries only one restart-safe request identity")
+func fleetPairingRevokeRequestEncoding() throws {
+    let client = ControlAPIClient(
+        baseURL: URL(string: "http://localhost:17321")!,
+        adminPassword: "secret"
+    )
+    let requestID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    let request = try client.fleetPairingRevokeRequest(requestID: requestID)
+
+    #expect(
+        request.url?.absoluteString
+            == "http://localhost:17321/manager/fleet/pairing/revoke"
+    )
+    #expect(request.httpMethod == "POST")
+    #expect(request.value(forHTTPHeaderField: "Content-Type") == "application/json")
+    #expect(
+        request.value(forHTTPHeaderField: "Authorization")
+            == "Basic YWRtaW46c2VjcmV0"
+    )
+    let body = try #require(request.httpBody)
+    let object = try #require(
+        JSONSerialization.jsonObject(with: body) as? [String: Any]
+    )
+    #expect(object.count == 2)
+    #expect(object["schema_version"] as? Int == 1)
+    #expect(object["request_id"] as? String == requestID)
+}
+
+@Test("Fleet participation mutations send only the requested local state")
+func setFleetParticipationRequestEncoding() throws {
+    let client = ControlAPIClient(
+        baseURL: URL(string: "http://localhost:17321")!,
+        adminPassword: "secret"
+    )
+    let request = try client.setFleetParticipationRequest(enabled: false)
+
+    #expect(
+        request.url?.absoluteString
+            == "http://localhost:17321/manager/fleet/participation"
+    )
+    #expect(request.httpMethod == "PUT")
+    #expect(request.value(forHTTPHeaderField: "Content-Type") == "application/json")
+    #expect(
+        request.value(forHTTPHeaderField: "Authorization")
+            == "Basic YWRtaW46c2VjcmV0"
+    )
+    let body = try #require(request.httpBody)
+    let payload = try JSONDecoder().decode(
+        SetFleetParticipationRequest.self,
+        from: body
+    )
+    #expect(payload == SetFleetParticipationRequest(enabled: false))
+    let object = try #require(
+        JSONSerialization.jsonObject(with: body) as? [String: Any]
+    )
+    #expect(object.count == 1)
+    #expect(object["enabled"] as? Bool == false)
+}
+
+@Test("Fleet participation snapshots decode drain progress")
+func fleetParticipationDecoding() throws {
+    let payload = #"""
+    {
+      "enabled": false,
+      "state": "draining",
+      "active_requests": 3,
+      "updated_at": 1788027600.25
+    }
+    """#.data(using: .utf8)!
+
+    let snapshot = try JSONDecoder().decode(
+        FleetParticipationSnapshot.self,
+        from: payload
+    )
+
+    #expect(!snapshot.enabled)
+    #expect(snapshot.state == "draining")
+    #expect(snapshot.activeRequests == 3)
+    #expect(snapshot.updatedAt == 1_788_027_600.25)
+}
+
+@Test("Fleet pairing status decodes without any credential fields")
+func fleetPairingDecoding() throws {
+    let payload = #"""
+    {
+      "schema_version": 1,
+      "available": true,
+      "state": "paired",
+      "device_id": "11111111-1111-4111-8111-111111111111",
+      "pairing_id": "22222222-2222-4222-8222-222222222222",
+      "reporting_node_id": "studio-mac",
+      "credential_generation": 1,
+      "credentials_configured": true,
+      "legacy_credentials_present": false,
+      "last_error_code": null,
+      "updated_at": 1788027600.25,
+      "paired_at": 1788027590.0,
+      "revoked_at": null
+    }
+    """#.data(using: .utf8)!
+
+    let snapshot = try JSONDecoder().decode(
+        FleetPairingSnapshot.self,
+        from: payload
+    )
+
+    #expect(snapshot.schemaVersion == 1)
+    #expect(snapshot.available)
+    #expect(snapshot.state == "paired")
+    #expect(snapshot.pairingId == "22222222-2222-4222-8222-222222222222")
+    #expect(snapshot.reportingNodeId == "studio-mac")
+    #expect(snapshot.credentialGeneration == 1)
+    #expect(snapshot.credentialsConfigured == true)
+    #expect(snapshot.permitsParticipationControl)
+    #expect(snapshot.selfRevoke == nil)
+}
+
+@Test("Fleet pairing status retains the exact pending self-revoke retry ID")
+func fleetPairingSelfRevokeDecoding() throws {
+    let payload = #"""
+    {
+      "schema_version": 1,
+      "available": true,
+      "state": "paired",
+      "credentials_configured": true,
+      "legacy_credentials_present": false,
+      "self_revoke": {
+        "schema_version": 1,
+        "request_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        "phase": "hub_committed"
+      }
+    }
+    """#.data(using: .utf8)!
+
+    let snapshot = try JSONDecoder().decode(
+        FleetPairingSnapshot.self,
+        from: payload
+    )
+    #expect(snapshot.selfRevoke?.requestID == "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+    #expect(snapshot.selfRevoke?.phase == "hub_committed")
+}
+
+@Test("Only paired or explicitly static enrollment enables pool controls")
+func fleetPairingParticipationBoundary() throws {
+    func decode(_ state: String, legacy: Bool) throws -> FleetPairingSnapshot {
+        let data = try JSONSerialization.data(
+            withJSONObject: [
+                "schema_version": 1,
+                "available": true,
+                "state": state,
+                "legacy_credentials_present": legacy,
+            ]
+        )
+        return try JSONDecoder().decode(FleetPairingSnapshot.self, from: data)
+    }
+
+    #expect(try decode("paired", legacy: false).permitsParticipationControl)
+    #expect(try decode("unpaired", legacy: true).permitsParticipationControl)
+    #expect(!(try decode("pending", legacy: false)).permitsParticipationControl)
+    #expect(!(try decode("revoked", legacy: false)).permitsParticipationControl)
+}
+
+@Test("Pairing owns Fleet credential slots throughout its durable lifecycle")
+func fleetPairingCredentialOwnershipBoundary() throws {
+    func decode(
+        _ state: String,
+        configured: Bool? = nil,
+        legacy: Bool = false
+    ) throws -> FleetPairingSnapshot {
+        var object: [String: Any] = [
+            "schema_version": 1,
+            "available": true,
+            "state": state,
+            "legacy_credentials_present": legacy,
+        ]
+        if let configured {
+            object["credentials_configured"] = configured
+        }
+        let data = try JSONSerialization.data(withJSONObject: object)
+        return try JSONDecoder().decode(FleetPairingSnapshot.self, from: data)
+    }
+
+    #expect(try decode("pending").ownsFleetCredentials)
+    #expect(try decode("paired", configured: true).ownsFleetCredentials)
+    #expect(try decode("recovery_required").ownsFleetCredentials)
+    #expect(try decode("revoked", configured: true).ownsFleetCredentials)
+    #expect(try decode("unpaired", configured: true).ownsFleetCredentials)
+    #expect(!(try decode("unpaired", configured: false)).ownsFleetCredentials)
+    #expect(!(try decode("unpaired", configured: true, legacy: true)).ownsFleetCredentials)
 }
 
 @Test("Engine benchmarks use a bounded fixed suite request")
@@ -210,6 +455,10 @@ func configurationSaveRequestEncoding() throws {
     #expect(server["max_concurrency"] as? Int == 3)
     #expect(server["max_queue_depth"] as? Int == 128)
     #expect(server["fleet_api_key_env"] as? String == "FLEET_API_KEY")
+    #expect(
+        server["fleet_inference_api_key_env"] as? String
+            == "FLEET_INFERENCE_API_KEY"
+    )
     #expect(load["context_length"] as? Int == 32_768)
     #expect(load["projector_path"] as? String == "/Volumes/Athena/models/mmproj.gguf")
     #expect(load["gpu_layers"] as? Int == 99)
@@ -341,7 +590,7 @@ func productBuildIdentityFormatting() {
     )
 }
 
-@Test("Structured configuration decodes every engine and image setting")
+@Test("Structured configuration decodes supported engines and image settings")
 func configurationDecoding() throws {
     let payload = #"""
     {
@@ -373,6 +622,45 @@ func configurationDecoding() throws {
     #expect(settings.server.maxConcurrency == nil)
     #expect(settings.server.maxQueueDepth == 128)
     #expect(settings.server.fleetApiKeyEnv == "FLEET_API_KEY")
+}
+
+@Test("Retired engine settings decode for upgrades but remain disabled")
+func retiredEngineSettingsRemainInert() throws {
+    let baseline = try JSONEncoder.nativeSettingsEncoder().encode(EngineSettings())
+    var legacyObject = try #require(
+        JSONSerialization.jsonObject(with: baseline) as? [String: Any]
+    )
+    var mlxcel = try #require(
+        JSONSerialization.jsonObject(
+            with: JSONEncoder.nativeSettingsEncoder().encode(MLXcelSettings())
+        ) as? [String: Any]
+    )
+    var mistralRs = try #require(
+        JSONSerialization.jsonObject(
+            with: JSONEncoder.nativeSettingsEncoder().encode(MistralRSSettings())
+        ) as? [String: Any]
+    )
+    mlxcel["enabled"] = true
+    mistralRs["enabled"] = true
+    legacyObject["mlxcel"] = mlxcel
+    legacyObject["mistral_rs"] = mistralRs
+    let payload = try JSONSerialization.data(withJSONObject: legacyObject)
+
+    let engines = try JSONDecoder.nativeSettingsDecoder()
+        .decode(EngineSettings.self, from: payload)
+
+    #expect(!engines.mlxcel.enabled)
+    #expect(!engines.mistralRs.enabled)
+    #expect(engines.mlxcel.port == 17_326)
+    #expect(engines.mistralRs.port == 17_327)
+    #expect(InferenceEngine.supportedCases == [.llamaCpp, .omlx, .ds4, .mflux])
+
+    let encoded = try JSONEncoder.nativeSettingsEncoder().encode(engines)
+    let object = try #require(
+        JSONSerialization.jsonObject(with: encoded) as? [String: Any]
+    )
+    #expect(object["mlxcel"] == nil)
+    #expect(object["mistral_rs"] == nil)
 }
 
 @Test("DS4 resident session capacity reuses the typed parallel setting")
@@ -581,6 +869,24 @@ func llamaCppFileSelectionDecoding() throws {
         install.capabilities
             == ModelRole.generation.capabilities(for: .llamaCpp)
     )
+
+    let client = ControlAPIClient(
+        baseURL: URL(string: "http://localhost:17321")!,
+        adminPassword: "secret"
+    )
+    let request = try client.startModelInstallRequest(install)
+    #expect(
+        request.url?.absoluteString
+            == "http://localhost:17321/manager/model-library/installs"
+    )
+    #expect(request.httpMethod == "POST")
+    let body = try #require(request.httpBody)
+    let object = try #require(
+        JSONSerialization.jsonObject(with: body) as? [String: Any]
+    )
+    #expect(object["storage"] as? String == "athena-models")
+    #expect(object["repo_id"] as? String == "org/model-GGUF")
+    #expect(object["filename"] as? String == "model-Q4_K_M.gguf")
 }
 
 @Test("GGUF file discovery preserves the llama.cpp engine value in the query")
@@ -604,6 +910,54 @@ func llamaCppFileSelectionRequest() throws {
     #expect(query["engine"] == "llama.cpp")
     #expect(query["repo_id"] == "org/model-GGUF")
     #expect(query["revision"] == "abc123")
+}
+
+@Test("Start-install URLRequest preserves the exact selected storage key")
+func modelInstallRequestPreservesSelectedStorage() throws {
+    let payload = #"""
+    {
+      "repo_id":"org/storage-proof-GGUF",
+      "engine":"llama.cpp",
+      "display_name":"storage-proof-Q4_K_M.gguf",
+      "model_kind":"language",
+      "compatibility":"supported",
+      "compatibility_reason":"Published GGUF.",
+      "filename":"storage-proof-Q4_K_M.gguf",
+      "resolved_revision":"abc123",
+      "installable":true,
+      "suggested_role":"generation"
+    }
+    """#.data(using: .utf8)!
+    let model = try JSONDecoder.nativeSettingsDecoder().decode(
+        LibraryModel.self,
+        from: payload
+    )
+    let install = StartModelInstallRequest(
+        model: model,
+        storage: "external-volume-nested-library",
+        role: .generation
+    )
+    let client = ControlAPIClient(
+        baseURL: URL(string: "http://localhost:17321")!,
+        adminPassword: "secret"
+    )
+
+    let request = try client.startModelInstallRequest(install)
+    let body = try #require(request.httpBody)
+    let object = try #require(
+        JSONSerialization.jsonObject(with: body) as? [String: Any]
+    )
+
+    #expect(request.httpMethod == "POST")
+    #expect(
+        request.url?.absoluteString
+            == "http://localhost:17321/manager/model-library/installs"
+    )
+    #expect(
+        object["storage"] as? String
+            == "external-volume-nested-library"
+    )
+    #expect(object.keys.contains("storage"))
 }
 
 @Test("Model library search requests one unified catalog without an engine filter")
@@ -693,6 +1047,85 @@ func modelDeletionRequestEncoding() throws {
             .decode(DeleteManagedModelRequest.self, from: body)
             == DeleteManagedModelRequest(revision: revision)
     )
+    let legacyObject = try #require(
+        JSONSerialization.jsonObject(with: body) as? [String: Any]
+    )
+    #expect(legacyObject.count == 1)
+    #expect(legacyObject["revision"] as? String == revision)
+    #expect(legacyObject["installation_id"] == nil)
+
+    let installationID = "11111111-1111-4111-8111-111111111111"
+    let exact = try client.deleteManagedModelRequest(
+        alias: "qwen-model",
+        revision: revision,
+        installationID: installationID
+    )
+    let exactBody = try #require(exact.httpBody)
+    let exactObject = try #require(
+        JSONSerialization.jsonObject(with: exactBody) as? [String: Any]
+    )
+    #expect(exactObject.count == 2)
+    #expect(exactObject["revision"] as? String == revision)
+    #expect(exactObject["installation_id"] as? String == installationID)
+}
+
+@Test("Cleanup history uses the hidden-inclusive evidence endpoint")
+func modelInstallHistoryRequestAndDecoding() throws {
+    let client = ControlAPIClient(
+        baseURL: URL(string: "http://localhost:17321")!,
+        adminPassword: "secret"
+    )
+    let request = client.modelInstallHistoryRequest()
+
+    #expect(
+        request.url?.absoluteString
+            == "http://localhost:17321/manager/model-library/install-evidence?limit=500"
+    )
+    #expect(request.httpMethod == "GET")
+    #expect(
+        request.value(forHTTPHeaderField: "Authorization")
+            == "Basic YWRtaW46c2VjcmV0"
+    )
+
+    let payload = #"""
+    {
+      "schema_version":1,
+      "installs":[{
+        "id":"11111111-1111-4111-8111-111111111111",
+        "repo_id":"owner/model",
+        "engine":"llama.cpp",
+        "storage":"internal",
+        "alias":"model",
+        "destination":"/models/llama.cpp/owner/model",
+        "status":"installed",
+        "revision":"abc123",
+        "filename":"model.gguf",
+        "projector_filename":null,
+        "context_length":null,
+        "download_files":["model.gguf"],
+        "capabilities":["generation"],
+        "family":null,
+        "bytes_downloaded":1,
+        "total_bytes":1,
+        "download_speed_bps":null,
+        "error":null,
+        "pid":null,
+        "created_at":1,
+        "updated_at":2,
+        "dismissed":true,
+        "events":[]
+      }]
+    }
+    """#.data(using: .utf8)!
+    let snapshot = try JSONDecoder.nativeSettingsDecoder().decode(
+        ModelInstallEvidenceSnapshot.self,
+        from: payload
+    )
+
+    #expect(snapshot.schemaVersion == 1)
+    #expect(snapshot.installs.count == 1)
+    #expect(snapshot.installs[0].id == "11111111-1111-4111-8111-111111111111")
+    #expect(snapshot.installs[0].status == "installed")
 }
 
 @Test("Downloaded weights can retry registration without appearing active")
@@ -854,6 +1287,66 @@ func runtimeUpdateDecoding() throws {
     #expect(snapshot.engines[1].canRollback)
 }
 
+@Test("DS4 runtime snapshots preserve the exact GLM 5.3 experimental channel")
+func ds4GLM53RuntimeChannelDecoding() throws {
+    let payload = #"""
+    {
+      "channel":"official",
+      "manifest_url":null,
+      "checked_at":1784559600,
+      "core_protocol":1,
+      "engines":[{
+        "engine":"ds4",
+        "release_tier":"preview",
+        "display_name":"DS4",
+        "ownership":"managed_or_external",
+        "installed":true,
+        "installed_version":"main-123",
+        "installed_revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "installed_path":"/runtime/ds4",
+        "installed_channel":"official",
+        "installation_kind":"managed_or_configured",
+        "upgrade_strategy":"managed",
+        "latest_upstream_version":"main-124",
+        "latest_upstream_revision":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "latest_upstream_url":"https://github.com/antirez/ds4",
+        "official_installer_url":null,
+        "available_version":"main-124",
+        "available_revision":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "release_notes_url":"https://github.com/antirez/ds4",
+        "update_available":true,
+        "can_install":true,
+        "can_rollback":false,
+        "management_note":"Official source.",
+        "diagnostic":null,
+        "managed_channels":[{
+          "channel":"glm-5.3-flash",
+          "source_branch":"glm-5.3-flash",
+          "release_tier":"experimental",
+          "available_version":"cccccccccccc",
+          "available_revision":"cccccccccccccccccccccccccccccccccccccccc",
+          "release_notes_url":"https://github.com/antirez/ds4/commit/cccccccccccccccccccccccccccccccccccccccc",
+          "update_available":true,
+          "can_install":true,
+          "diagnostic":null
+        }]
+      }]
+    }
+    """#.data(using: .utf8)!
+
+    let snapshot = try JSONDecoder.nativeSettingsDecoder()
+        .decode(RuntimeUpdateSnapshot.self, from: payload)
+    let ds4 = try #require(snapshot.engines.first)
+    let preview = try #require(ds4.ds4GLM53FlashPreview)
+
+    #expect(ds4.installedChannel == "official")
+    #expect(preview.channel == "glm-5.3-flash")
+    #expect(preview.sourceBranch == "glm-5.3-flash")
+    #expect(preview.releaseTierLabel == "EXPERIMENTAL")
+    #expect(preview.availableVersion == "cccccccccccc")
+    #expect(preview.canInstall)
+}
+
 @Test("Runtime install requests target the engine and requested official version")
 func runtimeInstallRequestEncoding() throws {
     let client = ControlAPIClient(
@@ -874,6 +1367,129 @@ func runtimeInstallRequestEncoding() throws {
     let payload = try JSONDecoder.nativeSettingsDecoder()
         .decode(InstallRuntimeUpdateRequest.self, from: body)
     #expect(payload.version == "0.19.0-ui1")
+    #expect(payload.channel == nil)
+}
+
+@Test("GLM 5.3 runtime install requests select only the exact DS4 preview channel")
+func ds4GLM53RuntimeInstallRequestEncoding() throws {
+    let client = ControlAPIClient(
+        baseURL: URL(string: "http://localhost:17321")!,
+        adminPassword: "secret"
+    )
+    let request = try client.runtimeInstallRequest(
+        engine: .ds4,
+        version: "cccccccccccc",
+        channel: ManagedRuntimeChannel.ds4GLM53FlashChannel
+    )
+
+    #expect(
+        request.url?.absoluteString
+            == "http://localhost:17321/manager/runtime-updates/ds4/install"
+    )
+    let body = try #require(request.httpBody)
+    let object = try #require(
+        JSONSerialization.jsonObject(with: body) as? [String: Any]
+    )
+    #expect(object.count == 2)
+    #expect(object["version"] as? String == "cccccccccccc")
+    #expect(object["channel"] as? String == "glm-5.3-flash")
+}
+
+@Test("GLM 5.3 search waits for the exact DS4 preview instead of showing generic matches")
+func glm53SearchRuntimeGate() throws {
+    let updatePayload = #"""
+    {
+      "engine":"ds4",
+      "display_name":"DS4",
+      "ownership":"managed_or_external",
+      "installed":true,
+      "update_available":false,
+      "can_install":false,
+      "can_rollback":false,
+      "management_note":"Official source.",
+      "managed_channels":[{
+        "channel":"glm-5.3-flash",
+        "source_branch":"glm-5.3-flash",
+        "release_tier":"experimental",
+        "available_version":"cccccccccccc",
+        "available_revision":"cccccccccccccccccccccccccccccccccccccccc",
+        "release_notes_url":"https://github.com/antirez/ds4/commit/cccccccccccccccccccccccccccccccccccccccc",
+        "update_available":true,
+        "can_install":true,
+        "diagnostic":null
+      }]
+    }
+    """#.data(using: .utf8)!
+    let modelPayload = #"""
+    [
+      {
+        "repo_id":"third-party/GLM-5.3-Flash-MLX",
+        "engine":"omlx",
+        "display_name":"GLM-5.3-Flash-MLX",
+        "model_kind":"language",
+        "compatibility":"likely",
+        "compatibility_reason":"Generic Hub metadata only."
+      },
+      {
+        "repo_id":"antirez/glm-5.2-gguf",
+        "engine":"ds4",
+        "display_name":"GLM 5.2",
+        "model_kind":"language",
+        "compatibility":"verified",
+        "compatibility_reason":"Declared by main."
+      }
+    ]
+    """#.data(using: .utf8)!
+    let update = try JSONDecoder.nativeSettingsDecoder()
+        .decode(EngineRuntimeUpdate.self, from: updatePayload)
+    let models = try JSONDecoder.nativeSettingsDecoder()
+        .decode([LibraryModel].self, from: modelPayload)
+
+    let visible = GLM53PreviewPresentation.visibleModels(
+        query: "GLM 5.3 Flash",
+        models: models
+    )
+
+    #expect(visible.map(\.displayName) == ["GLM 5.2"])
+    #expect(
+        GLM53PreviewPresentation.shouldOfferRuntimeInstall(
+            query: "glm-5.3-flash",
+            models: visible,
+            ds4Update: update
+        )
+    )
+    #expect(!GLM53PreviewPresentation.queryTargetsPreview("GLM 5.2"))
+    #expect(GLM53PreviewPresentation.q2MinimumMemoryGB == 128)
+    #expect(GLM53PreviewPresentation.q4MinimumMemoryGB == 256)
+
+    let exactPayload = #"""
+    [{
+      "repo_id":"antirez/glm-5.3-flash-gguf",
+      "engine":"ds4",
+      "display_name":"GLM 5.3 Flash — Q2 (Experimental Preview)",
+      "model_kind":"language",
+      "compatibility":"experimental",
+      "compatibility_reason":"Exact source-bound preview.",
+      "family":"glm-5.3-flash",
+      "release_tier":"experimental",
+      "recommended_memory_gb":128
+    }]
+    """#.data(using: .utf8)!
+    let exact = try JSONDecoder.nativeSettingsDecoder()
+        .decode([LibraryModel].self, from: exactPayload)
+    #expect(
+        GLM53PreviewPresentation.visibleModels(
+            query: "GLM 5.3",
+            models: exact
+        ) == exact
+    )
+    #expect(
+        !GLM53PreviewPresentation.shouldOfferRuntimeInstall(
+            query: "GLM 5.3",
+            models: exact,
+            ds4Update: update
+        )
+    )
 }
 
 @Test("llama.cpp runtime updates retain the dotted official engine identifier")

@@ -56,7 +56,7 @@ public enum ModelRole: String, Codable, CaseIterable, Identifiable, Sendable {
     }
 
     public func capabilities(for engine: InferenceEngine) -> [String] {
-        if self == .generation, engine == .llamaCpp || engine == .mlxcel {
+        if self == .generation, engine == .llamaCpp {
             return ["chat/completions", "completions", "responses"]
         }
         return capabilities
@@ -121,7 +121,7 @@ public extension ModelProfileSettings {
         case .mflux:
             [.image]
         case .mlxcel, .mistralRs:
-            [.generation]
+            []
         }
     }
 
