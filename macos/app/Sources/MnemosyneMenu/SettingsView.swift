@@ -16,9 +16,11 @@ struct SettingsView: View {
     @ObservedObject var registration: LaunchAgentRegistration
     let markSetupCompleted: () -> Void
     let restartService: () -> Void
+    @StateObject private var hubMode = HubModeViewModel()
     @State private var previewedCredentialDrafts: Set<ManagedCredential> = []
     @State private var selfTestAlias = ""
     @State private var alternativeSourceIndex: Int?
+    @State private var confirmPromoteHub = false
     private let productBuildIdentity = ProductBuildIdentity.current
 
     var body: some View {
@@ -35,7 +37,7 @@ struct SettingsView: View {
         }
         .frame(minWidth: 900, minHeight: 650)
         .task {
-            if !viewModel.isLoaded { await viewModel.load() }
+            await loadInitialState()
         }
         .onChange(of: viewModel.pairingOwnsFleetCredentials) { _, pairingOwns in
             guard pairingOwns else { return }
@@ -47,6 +49,8 @@ struct SettingsView: View {
         }
         .onChange(of: viewModel.selectedSection) { _, section in
             switch section {
+            case .hub:
+                Task { await hubMode.load(registration: registration) }
             case .pool:
                 Task { await viewModel.refreshDesiredInstalls() }
             case .lifecycle:
@@ -169,6 +173,13 @@ struct SettingsView: View {
         }
     }
 
+    private func loadInitialState() async {
+        if !viewModel.isLoaded {
+            await viewModel.load()
+        }
+        await hubMode.load(registration: registration)
+    }
+
     private var sidebar: some View {
         VStack(alignment: .leading, spacing: 4) {
             Text("SETTINGS")
@@ -288,6 +299,7 @@ struct SettingsView: View {
             switch viewModel.selectedSection {
             case .setup: setupPage
             case .general: generalPage
+            case .hub: hubPage
             case .pool: poolPage
             case .engines: enginesPage
             case .updates: runtimeUpdatesPage
@@ -299,6 +311,181 @@ struct SettingsView: View {
             case .credentials: credentialsPage
             }
         }
+    }
+
+    private var hubPage: some View {
+        Form {
+            Section("Hub service") {
+                Toggle(
+                    "Run this Mac as Fleet Hub",
+                    isOn: Binding(
+                        get: { registration.hubAgentStatus == .enabled },
+                        set: { enabled in
+                            if enabled {
+                                if hubMode.configuration == nil {
+                                    confirmPromoteHub = true
+                                } else {
+                                    Task {
+                                        await hubMode.reenable(
+                                            registration: registration
+                                        )
+                                    }
+                                }
+                            } else {
+                                Task {
+                                    await hubMode.disable(
+                                        registration: registration
+                                    )
+                                }
+                            }
+                        }
+                    )
+                )
+                .toggleStyle(.switch)
+                .disabled(hubMode.isWorking || registration.isChangingRegistration)
+
+                LabeledContent(
+                    "Login service",
+                    value: registration.label(for: registration.hubAgentStatus)
+                )
+                LabeledContent(
+                    "Health",
+                    value: hubMode.hubHealthy ? "Ready" : "Not ready"
+                )
+                Text(hubMode.statusMessage)
+                    .font(.caption)
+                    .foregroundStyle(hubMode.isError ? Color.red : Color.secondary)
+                    .textSelection(.enabled)
+
+                if registration.hubAgentStatus == .requiresApproval {
+                    Button("Approve in Login Items") {
+                        registration.openLoginItemsSettings()
+                    }
+                }
+            }
+
+            Section("Secure Hub address") {
+                Picker("Exposure", selection: $hubMode.exposureMode) {
+                    ForEach(HubModeViewModel.ExposureMode.allCases) { mode in
+                        Text(mode.rawValue).tag(mode)
+                    }
+                }
+                if hubMode.exposureMode == .existingHTTPS {
+                    TextField(
+                        "https://nyx.example.internal",
+                        text: $hubMode.customPublicOrigin
+                    )
+                    .textFieldStyle(.roundedBorder)
+                } else {
+                    Text(
+                        "Tailscale Serve keeps Fleet on 127.0.0.1 and exposes it only inside your tailnet with an automatically managed HTTPS certificate. Tailscale CLI integration and tailnet HTTPS must be enabled."
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                }
+                if let configuration = hubMode.configuration {
+                    LabeledContent("Public origin") {
+                        Text(configuration.publicOrigin)
+                            .textSelection(.enabled)
+                    }
+                }
+                Button(
+                    hubMode.configuration == nil
+                        ? "Configure and Enable Hub…"
+                        : "Apply and Restart Hub…"
+                ) {
+                    confirmPromoteHub = true
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(hubMode.isWorking)
+            }
+
+            if let configuration = hubMode.configuration {
+                Section("Nyx local worker") {
+                    LabeledContent(
+                        "Node identity",
+                        value: configuration.localWorkerNodeID
+                    )
+                    LabeledContent("Scheduling class", value: "LIMITED / overflow")
+                    LabeledContent(
+                        "Published models",
+                        value: configuration.publishedDeployments.count.formatted()
+                    )
+                    ForEach(configuration.publishedDeployments) { model in
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(model.alias).fontWeight(.medium)
+                            Text(model.deploymentID)
+                                .font(.caption.monospaced())
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                            Text(model.capabilities.joined(separator: ", "))
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    Button("Sync Local Model Mappings") {
+                        Task {
+                            await hubMode.syncLocalModels(
+                                registration: registration
+                            )
+                        }
+                    }
+                    .disabled(
+                        hubMode.isWorking
+                            || registration.hubAgentStatus != .enabled
+                    )
+                }
+
+                Section("Hub administration") {
+                    HStack {
+                        Button("Open Hub Dashboard") {
+                            hubMode.openDashboard()
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(!hubMode.hubHealthy)
+                        Button("Copy Admin Key") { hubMode.copyAdminKey() }
+                        Button("Copy Client API Key") { hubMode.copyClientKey() }
+                    }
+                    Text(
+                        "Create invitations, approve Macs, assign primary/opportunistic/LIMITED service classes, and enable or revoke enrollments from the Hub dashboard. Credentials are revealed only by an explicit copy action."
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                }
+            }
+
+            Section("Preservation") {
+                Text(
+                    "Replacing Unified Inference.app preserves Hub credentials, pairings, inventory, routing metadata, local model mappings, and the Mac's existing .env. Disabling Hub Mode stops routing but keeps that state for re-enable. The preserve-data uninstaller also retains the Hub directory."
+                )
+                .foregroundStyle(.secondary)
+            }
+        }
+        .formStyle(.grouped)
+        .confirmationDialog(
+            "Run this Mac as Fleet Hub?",
+            isPresented: $confirmPromoteHub,
+            titleVisibility: .visible
+        ) {
+            Button("Configure and Enable Hub") {
+                Task {
+                    await hubMode.promote(
+                        registration: registration,
+                        fallbackWorkerNodeID: viewModel.tokenReportingNodeID
+                    )
+                }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(hubPromotionConfirmationMessage)
+        }
+    }
+
+    private var hubPromotionConfirmationMessage: String {
+        if hubMode.exposureMode == .tailscale {
+            return "Unified Inference will generate private Hub credentials, restart this Mac's local inference worker, enroll it as LIMITED / overflow, register Fleet Hub at login, and ask Tailscale Serve to publish port 17400 through private HTTPS. Model files and token history are not changed."
+        }
+        return "Unified Inference will generate private Hub credentials, restart this Mac's local inference worker, enroll it as LIMITED / overflow, and register Fleet Hub at login. The entered HTTPS proxy must already forward to 127.0.0.1:17400. Model files and token history are not changed."
     }
 
     private var setupPage: some View {
@@ -3414,6 +3601,7 @@ struct SettingsView: View {
         switch viewModel.selectedSection {
         case .setup: "First-run guidance, system health, recovery, and verification"
         case .general: "Ports, timeouts, model residency, and local storage"
+        case .hub: "Promote this Mac, manage the gateway, and administer enrollment"
         case .pool: "Pair this Mac with a Hub and manage path-free download requests"
         case .engines: "Choose and connect the inference engines available on this Mac"
         case .updates: "Check and install updates from each engine's official source"

@@ -114,6 +114,7 @@ CONTENTS="$APP_DIR/Contents"
 RESOURCES="$CONTENTS/Resources"
 FRAMEWORKS="$CONTENTS/Frameworks"
 SERVICE_BOOTSTRAP="$CONTENTS/MacOS/mnemosyne-service-bootstrap"
+HUB_BOOTSTRAP="$CONTENTS/MacOS/mnemosyne-hub-bootstrap"
 FILE_TRASH_HELPER="$CONTENTS/MacOS/mnemosyne-file-trash"
 LIFECYCLE_HELPER_WRAPPER="$CONTENTS/Helpers/MnemosyneLifecycleAuthorization.app"
 LIFECYCLE_HELPER_CONTENTS="$LIFECYCLE_HELPER_WRAPPER/Contents"
@@ -132,6 +133,7 @@ mkdir -p \
     "$CONTENTS/Library/LaunchAgents" \
     "$FRAMEWORKS" \
     "$RESOURCES/Service" \
+    "$RESOURCES/Fleet" \
     "$RESOURCES/ImageWorker"
 
 install -m 644 "$SCRIPT_DIR/Info.plist" "$CONTENTS/Info.plist"
@@ -158,6 +160,9 @@ install -m 755 \
     "$BIN_DIR/mnemosyne-service-bootstrap" \
     "$SERVICE_BOOTSTRAP"
 install -m 755 \
+    "$BIN_DIR/mnemosyne-hub-bootstrap" \
+    "$HUB_BOOTSTRAP"
+install -m 755 \
     "$BIN_DIR/mnemosyne-file-trash" \
     "$FILE_TRASH_HELPER"
 install -m 755 \
@@ -180,8 +185,12 @@ fi
 install -m 644 \
     "$SCRIPT_DIR/LaunchAgents/com.mnemosyne.inference.agent.plist" \
     "$CONTENTS/Library/LaunchAgents/com.mnemosyne.inference.agent.plist"
+install -m 644 \
+    "$SCRIPT_DIR/LaunchAgents/com.mnemosyne.inference.hub.plist" \
+    "$CONTENTS/Library/LaunchAgents/com.mnemosyne.inference.hub.plist"
 
 ditto "$REPO_ROOT/macos/service/src" "$RESOURCES/Service"
+ditto "$REPO_ROOT/fleet/src" "$RESOURCES/Fleet"
 ditto "$REPO_ROOT/macos/image-worker/src" "$RESOURCES/ImageWorker"
 mkdir -p "$RESOURCES/Service/mnemosyne_macos/schemas"
 install -m 644 \
@@ -190,6 +199,22 @@ install -m 644 \
 install -m 644 \
     "$REPO_ROOT/mac_pool_protocol/v1/desired_install.schema.json" \
     "$RESOURCES/Service/mnemosyne_macos/schemas/desired_install.schema.json"
+mkdir -p "$RESOURCES/Fleet/mnemosyne_fleet/schemas"
+install -m 644 \
+    "$REPO_ROOT/fleet_protocol/v1/snapshot.schema.json" \
+    "$RESOURCES/Fleet/mnemosyne_fleet/schemas/snapshot.schema.json"
+install -m 644 \
+    "$REPO_ROOT/mac_pool_protocol/v1/mac_inventory.schema.json" \
+    "$RESOURCES/Fleet/mnemosyne_fleet/schemas/mac_inventory.schema.json"
+install -m 644 \
+    "$REPO_ROOT/mac_pool_protocol/v1/desired_install.schema.json" \
+    "$RESOURCES/Fleet/mnemosyne_fleet/schemas/desired_install.schema.json"
+install -m 644 \
+    "$REPO_ROOT/mac_pool_protocol/v1/placement_recommendation.schema.json" \
+    "$RESOURCES/Fleet/mnemosyne_fleet/schemas/placement_recommendation.schema.json"
+install -m 644 \
+    "$REPO_ROOT/compatibility_catalog/v1/catalog.schema.json" \
+    "$RESOURCES/Fleet/mnemosyne_fleet/schemas/compatibility_catalog.schema.json"
 install -m 644 \
     "$REPO_ROOT/macos/image-worker/capabilities.json" \
     "$RESOURCES/ImageWorker/capabilities.json"
@@ -270,6 +295,10 @@ codesign \
     "$SERVICE_BOOTSTRAP"
 codesign \
     "${CODESIGN_ARGS[@]}" \
+    --identifier com.mnemosyne.inference.hub \
+    "$HUB_BOOTSTRAP"
+codesign \
+    "${CODESIGN_ARGS[@]}" \
     --identifier com.mnemosyne.inference.file-trash \
     "$FILE_TRASH_HELPER"
 LIFECYCLE_HELPER_CODESIGN_ARGS=(
@@ -307,7 +336,8 @@ codesign "${CODESIGN_ARGS[@]}" "$APP_DIR"
 plutil -lint \
     "$CONTENTS/Info.plist" \
     "$LIFECYCLE_HELPER_CONTENTS/Info.plist" \
-    "$CONTENTS/Library/LaunchAgents/com.mnemosyne.inference.agent.plist"
+    "$CONTENTS/Library/LaunchAgents/com.mnemosyne.inference.agent.plist" \
+    "$CONTENTS/Library/LaunchAgents/com.mnemosyne.inference.hub.plist"
 codesign --verify --deep --strict "$APP_DIR"
 VERIFY_RELEASE_ARGS=(--app "$APP_DIR")
 if [[ "$BARE" -eq 1 ]]; then

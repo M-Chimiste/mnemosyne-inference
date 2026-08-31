@@ -12,6 +12,18 @@ route_history_limit = 10000
 poll_interval_seconds = 2
 snapshot_ttl_seconds = 10
 
+[batch]
+# Async batches reuse the ordinary authenticated inference path and enter the
+# scheduler's lowest-priority lane. Inputs/results are bounded process memory
+# only: they never enter SQLite and expire on Hub restart.
+enabled = true
+max_active_jobs = 32
+max_requests_per_job = 256
+max_concurrency = 4
+max_result_bytes_per_item = 16777216
+max_retained_result_bytes = 268435456
+retention_seconds = 3600
+
 [pairing]
 # Pairing is disabled by default so existing static deployments behave exactly
 # as before and the pairing routes are not mounted. The current release exposes

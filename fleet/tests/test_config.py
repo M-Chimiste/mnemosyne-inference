@@ -53,6 +53,61 @@ capabilities = ["responses"]
     assert config.placement.desired_install_valid_seconds == 900
     assert config.placement.maximum_active_desired_installs == 1_000
     assert config.placement.desired_install_history_limit == 10_000
+    assert config.batch.enabled is True
+    assert config.batch.max_active_jobs == 32
+    assert config.batch.max_requests_per_job == 256
+    assert config.batch.max_concurrency == 4
+    assert config.batch.max_result_bytes_per_item == 16 * 1024 * 1024
+    assert config.batch.max_retained_result_bytes == 256 * 1024 * 1024
+    assert config.batch.retention_seconds == 3600
+
+
+def test_batch_configuration_is_bounded_and_result_cap_is_coherent(tmp_path) -> None:
+    path = tmp_path / "config.toml"
+    template = """
+[server]
+api_key_env = "CLIENT"
+admin_api_key_env = "ADMIN"
+poll_interval_seconds = 1
+snapshot_ttl_seconds = 2
+
+[batch]
+enabled = true
+max_active_jobs = 3
+max_requests_per_job = 5
+max_concurrency = 2
+max_result_bytes_per_item = ITEM_CAP
+max_retained_result_bytes = 4096
+retention_seconds = 60
+
+[[nodes]]
+node_id = "node"
+url = "http://node"
+fleet_token_env = "FLEET"
+inference_token_env = "INFER"
+
+[[models]]
+name = "model"
+deployment_id = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+capabilities = ["responses"]
+"""
+    environment = {
+        "CLIENT": "client",
+        "ADMIN": "admin",
+        "FLEET": "fleet",
+        "INFER": "infer",
+    }
+    path.write_text(template.replace("ITEM_CAP", "2048"), encoding="utf-8")
+    config = load_config(path, environ=environment)
+    assert config.batch.max_active_jobs == 3
+    assert config.batch.max_requests_per_job == 5
+    assert config.batch.max_concurrency == 2
+    assert config.batch.max_result_bytes_per_item == 2048
+    assert config.batch.max_retained_result_bytes == 4096
+
+    path.write_text(template.replace("ITEM_CAP", "8192"), encoding="utf-8")
+    with pytest.raises(ConfigError, match="must not exceed retained capacity"):
+        load_config(path, environ=environment)
 
 
 def test_signed_catalog_configuration_is_explicit_strict_and_public_key_only(

@@ -336,22 +336,30 @@ and is retried on the next launch. This covers the former `Mnemosyne.app`
 filename migration and local ad-hoc-signed updates without restarting either
 registration on ordinary launches.
 
-For an ad-hoc-signed pilot update, do not merge the staged directory over a
-running installation. Build the DMG, quit the menu app, and run its **Install
-or Upgrade Unified Inference.command**. The assistant verifies the exact
-candidate identity and signature, refuses a downgrade, stages a complete
-bundle on the Applications filesystem, moves the old app to Trash, atomically
-activates the candidate, and launches it. An already-enabled service may keep
-serving during bundle staging; the new menu app then refreshes that exact
-Service Management registration and the assistant requires a changed healthy
-agent PID. The assistant hashes `.env` before and after and never writes to
-Application Support or model storage.
+For an ad-hoc-signed pilot update, quit the menu app and use Finder to drag the
+new **Unified Inference** onto **Applications**, choose **Replace**, and open
+the installed copy. Do not merge app-bundle directories or alter Application
+Support. An already-enabled service may keep serving while Finder replaces the
+bundle; the new menu app fingerprints the changed installed bundle and safely
+refreshes that exact Service Management registration on first launch. Private
+configuration, `.env`, token state, storage grants, runtimes, and model weights
+live outside the application bundle and remain unchanged.
 
 The DMG also carries **Uninstall Unified Inference (Preserve Data).command**.
 It requires the exact service to be disabled and the menu app to be quit, then
 moves the canonical app and default manager-owned runtime directory to Trash.
 It deliberately retains the entire accounting recovery surface: `.env`,
 config, SQLite usage/outbox state, identity, scopes, pairing, and weights.
+
+The app also embeds `mnemosyne-hub-bootstrap`, the exact Fleet Python source,
+and `com.mnemosyne.inference.hub.plist`. Hub Mode is not enabled by first-run
+defaults. After an explicit promotion confirmation, the native app writes a
+private Hub `.env` and TOML below Application Support, publishes only the local
+worker's authoritative snapshot models, and registers the separate Hub
+LaunchAgent. An enabled Hub registration participates in the same bundle-
+fingerprint refresh as the inference service; a disabled Hub is preserved as
+disabled. Replacement and the preserve-data uninstaller retain the complete
+Hub directory.
 
 Ad-hoc signing is for local development only. `CODESIGN_IDENTITY` provides
 signature stability but does not by itself implement distribution.

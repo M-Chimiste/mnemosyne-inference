@@ -9,6 +9,7 @@ ENV_PATH="$SUPPORT_ROOT/.env"
 RUNTIME_ROOT="$SUPPORT_ROOT/runtimes"
 BUNDLE_ID="com.mnemosyne.inference.menu"
 AGENT_LABEL="com.mnemosyne.inference.agent"
+HUB_AGENT_LABEL="com.mnemosyne.inference.hub"
 
 pause_before_exit() {
     if [[ -t 0 ]]; then
@@ -33,7 +34,10 @@ bundle_value() {
     || fail "The Applications target belongs to another product."
 
 if /bin/launchctl print "gui/$UID/$AGENT_LABEL" >/dev/null 2>&1; then
-    fail "Open Unified Inference, choose Disable Service, turn off Open Unified Inference at login, then Quit. This prevents a registered job from surviving removal."
+    fail "Open Unified Inference, disable the Background service, turn off Open Unified Inference at login, then Quit. This prevents a registered job from surviving removal."
+fi
+if /bin/launchctl print "gui/$UID/$HUB_AGENT_LABEL" >/dev/null 2>&1; then
+    fail "Open Unified Inference, turn off Run this Mac as Fleet Hub, then Quit. Hub configuration and enrollments will be preserved."
 fi
 if /usr/bin/pgrep -x UnifiedInference >/dev/null 2>&1; then
     fail "Quit Unified Inference from its menu-bar menu, then run this assistant again."
@@ -59,6 +63,7 @@ printf '  %s/config.yaml\n' "$SUPPORT_ROOT"
 printf '  %s/state (token ledger, outbox, identity, and receipts)\n' "$SUPPORT_ROOT"
 printf '  %s/models and every configured external model location\n' "$SUPPORT_ROOT"
 printf '  %s/state/security-scopes and Nyx pairing data\n' "$SUPPORT_ROOT"
+printf '  %s/hub (Hub credentials, pairings, inventory, and route metadata)\n' "$SUPPORT_ROOT"
 printf '\nExternally owned engines such as oMLX are not modified.\n'
 printf 'Type UNINSTALL to continue: '
 read -r CONFIRMATION
@@ -88,7 +93,7 @@ fi
 printf '\nRecoverable uninstall complete.\n'
 printf 'Preserved private environment: %s\n' "$ENV_PATH"
 printf 'Preserved token accounting state: %s/state\n' "$SUPPORT_ROOT"
-printf 'Reinstall with Install or Upgrade Unified Inference.command to resume the same identity and outbox.\n'
+printf 'Reinstall Unified Inference.app through Finder to resume the same identity and outbox.\n'
 printf 'App in Trash: %s\n' "$APP_TRASH"
 if [[ -n "$RUNTIME_TRASH" ]]; then
     printf 'Managed runtimes in Trash: %s\n' "$RUNTIME_TRASH"

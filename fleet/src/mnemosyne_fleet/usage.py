@@ -61,3 +61,44 @@ class UsageReader:
         finally:
             await conn.close()
 
+    async def token_rates(self, *, minutes: int = 5) -> list[dict[str, Any]]:
+        """Return a bounded recent token rate without copying token rows."""
+
+        if self._dsn is None:
+            return []
+        bounded_minutes = max(1, min(int(minutes), 60))
+        conn = await psycopg.AsyncConnection.connect(
+            self._dsn,
+            connect_timeout=5,
+            autocommit=False,
+        )
+        try:
+            async with conn.transaction():
+                await conn.execute("SET TRANSACTION READ ONLY")
+                async with conn.cursor() as cursor:
+                    await cursor.execute(
+                        """
+                        SELECT node_id,
+                               coalesce(sum(total_tokens), 0)::bigint,
+                               count(*)::bigint
+                        FROM public.token_usage
+                        WHERE timestamp >= now() - (%s * interval '1 minute')
+                        GROUP BY node_id
+                        ORDER BY node_id
+                        LIMIT 10000
+                        """,
+                        (bounded_minutes,),
+                    )
+                    rows = await cursor.fetchall()
+            seconds = bounded_minutes * 60.0
+            return [
+                {
+                    "node_id": row[0],
+                    "tokens_per_second": int(row[1]) / seconds,
+                    "request_rate_per_second": int(row[2]) / seconds,
+                    "window_seconds": int(seconds),
+                }
+                for row in rows
+            ]
+        finally:
+            await conn.close()

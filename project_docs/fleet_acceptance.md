@@ -4,6 +4,22 @@ Run these checks after Nyx and at least two strict replicas are configured.
 They complement the automated suites; they do not replace each node's existing
 engine, download, release, or hardware smoke checks.
 
+For the bundled macOS Hub pilot, also require:
+
+- Hub promotion refuses a Mac with no authoritative Fleet-eligible local model;
+- the resulting Hub and native worker have separate PIDs, listeners, state
+  roots, and credentials, with the local worker fixed to `overflow`;
+- the Hub binds only `127.0.0.1:17400`, and its configured HTTPS origin reaches
+  it through the intended private proxy;
+- invitation create, Mac claim, exact-locator approval, activation, explicit
+  Hub enable, local pause/rejoin, Hub disable/re-enable, and permanent revoke
+  pass on the signed candidate across representative Macs;
+- Finder replacement refreshes an enabled Hub login registration but leaves an
+  explicitly disabled one disabled; both paths retain the exact Hub identity,
+  pairing generations, inventory, mappings, and route history;
+- the preserve-data uninstaller refuses while the Hub job is active and retains
+  the Hub directory after the exact app and managed runtimes move to Trash.
+
 ## Preconditions
 
 - Nyx can reach each enrolled inference-plane URL over the trusted LAN or
@@ -114,6 +130,33 @@ the evidence surfaces.
   capacity and is excluded from routing.
 - Fleet SQLite contains no prompt, output, credential, DSN, or token-usage
   columns.
+
+## Routing controls and batches
+
+Using a non-sensitive payload and two eligible Macs:
+
+1. Send an ordinary request without control headers and confirm the existing
+   warm/service-class/load behavior is unchanged.
+2. Send a request with an exact enrollment affinity and confirm it reaches
+   that Mac when eligible. Repeat while it is unavailable with fallback
+   allowed, then with fallback disabled; only the former may use another Mac.
+3. Saturate one mapped model, queue `batch`, `normal`, and `interactive` work,
+   and confirm the visible lane counts and admission order. Repeat with a
+   shorter `X-Mnemosyne-Max-Wait-Ms` and confirm it cannot extend the TOML
+   model deadline.
+4. Submit a multi-item `/v1/batches` job, observe progress, retrieve ordered
+   results, and confirm each completed item produced one ordinary route row
+   and one serving-node token event.
+5. Cancel a job with one item active and another pending. Confirm both settle
+   cancelled, active Fleet reservations return to zero, and no second node
+   receives ambiguous work.
+6. Search the Fleet SQLite database for unique sentinel strings used only in
+   the batch input/output and confirm neither appears. Restart Fleet and
+   confirm the old batch ID is unavailable.
+7. Open `/fleet/` and compare its first overview table with
+   `/fleet/api/overview`, authenticated snapshots, Mac inventory, and the
+   read-only five-minute ledger rate. No node URL, path, credential, prompt, or
+   response may appear.
 
 The automated gateway and node suites exercise these destructive/fault cases
 with isolated fakes. The live check should use only ordinary service stop,

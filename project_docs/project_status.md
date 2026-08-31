@@ -1,6 +1,6 @@
 # Mnemosyne Inference — Project Status
 
-**Last updated:** 2026-08-30
+**Last updated:** 2026-08-31
 
 ## Current state
 
@@ -32,6 +32,30 @@ fault-injection coverage and a content-redacted multi-node acceptance runner
 are present. LAN/Tailscale deployment on Nyx and representative simultaneous
 Mac/CUDA hardware evidence remain release gates; see
 [fleet acceptance](fleet_acceptance.md).
+
+Fleet now also has a single joined Mac overview for online/joined state,
+hardware, path-free free storage, installed/resident models, active work,
+queues, recent fixed-code errors, and a read-only five-minute token rate.
+Optional request headers add bounded priority, exact enrollment affinity,
+shorter maximum wait, and safe pre-work fallback policy without changing
+ordinary clients. Bounded `/v1/batches` execution groups compatible
+non-streaming requests through the same scheduler/proxy/accounting path in the
+lowest-priority lane, with progress, cancellation, and ordered results.
+Batch bodies/results are process-memory-only with per-item, aggregate, job,
+concurrency, and retention caps; restart expires them and Fleet SQLite remains
+metadata-only.
+
+The macOS pilot now bundles that Fleet gateway behind a separate, explicitly
+enabled **Hub Mode** login service. Promotion creates five distinct private
+credentials, keeps the gateway on loopback `:17400`, publishes authoritative
+local snapshot deployments, and enrolls the existing native worker on `:1240`
+as `overflow`; it does not merge gateway and engine ownership. The guided
+remote path configures Tailscale Serve HTTPS, while an existing HTTPS proxy is
+an advanced alternative. The Hub dashboard now creates one-time invitations,
+approves/rejects claims with exact-locator re-entry, assigns service class, and
+enables/disables/revokes enrollments. Finder replacement refreshes an enabled
+Hub registration, and disable/re-enable plus preserve-data uninstall retain
+Hub credentials, pairings, inventory, mappings, and route metadata.
 
 Mac-first pool hardening is now an active follow-on milestone. Several
 non-breaking foundations are implemented:
@@ -921,17 +945,17 @@ Latest Mac-first host verification on 2026-08-30:
   six current Mac engines and nested external/symlink lexical destinations
   with no default-location fallback, storage-rebind laundering, or stale retry
   transition.
-- Nyx Fleet suite: `381 passed`; cross-component catalog, inventory,
+- Nyx Fleet suite: `388 passed`; cross-component catalog, inventory,
   DesiredInstall, catalog-ceremony, and live-acceptance contracts: `127 passed`.
-- Isolated MFLUX worker suite: `23 passed`; Swift app suite: `152 passed`;
-  packaging logic: `72 passed` (plus 3 subtests).
-- The complete ad-hoc `Unified Inference 0.9.0 (66)` app was rebuilt from the
+- Isolated MFLUX worker suite: `23 passed`; Swift app suite: `164 passed`;
+  packaging logic: `73 passed`.
+- The complete ad-hoc `Unified Inference 0.9.0 (73)` app was rebuilt from the
   final sources. The isolated packaged verifier and secret-redacted acceptance
   collector passed and it contains zero `.pyc` or `.pyo` files. The canonical
   arm64 pilot DMG passed disk-image and artifact acceptance with SHA-256
-  `edbc25194c1432fd4146451790f9332fec0132e1893d92d0e2940a5a9a9f0724`.
-  The mounted image also proves both executable pilot lifecycle assistants are
-  present and syntactically valid.
+  `d5bdc87b06629d87c7a05d53e010f4cb0efac8401edc65bf26e968f6a4bc3fc3`.
+  The mounted image also proves the preserve-data uninstall assistant, native
+  service helper, and separate Hub helper/LaunchAgent are present and valid.
   The nested lifecycle-helper wrapper is present, but no provisioning profile,
   OS-backed proof authority, or effects runner is enabled. This is development
   evidence only: it has no Team Identifier, hardened runtime, or timestamp and

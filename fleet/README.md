@@ -60,6 +60,24 @@ inside the Fleet gateway process. Configure that limited worker with
 resource isolation by itself, so the operator must establish those boundaries
 before enrolling the worker.
 
+The macOS pilot can establish these boundaries from **Unified Inference →
+Settings → Hub Mode**. The application embeds the exact Fleet source and runs
+it under its own opt-in login service on `127.0.0.1:17400`; the existing native
+manager stays on `127.0.0.1:1240`. Promotion generates distinct client, admin,
+pairing-master, local-snapshot, and local-dispatch secrets, publishes only
+authoritative deployments from the native snapshot, and configures the local
+worker as `overflow`. The recommended UI path exposes only the loopback Hub
+through Tailscale Serve HTTPS. Hub credentials, enrollments, inventory, model
+mappings, and route metadata live outside the app bundle and survive Finder
+replacement, disable/re-enable, and the preserve-data uninstaller.
+
+The same dashboard now has **Hub enrollment → Invite and manage Macs**. It can
+create a five-minute invitation, approve or reject a claim after the operator
+re-enters the exact authorized locator, choose the service class, explicitly
+enable or disable an activated enrollment, and permanently revoke it. The
+one-time invitation secret remains only in the create response/browser
+session, and a new enrollment never routes until its separate enable action.
+
 A logical model maps to one exact `sha256:` deployment ID and an exact
 capability set. A node is eligible only when its authenticated, fresh protocol
 v1 snapshot reports the same ID, an authoritative identity, an immutable
@@ -86,7 +104,7 @@ prefer, in order:
 2. a warm deployment with room in its bounded node queue;
 3. an empty node that can load the deployment;
 4. a node that can safely drain and switch;
-5. the model's bounded FIFO queue.
+5. the model's bounded queue.
 
 Thus a cold/loadable primary node precedes a warm overflow node; a lower class
 becomes available only after every higher-class node is ineligible, stale, or
@@ -96,6 +114,35 @@ that has not received upstream headers is counted regardless of when the
 latest poll began. Once non-busy headers prove node admission, only a poll
 started after that admission may account for the request in node-local state.
 The node remains the final admission authority.
+
+Ordinary clients that send no routing headers retain that behavior. Advanced
+clients may add the following closed, Hub-only controls; Fleet removes them
+before forwarding to a node:
+
+- `X-Mnemosyne-Priority: interactive|normal|batch` selects a bounded priority
+  lane. Equal-priority work remains FIFO and lower lanes age toward admission.
+- `X-Mnemosyne-Affinity: <enrollment_id>` prefers one exact enrolled machine.
+- `X-Mnemosyne-Fallback: allow|none` controls safe pre-work cross-node retry;
+  `none` also makes a supplied affinity strict.
+- `X-Mnemosyne-Max-Wait-Ms: <integer>` may shorten, never extend, the mapped
+  model's configured queue timeout.
+
+Warm state, service class, advertised node capacity, queue room, and local
+reservations remain authoritative. Affinity cannot make an offline,
+unhealthy, incompatible, or full node eligible. Cross-node fallback still
+occurs only for the existing proven pre-work failures.
+
+`POST /v1/batches` accepts a bounded array of non-streaming requests for the
+existing route allowlist. `GET /v1/batches/{id}` reports progress,
+`GET /v1/batches/{id}/results` returns completed JSON results, and
+`POST /v1/batches/{id}/cancel` cancels pending/running work through the same
+cancellation-safe route ownership used by interactive requests. Compatible
+items are grouped before dispatch and execute with bounded concurrency in the
+`batch` priority lane, so ordinary and explicitly interactive work can enter
+ahead of them. Batch bodies/results are held only in bounded process memory,
+never persisted or exposed to the dashboard, and disappear on restart, expiry,
+or bounded terminal-job eviction. `[batch]` controls active-job, item,
+concurrency, per-result, aggregate-retained-result, and retention limits.
 
 Run one Fleet process on Nyx. Protocol-v1 FIFO and reservation state is
 in-memory by design; multiple Uvicorn workers are unsafe until that state is
@@ -121,6 +168,9 @@ usage continues to be emitted exactly once by the serving node. The optional
 ledger integration uses a read-only Postgres credential to show aggregates.
 
 ## Nyx install
+
+For the bundled macOS pilot, prefer the Hub Mode workflow above. The following
+standalone installation remains the server/Linux and advanced operator path.
 
 Python 3.11 or newer and `uv` are required:
 
@@ -220,6 +270,15 @@ cancellation is revision-preconditioned and stop-only. With those switches
 off, these controls report disabled and static enrollment behavior is
 unchanged. Promotion into a public Fleet model remains an explicit TOML
 mapping.
+
+The first dashboard section and `GET /fleet/api/overview` provide the joined
+operator view: online/joined state, hardware, aggregate path-free storage,
+installed and resident models, active requests, node/Fleet queues, a bounded
+five-minute token rate from the read-only ledger, recent fixed-code route or
+snapshot errors, and aggregate batch progress. The realtime stream refreshes
+live/inventory fields without re-querying Postgres every two seconds; it
+reuses the last bounded token-rate observation until the next authenticated
+status/overview refresh.
 
 The complete protocol and threat boundary are documented in
 [Fleet architecture](../project_docs/fleet_architecture.md) and

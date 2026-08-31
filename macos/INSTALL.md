@@ -62,15 +62,15 @@ The same signed arm64 disk image can be copied to every Apple Silicon Mac; it
 does not need to be rebuilt on Metis, Athena, or another workstation. Engine
 runtimes and model folders are prepared separately on each machine.
 
-For an existing 0.9 pilot, quit the menu app and run **Install or Upgrade
-Unified Inference.command** from the mounted disk image instead of merging app
-bundle directories. The assistant stages and verifies the complete candidate,
-moves the prior app to Trash for rollback, installs at the canonical path,
-then launches the new app so its exact Service Management registrations are
-refreshed. It never writes below `~/Library/Application Support/Mnemosyne` and
-proves the existing private `.env` has the same SHA-256 before and after. The
-configuration, selected storage paths, weights, local token ledger/outbox,
-node identity, and reporting DSN therefore survive the upgrade.
+For an existing 0.9 pilot, quit the menu app, drag the new **Unified
+Inference** onto the **Applications** shortcut, choose **Replace**, and open
+the installed app. Finder replaces only the application bundle. Unified
+Inference keeps configuration, `.env`, selected storage paths, weights, the
+local token ledger/outbox, node identity, and reporting DSN below the existing
+private Application Support tree, so they survive the replacement. The new
+app fingerprints its changed bundle on first launch and safely refreshes any
+previously enabled exact Service Management registrations; a registration the
+user explicitly disabled remains disabled.
 
 On a fresh installation, the first app launch requests both native Service
 Management registrations: the inference LaunchAgent starts at login with
@@ -81,12 +81,14 @@ and explicitly disabling either registration is never undone on a later app
 launch.
 
 For a recoverable uninstall, disable **Background service**, turn off **Open
-Unified Inference at login**, quit the menu app, and run **Uninstall Unified Inference
-(Preserve Data).command** from the mounted image. The assistant moves only the
-exact installed app and default manager-owned `runtimes` folder to Trash. It
-retains `.env`, config, SQLite state/outbox, storage grants, pairing data, and
-all model locations so reinstall resumes token accounting without an identity
-reset. It never removes externally owned oMLX installs.
+Unified Inference at login**, disable **Run this Mac as Fleet Hub** when it is
+enabled, quit the menu app, and run **Uninstall Unified Inference (Preserve
+Data).command** from the mounted image. The assistant moves only the exact
+installed app and default manager-owned `runtimes` folder to Trash. It retains
+`.env`, config, SQLite state/outbox, storage grants, pairing data, Hub
+credentials/enrollments, and all model locations so reinstall resumes token
+accounting and Hub identity without a reset. It never removes externally owned
+oMLX installs.
 
 For a private, non-notarized local build, use Finder's **Control-click →
 Open** once if Gatekeeper asks. Do not disable Gatekeeper system-wide.
@@ -146,6 +148,48 @@ settings and restart the background service before testing a replacement.
 
 Model weights are separate from engine runtimes. Install or import weights
 through **Settings → Model Library** after preparing the corresponding engine.
+
+## Promote one Mac to Fleet Hub
+
+Hub Mode is opt-in and is intended for one always-available Mac such as Nyx.
+It runs the gateway as a separate login service on loopback port `17400`; the
+ordinary inference worker remains on `1240` with its own state, process, and
+credentials. Nyx's worker is enrolled automatically as **LIMITED / overflow**,
+so a primary or opportunistic Mac remains preferred whenever it is eligible.
+
+Before promotion, install or import at least one Fleet-eligible model on Nyx
+and confirm its local self-test. For the secure default, also install and sign
+in to Tailscale on Nyx, enable tailnet HTTPS, and make the Tailscale CLI
+available. Then:
+
+1. Open **Settings → Hub Mode** on Nyx.
+2. Leave **Tailscale HTTPS** selected and choose **Configure and Enable Hub**.
+   Unified Inference creates five distinct private credentials, preserves the
+   existing native `.env`, restarts only its local inference worker, publishes
+   its authoritative model mappings, registers the Hub at login, and asks
+   Tailscale Serve to expose the loopback gateway through private HTTPS.
+3. If macOS reports **Needs approval**, approve **Fleet Hub** in **System
+   Settings → General → Login Items**, then toggle Hub Mode on again.
+4. Choose **Open Hub Dashboard**, paste the value from **Copy Admin Key**, and
+   use **Invite and manage Macs** to create one five-minute invitation. Select
+   `primary`, `opportunistic`, or **LIMITED / overflow** for that Mac.
+5. On the invited Mac, expose its public inference listener on the tailnet in
+   **Settings → General**, open **Settings → Inference Pool**, and enter the
+   Hub origin, invitation ID, and one-time pairing secret. The invitation
+   secret remains memory-only on the Mac.
+6. Back in the Hub dashboard, re-enter the exact Mac pool address, approve the
+   pending claim, and let the Mac resume activation. Newly activated Macs stay
+   Hub-disabled until the administrator explicitly chooses **Enable**. The
+   Mac's own **Contribute this Mac to the pool** switch remains an independent,
+   temporary join/pause control.
+
+Use **Sync Local Model Mappings** after adding or removing a Fleet-eligible
+model on Nyx. Disabling Hub Mode stops routing and its managed Tailscale Serve
+listener but preserves credentials, invitations, enrollments, inventory, route
+metadata, and model mappings. Finder replacement and the preserve-data
+uninstaller retain the same Hub directory. A permanent Mac self-revoke is
+different: it requires a new invitation, but still does not remove models,
+storage bindings, profiles, local inference, or token history.
 
 ## 4. Install llama.cpp
 

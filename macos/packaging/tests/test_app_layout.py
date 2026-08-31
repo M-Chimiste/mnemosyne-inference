@@ -21,6 +21,7 @@ from macos.packaging.verify_release import (
     LIFECYCLE_PEER_MANIFEST_RELATIVE_PATH,
     LIFECYCLE_RUNNER_IDENTIFIER,
     LIFECYCLE_RUNNER_RELATIVE_PATH,
+    HUB_HELPER_IDENTIFIER,
     REQUIRED_MAC_POOL_ACCEPTANCE_GATE_IDS,
     SERVICE_HELPER_IDENTIFIER,
     SPARKLE_DEPENDENCY,
@@ -48,9 +49,13 @@ AGENT_PLIST = (
     / "LaunchAgents"
     / "com.mnemosyne.inference.agent.plist"
 )
+HUB_AGENT_PLIST = (
+    PACKAGING_ROOT
+    / "LaunchAgents"
+    / "com.mnemosyne.inference.hub.plist"
+)
 BUILD_SCRIPT = PACKAGING_ROOT / "build_app.sh"
 DMG_BUILD_SCRIPT = PACKAGING_ROOT / "build_dmg.sh"
-PILOT_UPGRADE_SCRIPT = PACKAGING_ROOT / "pilot_install_or_upgrade.command"
 PILOT_UNINSTALL_SCRIPT = (
     PACKAGING_ROOT / "pilot_uninstall_preserving_data.command"
 )
@@ -61,6 +66,13 @@ BOOTSTRAP_SOURCE = (
     / "app"
     / "Sources"
     / "MnemosyneServiceBootstrap"
+    / "main.swift"
+)
+HUB_BOOTSTRAP_SOURCE = (
+    PACKAGING_ROOT.parent
+    / "app"
+    / "Sources"
+    / "MnemosyneHubBootstrap"
     / "main.swift"
 )
 LIFECYCLE_RUNNER_SOURCE = (
@@ -104,29 +116,24 @@ VERSION_FILE = PACKAGING_ROOT.parent / "VERSION"
 
 
 class AppLayoutTests(unittest.TestCase):
-    def test_dmg_stages_reinstall_safe_lifecycle_assistants(self) -> None:
+    def test_dmg_uses_finder_replacement_and_stages_preserve_data_uninstall(self) -> None:
         build = DMG_BUILD_SCRIPT.read_text(encoding="utf-8")
-        upgrade = PILOT_UPGRADE_SCRIPT.read_text(encoding="utf-8")
         uninstall = PILOT_UNINSTALL_SCRIPT.read_text(encoding="utf-8")
 
-        for script in (PILOT_UPGRADE_SCRIPT, PILOT_UNINSTALL_SCRIPT):
-            subprocess.run(
-                ["/bin/bash", "-n", str(script)],
-                check=True,
-                capture_output=True,
-                text=True,
-            )
+        self.assertFalse(
+            (PACKAGING_ROOT / "pilot_install_or_upgrade.command").exists()
+        )
+        subprocess.run(
+            ["/bin/bash", "-n", str(PILOT_UNINSTALL_SCRIPT)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
 
-        self.assertIn("pilot_install_or_upgrade.command", build)
+        self.assertNotIn("pilot_install_or_upgrade.command", build)
+        self.assertNotIn("Install or Upgrade Unified Inference.command", build)
         self.assertIn("pilot_uninstall_preserving_data.command", build)
-        self.assertIn('/bin/bash -n "$MOUNTED_UPGRADE"', build)
         self.assertIn('/bin/bash -n "$MOUNTED_UNINSTALL"', build)
-
-        self.assertIn('ENV_BEFORE="$(environment_digest)"', upgrade)
-        self.assertIn('ENV_AFTER="$(environment_digest)"', upgrade)
-        self.assertIn('[[ "$ENV_AFTER" == "$ENV_BEFORE" ]]', upgrade)
-        self.assertNotIn('/bin/mv "$SUPPORT_ROOT"', upgrade)
-        self.assertNotIn('/bin/mv "$ENV_PATH"', upgrade)
 
         self.assertIn('Type UNINSTALL to continue:', uninstall)
         self.assertIn('/bin/mv "$RUNTIME_ROOT" "$RUNTIME_TRASH"', uninstall)
@@ -146,6 +153,16 @@ class AppLayoutTests(unittest.TestCase):
         self.assertNotIn("AssociatedBundleIdentifiers", agent)
         self.assertNotIn(".app/", agent["BundleProgram"])
 
+        with HUB_AGENT_PLIST.open("rb") as stream:
+            hub_agent = plistlib.load(stream)
+        self.assertEqual(
+            hub_agent["BundleProgram"],
+            "Contents/MacOS/mnemosyne-hub-bootstrap",
+        )
+        self.assertEqual(hub_agent["Label"], "com.mnemosyne.inference.hub")
+        self.assertTrue(hub_agent["RunAtLoad"])
+        self.assertTrue(hub_agent["KeepAlive"])
+
     def test_build_stages_and_signs_wrapped_helper(self) -> None:
         script = BUILD_SCRIPT.read_text(encoding="utf-8")
 
@@ -157,6 +174,12 @@ class AppLayoutTests(unittest.TestCase):
             "--identifier com.mnemosyne.inference.service",
             script,
         )
+        self.assertIn(
+            'HUB_BOOTSTRAP="$CONTENTS/MacOS/mnemosyne-hub-bootstrap"',
+            script,
+        )
+        self.assertIn(f"--identifier {HUB_HELPER_IDENTIFIER}", script)
+        self.assertIn('ditto "$REPO_ROOT/fleet/src" "$RESOURCES/Fleet"', script)
         self.assertIn(
             'FILE_TRASH_HELPER="$CONTENTS/MacOS/mnemosyne-file-trash"',
             script,
@@ -211,6 +234,7 @@ class AppLayoutTests(unittest.TestCase):
     def test_signed_bundle_cannot_be_mutated_by_python_bytecode(self) -> None:
         script = BUILD_SCRIPT.read_text(encoding="utf-8")
         bootstrap = BOOTSTRAP_SOURCE.read_text(encoding="utf-8")
+        hub_bootstrap = HUB_BOOTSTRAP_SOURCE.read_text(encoding="utf-8")
 
         self.assertIn("-name '*.pyc' -o -name '*.pyo'", script)
         self.assertIn("-name '__pycache__' -empty -delete", script)
@@ -222,6 +246,11 @@ class AppLayoutTests(unittest.TestCase):
             'environment["PYTHONDONTWRITEBYTECODE"] = "1"',
             bootstrap,
         )
+        self.assertIn(
+            'environment["PYTHONDONTWRITEBYTECODE"] = "1"',
+            hub_bootstrap,
+        )
+        self.assertIn('"mnemosyne_fleet.main"', hub_bootstrap)
 
     def test_lifecycle_runner_is_an_inert_inherited_socket_adapter(self) -> None:
         source = LIFECYCLE_RUNNER_SOURCE.read_text(encoding="utf-8")

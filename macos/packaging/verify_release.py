@@ -56,10 +56,22 @@ IMAGE_WORKER_SOURCE = (
     MACOS_ROOT / "image-worker" / "src" / "mnemosyne_mflux_worker"
 )
 IMAGE_WORKER_SOURCE_ROOT = IMAGE_WORKER_SOURCE.parent
+FLEET_SOURCE = REPO_ROOT / "fleet" / "src" / "mnemosyne_fleet"
+FLEET_SOURCE_ROOT = FLEET_SOURCE.parent
 IMAGE_CAPABILITIES = MACOS_ROOT / "image-worker" / "capabilities.json"
 CATALOG_SCHEMA = REPO_ROOT / "compatibility_catalog" / "v1" / "catalog.schema.json"
 DESIRED_INSTALL_SCHEMA = (
     REPO_ROOT / "mac_pool_protocol" / "v1" / "desired_install.schema.json"
+)
+FLEET_SNAPSHOT_SCHEMA = REPO_ROOT / "fleet_protocol" / "v1" / "snapshot.schema.json"
+MAC_INVENTORY_SCHEMA = (
+    REPO_ROOT / "mac_pool_protocol" / "v1" / "mac_inventory.schema.json"
+)
+PLACEMENT_SCHEMA = (
+    REPO_ROOT
+    / "mac_pool_protocol"
+    / "v1"
+    / "placement_recommendation.schema.json"
 )
 AGENT_PLIST = (
     MACOS_ROOT
@@ -67,7 +79,14 @@ AGENT_PLIST = (
     / "LaunchAgents"
     / "com.mnemosyne.inference.agent.plist"
 )
+HUB_AGENT_PLIST = (
+    MACOS_ROOT
+    / "packaging"
+    / "LaunchAgents"
+    / "com.mnemosyne.inference.hub.plist"
+)
 SERVICE_HELPER_IDENTIFIER = "com.mnemosyne.inference.service"
+HUB_HELPER_IDENTIFIER = "com.mnemosyne.inference.hub"
 TRASH_HELPER_IDENTIFIER = "com.mnemosyne.inference.file-trash"
 LIFECYCLE_HELPER_IDENTIFIER = "com.mnemosyne.inference.lifecycle-helper"
 LIFECYCLE_HELPER_WRAPPER_RELATIVE_PATH = Path(
@@ -1195,13 +1214,21 @@ def _validate_app_payload(
     contents = app / "Contents"
     resources = contents / "Resources"
     service = resources / "Service" / "mnemosyne_macos"
+    fleet = resources / "Fleet" / "mnemosyne_fleet"
     image_worker = resources / "ImageWorker" / "mnemosyne_mflux_worker"
     bootstrap = contents / "MacOS" / "mnemosyne-service-bootstrap"
+    hub_bootstrap = contents / "MacOS" / "mnemosyne-hub-bootstrap"
     trash_helper = contents / "MacOS" / "mnemosyne-file-trash"
     lifecycle_helper = app / LIFECYCLE_HELPER_RELATIVE_PATH
     lifecycle_runner = app / LIFECYCLE_RUNNER_RELATIVE_PATH
     if bootstrap.is_symlink() or not bootstrap.is_file() or not bootstrap.stat().st_mode & 0o111:
         raise ValueError(f"{bootstrap} is missing or not executable")
+    if (
+        hub_bootstrap.is_symlink()
+        or not hub_bootstrap.is_file()
+        or not hub_bootstrap.stat().st_mode & 0o111
+    ):
+        raise ValueError(f"{hub_bootstrap} is missing or not executable")
     if trash_helper.is_symlink() or not trash_helper.is_file() or not trash_helper.stat().st_mode & 0o111:
         raise ValueError(f"{trash_helper} is missing or not executable")
     if (
@@ -1218,6 +1245,8 @@ def _validate_app_payload(
         raise ValueError(f"{lifecycle_runner} is missing or not executable")
     if _codesign_identifier(bootstrap) != SERVICE_HELPER_IDENTIFIER:
         raise ValueError("staged service bootstrap has the wrong code-signing identifier")
+    if _codesign_identifier(hub_bootstrap) != HUB_HELPER_IDENTIFIER:
+        raise ValueError("staged Hub bootstrap has the wrong code-signing identifier")
     if _codesign_identifier(trash_helper) != TRASH_HELPER_IDENTIFIER:
         raise ValueError("staged Trash helper has the wrong code-signing identifier")
     if _codesign_identifier(lifecycle_helper) != LIFECYCLE_HELPER_IDENTIFIER:
@@ -1238,6 +1267,18 @@ def _validate_app_payload(
         resources / "Service",
         extra_files=service_extras,
     )
+    fleet_extras = {
+        Path("mnemosyne_fleet/schemas/snapshot.schema.json"): FLEET_SNAPSHOT_SCHEMA,
+        Path("mnemosyne_fleet/schemas/mac_inventory.schema.json"): MAC_INVENTORY_SCHEMA,
+        Path("mnemosyne_fleet/schemas/desired_install.schema.json"): DESIRED_INSTALL_SCHEMA,
+        Path("mnemosyne_fleet/schemas/placement_recommendation.schema.json"): PLACEMENT_SCHEMA,
+        Path("mnemosyne_fleet/schemas/compatibility_catalog.schema.json"): CATALOG_SCHEMA,
+    }
+    _validate_source_copy(
+        FLEET_SOURCE_ROOT,
+        resources / "Fleet",
+        extra_files=fleet_extras,
+    )
     _validate_source_copy(
         IMAGE_WORKER_SOURCE_ROOT,
         resources / "ImageWorker",
@@ -1249,10 +1290,19 @@ def _validate_app_payload(
         resources / "ImageWorker" / "capabilities.json": IMAGE_CAPABILITIES,
         service / "schemas" / "compatibility_catalog.schema.json": CATALOG_SCHEMA,
         service / "schemas" / "desired_install.schema.json": DESIRED_INSTALL_SCHEMA,
+        fleet / "schemas" / "snapshot.schema.json": FLEET_SNAPSHOT_SCHEMA,
+        fleet / "schemas" / "mac_inventory.schema.json": MAC_INVENTORY_SCHEMA,
+        fleet / "schemas" / "desired_install.schema.json": DESIRED_INSTALL_SCHEMA,
+        fleet / "schemas" / "placement_recommendation.schema.json": PLACEMENT_SCHEMA,
+        fleet / "schemas" / "compatibility_catalog.schema.json": CATALOG_SCHEMA,
         contents
         / "Library"
         / "LaunchAgents"
         / "com.mnemosyne.inference.agent.plist": AGENT_PLIST,
+        contents
+        / "Library"
+        / "LaunchAgents"
+        / "com.mnemosyne.inference.hub.plist": HUB_AGENT_PLIST,
     }
     for staged, source in exact_resources.items():
         if staged.is_symlink() or not staged.is_file() or staged.read_bytes() != source.read_bytes():
@@ -1275,6 +1325,15 @@ def _validate_app_payload(
         "Contents/MacOS/mnemosyne-service-bootstrap"
     ):
         raise ValueError("staged LaunchAgent does not target the direct bootstrap")
+    with (
+        contents
+        / "Library"
+        / "LaunchAgents"
+        / "com.mnemosyne.inference.hub.plist"
+    ).open("rb") as stream:
+        hub_agent = plistlib.load(stream)
+    if hub_agent.get("BundleProgram") != "Contents/MacOS/mnemosyne-hub-bootstrap":
+        raise ValueError("staged Hub LaunchAgent does not target the direct bootstrap")
     _validate_embedded_python(resources, allow_bare=allow_bare)
     _validate_lifecycle_peer_manifest(app, allow_bare=allow_bare)
 

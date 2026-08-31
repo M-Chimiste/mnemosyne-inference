@@ -25,11 +25,29 @@ read-only discovery hint.
   enrollment, invitations, approval, removal, routing, downloads, and
   credential guidance. Nyx remains only the name of this deployment's host;
   it is not baked into the operator-facing pairing experience.
+- A Mac can now be promoted from **Settings → Hub Mode** without a manual Fleet
+  installation. The app creates and preserves separate Hub credentials,
+  bundles Fleet behind its own login service on loopback `17400`, publishes
+  authoritative local model mappings, and enrolls the same Mac's independent
+  inference worker as **LIMITED / overflow**. Tailscale Serve is the guided
+  private-HTTPS path; an existing HTTPS proxy remains an advanced option.
+- The Hub dashboard now creates one-time Mac invitations, approves or rejects
+  pending claims, assigns service class, and enables, disables, or permanently
+  revokes paired Macs. Newly activated enrollments remain disabled until the
+  administrator explicitly enables them.
 - The menu-bar pool participation control uses the native macOS switch style
   while retaining the same durable join, drain, pause, and rejoin behavior.
 - Fresh installations request both the inference LaunchAgent and menu-app login
   registrations on first launch. Existing installations retain their choices,
   and a later explicit disable is never automatically reversed.
+- Pilot upgrades now use the ordinary Finder replacement flow: quit the menu
+  app, drag the new app to Applications, choose Replace, and open it. The new
+  bundle refreshes previously enabled login registrations on first launch,
+  while private configuration, token accounting, model paths, runtimes, and
+  weights remain outside the replaced bundle.
+- Replacing the app also refreshes an enabled Hub login registration. An
+  explicitly disabled Hub remains disabled, while its credentials, pairings,
+  inventory, local mappings, and route metadata remain in Application Support.
 - A profile can attach one exact candidate per engine and opt into durable
   cross-engine selection. Repeated streamed samples rank first-token latency,
   throughput, or a balanced objective; stale, failed, marginal, or unapproved

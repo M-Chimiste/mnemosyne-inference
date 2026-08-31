@@ -26,6 +26,16 @@ never connects directly to a node. Nyx does not receive node administrative
 credentials. Node control-plane mutation routes remain outside the fleet
 protocol.
 
+The macOS Hub Mode pilot preserves the same boundary. It generates five
+distinct random values for the public client, dashboard admin, pairing master,
+local snapshot, and local Fleet-dispatch roles. Hub secrets live in a private
+mode-0600 environment below Application Support; Hub TOML names only their
+environment variables. Only the two local-worker values are added to the
+native private `.env`, without replacing token-ledger or unrelated settings.
+The Hub binds loopback `:17400`; the guided remote exposure is a separate
+Tailscale Serve HTTPS listener. Copying the client or admin value requires an
+explicit UI action.
+
 LAN and Tailscale are transport choices, not identities. An address discovered
 through DNS or MagicDNS is never enrolled automatically.
 
@@ -153,6 +163,12 @@ through DNS or MagicDNS is never enrolled automatically.
   behavior.
 - Route history stores fixed metadata and failure codes only.
 - The service never logs or persists request or response bodies.
+- Async batch bodies and results exist only in bounded process memory, are
+  addressed by unguessable batch UUID, require the same public inference
+  bearer for submit/status/cancel/results, never enter SQLite or admin/
+  dashboard payloads, and disappear on expiry, bounded eviction, or restart.
+  Batch completion releases the original request body immediately. This is an
+  inference result surface, not a durable job or content store.
 - A response is never retried after headers or body bytes arrive. Generic
   timeouts and ambiguous connection loss are not automatic failover signals.
   Retry is limited to a `429` with the manager-owned

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from dataclasses import replace
 
 import pytest
 
@@ -13,7 +14,7 @@ from mnemosyne_fleet.config import (
 )
 from mnemosyne_fleet.protocol import Snapshot
 from mnemosyne_fleet.registry import NodeRecord
-from mnemosyne_fleet.scheduler import FleetBusyError, Scheduler
+from mnemosyne_fleet.scheduler import FleetBusyError, RoutingControls, Scheduler
 
 from .helpers import capacity, identity, snapshot_payload
 
@@ -146,6 +147,81 @@ async def test_equal_warm_replicas_fan_out_with_local_reservations() -> None:
     assert {first.node_id, second.node_id} == {"a", "b"}
     await first.release()
     await second.release()
+
+
+async def test_affinity_prefers_the_requested_enrollment_without_changing_defaults() -> None:
+    target = scheduler([record("a"), record("b")])
+
+    preferred = await target.acquire(
+        public_model="qwen",
+        capability="responses",
+        controls=RoutingControls(affinity_enrollment_id="b"),
+    )
+    assert preferred.enrollment_id == "b"
+    await preferred.release()
+
+
+async def test_strict_affinity_and_zero_wait_do_not_fall_back() -> None:
+    unavailable = record("b")
+    unavailable = replace(
+        unavailable,
+        snapshot=Snapshot.model_validate(snapshot_payload("b", accepting=False)),
+    )
+    target = scheduler([record("a"), unavailable])
+    with pytest.raises(FleetBusyError, match="fleet_queue_timeout"):
+        await target.acquire(
+            public_model="qwen",
+            capability="responses",
+            controls=RoutingControls(
+                affinity_enrollment_id="b",
+                fallback="none",
+                max_wait_seconds=0,
+            ),
+        )
+
+
+async def test_interactive_queue_lane_precedes_batch_and_reports_each_lane() -> None:
+    bounded = record("a")
+    bounded = replace(
+        bounded,
+        snapshot=Snapshot.model_validate(snapshot_payload("a", queue_limit=2)),
+    )
+    target = scheduler([bounded], queue_depth=4)
+    held = [
+        await target.acquire(public_model="qwen", capability="responses")
+        for _ in range(2)
+    ]
+    batch_task = asyncio.create_task(
+        target.acquire(
+            public_model="qwen",
+            capability="responses",
+            controls=RoutingControls(priority="batch"),
+        )
+    )
+    await asyncio.sleep(0)
+    interactive_task = asyncio.create_task(
+        target.acquire(
+            public_model="qwen",
+            capability="responses",
+            controls=RoutingControls(priority="interactive"),
+        )
+    )
+    await asyncio.sleep(0)
+    queue = target.status()["queues"]["qwen"]
+    assert queue["by_priority"] == {
+        "interactive": 1,
+        "normal": 0,
+        "batch": 1,
+    }
+
+    await held.pop().release()
+    interactive = await asyncio.wait_for(interactive_task, timeout=0.1)
+    assert not batch_task.done()
+    await interactive.release()
+    batch = await asyncio.wait_for(batch_task, timeout=0.1)
+    await batch.release()
+    for reservation in held:
+        await reservation.release()
 
 
 async def test_registry_membership_changes_without_rebuilding_scheduler() -> None:

@@ -63,9 +63,12 @@ engine process.
   a network, or treat a valid signature as model/runtime/hardware evidence.
 - `fleet/` is the independently locked Nyx service. It owns explicit node
   enrollment, authenticated snapshot polling, strict model mappings,
-  capacity-aware routing, bounded fleet queues, metadata-only route history,
-  the realtime dashboard, and read-only token-ledger aggregates. It must run
-  as one process unless reservations are moved to a shared transactional
+  capacity-aware routing, bounded priority/affinity controls, process-local
+  async batches, metadata-only route history, the joined fleet overview and
+  realtime dashboard, and read-only token-ledger aggregates. Batch request and
+  response content must remain bounded process memory and must never enter
+  Fleet SQLite or browser-facing admin APIs. It must run as one process unless
+  reservations and batch ownership are moved to a shared transactional
   scheduler.
 - `fleet/src/mnemosyne_fleet/pairing_store.py`, `secret_store.py`,
   `locator_policy.py`, `paired_transport.py`, `pairing_probe.py`,
@@ -196,6 +199,18 @@ engine process.
   barrier; never introduce a repository-owned dependency manifest.
 - `macos/image-worker/` is the separately locked MFLUX runtime. It is launched only as a manager-owned child, binds loopback `:17324`, and must remain dependency-isolated from the macOS coordinator service.
 - `macos/app/` is the SwiftPM menu bar controller, typed native settings UI, secret-safe credential store, and native service bootstrap. `macos/packaging/` stages the signed app, embedded LaunchAgent plist, direct `Contents/MacOS/mnemosyne-service-bootstrap` executable, relocatable Python runtime, and verified drag-to-Applications DMG. Keep this unsandboxed `SMAppService` LaunchAgent's `BundleProgram` pointed at that direct helper; introducing a second bundle identity is unnecessary here and broke launch-requirement refresh during in-place updates. A future sandboxed or restricted-entitlement job would require its own deliberate wrapper architecture.
+- The Mac app also bundles the exact Fleet source and a direct
+  `Contents/MacOS/mnemosyne-hub-bootstrap` executable behind the independently
+  opt-in `com.mnemosyne.inference.hub` LaunchAgent. Hub Mode writes its secrets,
+  configuration, pairing stores, inventory, and route database below the
+  private Application Support `hub` tree; the gateway remains a separate
+  process on loopback `:17400` and never owns the native worker on `:1240`.
+  Promotion publishes only authoritative local snapshot deployments and
+  enrolls that independent worker as `overflow`. Fresh installs must not enable
+  the Hub automatically, while Finder replacement must refresh an enabled Hub
+  registration and preserve an explicitly disabled one. Disable/uninstall must
+  retain Hub identity and state unless the user separately requests a privacy
+  reset.
 - `macos/VERSION` is the only native product-version source.
   `macos/packaging/verify_release.py`, the native packages/locks, staged app,
   release tag, DMG name, and Sparkle appcast must agree. CI may stage ad-hoc
@@ -293,9 +308,13 @@ The live `docker-compose.yml` is intentionally machine-specific and may live out
   storage paths, capacity, and live residency are excluded from deployment
   identity. The schema, packaged copy, producers, validators, and golden
   vectors must change together.
-- Scheduling is warm-first, weighted least-outstanding within a tier, and
-  bounded FIFO per public model. In-memory reservations cover the stale-poll
-  window, while the selected node remains final admission authority.
+- Scheduling is warm-first and weighted least-outstanding within a tier.
+  Requests without routing controls retain the normal FIFO lane; closed
+  interactive/normal/batch lanes age lower priority toward admission. Exact
+  enrollment affinity, shortened maximum wait, and disabled fallback may only
+  narrow/rank existing eligibility and must never create routing authority.
+  In-memory reservations cover the stale-poll window, while the selected node
+  remains final admission authority.
 - A reservation lasts through the complete response body or stream.
   Cancellation-safe cleanup must return it exactly once. Retry is permitted
   only for proven connection establishment failure or a pre-work `429` with

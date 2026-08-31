@@ -18,6 +18,7 @@ from fastapi import Depends, FastAPI, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 from .catalog_service import FleetCatalogService
+from .batch import BatchAPIError, BatchManager
 from .compatibility_catalog import (
     CatalogStore,
     CatalogVerifier,
@@ -506,7 +507,17 @@ def create_app(
         paired_locator_policy=pairing_locator_policy,
         paired_client_factory=paired_proxy_client_factory,
     )
+    batches = BatchManager(
+        proxy=proxy,
+        routes=ROUTES,
+        config=config.batch,
+        max_submission_bytes=config.server.max_body_bytes,
+    )
     usage = UsageReader(config.ledger.dsn)
+    overview_rate_cache: dict[str, object] = {
+        "rows": {},
+        "error_code": None,
+    }
     pairing_coordinator: PairingCoordinator | None = None
     inventory_store: InventoryStore | None = None
     desired_install_store: DesiredInstallStore | None = None
@@ -686,6 +697,7 @@ def create_app(
         try:
             yield
         finally:
+            await batches.shutdown()
             await registry.stop()
             if catalog_service is not None:
                 await catalog_service.stop()
@@ -707,6 +719,7 @@ def create_app(
     app.state.scheduler = scheduler
     app.state.store = store
     app.state.proxy = proxy
+    app.state.batches = batches
     app.state.usage = usage
     app.state.pairing = pairing_coordinator
     app.state.pairing_runtime = pairing_runtime
@@ -987,6 +1000,195 @@ def create_app(
         if include_inventory:
             payload["inventory"] = record.inventory
         return payload
+
+    async def fleet_overview_payload(
+        *,
+        refresh_token_rates: bool = True,
+    ) -> dict[str, object]:
+        """Join secret-free live, inventory, route, and ledger observations."""
+
+        node_rows = registry.status()
+        scheduler_row = scheduler.status()
+        recent_routes = await store.recent_routes(limit=500)
+        inventories: dict[str, dict[str, object]] = {}
+        if (
+            inventory_store is not None
+            and inventory_runtime.get("available") is True
+        ):
+            try:
+                records = await inventory_store.records(limit=1000)
+            except InventoryStoreError:
+                records = ()
+            inventories = {
+                record.pairing_id: record.inventory for record in records
+            }
+
+        rate_by_node: dict[object, dict[str, object]] = {}
+        rate_error_code: str | None = None
+        if usage.configured:
+            if refresh_token_rates:
+                try:
+                    rate_by_node = {
+                        row["node_id"]: row
+                        for row in await usage.token_rates(minutes=5)
+                    }
+                    overview_rate_cache["rows"] = rate_by_node
+                    overview_rate_cache["error_code"] = None
+                except Exception:
+                    rate_error_code = "ledger_unavailable"
+                    overview_rate_cache["error_code"] = rate_error_code
+            else:
+                rate_by_node = overview_rate_cache["rows"]
+                rate_error_code = overview_rate_cache["error_code"]
+
+        errors_by_enrollment: dict[object, list[dict[str, object]]] = {}
+        for route in recent_routes:
+            if route["failure_code"] is None and (
+                route["status_code"] is None
+                or int(route["status_code"]) < 400
+            ):
+                continue
+            errors = errors_by_enrollment.setdefault(
+                route["enrollment_id"],
+                [],
+            )
+            if len(errors) < 3:
+                errors.append(
+                    {
+                        "observed_at": route["completed_at"] or route["started_at"],
+                        "code": route["failure_code"]
+                        or f"http_{route['status_code']}",
+                        "model": route["public_model"],
+                    }
+                )
+
+        overview_nodes: list[dict[str, object]] = []
+        active_by_enrollment = scheduler_row["active_by_enrollment"]
+        for node in node_rows:
+            enrollment_id = node["enrollment_id"]
+            inventory = inventories.get(str(enrollment_id))
+            participation = (
+                None if inventory is None else inventory["participation"]
+            )
+            installations = (
+                [] if inventory is None else inventory["installations"]
+            )
+            storage_locations = (
+                [] if inventory is None else inventory["storage_locations"]
+            )
+            installed_models = [
+                {
+                    "name": (
+                        (installation.get("aliases") or [None])[0]
+                        or installation.get("logical_model_id")
+                        or installation["installation_id"]
+                    ),
+                    "engine": installation["engine"],
+                    "residency": installation["residency"],
+                    "availability": installation["availability"],
+                }
+                for installation in installations[:256]
+            ]
+            if inventory is None:
+                installed_models = [
+                    {
+                        "name": deployment["alias"],
+                        "engine": deployment["engine"],
+                        "residency": "warm" if deployment["warm"] else "cold",
+                        "availability": (
+                            "available" if deployment["loadable"] else "unavailable"
+                        ),
+                    }
+                    for deployment in node.get("deployments", [])[:256]
+                ]
+            available_storage = [
+                storage
+                for storage in storage_locations
+                if storage["availability"] == "available"
+            ]
+            rate = rate_by_node.get(node["reporting_node_id"])
+            joined_state = (
+                participation["state"]
+                if participation is not None
+                else (
+                    "joined"
+                    if node.get("health", {}).get("accepting") is True
+                    else "paused"
+                )
+            )
+            overview_nodes.append(
+                {
+                    "node_id": node["node_id"],
+                    "enrollment_id": enrollment_id,
+                    "source": node["source"],
+                    "service_class": node["service_class"],
+                    "online": node["online"],
+                    "joined_state": joined_state,
+                    "last_seen": node["last_seen"],
+                    "hardware": None if inventory is None else inventory["hardware"],
+                    "storage": {
+                        "location_count": len(storage_locations),
+                        "available_location_count": len(available_storage),
+                        "free_bytes": None if inventory is None else sum(
+                            int(storage["free_bytes"] or 0)
+                            for storage in available_storage
+                        ),
+                        "total_bytes": None if inventory is None else sum(
+                            int(storage["total_bytes"] or 0)
+                            for storage in available_storage
+                        ),
+                    },
+                    "installed_model_count": len(installations)
+                    if inventory is not None
+                    else len(node.get("deployments", [])),
+                    "installed_models": installed_models,
+                    "installed_models_truncated": (
+                        len(installations)
+                        if inventory is not None
+                        else len(node.get("deployments", []))
+                    )
+                    > 256,
+                    "resident_model": {
+                        "alias": node.get("residency", {}).get("alias"),
+                        "deployment_id": node.get("residency", {}).get(
+                            "deployment_id"
+                        ),
+                        "engine": node.get("residency", {}).get("engine"),
+                    },
+                    "active_requests": active_by_enrollment.get(enrollment_id, 0),
+                    "node_queue_depth": node.get("admission", {}).get(
+                        "queue_depth", 0
+                    ),
+                    "tokens_per_second": None
+                    if rate is None
+                    else rate["tokens_per_second"],
+                    "token_rate_window_seconds": None
+                    if rate is None
+                    else rate["window_seconds"],
+                    "recent_errors": errors_by_enrollment.get(enrollment_id, []),
+                    "snapshot_error_code": node["error_code"],
+                }
+            )
+
+        return {
+            "schema_version": 1,
+            "observed_at": time.time(),
+            "token_rate_configured": usage.configured,
+            "token_rate_error_code": rate_error_code,
+            "nodes": overview_nodes,
+            "totals": {
+                "online_nodes": sum(row["online"] is True for row in overview_nodes),
+                "joined_nodes": sum(
+                    row["joined_state"] == "joined" for row in overview_nodes
+                ),
+                "active_requests": scheduler_row["active_total"],
+                "gateway_queue_depth": sum(
+                    queue["depth"] for queue in scheduler_row["queues"].values()
+                ),
+            },
+            "queues": scheduler_row["queues"],
+            "batches": batches.summary(),
+        }
 
     if config.catalog.enabled:
 
@@ -1687,6 +1889,70 @@ def create_app(
             ],
         }
 
+    def batch_error(error: BatchAPIError) -> JSONResponse:
+        messages = {
+            "batch_disabled": "Fleet batch execution is disabled.",
+            "batch_not_found": "The batch was not found or has expired.",
+            "batch_active_limit_reached": "Fleet has reached its active batch limit.",
+            "batch_request_too_large": "The batch submission is too large.",
+            "batch_json_required": "The batch submission must be JSON.",
+            "batch_content_encoding_unsupported": "The batch content encoding is unsupported.",
+            "batch_invalid_request": "The batch submission is invalid.",
+        }
+        return JSONResponse(
+            status_code=error.status_code,
+            headers={"Cache-Control": "no-store"},
+            content={
+                "error": {
+                    "type": "fleet_batch_error",
+                    "code": error.code,
+                    "message": messages.get(error.code, "The batch request failed."),
+                }
+            },
+        )
+
+    @app.post("/v1/batches", dependencies=[Depends(require_inference)])
+    async def create_batch(request: Request):
+        try:
+            payload = await batches.submit(request)
+        except BatchAPIError as error:
+            return batch_error(error)
+        return JSONResponse(
+            status_code=202,
+            headers={"Cache-Control": "no-store"},
+            content=payload,
+        )
+
+    @app.get("/v1/batches/{batch_id}", dependencies=[Depends(require_inference)])
+    async def batch_status(batch_id: str):
+        try:
+            payload = await batches.status(batch_id)
+        except BatchAPIError as error:
+            return batch_error(error)
+        return JSONResponse(headers={"Cache-Control": "no-store"}, content=payload)
+
+    @app.get(
+        "/v1/batches/{batch_id}/results",
+        dependencies=[Depends(require_inference)],
+    )
+    async def batch_results(batch_id: str):
+        try:
+            payload = await batches.results(batch_id)
+        except BatchAPIError as error:
+            return batch_error(error)
+        return JSONResponse(headers={"Cache-Control": "no-store"}, content=payload)
+
+    @app.post(
+        "/v1/batches/{batch_id}/cancel",
+        dependencies=[Depends(require_inference)],
+    )
+    async def cancel_batch(batch_id: str):
+        try:
+            payload = await batches.cancel(batch_id)
+        except BatchAPIError as error:
+            return batch_error(error)
+        return JSONResponse(headers={"Cache-Control": "no-store"}, content=payload)
+
     async def proxy_route(request: Request):
         capability = ROUTES[request.url.path]
         return await proxy.handle(request, capability=capability)
@@ -1706,10 +1972,16 @@ def create_app(
             "nodes": registry.status(),
             "models": scheduler.model_matrix(),
             "scheduler": scheduler.status(),
+            "batches": batches.summary(),
             "routes": await store.recent_routes(limit=100),
             "usage_configured": usage.configured,
             "mac_pool": mac_pool_status_payload(),
+            "overview": await fleet_overview_payload(),
         }
+
+    @app.get("/fleet/api/overview", dependencies=[Depends(require_admin)])
+    async def fleet_overview() -> dict[str, object]:
+        return await fleet_overview_payload()
 
     @app.get("/fleet/api/usage", dependencies=[Depends(require_admin)])
     async def fleet_usage(
@@ -1766,6 +2038,10 @@ def create_app(
                     "nodes": registry.status(),
                     "models": scheduler.model_matrix(),
                     "scheduler": scheduler.status(),
+                    "batches": batches.summary(),
+                    "overview": await fleet_overview_payload(
+                        refresh_token_rates=False
+                    ),
                     "routes": await store.recent_routes(limit=100),
                     "mac_pool": mac_pool_status_payload(),
                 }

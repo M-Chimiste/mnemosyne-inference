@@ -207,9 +207,6 @@ fi
 ditto "$APP_PATH" "$SOURCE_DIR/Unified Inference.app"
 ln -s /Applications "$SOURCE_DIR/Applications"
 install -m 755 \
-    "$SCRIPT_DIR/pilot_install_or_upgrade.command" \
-    "$SOURCE_DIR/Install or Upgrade Unified Inference.command"
-install -m 755 \
     "$SCRIPT_DIR/pilot_uninstall_preserving_data.command" \
     "$SOURCE_DIR/Uninstall Unified Inference (Preserve Data).command"
 
@@ -262,13 +259,11 @@ if [[ "$(readlink "$MOUNT_DIR/Applications")" != "/Applications" ]]; then
     echo "Verification failed: mounted DMG has no Applications shortcut" >&2
     exit 1
 fi
-MOUNTED_UPGRADE="$MOUNT_DIR/Install or Upgrade Unified Inference.command"
 MOUNTED_UNINSTALL="$MOUNT_DIR/Uninstall Unified Inference (Preserve Data).command"
-if [[ ! -x "$MOUNTED_UPGRADE" || ! -x "$MOUNTED_UNINSTALL" ]]; then
-    echo "Verification failed: mounted DMG is missing its executable lifecycle assistants" >&2
+if [[ ! -x "$MOUNTED_UNINSTALL" ]]; then
+    echo "Verification failed: mounted DMG is missing its preserve-data uninstall assistant" >&2
     exit 1
 fi
-/bin/bash -n "$MOUNTED_UPGRADE"
 /bin/bash -n "$MOUNTED_UNINSTALL"
 codesign --verify --deep --strict --verbose=2 "$MOUNTED_APP"
 run_isolated_verify_release --app "$MOUNTED_APP"
@@ -300,7 +295,7 @@ python3 "$SCRIPT_DIR/collect_acceptance.py" "${ACCEPTANCE_ARGS[@]}"
 
 echo "Built $OUTPUT_PATH"
 echo "Acceptance evidence: $ACCEPTANCE_REPORT"
-echo "Volume contents verified: app, Applications shortcut, and lifecycle assistants"
+echo "Volume contents verified: app, Applications shortcut, and preserve-data uninstall assistant"
 if [[ -n "$NOTARYTOOL_PROFILE" ]]; then
     echo "DMG notarized and stapled with profile: $NOTARYTOOL_PROFILE"
 elif [[ -n "$CODESIGN_IDENTITY" && "$CODESIGN_IDENTITY" != "-" ]]; then

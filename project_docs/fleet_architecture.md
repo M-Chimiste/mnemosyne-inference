@@ -5,6 +5,13 @@ host rollout evidence is tracked in [fleet acceptance](fleet_acceptance.md).
 The opt-in dynamic-pairing foundation is implemented only to the boundary
 described below and is not yet a production signed-app workflow.
 
+The Mac pilot now embeds Fleet as an independently launched, opt-in Hub Mode.
+It creates private Hub configuration and credentials outside the app bundle,
+runs the gateway on loopback `:17400`, and optionally asks Tailscale Serve to
+publish that listener through tailnet HTTPS. It does not merge the gateway and
+native manager processes or their mutable state. Signed multi-host acceptance
+is still required before treating this convenience path as production.
+
 ## Purpose
 
 Mnemosyne Fleet provides one OpenAI-compatible endpoint across independently
@@ -117,6 +124,17 @@ The class is Hub-owned scheduling policy and is deliberately absent from
 deployment identity and the node snapshot protocol. Configuration alone does
 not create OS process or resource isolation; those deployment boundaries are
 an operator prerequisite for enrollment.
+
+On the macOS Hub pilot, the app establishes those specific product boundaries:
+the bundled Hub has its own LaunchAgent/helper, listener, private `.env`, TOML,
+and SQLite trees; the native worker keeps its existing LaunchAgent, listener,
+configuration, token ledger/outbox, residency coordinator, runtimes, and model
+storage. Promotion provisions two Hub-owned worker credentials into the native
+private environment, restarts the worker, obtains a fresh authenticated
+snapshot, and writes an `overflow` static enrollment. It refuses promotion
+without at least one authoritative Fleet-eligible deployment. Disabling Hub
+Mode unregisters only the gateway and its managed Tailscale Serve endpoint;
+the worker and all Hub/native durable state remain intact.
 
 ## Versioned node protocol
 
@@ -399,10 +417,15 @@ node-advertised limits are the authoritative concurrency controls, so admitted
 work is not hidden in an HTTP connection-pool queue. Each client retains only
 20 idle keepalive connections.
 
-Queues are FIFO per public model. Queue sizes and deadlines are bounded.
-Cancellation removes a waiter without consuming later capacity. A pending
-model switch prevents an unbounded stream of new requests to the old resident
-model from starving the queued target.
+Queues are bounded per public model. Requests without controls use the normal
+lane and preserve FIFO behavior. The closed `interactive`, `normal`, and
+`batch` lanes prefer higher-priority work while wait-time aging promotes lower
+lanes; equal effective priority remains FIFO. A caller may shorten the model's
+queue deadline, prefer one exact enrollment, or make that affinity strict by
+disabling fallback. Affinity is a ranking/restriction only: it never grants an
+otherwise ineligible node authority. Cancellation removes a waiter without
+consuming later capacity. A pending model switch prevents an unbounded stream
+of new requests to the old resident model from starving the queued target.
 
 ## Data-plane behavior
 
@@ -449,6 +472,19 @@ risk duplicate inference.
 
 Stateful follow-up APIs that omit a model require explicit response-to-node
 affinity and are out of the initial route set.
+
+Fleet also exposes bounded process-local async batches at `/v1/batches`.
+Submissions contain only non-streaming requests for the existing closed route
+allowlist. Compatible model/route/affinity work is grouped before dispatch,
+global and per-job concurrency are capped, and every item enters the `batch`
+priority lane through the ordinary proxy, scheduler, route metadata, node
+accounting, and cancellation ownership. Status and cancellation contain no
+inference content; results are available only through the public inference
+credential. Request/result bodies are never written to Fleet SQLite or shown
+on the dashboard. Per-result bytes, aggregate retained result bytes, active
+jobs, items, concurrency, retention, and terminal-job count are bounded.
+Restart loses all batches by design rather than creating a second content
+store on Nyx.
 
 `GET /v1/models` lists logical fleet models with at least one live eligible
 deployment. Rich replica state remains on the authenticated fleet admin API.
@@ -546,6 +582,9 @@ device attribution in the current ledger.
 
 The realtime dashboard displays:
 
+- one joined Mac overview combining online/joined state, hardware, path-free
+  free storage, installed/resident models, active work, queue depth, recent
+  fixed errors, and a bounded five-minute token rate;
 - node online, health, accepting, and last-seen state;
 - resident engine/model, epoch, transition target, and queue;
 - derived, configured, and effective capacity with its source;
@@ -554,6 +593,11 @@ The realtime dashboard displays:
 - token totals, request counts, and latency by node/model;
 - node usage-outbox depth and delivery health;
 - recent bounded route metadata.
+
+The same joined view is available at authenticated `GET
+/fleet/api/overview`. Its ledger query is not part of the two-second event
+loop; realtime updates reuse the last bounded token-rate observation while
+refreshing the other overview fields.
 
 Browser updates use a Nyx-owned event stream. Browsers never connect directly
 to node inference or control planes.
@@ -571,7 +615,10 @@ history database, and browser-facing APIs expose neither raw locator nor
 secret reference. Fleet's route database persists bounded route metadata with
 fixed failure codes and contains no request bodies or token rows.
 
-High-frequency heartbeats and active reservations are in-memory state.
+High-frequency heartbeats, active reservations, batch requests, and batch
+results are in-memory state. Batch content has explicit byte/count/retention
+bounds and is discarded on restart; it is never eligible for diagnostic
+persistence.
 Persisting occasional last-known snapshots is permitted for diagnostics, but
 stale persisted state is never eligible for routing after Nyx restarts.
 
@@ -618,8 +665,9 @@ Implementation is not complete until automated or target-host evidence proves:
 9. A mid-stream node failure is never retried on another node.
 10. Successful requests through Nyx create exactly one token event attributed
     to the serving node.
-11. Node and Nyx APIs never return stored credentials, prompts, outputs,
-    bookmark bytes, or unbounded diagnostics.
+11. Node and Nyx administrative/control APIs never return credentials,
+    prompts, outputs, bookmark bytes, or unbounded diagnostics; transient
+    batch results remain confined to the inference-authenticated result API.
 12. Dashboard realtime state agrees with the authoritative snapshots and
     historical usage agrees with the central token ledger.
 

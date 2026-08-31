@@ -14,6 +14,10 @@ let package = Package(
             targets: ["MnemosyneServiceBootstrap"]
         ),
         .executable(
+            name: "mnemosyne-hub-bootstrap",
+            targets: ["MnemosyneHubBootstrap"]
+        ),
+        .executable(
             name: "mnemosyne-file-trash",
             targets: ["MnemosyneFileTrash"]
         ),
@@ -48,6 +52,10 @@ let package = Package(
         .executableTarget(
             name: "MnemosyneServiceBootstrap",
             path: "Sources/MnemosyneServiceBootstrap"
+        ),
+        .executableTarget(
+            name: "MnemosyneHubBootstrap",
+            path: "Sources/MnemosyneHubBootstrap"
         ),
         .executableTarget(
             name: "MnemosyneFileTrash",

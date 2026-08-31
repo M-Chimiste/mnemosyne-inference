@@ -284,7 +284,20 @@ async def test_explicit_node_busy_can_fail_over_before_work(tmp_path) -> None:
                 json={"model": "qwen-coder", "input": "hello"},
             )
             assert response.status_code == 200
-    assert calls == ["a", "b"]
+            assert calls == ["a", "b"]
+            calls.clear()
+            no_fallback = await client.post(
+                "/v1/responses",
+                headers={
+                    "Authorization": "Bearer client-key",
+                    "X-Mnemosyne-Affinity": "a",
+                    "X-Mnemosyne-Fallback": "none",
+                },
+                json={"model": "qwen-coder", "input": "hello"},
+            )
+    assert no_fallback.status_code == 429
+    assert no_fallback.json()["error"]["code"] == "fleet_capacity_busy"
+    assert calls == ["a"]
 
 
 async def test_body_only_node_busy_is_not_failed_over(tmp_path) -> None:
@@ -383,6 +396,12 @@ async def test_inference_and_admin_endpoints_require_separate_client_keys(tmp_pa
             assert "Hardware-aware placement" in dashboard.text
             assert "DesiredInstall delivery and progress" in dashboard.text
             assert "LIMITED / overflow" in dashboard.text
+            assert "Hub enrollment" in dashboard.text
+            assert "Invite and manage Macs" in dashboard.text
+            assert "/fleet/api/v1/pairing/invitations" in dashboard.text
+            assert "/fleet/api/v1/pairing/claims/" in dashboard.text
+            assert "/fleet/api/v1/pairing/enrollments/" in dashboard.text
+            assert "Copy invitation details" in dashboard.text
             assert 'headers:{"If-Match":`"${revision}"`}' in dashboard.text
             assert "window.confirm" in dashboard.text
             for forbidden in (
@@ -827,3 +846,210 @@ async def test_concurrent_first_wave_fans_out_across_advertised_node_limits(
             assert app.state.scheduler.status()["active_total"] == 0
 
     assert peaks == {"a": 1, "b": 1}
+
+
+async def test_routing_affinity_header_selects_exact_enrollment(tmp_path) -> None:
+    nodes = (
+        NodeConfig(
+            node_id="a",
+            url="http://a",
+            fleet_token="fleet-a",
+            inference_token="infer-a",
+        ),
+        NodeConfig(
+            node_id="b",
+            url="http://b",
+            fleet_token="fleet-b",
+            inference_token="infer-b",
+        ),
+    )
+
+    def registry_handler(request: httpx.Request) -> httpx.Response:
+        node_id = str(request.url.host)
+        return httpx.Response(200, json=snapshot_payload(node_id))
+
+    def proxy_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"node": request.url.host})
+
+    app = create_app(
+        fleet_config(tmp_path, nodes=nodes),
+        registry_client=httpx.AsyncClient(
+            transport=httpx.MockTransport(registry_handler)
+        ),
+        proxy_client=httpx.AsyncClient(
+            transport=httpx.MockTransport(proxy_handler)
+        ),
+        start_polling=False,
+    )
+    async with app.router.lifespan_context(app):
+        await app.state.registry.poll_all_once()
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://fleet",
+        ) as client:
+            response = await client.post(
+                "/v1/responses",
+                headers={
+                    "Authorization": "Bearer client-key",
+                    "X-Mnemosyne-Affinity": "b",
+                    "X-Mnemosyne-Fallback": "none",
+                    "X-Mnemosyne-Max-Wait-Ms": "100",
+                    "X-Mnemosyne-Priority": "interactive",
+                },
+                json={"model": "qwen-coder", "input": "affinity"},
+            )
+            invalid = await client.post(
+                "/v1/responses",
+                headers={
+                    "Authorization": "Bearer client-key",
+                    "X-Mnemosyne-Affinity": "unknown",
+                },
+                json={"model": "qwen-coder", "input": "invalid"},
+            )
+
+    assert response.json() == {"node": "b"}
+    assert invalid.status_code == 400
+    assert invalid.json()["error"]["code"] == "routing_controls_invalid"
+
+
+async def test_ephemeral_batch_returns_results_without_persisting_content(
+    tmp_path,
+) -> None:
+    unique_prompt = "batch-content-must-never-enter-fleet-sqlite"
+
+    def registry_handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=snapshot_payload("node-a"))
+
+    def proxy_handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={"id": payload["input"], "usage": {"total_tokens": 2}},
+        )
+
+    config = fleet_config(tmp_path)
+    app = create_app(
+        config,
+        registry_client=httpx.AsyncClient(
+            transport=httpx.MockTransport(registry_handler)
+        ),
+        proxy_client=httpx.AsyncClient(
+            transport=httpx.MockTransport(proxy_handler)
+        ),
+        start_polling=False,
+    )
+    async with app.router.lifespan_context(app):
+        await app.state.registry.poll_all_once()
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://fleet",
+        ) as client:
+            created = await client.post(
+                "/v1/batches",
+                headers={"Authorization": "Bearer client-key"},
+                json={
+                    "max_concurrency": 2,
+                    "requests": [
+                        {
+                            "custom_id": "first",
+                            "url": "/v1/responses",
+                            "body": {
+                                "model": "qwen-coder",
+                                "input": unique_prompt,
+                            },
+                        },
+                        {
+                            "custom_id": "second",
+                            "url": "/v1/responses",
+                            "body": {
+                                "model": "qwen-coder",
+                                "input": "second-input",
+                            },
+                        },
+                    ],
+                },
+            )
+            assert created.status_code == 202
+            batch_id = created.json()["id"]
+            for _ in range(100):
+                status = await client.get(
+                    f"/v1/batches/{batch_id}",
+                    headers={"Authorization": "Bearer client-key"},
+                )
+                if status.json()["state"] == "completed":
+                    break
+                await asyncio.sleep(0.01)
+            results = await client.get(
+                f"/v1/batches/{batch_id}/results",
+                headers={"Authorization": "Bearer client-key"},
+            )
+            overview = await client.get(
+                "/fleet/api/overview",
+                headers={"Authorization": "Bearer admin-key"},
+            )
+
+        assert status.json()["request_counts"]["completed"] == 2
+        assert [row["custom_id"] for row in results.json()["data"]] == [
+            "first",
+            "second",
+        ]
+        assert results.json()["data"][0]["response"]["body"]["id"] == unique_prompt
+        assert overview.json()["batches"]["jobs"]["completed"] == 1
+        assert app.state.scheduler.status()["active_total"] == 0
+
+    with sqlite3.connect(config.server.database_path) as conn:
+        database_dump = "\n".join(conn.iterdump())
+    assert unique_prompt not in database_dump
+
+
+async def test_cancelling_batch_releases_active_route(tmp_path) -> None:
+    entered = asyncio.Event()
+    never = asyncio.Event()
+
+    def registry_handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=snapshot_payload("node-a"))
+
+    async def proxy_handler(_request: httpx.Request) -> httpx.Response:
+        entered.set()
+        await never.wait()
+        return httpx.Response(200, json={"unreachable": True})
+
+    app = create_app(
+        fleet_config(tmp_path),
+        registry_client=httpx.AsyncClient(
+            transport=httpx.MockTransport(registry_handler)
+        ),
+        proxy_client=httpx.AsyncClient(
+            transport=httpx.MockTransport(proxy_handler)
+        ),
+        start_polling=False,
+    )
+    async with app.router.lifespan_context(app):
+        await app.state.registry.poll_all_once()
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://fleet",
+        ) as client:
+            created = await client.post(
+                "/v1/batches",
+                headers={"Authorization": "Bearer client-key"},
+                json={
+                    "requests": [
+                        {
+                            "custom_id": "cancel-me",
+                            "url": "/v1/responses",
+                            "body": {"model": "qwen-coder", "input": "cancel"},
+                        }
+                    ]
+                },
+            )
+            await asyncio.wait_for(entered.wait(), timeout=1)
+            assert app.state.scheduler.status()["active_total"] == 1
+            cancelled = await client.post(
+                f"/v1/batches/{created.json()['id']}/cancel",
+                headers={"Authorization": "Bearer client-key"},
+            )
+
+    assert cancelled.json()["state"] == "cancelled"
+    assert cancelled.json()["request_counts"]["cancelled"] == 1
+    assert app.state.scheduler.status()["active_total"] == 0

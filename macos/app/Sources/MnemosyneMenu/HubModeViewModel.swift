@@ -1,0 +1,315 @@
+import AppKit
+import Foundation
+import MnemosyneAppCore
+import ServiceManagement
+
+@MainActor
+final class HubModeViewModel: ObservableObject {
+    enum ExposureMode: String, CaseIterable, Identifiable {
+        case tailscale = "Tailscale HTTPS"
+        case existingHTTPS = "Existing HTTPS proxy"
+
+        var id: String { rawValue }
+    }
+
+    @Published var exposureMode: ExposureMode = .tailscale
+    @Published var customPublicOrigin = ""
+    @Published private(set) var configuration: HubModeConfiguration?
+    @Published private(set) var isWorking = false
+    @Published private(set) var hubHealthy = false
+    @Published private(set) var statusMessage = "Hub Mode has not been configured."
+    @Published private(set) var isError = false
+
+    private let controlConfiguration: ControlConnectionConfiguration
+    private let store: HubConfigurationStore
+    private let snapshotClient = HubLocalSnapshotClient()
+    private let tailscale = HubTailscaleManager()
+
+    init(configuration: ControlConnectionConfiguration = .load()) {
+        controlConfiguration = configuration
+        store = HubConfigurationStore(
+            nativeEnvironmentURL: configuration.environmentURL
+        )
+        if let existing = try? store.loadConfiguration() {
+            self.configuration = existing
+            customPublicOrigin = existing.publicOrigin
+            exposureMode = existing.managedTailscaleServe
+                ? .tailscale : .existingHTTPS
+        }
+    }
+
+    func load(registration: LaunchAgentRegistration) async {
+        registration.refresh()
+        configuration = try? store.loadConfiguration()
+        if let configuration {
+            customPublicOrigin = configuration.publicOrigin
+            exposureMode = configuration.managedTailscaleServe
+                ? .tailscale : .existingHTTPS
+        }
+        hubHealthy = await healthCheck()
+        updateStatus(registration: registration)
+    }
+
+    func promote(
+        registration: LaunchAgentRegistration,
+        fallbackWorkerNodeID: String
+    ) async {
+        guard !isWorking else { return }
+        isWorking = true
+        isError = false
+        statusMessage = "Preparing private Hub configuration…"
+        defer { isWorking = false }
+
+        do {
+            let discovery: HubTailscaleManager.Discovery?
+            let publicOrigin: String
+            switch exposureMode {
+            case .tailscale:
+                statusMessage = "Detecting Nyx on Tailscale…"
+                let found = try await tailscale.discover()
+                discovery = found
+                publicOrigin = found.publicOrigin
+            case .existingHTTPS:
+                discovery = nil
+                publicOrigin = try HubConfigurationStore.normalizedHTTPSOrigin(
+                    customPublicOrigin
+                )
+            }
+
+            if registration.agentStatus != .enabled {
+                statusMessage = "Enabling the local inference worker…"
+                await registration.enableAgent()
+                guard registration.agentStatus == .enabled else {
+                    throw HubModePresentationError.registration(
+                        registration.lastError
+                            ?? "Approve the background service in Login Items, then try again."
+                    )
+                }
+            }
+
+            let credentialStore = CredentialStore(
+                environmentURL: controlConfiguration.environmentURL
+            )
+            let secrets = try store.prepareSecrets(
+                nativeCredentialStore: credentialStore
+            )
+            statusMessage = "Restarting the local worker with its Hub-only credentials…"
+            guard await registration.restartAgent() else {
+                throw HubModePresentationError.registration(
+                    registration.lastError ?? "The local worker could not restart."
+                )
+            }
+
+            statusMessage = "Publishing Fleet-eligible local models…"
+            let local = try await snapshotClient.waitForEligibleSnapshot(
+                snapshotKey: secrets.localWorkerSnapshotKey
+            )
+            let nodeID = local.nodeID.isEmpty
+                ? fallbackWorkerNodeID : local.nodeID
+            let saved = try store.saveConfiguration(
+                publicOrigin: publicOrigin,
+                localWorkerNodeID: nodeID,
+                managedTailscaleServe: discovery != nil,
+                deployments: local.deployments
+            )
+            configuration = saved
+            customPublicOrigin = saved.publicOrigin
+
+            statusMessage = "Starting Fleet Hub at login…"
+            if registration.hubAgentStatus == .enabled {
+                guard await registration.restartHubAgent() else {
+                    throw HubModePresentationError.registration(
+                        registration.lastError ?? "Fleet Hub could not restart."
+                    )
+                }
+            } else {
+                await registration.enableHubAgent()
+                guard registration.hubAgentStatus == .enabled else {
+                    throw HubModePresentationError.registration(
+                        registration.lastError
+                            ?? "Approve Fleet Hub in Login Items, then try again."
+                    )
+                }
+            }
+            guard await waitForHealth() else {
+                throw HubModePresentationError.health
+            }
+
+            if let discovery {
+                statusMessage = "Publishing Fleet Hub privately through Tailscale HTTPS…"
+                try await tailscale.enableServe(using: discovery)
+            }
+            hubHealthy = true
+            isError = false
+            statusMessage = "This Mac is running Fleet Hub. Its local worker is enrolled as LIMITED / overflow."
+        } catch {
+            hubHealthy = await healthCheck()
+            isError = true
+            statusMessage = error.localizedDescription
+        }
+    }
+
+    func syncLocalModels(registration: LaunchAgentRegistration) async {
+        guard !isWorking, let existing = configuration else { return }
+        isWorking = true
+        isError = false
+        statusMessage = "Refreshing Fleet-eligible local models…"
+        defer { isWorking = false }
+        do {
+            let secrets = try store.prepareSecrets(
+                nativeCredentialStore: CredentialStore(
+                    environmentURL: controlConfiguration.environmentURL
+                )
+            )
+            let local = try await snapshotClient.waitForEligibleSnapshot(
+                snapshotKey: secrets.localWorkerSnapshotKey
+            )
+            configuration = try store.saveConfiguration(
+                publicOrigin: existing.publicOrigin,
+                localWorkerNodeID: local.nodeID,
+                managedTailscaleServe: existing.managedTailscaleServe,
+                deployments: local.deployments
+            )
+            guard await registration.restartHubAgent(), await waitForHealth() else {
+                throw HubModePresentationError.health
+            }
+            hubHealthy = true
+            statusMessage = "Hub model mappings now match this Mac's eligible local models."
+        } catch {
+            hubHealthy = await healthCheck()
+            isError = true
+            statusMessage = error.localizedDescription
+        }
+    }
+
+    func disable(registration: LaunchAgentRegistration) async {
+        guard !isWorking else { return }
+        isWorking = true
+        isError = false
+        statusMessage = "Stopping Fleet Hub…"
+        defer { isWorking = false }
+        let managedServe = configuration?.managedTailscaleServe == true
+        await registration.disableHubAgent()
+        if registration.hubAgentStatus == .notRegistered {
+            if managedServe { await tailscale.disableServeIfAvailable() }
+            hubHealthy = false
+            statusMessage = "Fleet Hub is disabled. Its configuration, invitations, enrollments, and route history are preserved."
+        } else {
+            isError = true
+            statusMessage = registration.lastError ?? "Fleet Hub could not be disabled."
+        }
+    }
+
+    func reenable(registration: LaunchAgentRegistration) async {
+        guard !isWorking, let configuration else { return }
+        isWorking = true
+        isError = false
+        statusMessage = "Starting the preserved Fleet Hub…"
+        defer { isWorking = false }
+        await registration.enableHubAgent()
+        guard registration.hubAgentStatus == .enabled else {
+            isError = true
+            statusMessage = registration.lastError ?? "Fleet Hub could not start."
+            return
+        }
+        if configuration.managedTailscaleServe {
+            do {
+                let discovery = try await tailscale.discover()
+                guard discovery.publicOrigin == configuration.publicOrigin else {
+                    throw HubModeError.tailscaleNotConnected
+                }
+                try await tailscale.enableServe(using: discovery)
+            } catch {
+                isError = true
+                statusMessage = error.localizedDescription
+                hubHealthy = await healthCheck()
+                return
+            }
+        }
+        hubHealthy = await waitForHealth()
+        isError = !hubHealthy
+        statusMessage = hubHealthy
+            ? "Fleet Hub is running with its preserved identity and enrollments."
+            : "Fleet Hub was registered but did not become healthy."
+    }
+
+    func copyAdminKey() {
+        copySecret { try store.adminKey() }
+    }
+
+    func copyClientKey() {
+        copySecret { try store.clientKey() }
+    }
+
+    func openDashboard() {
+        let base = configuration?.publicOrigin ?? "http://127.0.0.1:17400"
+        guard let url = URL(string: base + "/fleet/") else { return }
+        NSWorkspace.shared.open(url)
+    }
+
+    private func copySecret(_ value: () throws -> String) {
+        do {
+            let pasteboard = NSPasteboard.general
+            pasteboard.clearContents()
+            pasteboard.setString(try value(), forType: .string)
+            isError = false
+            statusMessage = "Credential copied. Paste it only into the intended trusted client."
+        } catch {
+            isError = true
+            statusMessage = error.localizedDescription
+        }
+    }
+
+    private func updateStatus(registration: LaunchAgentRegistration) {
+        if configuration == nil {
+            statusMessage = "Hub Mode has not been configured."
+        } else if registration.hubAgentStatus == .requiresApproval {
+            statusMessage = "Fleet Hub needs approval in System Settings → General → Login Items."
+        } else if registration.hubAgentStatus != .enabled {
+            statusMessage = "Fleet Hub is configured but disabled. Private state is preserved."
+        } else if hubHealthy {
+            statusMessage = "Fleet Hub is running."
+        } else {
+            statusMessage = "Fleet Hub is registered but not healthy yet."
+        }
+        isError = registration.hubAgentStatus == .enabled && !hubHealthy
+    }
+
+    private func waitForHealth() async -> Bool {
+        let deadline = Date().addingTimeInterval(30)
+        while Date() < deadline {
+            if await healthCheck() { return true }
+            try? await Task.sleep(for: .milliseconds(500))
+        }
+        return false
+    }
+
+    private func healthCheck() async -> Bool {
+        var request = URLRequest(url: URL(string: "http://127.0.0.1:17400/health")!)
+        request.timeoutInterval = 2
+        request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        let sessionConfiguration = URLSessionConfiguration.ephemeral
+        sessionConfiguration.connectionProxyDictionary = [:]
+        do {
+            let (_, response) = try await URLSession(
+                configuration: sessionConfiguration
+            ).data(for: request)
+            return (response as? HTTPURLResponse)?.statusCode == 200
+        } catch {
+            return false
+        }
+    }
+}
+
+private enum HubModePresentationError: Error, LocalizedError {
+    case registration(String)
+    case health
+
+    var errorDescription: String? {
+        switch self {
+        case let .registration(message): message
+        case .health:
+            "Fleet Hub did not become healthy. Its preserved configuration remains available for retry."
+        }
+    }
+}

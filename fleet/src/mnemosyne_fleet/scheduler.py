@@ -5,6 +5,7 @@ import time
 import uuid
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
+from typing import Literal
 
 from .config import SERVICE_CLASSES, ModelConfig, NodeConfig
 from .protocol import Deployment
@@ -24,6 +25,26 @@ class FleetBusyError(RuntimeError):
         super().__init__(code)
         self.code = code
         self.retry_after = retry_after
+
+
+RequestPriority = Literal["interactive", "normal", "batch"]
+FallbackPolicy = Literal["allow", "none"]
+_PRIORITY_RANK: dict[RequestPriority, int] = {
+    "interactive": 0,
+    "normal": 1,
+    "batch": 2,
+}
+_PRIORITY_AGING_SECONDS = 10.0
+
+
+@dataclass(frozen=True, slots=True)
+class RoutingControls:
+    """Optional caller policy; defaults reproduce the original scheduler."""
+
+    priority: RequestPriority = "normal"
+    affinity_enrollment_id: str | None = None
+    fallback: FallbackPolicy = "allow"
+    max_wait_seconds: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,6 +130,7 @@ class _Ticket:
     capability: str
     enqueued_at: float
     excluded_enrollment_ids: frozenset[str]
+    controls: RoutingControls
 
 
 class Scheduler:
@@ -203,6 +225,7 @@ class Scheduler:
         model: ModelConfig,
         capability: str,
         excluded_enrollment_ids: frozenset[str],
+        controls: RoutingControls,
     ) -> Candidate | None:
         candidates: list[Candidate] = []
         for record in self._registry.live_records():
@@ -213,6 +236,11 @@ class Scheduler:
             snapshot = record.snapshot
             if (
                 enrollment_id in excluded_enrollment_ids
+                or (
+                    controls.affinity_enrollment_id is not None
+                    and controls.fallback == "none"
+                    and enrollment_id != controls.affinity_enrollment_id
+                )
                 or not snapshot.health.accepting
                 or not snapshot.health.authoritative
                 or snapshot.health.state in {"degraded", "stopping"}
@@ -274,6 +302,13 @@ class Scheduler:
         return min(
             candidates,
             key=lambda candidate: (
+                0
+                if (
+                    controls.affinity_enrollment_id is None
+                    or candidate.enrollment.enrollment_id
+                    == controls.affinity_enrollment_id
+                )
+                else 1,
                 candidate.service_class_rank,
                 candidate.tier,
                 candidate.load_score,
@@ -290,13 +325,20 @@ class Scheduler:
         public_model: str,
         capability: str,
         excluded_enrollment_ids: frozenset[str] = frozenset(),
+        controls: RoutingControls = RoutingControls(),
     ) -> Reservation:
         model = self.model(public_model)
         if capability not in model.capabilities:
             raise CapabilityError(capability)
         started = time.monotonic()
         ticket: _Ticket | None = None
-        deadline = started + model.queue_timeout_seconds
+        requested_wait = controls.max_wait_seconds
+        wait_seconds = (
+            model.queue_timeout_seconds
+            if requested_wait is None
+            else max(0.0, min(requested_wait, model.queue_timeout_seconds))
+        )
+        deadline = started + wait_seconds
 
         async with self._condition:
             queue = self._queues[public_model]
@@ -305,6 +347,7 @@ class Scheduler:
                     model=model,
                     capability=capability,
                     excluded_enrollment_ids=excluded_enrollment_ids,
+                    controls=controls,
                 )
                 if candidate is not None:
                     return self._reserve(candidate, model, capability, started, started)
@@ -315,18 +358,20 @@ class Scheduler:
                 capability=capability,
                 enqueued_at=started,
                 excluded_enrollment_ids=excluded_enrollment_ids,
+                controls=controls,
             )
             queue.append(ticket)
             try:
                 while True:
-                    if queue and queue[0].ticket_id == ticket.ticket_id:
+                    if self._next_ticket(queue).ticket_id == ticket.ticket_id:
                         candidate = self._select(
                             model=model,
                             capability=capability,
                             excluded_enrollment_ids=excluded_enrollment_ids,
+                            controls=controls,
                         )
                         if candidate is not None:
-                            queue.popleft()
+                            queue.remove(ticket)
                             reservation = self._reserve(
                                 candidate,
                                 model,
@@ -347,6 +392,24 @@ class Scheduler:
                 if ticket in queue:
                     queue.remove(ticket)
                     self._condition.notify_all()
+
+    @staticmethod
+    def _next_ticket(queue: deque[_Ticket]) -> _Ticket:
+        """Prefer explicit priority while aging lower lanes toward fairness."""
+
+        now = time.monotonic()
+        return min(
+            queue,
+            key=lambda ticket: (
+                max(
+                    0,
+                    _PRIORITY_RANK[ticket.controls.priority]
+                    - int((now - ticket.enqueued_at) / _PRIORITY_AGING_SECONDS),
+                ),
+                ticket.enqueued_at,
+                ticket.ticket_id,
+            ),
+        )
 
     def _reserve(
         self,
@@ -403,6 +466,9 @@ class Scheduler:
             raise KeyError(enrollment_id)
         return enrollment
 
+    def has_enrollment(self, enrollment_id: str) -> bool:
+        return self._registry.enrollment(enrollment_id) is not None
+
     @property
     def node_count(self) -> int:
         return self._registry.node_count
@@ -423,6 +489,14 @@ class Scheduler:
             "queues": {
                 model: {
                     "depth": len(self._queues[model]),
+                    "by_priority": {
+                        priority: sum(
+                            1
+                            for ticket in self._queues[model]
+                            if ticket.controls.priority == priority
+                        )
+                        for priority in ("interactive", "normal", "batch")
+                    },
                     "limit": config.queue_depth,
                     "timeout_seconds": config.queue_timeout_seconds,
                 }

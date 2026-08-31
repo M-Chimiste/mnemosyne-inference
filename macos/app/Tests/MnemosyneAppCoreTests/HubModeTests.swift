@@ -1,0 +1,152 @@
+import Foundation
+import Testing
+@testable import MnemosyneAppCore
+
+@Test("Hub Mode creates separate persistent credentials and enrolls only the local worker slots")
+func hubModeCreatesSeparatedCredentials() throws {
+    let temporary = FileManager.default.temporaryDirectory
+        .appending(path: UUID().uuidString, directoryHint: .isDirectory)
+    defer { try? FileManager.default.removeItem(at: temporary) }
+    try FileManager.default.createDirectory(
+        at: temporary,
+        withIntermediateDirectories: true,
+        attributes: [.posixPermissions: 0o700]
+    )
+    let nativeEnvironment = temporary.appending(path: "native.env")
+    try Data("TOKEN_LEDGER_DSN=preserved\n".utf8).write(to: nativeEnvironment)
+    let nativeStore = CredentialStore(environmentURL: nativeEnvironment)
+    let hubStore = HubConfigurationStore(
+        rootURL: temporary.appending(path: "hub", directoryHint: .isDirectory)
+    )
+
+    let first = try hubStore.prepareSecrets(nativeCredentialStore: nativeStore)
+    let second = try hubStore.prepareSecrets(nativeCredentialStore: nativeStore)
+
+    #expect(first.clientKey == second.clientKey)
+    #expect(first.adminKey == second.adminKey)
+    #expect(first.pairingMasterKey == second.pairingMasterKey)
+    #expect(first.localWorkerSnapshotKey == second.localWorkerSnapshotKey)
+    #expect(first.localWorkerDispatchKey == second.localWorkerDispatchKey)
+    #expect(Set([
+        first.clientKey,
+        first.adminKey,
+        first.pairingMasterKey,
+        first.localWorkerSnapshotKey,
+        first.localWorkerDispatchKey,
+    ]).count == 5)
+    #expect(first.clientKey.count == 64)
+    #expect(first.pairingMasterKey.count == 43)
+
+    let nativeText = try String(contentsOf: nativeEnvironment, encoding: .utf8)
+    #expect(nativeText.contains("TOKEN_LEDGER_DSN=preserved"))
+    #expect(nativeText.contains("FLEET_API_KEY=\(first.localWorkerSnapshotKey)"))
+    #expect(nativeText.contains("FLEET_INFERENCE_API_KEY=\(first.localWorkerDispatchKey)"))
+    #expect(!nativeText.contains(first.clientKey))
+    #expect(!nativeText.contains(first.adminKey))
+    #expect(!nativeText.contains(first.pairingMasterKey))
+
+    let attributes = try FileManager.default.attributesOfItem(
+        atPath: hubStore.environmentURL.path
+    )
+    #expect((attributes[.posixPermissions] as? NSNumber)?.intValue == 0o600)
+}
+
+@Test("Hub configuration publishes authoritative models and keeps secrets outside TOML")
+func hubModeRendersClosedFleetConfiguration() throws {
+    let temporary = FileManager.default.temporaryDirectory
+        .appending(path: UUID().uuidString, directoryHint: .isDirectory)
+    defer { try? FileManager.default.removeItem(at: temporary) }
+    let nativeEnvironment = temporary.appending(path: "native.env")
+    let nativeStore = CredentialStore(environmentURL: nativeEnvironment)
+    let hubStore = HubConfigurationStore(
+        rootURL: temporary.appending(path: "hub", directoryHint: .isDirectory)
+    )
+    let secrets = try hubStore.prepareSecrets(nativeCredentialStore: nativeStore)
+    let deployment = HubPublishedDeployment(
+        alias: "glm-5.3-flash",
+        deploymentID: "sha256:" + String(repeating: "a", count: 64),
+        capabilities: ["responses", "chat/completions", "responses"]
+    )
+
+    let saved = try hubStore.saveConfiguration(
+        publicOrigin: " HTTPS://nyx.example.ts.net/ ",
+        localWorkerNodeID: "nyx-worker",
+        managedTailscaleServe: true,
+        deployments: [deployment]
+    )
+
+    #expect(saved.publicOrigin == "https://nyx.example.ts.net")
+    #expect(saved.localWorkerNodeID == "nyx-worker")
+    #expect(saved.publishedDeployments.first?.capabilities == [
+        "chat/completions", "responses",
+    ])
+    #expect(try hubStore.loadConfiguration() == saved)
+
+    let config = try String(contentsOf: hubStore.configurationURL, encoding: .utf8)
+    #expect(config.contains("host = \"127.0.0.1\""))
+    #expect(config.contains("port = 17400"))
+    #expect(config.contains("url = \"http://127.0.0.1:1240\""))
+    #expect(config.contains("service_class = \"overflow\""))
+    #expect(config.contains("enabled = true"))
+    #expect(config.contains("deployment_id = \"\(deployment.deploymentID)\""))
+    #expect(config.contains("api_key_env = \"MNEMOSYNE_FLEET_CLIENT_KEY\""))
+    #expect(!config.contains(secrets.clientKey))
+    #expect(!config.contains(secrets.adminKey))
+    #expect(!config.contains(secrets.pairingMasterKey))
+    #expect(!config.contains(secrets.localWorkerSnapshotKey))
+    #expect(!config.contains(secrets.localWorkerDispatchKey))
+}
+
+@Test("Hub Mode refuses unsafe origins and empty deployment authority")
+func hubModeRejectsUnsafeConfiguration() throws {
+    let temporary = FileManager.default.temporaryDirectory
+        .appending(path: UUID().uuidString, directoryHint: .isDirectory)
+    defer { try? FileManager.default.removeItem(at: temporary) }
+    let hubStore = HubConfigurationStore(
+        rootURL: temporary.appending(path: "hub", directoryHint: .isDirectory)
+    )
+    let deployment = HubPublishedDeployment(
+        alias: "model",
+        deploymentID: "sha256:" + String(repeating: "b", count: 64),
+        capabilities: ["responses"]
+    )
+
+    #expect(throws: HubModeError.invalidPublicOrigin) {
+        try hubStore.saveConfiguration(
+            publicOrigin: "http://nyx.example.ts.net",
+            localWorkerNodeID: "nyx-worker",
+            managedTailscaleServe: false,
+            deployments: [deployment]
+        )
+    }
+    #expect(throws: HubModeError.noEligibleModels) {
+        try hubStore.saveConfiguration(
+            publicOrigin: "https://nyx.example.ts.net",
+            localWorkerNodeID: "nyx-worker",
+            managedTailscaleServe: false,
+            deployments: []
+        )
+    }
+}
+
+@Test("Hub Mode refuses a symlinked private-state root")
+func hubModeRejectsSymlinkedStateRoot() throws {
+    let temporary = FileManager.default.temporaryDirectory
+        .appending(path: UUID().uuidString, directoryHint: .isDirectory)
+    defer { try? FileManager.default.removeItem(at: temporary) }
+    let victim = temporary.appending(path: "victim", directoryHint: .isDirectory)
+    let link = temporary.appending(path: "hub", directoryHint: .isDirectory)
+    try FileManager.default.createDirectory(
+        at: victim,
+        withIntermediateDirectories: true
+    )
+    try FileManager.default.createSymbolicLink(at: link, withDestinationURL: victim)
+
+    #expect(throws: HubModeError.unsafeStatePath) {
+        try HubConfigurationStore(rootURL: link).prepareSecrets(
+            nativeCredentialStore: CredentialStore(
+                environmentURL: temporary.appending(path: "native.env")
+            )
+        )
+    }
+}

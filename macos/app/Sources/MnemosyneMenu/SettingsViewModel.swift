@@ -8,6 +8,7 @@ final class SettingsViewModel: ObservableObject {
     enum Section: String, CaseIterable, Identifiable {
         case setup = "Setup & Health"
         case general = "General"
+        case hub = "Hub Mode"
         case pool = "Inference Pool"
         case engines = "Engines"
         case updates = "Runtime Updates"
@@ -24,6 +25,7 @@ final class SettingsViewModel: ObservableObject {
             switch self {
             case .setup: "checklist"
             case .general: "gearshape"
+            case .hub: "network"
             case .pool: "point.3.connected.trianglepath.dotted"
             case .engines: "cpu"
             case .updates: "arrow.triangle.2.circlepath.circle"

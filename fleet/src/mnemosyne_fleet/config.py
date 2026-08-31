@@ -443,6 +443,23 @@ class PlacementConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class BatchConfig:
+    """Bounded, process-local async batch execution.
+
+    Batch inputs and results are intentionally never written to Fleet's
+    metadata database.  A Hub restart therefore expires every batch.
+    """
+
+    enabled: bool = True
+    max_active_jobs: int = 32
+    max_requests_per_job: int = 256
+    max_concurrency: int = 4
+    max_result_bytes_per_item: int = 16 * 1024 * 1024
+    max_retained_result_bytes: int = 256 * 1024 * 1024
+    retention_seconds: int = 3600
+
+
+@dataclass(frozen=True, slots=True)
 class FleetConfig:
     server: ServerConfig
     nodes: tuple[NodeConfig, ...]
@@ -451,6 +468,7 @@ class FleetConfig:
     pairing: PairingConfig = field(default_factory=PairingConfig)
     catalog: CatalogConfig = field(default_factory=CatalogConfig)
     placement: PlacementConfig = field(default_factory=PlacementConfig)
+    batch: BatchConfig = field(default_factory=BatchConfig)
 
 
 def _expect_list(data: dict[str, Any], key: str) -> list[dict[str, Any]]:
@@ -916,6 +934,67 @@ def load_config(
             "placement.remote_installs_enabled requires pairing.enabled"
         )
 
+    batch_raw = raw.get("batch", {})
+    if not isinstance(batch_raw, dict):
+        raise ConfigError("[batch] must be a table")
+    allowed_batch_fields = {
+        "enabled",
+        "max_active_jobs",
+        "max_requests_per_job",
+        "max_concurrency",
+        "max_result_bytes_per_item",
+        "max_retained_result_bytes",
+        "retention_seconds",
+    }
+    if set(batch_raw) - allowed_batch_fields:
+        raise ConfigError("[batch] contains unsupported fields")
+    batch_enabled = batch_raw.get("enabled", True)
+    if not isinstance(batch_enabled, bool):
+        raise ConfigError("batch.enabled must be a boolean")
+    batch = BatchConfig(
+        enabled=batch_enabled,
+        max_active_jobs=_strict_bounded_int(
+            batch_raw.get("max_active_jobs", 32),
+            name="batch.max_active_jobs",
+            minimum=1,
+            maximum=1_000,
+        ),
+        max_requests_per_job=_strict_bounded_int(
+            batch_raw.get("max_requests_per_job", 256),
+            name="batch.max_requests_per_job",
+            minimum=1,
+            maximum=10_000,
+        ),
+        max_concurrency=_strict_bounded_int(
+            batch_raw.get("max_concurrency", 4),
+            name="batch.max_concurrency",
+            minimum=1,
+            maximum=128,
+        ),
+        max_result_bytes_per_item=_strict_bounded_int(
+            batch_raw.get("max_result_bytes_per_item", 16 * 1024 * 1024),
+            name="batch.max_result_bytes_per_item",
+            minimum=1_024,
+            maximum=256 * 1024 * 1024,
+        ),
+        max_retained_result_bytes=_strict_bounded_int(
+            batch_raw.get("max_retained_result_bytes", 256 * 1024 * 1024),
+            name="batch.max_retained_result_bytes",
+            minimum=1_024,
+            maximum=1024 * 1024 * 1024,
+        ),
+        retention_seconds=_strict_bounded_int(
+            batch_raw.get("retention_seconds", 3600),
+            name="batch.retention_seconds",
+            minimum=60,
+            maximum=86_400,
+        ),
+    )
+    if batch.max_result_bytes_per_item > batch.max_retained_result_bytes:
+        raise ConfigError(
+            "batch.max_result_bytes_per_item must not exceed retained capacity"
+        )
+
     nodes: list[NodeConfig] = []
     seen_nodes: set[str] = set()
     for index, node_raw in enumerate(_expect_list(raw, "nodes")):
@@ -1058,6 +1137,7 @@ def load_config(
         pairing=pairing,
         catalog=catalog,
         placement=placement,
+        batch=batch,
     )
 
 

@@ -17,6 +17,7 @@ from .scheduler import (
     CapabilityError,
     FleetBusyError,
     Reservation,
+    RoutingControls,
     Scheduler,
     UnknownModelError,
 )
@@ -134,6 +135,43 @@ class FleetProxy:
                 raise OverflowError
         return bytes(output)
 
+    def _routing_controls(self, request: Request) -> RoutingControls:
+        priority = request.headers.get("x-mnemosyne-priority", "normal")
+        if priority not in {"interactive", "normal", "batch"}:
+            raise ValueError
+        fallback = request.headers.get("x-mnemosyne-fallback", "allow")
+        if fallback not in {"allow", "none"}:
+            raise ValueError
+        affinity = request.headers.get("x-mnemosyne-affinity")
+        if affinity is not None:
+            if (
+                not affinity
+                or affinity != affinity.strip()
+                or len(affinity) > 128
+                or any(ord(character) < 33 for character in affinity)
+                or not self._scheduler.has_enrollment(affinity)
+            ):
+                raise ValueError
+        max_wait_raw = request.headers.get("x-mnemosyne-max-wait-ms")
+        max_wait_seconds: float | None = None
+        if max_wait_raw is not None:
+            if (
+                not max_wait_raw.isascii()
+                or not max_wait_raw.isdigit()
+                or len(max_wait_raw) > 8
+            ):
+                raise ValueError
+            max_wait_ms = int(max_wait_raw)
+            if max_wait_ms > 86_400_000:
+                raise ValueError
+            max_wait_seconds = max_wait_ms / 1000.0
+        return RoutingControls(
+            priority=priority,
+            affinity_enrollment_id=affinity,
+            fallback=fallback,
+            max_wait_seconds=max_wait_seconds,
+        )
+
     async def handle(self, request: Request, *, capability: str):
         try:
             raw_body = await self._read_body(request)
@@ -170,10 +208,22 @@ class FleetProxy:
         public_model = payload.get("model")
         if not isinstance(public_model, str) or not public_model.strip():
             return error_response(400, "model_required", "A non-empty model is required.")
+        try:
+            controls = self._routing_controls(request)
+        except ValueError:
+            return error_response(
+                400,
+                "routing_controls_invalid",
+                "The Fleet routing controls are invalid.",
+            )
 
         excluded_enrollment_ids: set[str] = set()
         all_retries_were_node_busy = True
-        max_attempts = max(1, self._scheduler.node_count)
+        max_attempts = (
+            1
+            if controls.fallback == "none"
+            else max(1, self._scheduler.node_count)
+        )
         for _attempt in range(max_attempts):
             try:
                 reservation = await self._scheduler.acquire(
@@ -182,6 +232,7 @@ class FleetProxy:
                     excluded_enrollment_ids=frozenset(
                         excluded_enrollment_ids
                     ),
+                    controls=controls,
                 )
             except UnknownModelError:
                 return error_response(404, "model_not_found", "The requested model is unavailable.")

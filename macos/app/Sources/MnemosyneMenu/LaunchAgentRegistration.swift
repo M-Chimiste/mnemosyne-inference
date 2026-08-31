@@ -6,28 +6,35 @@ import SwiftUI
 @MainActor
 final class LaunchAgentRegistration: ObservableObject {
     static let agentPlistName = "com.mnemosyne.inference.agent.plist"
+    static let hubAgentPlistName = "com.mnemosyne.inference.hub.plist"
     private static let registrationFingerprintKey =
         "registeredServiceBundleFingerprintV2"
     private static let pendingAgentRefreshKey =
         "pendingServiceBundleAgentRefreshV1"
     private static let pendingMenuRefreshKey =
         "pendingServiceBundleMenuRefreshV1"
+    private static let pendingHubRefreshKey =
+        "pendingServiceBundleHubRefreshV1"
 
     @Published private(set) var agentStatus: SMAppService.Status
+    @Published private(set) var hubAgentStatus: SMAppService.Status
     @Published private(set) var menuLoginStatus: SMAppService.Status
     @Published private(set) var lastError: String?
     @Published private(set) var isChangingRegistration = false
 
     private let agent = SMAppService.agent(plistName: agentPlistName)
+    private let hubAgent = SMAppService.agent(plistName: hubAgentPlistName)
     private let menuLoginItem = SMAppService.mainApp
 
     init() {
         agentStatus = agent.status
+        hubAgentStatus = hubAgent.status
         menuLoginStatus = menuLoginItem.status
     }
 
     func refresh() {
         agentStatus = agent.status
+        hubAgentStatus = hubAgent.status
         menuLoginStatus = menuLoginItem.status
     }
 
@@ -84,7 +91,21 @@ final class LaunchAgentRegistration: ObservableObject {
         guard !isChangingRegistration else { return }
         let defaults = UserDefaults.standard
         let fingerprint = currentBundleFingerprint()
-        guard defaults.string(forKey: Self.registrationFingerprintKey) != fingerprint else {
+        let bundleChanged = defaults.string(
+            forKey: Self.registrationFingerprintKey
+        ) != fingerprint
+        let agentRefreshPending = defaults.bool(
+            forKey: Self.pendingAgentRefreshKey
+        )
+        let menuRefreshPending = defaults.bool(
+            forKey: Self.pendingMenuRefreshKey
+        )
+        let hubRefreshPending = defaults.bool(
+            forKey: Self.pendingHubRefreshKey
+        )
+        guard bundleChanged || agentRefreshPending || menuRefreshPending
+                || hubRefreshPending
+        else {
             return
         }
 
@@ -94,15 +115,46 @@ final class LaunchAgentRegistration: ObservableObject {
             refresh()
         }
 
-        if isRegistered(agent.status) {
-            defaults.set(true, forKey: Self.pendingAgentRefreshKey)
-        }
-        if isRegistered(menuLoginItem.status) {
-            defaults.set(true, forKey: Self.pendingMenuRefreshKey)
-        }
-
         var failures: [String] = []
         var notices: [String] = []
+        let agentAction = BundleRegistrationRefreshPolicy.action(
+            bundleChanged: bundleChanged,
+            refreshPending: agentRefreshPending,
+            state: managedState(agent.status)
+        )
+        let menuAction = BundleRegistrationRefreshPolicy.action(
+            bundleChanged: bundleChanged,
+            refreshPending: menuRefreshPending,
+            state: managedState(menuLoginItem.status)
+        )
+        let hubAction = BundleRegistrationRefreshPolicy.action(
+            bundleChanged: bundleChanged,
+            refreshPending: hubRefreshPending,
+            state: managedState(hubAgent.status)
+        )
+
+        if agentAction == .refresh {
+            defaults.set(true, forKey: Self.pendingAgentRefreshKey)
+        } else if agentAction == .retryDiscovery {
+            failures.append(
+                "The replaced app is still waiting for macOS to discover its bundled background service. Reopen Unified Inference to retry."
+            )
+        }
+        if menuAction == .refresh {
+            defaults.set(true, forKey: Self.pendingMenuRefreshKey)
+        } else if menuAction == .retryDiscovery {
+            failures.append(
+                "The replaced app is still waiting for macOS to discover its menu login item. Reopen Unified Inference to retry."
+            )
+        }
+        if hubAction == .refresh {
+            defaults.set(true, forKey: Self.pendingHubRefreshKey)
+        } else if hubAction == .retryDiscovery {
+            failures.append(
+                "The replaced app is still waiting for macOS to discover its bundled Hub service. Reopen Unified Inference to retry."
+            )
+        }
+
         if defaults.bool(forKey: Self.pendingAgentRefreshKey) {
             do {
                 let status = try await refreshRegistration(
@@ -136,6 +188,23 @@ final class LaunchAgentRegistration: ObservableObject {
                 )
             }
         }
+        if !Task.isCancelled,
+           defaults.bool(forKey: Self.pendingHubRefreshKey) {
+            do {
+                let status = try await refreshRegistration(
+                    hubAgent,
+                    serviceName: "Fleet Hub"
+                )
+                defaults.removeObject(forKey: Self.pendingHubRefreshKey)
+                if status == .requiresApproval {
+                    notices.append(approvalMessage(for: "Fleet Hub"))
+                }
+            } catch {
+                failures.append(
+                    "Could not update the Fleet Hub registration: \(error.localizedDescription)"
+                )
+            }
+        }
 
         if Task.isCancelled {
             failures.append(
@@ -144,6 +213,7 @@ final class LaunchAgentRegistration: ObservableObject {
         }
         let refreshPending = defaults.bool(forKey: Self.pendingAgentRefreshKey)
             || defaults.bool(forKey: Self.pendingMenuRefreshKey)
+            || defaults.bool(forKey: Self.pendingHubRefreshKey)
         if failures.isEmpty, !refreshPending {
             defaults.set(fingerprint, forKey: Self.registrationFingerprintKey)
         }
@@ -156,6 +226,8 @@ final class LaunchAgentRegistration: ObservableObject {
             .appending(path: "Contents/MacOS/UnifiedInference")
         let helper = Bundle.main.bundleURL
             .appending(path: "Contents/MacOS/mnemosyne-service-bootstrap")
+        let hubHelper = Bundle.main.bundleURL
+            .appending(path: "Contents/MacOS/mnemosyne-hub-bootstrap")
         let signature = Bundle.main.bundleURL
             .appending(path: "Contents/_CodeSignature/CodeResources")
         let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String
@@ -164,6 +236,7 @@ final class LaunchAgentRegistration: ObservableObject {
             version ?? "unknown",
             fileFingerprint(menuExecutable),
             fileFingerprint(helper),
+            fileFingerprint(hubHelper),
             fileFingerprint(signature),
         ].joined(separator: "|")
     }
@@ -212,6 +285,64 @@ final class LaunchAgentRegistration: ObservableObject {
             lastError = nil
         } catch {
             lastError = "Could not disable the background service: \(error.localizedDescription)"
+        }
+    }
+
+    func enableHubAgent() async {
+        guard beginRegistrationChange() else { return }
+        defer { finishRegistrationChange() }
+        do {
+            let status = try await registerAndWait(
+                hubAgent,
+                serviceName: "Fleet Hub"
+            )
+            UserDefaults.standard.removeObject(forKey: Self.pendingHubRefreshKey)
+            lastError = status == .requiresApproval
+                ? approvalMessage(for: "Fleet Hub") : nil
+        } catch {
+            lastError = "Could not enable Fleet Hub: \(error.localizedDescription)"
+        }
+    }
+
+    func disableHubAgent() async {
+        guard beginRegistrationChange() else { return }
+        UserDefaults.standard.removeObject(forKey: Self.pendingHubRefreshKey)
+        defer { finishRegistrationChange() }
+        do {
+            try await unregisterAndWait(
+                hubAgent,
+                serviceName: "Fleet Hub"
+            )
+            lastError = nil
+        } catch {
+            lastError = "Could not disable Fleet Hub: \(error.localizedDescription)"
+        }
+    }
+
+    @discardableResult
+    func restartHubAgent() async -> Bool {
+        guard beginRegistrationChange() else { return false }
+        defer { finishRegistrationChange() }
+        guard hubAgent.status == .enabled else {
+            lastError = hubAgent.status == .requiresApproval
+                ? approvalMessage(for: "Fleet Hub")
+                : "Enable Fleet Hub before restarting it."
+            return false
+        }
+        do {
+            let status = try await refreshRegistration(
+                hubAgent,
+                serviceName: "Fleet Hub"
+            )
+            guard status == .enabled else {
+                lastError = approvalMessage(for: "Fleet Hub")
+                return false
+            }
+            lastError = nil
+            return true
+        } catch {
+            lastError = "Could not restart Fleet Hub: \(error.localizedDescription)"
+            return false
         }
     }
 
@@ -397,10 +528,6 @@ final class LaunchAgentRegistration: ObservableObject {
         case .notFound: .notFound
         @unknown default: .unknown
         }
-    }
-
-    private func isRegistered(_ status: SMAppService.Status) -> Bool {
-        status == .enabled || status == .requiresApproval
     }
 
     private func approvalMessage(for serviceName: String) -> String {
