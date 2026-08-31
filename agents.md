@@ -62,14 +62,18 @@ engine process.
   the repository, accept the golden test key as publication authority, contact
   a network, or treat a valid signature as model/runtime/hardware evidence.
 - `fleet/` is the independently locked Nyx service. It owns explicit node
-  enrollment, authenticated snapshot polling, strict model mappings,
+  enrollment, authenticated snapshot polling, a durable universal catalog of
+  config-owned and automatically published strict model mappings,
   capacity-aware routing, bounded priority/affinity controls, process-local
   async batches, metadata-only route history, the joined fleet overview and
-  realtime dashboard, and read-only token-ledger aggregates. Batch request and
-  response content must remain bounded process memory and must never enter
-  Fleet SQLite or browser-facing admin APIs. It must run as one process unless
-  reservations and batch ownership are moved to a shared transactional
-  scheduler.
+  realtime dashboard, and read-only token-ledger aggregates. Automatic
+  publication may consume only authoritative Fleet-eligible snapshot
+  deployments; exact deployment/capability replicas collapse regardless of
+  alias, and admin suppression remains exact and durable until explicit
+  re-add. Batch request and response content must remain bounded process memory
+  and must never enter Fleet SQLite or browser-facing admin APIs. It must run
+  as one process unless reservations and batch ownership are moved to a shared
+  transactional scheduler.
 - `fleet/src/mnemosyne_fleet/pairing_store.py`, `secret_store.py`,
   `locator_policy.py`, `paired_transport.py`, `pairing_probe.py`,
   `pairing_coordinator.py`, and `pairing_api.py` implement the opt-in Hub-side
@@ -205,9 +209,15 @@ engine process.
   configuration, pairing stores, inventory, and route database below the
   private Application Support `hub` tree; the gateway remains a separate
   process on loopback `:17400` and never owns the native worker on `:1240`.
-  Promotion publishes only authoritative local snapshot deployments and
-  enrolls that independent worker as `overflow`. Fresh installs must not enable
-  the Hub automatically, while Finder replacement must refresh an enabled Hub
+  Fresh promotion defaults to Hub-only and must not enable, restart,
+  credential, or enroll the native worker. An explicit option may enroll that
+  independent worker as `overflow`, and then requires an authoritative
+  Fleet-eligible local deployment. Every active enrollment automatically
+  publishes all authoritative Fleet-eligible snapshot deployments into the
+  durable universal catalog; exact replicas collapse, alias collisions receive
+  stable deployment suffixes, and an admin removal creates an exact durable
+  suppression until explicit re-add. Fresh installs must not enable the Hub
+  automatically, while Finder replacement must refresh an enabled Hub
   registration and preserve an explicitly disabled one. Disable/uninstall must
   retain Hub identity and state unless the user separately requests a privacy
   reset.
@@ -306,8 +316,10 @@ The live `docker-compose.yml` is intentionally machine-specific and may live out
 - A public model maps to one exact deployment ID and exact capability set.
   Only authoritative immutable provenance is eligible; aliases, node IDs,
   storage paths, capacity, and live residency are excluded from deployment
-  identity. The schema, packaged copy, producers, validators, and golden
-  vectors must change together.
+  identity. Fresh authenticated snapshots automatically publish every unique
+  eligible deployment/capability identity unless it is config-owned or
+  durably suppressed; aliases only propose public names. The schema, packaged
+  copy, producers, validators, and golden vectors must change together.
 - Scheduling is warm-first and weighted least-outstanding within a tier.
   Requests without routing controls retain the normal FIFO lane; closed
   interactive/normal/batch lanes age lower priority toward admission. Exact

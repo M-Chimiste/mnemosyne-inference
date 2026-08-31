@@ -21,6 +21,7 @@ public struct HubModeConfiguration: Codable, Equatable, Sendable {
     public let publicOrigin: String
     public let localWorkerNodeID: String
     public let managedTailscaleServe: Bool
+    public let includesLocalWorker: Bool
     public let publishedDeployments: [HubPublishedDeployment]
 
     public init(
@@ -28,12 +29,14 @@ public struct HubModeConfiguration: Codable, Equatable, Sendable {
         publicOrigin: String,
         localWorkerNodeID: String,
         managedTailscaleServe: Bool,
+        includesLocalWorker: Bool = true,
         publishedDeployments: [HubPublishedDeployment]
     ) {
         self.schemaVersion = schemaVersion
         self.publicOrigin = publicOrigin
         self.localWorkerNodeID = localWorkerNodeID
         self.managedTailscaleServe = managedTailscaleServe
+        self.includesLocalWorker = includesLocalWorker
         self.publishedDeployments = publishedDeployments
     }
 
@@ -42,7 +45,37 @@ public struct HubModeConfiguration: Codable, Equatable, Sendable {
         case publicOrigin = "public_origin"
         case localWorkerNodeID = "local_worker_node_id"
         case managedTailscaleServe = "managed_tailscale_serve"
+        case includesLocalWorker = "includes_local_worker"
         case publishedDeployments = "published_deployments"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        schemaVersion = try values.decode(Int.self, forKey: .schemaVersion)
+        publicOrigin = try values.decode(String.self, forKey: .publicOrigin)
+        localWorkerNodeID = try values.decode(String.self, forKey: .localWorkerNodeID)
+        managedTailscaleServe = try values.decode(
+            Bool.self,
+            forKey: .managedTailscaleServe
+        )
+        includesLocalWorker = try values.decodeIfPresent(
+            Bool.self,
+            forKey: .includesLocalWorker
+        ) ?? true
+        publishedDeployments = try values.decode(
+            [HubPublishedDeployment].self,
+            forKey: .publishedDeployments
+        )
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encode(schemaVersion, forKey: .schemaVersion)
+        try values.encode(publicOrigin, forKey: .publicOrigin)
+        try values.encode(localWorkerNodeID, forKey: .localWorkerNodeID)
+        try values.encode(managedTailscaleServe, forKey: .managedTailscaleServe)
+        try values.encode(includesLocalWorker, forKey: .includesLocalWorker)
+        try values.encode(publishedDeployments, forKey: .publishedDeployments)
     }
 }
 
@@ -86,7 +119,7 @@ public enum HubModeError: Error, Equatable, LocalizedError {
         case .invalidWorkerIdentity:
             "The local worker did not report a valid stable node identity."
         case .noEligibleModels:
-            "Install or import at least one Fleet-eligible model before enabling Hub Mode."
+            "Install or import at least one Fleet-eligible model before including this Mac as a Hub worker."
         case .localWorkerUnavailable:
             "The local inference worker did not become ready after its credential update."
         case .localWorkerRejected:
@@ -146,7 +179,8 @@ public struct HubConfigurationStore: Sendable {
     }
 
     public func prepareSecrets(
-        nativeCredentialStore: CredentialStore
+        nativeCredentialStore: CredentialStore,
+        provisionLocalWorker: Bool = true
     ) throws -> HubModeSecrets {
         try prepareRoot()
         let secrets: HubModeSecrets
@@ -166,13 +200,15 @@ public struct HubConfigurationStore: Sendable {
             )
         }
 
-        try nativeCredentialStore.apply(
-            replacements: [
-                .fleetAPIKey: secrets.localWorkerSnapshotKey,
-                .fleetInferenceAPIKey: secrets.localWorkerDispatchKey,
-            ],
-            clearing: []
-        )
+        if provisionLocalWorker {
+            try nativeCredentialStore.apply(
+                replacements: [
+                    .fleetAPIKey: secrets.localWorkerSnapshotKey,
+                    .fleetInferenceAPIKey: secrets.localWorkerDispatchKey,
+                ],
+                clearing: []
+            )
+        }
         return secrets
     }
 
@@ -180,26 +216,35 @@ public struct HubConfigurationStore: Sendable {
         publicOrigin: String,
         localWorkerNodeID: String,
         managedTailscaleServe: Bool,
+        includesLocalWorker: Bool = true,
         deployments: [HubPublishedDeployment]
     ) throws -> HubModeConfiguration {
         try prepareRoot()
         let origin = try Self.normalizedHTTPSOrigin(publicOrigin)
-        let nodeID = localWorkerNodeID.trimmingCharacters(
+        var nodeID = localWorkerNodeID.trimmingCharacters(
             in: .whitespacesAndNewlines
         )
-        guard
-            !nodeID.isEmpty,
-            nodeID.utf8.count <= 128,
-            !nodeID.unicodeScalars.contains(where: { $0.value < 0x20 })
-        else {
-            throw HubModeError.invalidWorkerIdentity
+        if includesLocalWorker {
+            guard
+                !nodeID.isEmpty,
+                nodeID.utf8.count <= 128,
+                !nodeID.unicodeScalars.contains(where: { $0.value < 0x20 })
+            else {
+                throw HubModeError.invalidWorkerIdentity
+            }
+        } else {
+            nodeID = ""
         }
 
-        let models = try normalizedDeployments(deployments)
+        let models = try normalizedDeployments(
+            deployments,
+            requireNonempty: includesLocalWorker
+        )
         let value = HubModeConfiguration(
             publicOrigin: origin,
             localWorkerNodeID: nodeID,
             managedTailscaleServe: managedTailscaleServe,
+            includesLocalWorker: includesLocalWorker,
             publishedDeployments: models
         )
         let config = renderTOML(value)
@@ -244,7 +289,8 @@ public struct HubConfigurationStore: Sendable {
     }
 
     private func normalizedDeployments(
-        _ deployments: [HubPublishedDeployment]
+        _ deployments: [HubPublishedDeployment],
+        requireNonempty: Bool
     ) throws -> [HubPublishedDeployment] {
         let supported = Set([
             "chat/completions", "completions", "responses", "messages",
@@ -274,7 +320,9 @@ public struct HubConfigurationStore: Sendable {
                 capabilities: capabilities
             )
         }.sorted { $0.alias < $1.alias }
-        guard !values.isEmpty else { throw HubModeError.noEligibleModels }
+        if requireNonempty && values.isEmpty {
+            throw HubModeError.noEligibleModels
+        }
         return values
     }
 
@@ -324,24 +372,17 @@ public struct HubConfigurationStore: Sendable {
             "[placement]",
             "remote_installs_enabled = false",
             "recommendation_valid_seconds = 60",
-            "",
-            "[[nodes]]",
-            "node_id = \(tomlString(value.localWorkerNodeID))",
-            "url = \"http://127.0.0.1:1240\"",
-            "fleet_token_env = \"\(Self.localSnapshotKeyName)\"",
-            "inference_token_env = \"\(Self.localDispatchKeyName)\"",
-            "service_class = \"overflow\"",
-            "routing_weight = 1",
         ]
-        for deployment in value.publishedDeployments {
+        if value.includesLocalWorker {
             lines.append(contentsOf: [
                 "",
-                "[[models]]",
-                "name = \(tomlString(deployment.alias))",
-                "deployment_id = \(tomlString(deployment.deploymentID))",
-                "capabilities = [\(deployment.capabilities.map(tomlString).joined(separator: ", "))]",
-                "queue_depth = 128",
-                "queue_timeout_seconds = 120",
+                "[[nodes]]",
+                "node_id = \(tomlString(value.localWorkerNodeID))",
+                "url = \"http://127.0.0.1:1240\"",
+                "fleet_token_env = \"\(Self.localSnapshotKeyName)\"",
+                "inference_token_env = \"\(Self.localDispatchKeyName)\"",
+                "service_class = \"overflow\"",
+                "routing_weight = 1",
             ])
         }
         lines.append(contentsOf: ["", "[ledger]", ""])
@@ -517,13 +558,16 @@ public struct HubLocalSnapshotClient: Sendable {
             do {
                 return try await snapshot(snapshotKey: snapshotKey)
             } catch {
+                if let hubError = error as? HubModeError,
+                   hubError == .noEligibleModels
+                {
+                    throw hubError
+                }
                 lastError = error
                 try? await Task.sleep(for: .milliseconds(500))
             }
         }
-        if let hubError = lastError as? HubModeError,
-           hubError == .localWorkerRejected
-        {
+        if let hubError = lastError as? HubModeError {
             throw hubError
         }
         throw HubModeError.localWorkerUnavailable

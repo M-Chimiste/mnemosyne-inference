@@ -15,6 +15,94 @@ from mnemosyne_fleet.locator_policy import LocatorPolicy
 from .helpers import capacity, fleet_config, snapshot_payload
 
 
+async def test_universal_catalog_admin_can_suppress_and_restore_a_live_route(
+    tmp_path,
+) -> None:
+    def registry_handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=snapshot_payload("node-a"))
+
+    def proxy_handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"ok": True})
+
+    config = replace(fleet_config(tmp_path), models=())
+    app = create_app(
+        config,
+        registry_client=httpx.AsyncClient(
+            transport=httpx.MockTransport(registry_handler)
+        ),
+        proxy_client=httpx.AsyncClient(
+            transport=httpx.MockTransport(proxy_handler)
+        ),
+        start_polling=False,
+    )
+
+    async with app.router.lifespan_context(app):
+        await app.state.registry.poll_all_once()
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://fleet",
+        ) as client:
+            headers = {"Authorization": "Bearer admin-key"}
+            catalog = (
+                await client.get("/fleet/api/model-catalog", headers=headers)
+            ).json()
+            mapping = catalog["mappings"][0]
+            assert mapping["public_model"] == "node-a-qwen"
+            assert mapping["source"] == "auto"
+            models = await client.get(
+                "/v1/models",
+                headers={"Authorization": "Bearer client-key"},
+            )
+            assert [row["id"] for row in models.json()["data"]] == [
+                "node-a-qwen"
+            ]
+
+            removed = await client.post(
+                "/fleet/api/model-catalog/remove",
+                headers=headers,
+                json={
+                    "schema_version": 1,
+                    "public_model": mapping["public_model"],
+                },
+            )
+            assert removed.status_code == 204
+            suppressed = (
+                await client.get("/fleet/api/model-catalog", headers=headers)
+            ).json()
+            assert suppressed["mappings"] == []
+            assert suppressed["candidates"][0]["suppressed"] is True
+            models = await client.get(
+                "/v1/models",
+                headers={"Authorization": "Bearer client-key"},
+            )
+            assert models.json()["data"] == []
+
+            restored = await client.post(
+                "/fleet/api/model-catalog",
+                headers=headers,
+                json={
+                    "schema_version": 1,
+                    "public_model": "universal-qwen",
+                    "origin_alias": suppressed["candidates"][0][
+                        "origin_alias"
+                    ],
+                    "deployment_id": suppressed["candidates"][0][
+                        "deployment_id"
+                    ],
+                    "capabilities": suppressed["candidates"][0][
+                        "capabilities"
+                    ],
+                },
+            )
+            assert restored.status_code == 201
+            inference = await client.post(
+                "/v1/responses",
+                headers={"Authorization": "Bearer client-key"},
+                json={"model": "universal-qwen", "input": "hello"},
+            )
+            assert inference.status_code == 200
+
+
 async def test_owned_clients_leave_active_capacity_to_the_scheduler(
     tmp_path,
     monkeypatch,

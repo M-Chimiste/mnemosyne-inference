@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
 import time
 from dataclasses import dataclass
@@ -26,6 +27,27 @@ class RouteRecord:
     @property
     def reporting_node_id(self) -> str:
         return self.node_id
+
+
+@dataclass(frozen=True, slots=True)
+class ManagedModelRecord:
+    public_model: str
+    origin_alias: str
+    deployment_id: str
+    capabilities: tuple[str, ...]
+    queue_depth: int
+    queue_timeout_seconds: float
+    source: str
+    created_at: float
+    updated_at: float
+
+
+@dataclass(frozen=True, slots=True)
+class ModelSuppressionRecord:
+    origin_alias: str
+    deployment_id: str
+    capabilities: tuple[str, ...]
+    suppressed_at: float
 
 
 class FleetStore:
@@ -71,6 +93,33 @@ class FleetStore:
                     deployment_id TEXT NOT NULL,
                     configured_at REAL NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS managed_model_catalog (
+                    public_model TEXT PRIMARY KEY,
+                    origin_alias TEXT NOT NULL,
+                    deployment_id TEXT NOT NULL,
+                    capabilities_json TEXT NOT NULL,
+                    queue_depth INTEGER NOT NULL,
+                    queue_timeout_seconds REAL NOT NULL,
+                    source TEXT NOT NULL CHECK(source IN ('auto', 'admin')),
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS managed_model_deployment_idx
+                    ON managed_model_catalog(
+                        deployment_id, capabilities_json
+                    );
+                CREATE TABLE IF NOT EXISTS model_catalog_suppressions (
+                    origin_alias TEXT NOT NULL,
+                    deployment_id TEXT NOT NULL,
+                    capabilities_json TEXT NOT NULL,
+                    suppressed_at REAL NOT NULL,
+                    PRIMARY KEY(deployment_id, capabilities_json)
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS
+                    model_catalog_suppression_deployment_idx
+                    ON model_catalog_suppressions(
+                        deployment_id, capabilities_json
+                    );
                 CREATE TABLE IF NOT EXISTS routes (
                     route_id TEXT PRIMARY KEY,
                     started_at REAL NOT NULL,
@@ -145,6 +194,8 @@ class FleetStore:
                     f"DELETE FROM enrolled_nodes WHERE node_id NOT IN ({placeholders})",
                     node_ids,
                 )
+            else:
+                conn.execute("DELETE FROM enrolled_nodes")
             model_names = tuple(row[0] for row in models)
             placeholders = ",".join("?" for _ in model_names)
             if placeholders:
@@ -152,6 +203,174 @@ class FleetStore:
                     f"DELETE FROM logical_models WHERE public_model NOT IN ({placeholders})",
                     model_names,
                 )
+            else:
+                conn.execute("DELETE FROM logical_models")
+
+    async def managed_models(self) -> tuple[ManagedModelRecord, ...]:
+        async with self._lock:
+            return await asyncio.to_thread(self._managed_models_sync)
+
+    def _managed_models_sync(self) -> tuple[ManagedModelRecord, ...]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT public_model, origin_alias, deployment_id,
+                       capabilities_json, queue_depth,
+                       queue_timeout_seconds, source, created_at, updated_at
+                  FROM managed_model_catalog
+                 ORDER BY public_model
+                """
+            ).fetchall()
+        return tuple(
+            ManagedModelRecord(
+                public_model=str(row["public_model"]),
+                origin_alias=str(row["origin_alias"]),
+                deployment_id=str(row["deployment_id"]),
+                capabilities=tuple(json.loads(row["capabilities_json"])),
+                queue_depth=int(row["queue_depth"]),
+                queue_timeout_seconds=float(row["queue_timeout_seconds"]),
+                source=str(row["source"]),
+                created_at=float(row["created_at"]),
+                updated_at=float(row["updated_at"]),
+            )
+            for row in rows
+        )
+
+    async def model_suppressions(self) -> tuple[ModelSuppressionRecord, ...]:
+        async with self._lock:
+            return await asyncio.to_thread(self._model_suppressions_sync)
+
+    def _model_suppressions_sync(self) -> tuple[ModelSuppressionRecord, ...]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT origin_alias, deployment_id, capabilities_json,
+                       suppressed_at
+                  FROM model_catalog_suppressions
+                 ORDER BY suppressed_at, origin_alias
+                """
+            ).fetchall()
+        return tuple(
+            ModelSuppressionRecord(
+                origin_alias=str(row["origin_alias"]),
+                deployment_id=str(row["deployment_id"]),
+                capabilities=tuple(json.loads(row["capabilities_json"])),
+                suppressed_at=float(row["suppressed_at"]),
+            )
+            for row in rows
+        )
+
+    async def put_managed_model(self, record: ManagedModelRecord) -> None:
+        async with self._lock:
+            await asyncio.to_thread(self._put_managed_model_sync, record)
+
+    def _put_managed_model_sync(self, record: ManagedModelRecord) -> None:
+        capabilities_json = json.dumps(
+            list(record.capabilities), separators=(",", ":")
+        )
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO managed_model_catalog(
+                    public_model, origin_alias, deployment_id,
+                    capabilities_json, queue_depth, queue_timeout_seconds,
+                    source, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(public_model) DO UPDATE SET
+                    origin_alias=excluded.origin_alias,
+                    deployment_id=excluded.deployment_id,
+                    capabilities_json=excluded.capabilities_json,
+                    queue_depth=excluded.queue_depth,
+                    queue_timeout_seconds=excluded.queue_timeout_seconds,
+                    source=excluded.source,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    record.public_model,
+                    record.origin_alias,
+                    record.deployment_id,
+                    capabilities_json,
+                    record.queue_depth,
+                    record.queue_timeout_seconds,
+                    record.source,
+                    record.created_at,
+                    record.updated_at,
+                ),
+            )
+            conn.execute(
+                """
+                DELETE FROM model_catalog_suppressions
+                 WHERE deployment_id=? AND capabilities_json=?
+                """,
+                (
+                    record.deployment_id,
+                    capabilities_json,
+                ),
+            )
+
+    async def remove_managed_model(
+        self,
+        public_model: str,
+        *,
+        suppress: bool,
+    ) -> ManagedModelRecord | None:
+        async with self._lock:
+            return await asyncio.to_thread(
+                self._remove_managed_model_sync,
+                public_model,
+                suppress,
+            )
+
+    def _remove_managed_model_sync(
+        self,
+        public_model: str,
+        suppress: bool,
+    ) -> ManagedModelRecord | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT public_model, origin_alias, deployment_id,
+                       capabilities_json, queue_depth,
+                       queue_timeout_seconds, source, created_at, updated_at
+                  FROM managed_model_catalog WHERE public_model=?
+                """,
+                (public_model,),
+            ).fetchone()
+            if row is None:
+                return None
+            conn.execute(
+                "DELETE FROM managed_model_catalog WHERE public_model=?",
+                (public_model,),
+            )
+            if suppress:
+                conn.execute(
+                    """
+                    INSERT INTO model_catalog_suppressions(
+                        origin_alias, deployment_id, capabilities_json,
+                        suppressed_at
+                    ) VALUES (?, ?, ?, ?)
+                    ON CONFLICT(deployment_id, capabilities_json) DO UPDATE SET
+                        origin_alias=excluded.origin_alias,
+                        suppressed_at=excluded.suppressed_at
+                    """,
+                    (
+                        row["origin_alias"],
+                        row["deployment_id"],
+                        row["capabilities_json"],
+                        time.time(),
+                    ),
+                )
+        return ManagedModelRecord(
+            public_model=str(row["public_model"]),
+            origin_alias=str(row["origin_alias"]),
+            deployment_id=str(row["deployment_id"]),
+            capabilities=tuple(json.loads(row["capabilities_json"])),
+            queue_depth=int(row["queue_depth"]),
+            queue_timeout_seconds=float(row["queue_timeout_seconds"]),
+            source=str(row["source"]),
+            created_at=float(row["created_at"]),
+            updated_at=float(row["updated_at"]),
+        )
 
     async def start_route(self, record: RouteRecord) -> None:
         async with self._lock:

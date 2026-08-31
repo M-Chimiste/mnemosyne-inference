@@ -26,15 +26,16 @@ never connects directly to a node. Nyx does not receive node administrative
 credentials. Node control-plane mutation routes remain outside the fleet
 protocol.
 
-The macOS Hub Mode pilot preserves the same boundary. It generates five
-distinct random values for the public client, dashboard admin, pairing master,
-local snapshot, and local Fleet-dispatch roles. Hub secrets live in a private
+The macOS Hub Mode pilot preserves the same boundary. It generates distinct
+random values for the public client, dashboard admin, pairing master, local
+snapshot, and local Fleet-dispatch roles. Hub secrets live in a private
 mode-0600 environment below Application Support; Hub TOML names only their
-environment variables. Only the two local-worker values are added to the
-native private `.env`, without replacing token-ledger or unrelated settings.
-The Hub binds loopback `:17400`; the guided remote exposure is a separate
-Tailscale Serve HTTPS listener. Copying the client or admin value requires an
-explicit UI action.
+environment variables. In default Hub-only mode, the native private `.env` is
+not changed and the local worker is not restarted or enrolled. Only when the
+operator explicitly includes the local worker are its two values added,
+without replacing token-ledger or unrelated settings. The Hub binds loopback
+`:17400`; the guided remote exposure is a separate Tailscale Serve HTTPS
+listener. Copying the client or admin value requires an explicit UI action.
 
 LAN and Tailscale are transport choices, not identities. An address discovered
 through DNS or MagicDNS is never enrolled automatically.

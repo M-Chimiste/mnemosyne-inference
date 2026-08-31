@@ -1120,9 +1120,6 @@ def load_config(
                 ),
             )
         )
-    if not models:
-        raise ConfigError("at least one [[models]] mapping is required")
-
     ledger_raw = raw.get("ledger", {})
     if not isinstance(ledger_raw, dict):
         raise ConfigError("[ledger] must be a table")

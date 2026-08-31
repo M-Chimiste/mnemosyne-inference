@@ -51,7 +51,7 @@ func hubModeCreatesSeparatedCredentials() throws {
     #expect((attributes[.posixPermissions] as? NSNumber)?.intValue == 0o600)
 }
 
-@Test("Hub configuration publishes authoritative models and keeps secrets outside TOML")
+@Test("Hub configuration enrolls an optional local worker while the Fleet catalog owns routes")
 func hubModeRendersClosedFleetConfiguration() throws {
     let temporary = FileManager.default.temporaryDirectory
         .appending(path: UUID().uuidString, directoryHint: .isDirectory)
@@ -77,6 +77,7 @@ func hubModeRendersClosedFleetConfiguration() throws {
 
     #expect(saved.publicOrigin == "https://nyx.example.ts.net")
     #expect(saved.localWorkerNodeID == "nyx-worker")
+    #expect(saved.includesLocalWorker)
     #expect(saved.publishedDeployments.first?.capabilities == [
         "chat/completions", "responses",
     ])
@@ -88,13 +89,82 @@ func hubModeRendersClosedFleetConfiguration() throws {
     #expect(config.contains("url = \"http://127.0.0.1:1240\""))
     #expect(config.contains("service_class = \"overflow\""))
     #expect(config.contains("enabled = true"))
-    #expect(config.contains("deployment_id = \"\(deployment.deploymentID)\""))
+    #expect(!config.contains("[[models]]"))
+    #expect(!config.contains("deployment_id = \"\(deployment.deploymentID)\""))
     #expect(config.contains("api_key_env = \"MNEMOSYNE_FLEET_CLIENT_KEY\""))
     #expect(!config.contains(secrets.clientKey))
     #expect(!config.contains(secrets.adminKey))
     #expect(!config.contains(secrets.pairingMasterKey))
     #expect(!config.contains(secrets.localWorkerSnapshotKey))
     #expect(!config.contains(secrets.localWorkerDispatchKey))
+}
+
+@Test("Hub-only configuration does not provision or enroll the local worker")
+func hubOnlyModeRendersWithoutLocalInference() throws {
+    let temporary = FileManager.default.temporaryDirectory
+        .appending(path: UUID().uuidString, directoryHint: .isDirectory)
+    defer { try? FileManager.default.removeItem(at: temporary) }
+    try FileManager.default.createDirectory(
+        at: temporary,
+        withIntermediateDirectories: true
+    )
+    let nativeEnvironment = temporary.appending(path: "native.env")
+    try Data("TOKEN_LEDGER_DSN=preserved\n".utf8).write(to: nativeEnvironment)
+    let hubStore = HubConfigurationStore(
+        rootURL: temporary.appending(path: "hub", directoryHint: .isDirectory)
+    )
+
+    _ = try hubStore.prepareSecrets(
+        nativeCredentialStore: CredentialStore(
+            environmentURL: nativeEnvironment
+        ),
+        provisionLocalWorker: false
+    )
+    let saved = try hubStore.saveConfiguration(
+        publicOrigin: "https://nyx.example.ts.net",
+        localWorkerNodeID: "nyx",
+        managedTailscaleServe: true,
+        includesLocalWorker: false,
+        deployments: []
+    )
+
+    #expect(!saved.includesLocalWorker)
+    #expect(saved.localWorkerNodeID.isEmpty)
+    #expect(saved.publishedDeployments.isEmpty)
+    #expect(try hubStore.loadConfiguration() == saved)
+    let nativeText = try String(
+        contentsOf: nativeEnvironment,
+        encoding: .utf8
+    )
+    #expect(nativeText == "TOKEN_LEDGER_DSN=preserved\n")
+    let config = try String(
+        contentsOf: hubStore.configurationURL,
+        encoding: .utf8
+    )
+    #expect(config.contains("[pairing]"))
+    #expect(config.contains("enabled = true"))
+    #expect(!config.contains("[[nodes]]"))
+    #expect(!config.contains("[[models]]"))
+}
+
+@Test("Older Hub metadata continues to include its local worker")
+func legacyHubMetadataDefaultsToLocalWorker() throws {
+    let data = Data(
+        """
+        {
+          "schema_version": 1,
+          "public_origin": "https://nyx.example.ts.net",
+          "local_worker_node_id": "nyx",
+          "managed_tailscale_serve": true,
+          "published_deployments": []
+        }
+        """.utf8
+    )
+    let decoded = try JSONDecoder().decode(
+        HubModeConfiguration.self,
+        from: data
+    )
+    #expect(decoded.includesLocalWorker)
 }
 
 @Test("Hub Mode refuses unsafe origins and empty deployment authority")

@@ -6,9 +6,18 @@ engine, download, release, or hardware smoke checks.
 
 For the bundled macOS Hub pilot, also require:
 
-- Hub promotion refuses a Mac with no authoritative Fleet-eligible local model;
-- the resulting Hub and native worker have separate PIDs, listeners, state
-  roots, and credentials, with the local worker fixed to `overflow`;
+- Hub-only promotion succeeds with no local models, does not enable, restart,
+  credential, or enroll the native worker, and starts with zero static model
+  mappings;
+- optional local-worker promotion still refuses a Mac with no authoritative
+  Fleet-eligible model, and the resulting Hub and worker have separate PIDs,
+  listeners, state roots, and credentials with the worker fixed to `overflow`;
+- every fresh authenticated node snapshot publishes all authoritative
+  Fleet-eligible models into the universal catalog; exact replicas share one
+  route and conflicting aliases receive stable deployment suffixes;
+- removing one managed route suppresses that exact candidate across later
+  polls and Hub restart, while explicit re-add restores routing without
+  changing model files or node configuration;
 - the Hub binds only `127.0.0.1:17400`, and its configured HTTPS origin reaches
   it through the intended private proxy;
 - invitation create, Mac claim, exact-locator approval, activation, explicit
@@ -16,7 +25,8 @@ For the bundled macOS Hub pilot, also require:
   pass on the signed candidate across representative Macs;
 - Finder replacement refreshes an enabled Hub login registration but leaves an
   explicitly disabled one disabled; both paths retain the exact Hub identity,
-  pairing generations, inventory, mappings, and route history;
+  pairing generations, inventory, catalog mappings/suppressions, and route
+  history;
 - the preserve-data uninstaller refuses while the Hub job is active and retains
   the Hub directory after the exact app and managed runtimes move to Trash.
 

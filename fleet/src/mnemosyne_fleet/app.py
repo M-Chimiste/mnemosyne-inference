@@ -15,7 +15,7 @@ from pathlib import Path
 
 import httpx
 from fastapi import Depends, FastAPI, Query, Request
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 
 from .catalog_service import FleetCatalogService
 from .batch import BatchAPIError, BatchManager
@@ -54,6 +54,7 @@ from .inventory_store import (
     InventoryStoreError,
 )
 from .locator_policy import LocatorPolicy, LocatorPolicyError
+from .model_catalog import ModelCatalogError, UniversalModelCatalog
 from .pairing_api import (
     ActivationAcknowledgement,
     ClaimApproval,
@@ -498,7 +499,21 @@ def create_app(
         paired_client_factory=paired_registry_client_factory,
     )
     scheduler = Scheduler(registry=registry, models=config.models, nodes=config.nodes)
-    registry.set_on_change(scheduler.wake)
+    model_catalog = UniversalModelCatalog(
+        store=store,
+        scheduler=scheduler,
+        registry=registry,
+        configured_models=config.models,
+    )
+
+    async def registry_changed() -> None:
+        try:
+            if model_catalog.initialized:
+                await model_catalog.reconcile()
+        finally:
+            await scheduler.wake()
+
+    registry.set_on_change(registry_changed)
     proxy = FleetProxy(
         scheduler=scheduler,
         store=store,
@@ -648,6 +663,15 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
+        await store.initialize(
+            node_ids=tuple(
+                node.reporting_node_id for node in registry.enrollments()
+            ),
+            models=tuple(
+                (model.name, model.deployment_id) for model in config.models
+            ),
+        )
+        await model_catalog.initialize()
         if inventory_store is not None:
             try:
                 await inventory_store.initialize()
@@ -686,12 +710,6 @@ def create_app(
             await catalog_service.initialize()
             if start_catalog_updates:
                 await catalog_service.start()
-        await store.initialize(
-            node_ids=tuple(
-                node.reporting_node_id for node in registry.enrollments()
-            ),
-            models=tuple((model.name, model.deployment_id) for model in config.models),
-        )
         if start_polling:
             await registry.start()
         try:
@@ -717,6 +735,7 @@ def create_app(
     app.state.config = config
     app.state.registry = registry
     app.state.scheduler = scheduler
+    app.state.model_catalog = model_catalog
     app.state.store = store
     app.state.proxy = proxy
     app.state.batches = batches
@@ -1974,6 +1993,7 @@ def create_app(
             "scheduler": scheduler.status(),
             "batches": batches.summary(),
             "routes": await store.recent_routes(limit=100),
+            "model_catalog": await model_catalog.status(),
             "usage_configured": usage.configured,
             "mac_pool": mac_pool_status_payload(),
             "overview": await fleet_overview_payload(),
@@ -1982,6 +2002,127 @@ def create_app(
     @app.get("/fleet/api/overview", dependencies=[Depends(require_admin)])
     async def fleet_overview() -> dict[str, object]:
         return await fleet_overview_payload()
+
+    def model_catalog_error(error: ModelCatalogError) -> JSONResponse:
+        return JSONResponse(
+            status_code=error.status_code,
+            content={
+                "detail": {
+                    "code": error.code,
+                    "message": "The universal model catalog request was not accepted.",
+                }
+            },
+        )
+
+    async def model_catalog_payload(request: Request) -> dict[str, object]:
+        maximum = 64 * 1024
+        if request.headers.get("content-encoding", "identity").lower() != "identity":
+            raise ModelCatalogError(
+                "model_catalog_content_encoding_unsupported",
+                status_code=415,
+            )
+        if request.headers.get("content-type", "").split(";", 1)[0].lower() != (
+            "application/json"
+        ):
+            raise ModelCatalogError(
+                "model_catalog_json_required",
+                status_code=415,
+            )
+        declared = request.headers.get("content-length")
+        if declared is not None:
+            try:
+                declared_length = int(declared)
+            except ValueError as exc:
+                raise ModelCatalogError(
+                    "model_catalog_request_invalid",
+                    status_code=400,
+                ) from exc
+            if declared_length < 0 or declared_length > maximum:
+                raise ModelCatalogError(
+                    "model_catalog_request_too_large",
+                    status_code=413,
+                )
+        body = bytearray()
+        async for chunk in request.stream():
+            body.extend(chunk)
+            if len(body) > maximum:
+                raise ModelCatalogError(
+                    "model_catalog_request_too_large",
+                    status_code=413,
+                )
+        try:
+            value = json.loads(body)
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise ModelCatalogError(
+                "model_catalog_request_invalid",
+                status_code=400,
+            ) from exc
+        if not isinstance(value, dict) or value.get("schema_version") != 1:
+            raise ModelCatalogError(
+                "model_catalog_request_invalid",
+                status_code=422,
+            )
+        return value
+
+    @app.get(
+        "/fleet/api/model-catalog",
+        dependencies=[Depends(require_admin)],
+    )
+    async def universal_model_catalog() -> dict[str, object]:
+        return await model_catalog.status()
+
+    @app.post(
+        "/fleet/api/model-catalog",
+        dependencies=[Depends(require_admin)],
+    )
+    async def publish_model_catalog_entry(request: Request):
+        try:
+            payload = await model_catalog_payload(request)
+            allowed = {
+                "schema_version",
+                "public_model",
+                "origin_alias",
+                "deployment_id",
+                "capabilities",
+            }
+            if set(payload) != allowed:
+                raise ModelCatalogError(
+                    "model_catalog_request_invalid",
+                    status_code=422,
+                )
+            public_model = await model_catalog.add(
+                public_model=payload.get("public_model"),
+                origin_alias=payload.get("origin_alias"),
+                deployment_id=payload.get("deployment_id"),
+                capabilities=payload.get("capabilities"),
+            )
+        except ModelCatalogError as error:
+            return model_catalog_error(error)
+        return JSONResponse(
+            status_code=201,
+            content={
+                "schema_version": 1,
+                "public_model": public_model,
+                "catalog": await model_catalog.status(),
+            },
+        )
+
+    @app.post(
+        "/fleet/api/model-catalog/remove",
+        dependencies=[Depends(require_admin)],
+    )
+    async def suppress_model_catalog_entry(request: Request):
+        try:
+            payload = await model_catalog_payload(request)
+            if set(payload) != {"schema_version", "public_model"}:
+                raise ModelCatalogError(
+                    "model_catalog_request_invalid",
+                    status_code=422,
+                )
+            await model_catalog.remove(payload.get("public_model"))
+        except ModelCatalogError as error:
+            return model_catalog_error(error)
+        return Response(status_code=204)
 
     @app.get("/fleet/api/usage", dependencies=[Depends(require_admin)])
     async def fleet_usage(
@@ -2037,6 +2178,7 @@ def create_app(
                     "observed_at": time.time(),
                     "nodes": registry.status(),
                     "models": scheduler.model_matrix(),
+                    "model_catalog": await model_catalog.status(),
                     "scheduler": scheduler.status(),
                     "batches": batches.summary(),
                     "overview": await fleet_overview_payload(

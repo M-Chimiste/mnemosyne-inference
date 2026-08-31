@@ -16,7 +16,7 @@ from mnemosyne_macos.install_launch import (
     OMLXInstallLaunch,
     with_omlx_target_launch,
 )
-from mnemosyne_macos.models import EngineName, ServiceState
+from mnemosyne_macos.models import EngineName, EngineSnapshot, ServiceState
 from mnemosyne_macos.runtime import NativeRuntime
 
 
@@ -716,6 +716,14 @@ async def test_failed_model_directory_sync_stays_pending_and_retries_after_recon
     )
     Path(config.storage.locations[0].path).mkdir()
     adapter = OMLXAdapter(OMLXConfig())
+    adapter.inspect = AsyncMock(  # type: ignore[method-assign]
+        return_value=EngineSnapshot(
+            engine=EngineName.OMLX,
+            residents=(),
+            authoritative=True,
+            service_state=ServiceState.READY,
+        )
+    )
     register = AsyncMock(side_effect=[RuntimeError("oMLX is starting"), None])
     adapter.register_model_directories = register  # type: ignore[method-assign]
     runtime = object.__new__(NativeRuntime)
@@ -739,6 +747,60 @@ async def test_failed_model_directory_sync_stays_pending_and_retries_after_recon
     assert register.await_count == 2
     assert runtime._omlx_directory_sync_pending is False
     assert runtime.startup_error is None
+    await adapter.aclose()
+
+
+@pytest.mark.asyncio
+async def test_stopped_omlx_directory_sync_stays_pending_without_global_degradation(
+    tmp_path: Path,
+) -> None:
+    class Coordinator:
+        def __init__(self) -> None:
+            self.events: list[str] = []
+
+        async def run_empty_maintenance(self, operation, *, name: str) -> None:
+            self.events.append(f"maintenance:{name}")
+            await operation(Deadline.after(1))
+
+    config = MacConfig.model_validate(
+        {
+            "engines": {
+                "llama_cpp": {"enabled": False},
+                "omlx": {"enabled": True},
+                "ds4": {"enabled": False},
+            },
+            "paths": {"state_database": str(tmp_path / "state.db")},
+            "storage": {
+                "default": "models",
+                "locations": [
+                    {"name": "models", "path": str(tmp_path / "models")}
+                ],
+            },
+        }
+    )
+    Path(config.storage.locations[0].path).mkdir()
+    adapter = OMLXAdapter(OMLXConfig())
+    adapter.inspect = AsyncMock(  # type: ignore[method-assign]
+        return_value=EngineSnapshot(
+            engine=EngineName.OMLX,
+            residents=(),
+            authoritative=True,
+            service_state=ServiceState.STOPPED,
+        )
+    )
+    register = AsyncMock()
+    adapter.register_model_directories = register  # type: ignore[method-assign]
+    runtime = object.__new__(NativeRuntime)
+    runtime.config = config
+    runtime.adapters = {EngineName.OMLX: adapter}
+    runtime.coordinator = Coordinator()
+    runtime._omlx_directory_sync_pending = False
+
+    await runtime._sync_omlx_model_directories()
+
+    assert runtime._omlx_directory_sync_pending is True
+    assert runtime.coordinator.events == []
+    register.assert_not_awaited()
     await adapter.aclose()
 
 

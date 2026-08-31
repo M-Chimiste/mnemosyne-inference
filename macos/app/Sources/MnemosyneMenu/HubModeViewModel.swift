@@ -14,6 +14,7 @@ final class HubModeViewModel: ObservableObject {
 
     @Published var exposureMode: ExposureMode = .tailscale
     @Published var customPublicOrigin = ""
+    @Published var includeLocalWorker = false
     @Published private(set) var configuration: HubModeConfiguration?
     @Published private(set) var isWorking = false
     @Published private(set) var hubHealthy = false
@@ -35,6 +36,7 @@ final class HubModeViewModel: ObservableObject {
             customPublicOrigin = existing.publicOrigin
             exposureMode = existing.managedTailscaleServe
                 ? .tailscale : .existingHTTPS
+            includeLocalWorker = existing.includesLocalWorker
         }
     }
 
@@ -45,6 +47,7 @@ final class HubModeViewModel: ObservableObject {
             customPublicOrigin = configuration.publicOrigin
             exposureMode = configuration.managedTailscaleServe
                 ? .tailscale : .existingHTTPS
+            includeLocalWorker = configuration.includesLocalWorker
         }
         hubHealthy = await healthCheck()
         updateStatus(registration: registration)
@@ -76,41 +79,47 @@ final class HubModeViewModel: ObservableObject {
                 )
             }
 
-            if registration.agentStatus != .enabled {
-                statusMessage = "Enabling the local inference worker…"
-                await registration.enableAgent()
-                guard registration.agentStatus == .enabled else {
-                    throw HubModePresentationError.registration(
-                        registration.lastError
-                            ?? "Approve the background service in Login Items, then try again."
-                    )
-                }
-            }
-
             let credentialStore = CredentialStore(
                 environmentURL: controlConfiguration.environmentURL
             )
             let secrets = try store.prepareSecrets(
-                nativeCredentialStore: credentialStore
+                nativeCredentialStore: credentialStore,
+                provisionLocalWorker: includeLocalWorker
             )
-            statusMessage = "Restarting the local worker with its Hub-only credentials…"
-            guard await registration.restartAgent() else {
-                throw HubModePresentationError.registration(
-                    registration.lastError ?? "The local worker could not restart."
+            var nodeID = fallbackWorkerNodeID
+            var deployments: [HubPublishedDeployment] = []
+            if includeLocalWorker {
+                if registration.agentStatus != .enabled {
+                    statusMessage = "Enabling the local inference worker…"
+                    await registration.enableAgent()
+                    guard registration.agentStatus == .enabled else {
+                        throw HubModePresentationError.registration(
+                            registration.lastError
+                                ?? "Approve the background service in Login Items, then try again."
+                        )
+                    }
+                }
+                statusMessage = "Restarting the local worker with its Hub credentials…"
+                guard await registration.restartAgent() else {
+                    throw HubModePresentationError.registration(
+                        registration.lastError
+                            ?? "The local worker could not restart."
+                    )
+                }
+                statusMessage = "Verifying Fleet-eligible local models…"
+                let local = try await snapshotClient.waitForEligibleSnapshot(
+                    snapshotKey: secrets.localWorkerSnapshotKey
                 )
+                nodeID = local.nodeID.isEmpty
+                    ? fallbackWorkerNodeID : local.nodeID
+                deployments = local.deployments
             }
-
-            statusMessage = "Publishing Fleet-eligible local models…"
-            let local = try await snapshotClient.waitForEligibleSnapshot(
-                snapshotKey: secrets.localWorkerSnapshotKey
-            )
-            let nodeID = local.nodeID.isEmpty
-                ? fallbackWorkerNodeID : local.nodeID
             let saved = try store.saveConfiguration(
                 publicOrigin: publicOrigin,
                 localWorkerNodeID: nodeID,
                 managedTailscaleServe: discovery != nil,
-                deployments: local.deployments
+                includesLocalWorker: includeLocalWorker,
+                deployments: deployments
             )
             configuration = saved
             customPublicOrigin = saved.publicOrigin
@@ -141,40 +150,9 @@ final class HubModeViewModel: ObservableObject {
             }
             hubHealthy = true
             isError = false
-            statusMessage = "This Mac is running Fleet Hub. Its local worker is enrolled as LIMITED / overflow."
-        } catch {
-            hubHealthy = await healthCheck()
-            isError = true
-            statusMessage = error.localizedDescription
-        }
-    }
-
-    func syncLocalModels(registration: LaunchAgentRegistration) async {
-        guard !isWorking, let existing = configuration else { return }
-        isWorking = true
-        isError = false
-        statusMessage = "Refreshing Fleet-eligible local models…"
-        defer { isWorking = false }
-        do {
-            let secrets = try store.prepareSecrets(
-                nativeCredentialStore: CredentialStore(
-                    environmentURL: controlConfiguration.environmentURL
-                )
-            )
-            let local = try await snapshotClient.waitForEligibleSnapshot(
-                snapshotKey: secrets.localWorkerSnapshotKey
-            )
-            configuration = try store.saveConfiguration(
-                publicOrigin: existing.publicOrigin,
-                localWorkerNodeID: local.nodeID,
-                managedTailscaleServe: existing.managedTailscaleServe,
-                deployments: local.deployments
-            )
-            guard await registration.restartHubAgent(), await waitForHealth() else {
-                throw HubModePresentationError.health
-            }
-            hubHealthy = true
-            statusMessage = "Hub model mappings now match this Mac's eligible local models."
+            statusMessage = includeLocalWorker
+                ? "This Mac is running Fleet Hub with its local worker enrolled as LIMITED / overflow."
+                : "This Mac is running Fleet Hub without local inference overhead. Enrolled nodes publish their eligible models automatically."
         } catch {
             hubHealthy = await healthCheck()
             isError = true

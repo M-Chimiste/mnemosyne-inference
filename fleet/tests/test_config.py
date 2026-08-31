@@ -9,6 +9,79 @@ PAIRING_MASTER_KEY = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 CATALOG_PUBLIC_KEY = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA"
 
 
+def test_pairing_hub_can_start_without_static_nodes_or_models(tmp_path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text(
+        f"""
+[server]
+api_key_env = "CLIENT"
+admin_api_key_env = "ADMIN"
+database_path = "{tmp_path / 'fleet.db'}"
+poll_interval_seconds = 1
+snapshot_ttl_seconds = 2
+
+[pairing]
+enabled = true
+public_origin = "https://nyx.example.ts.net"
+master_key_env = "PAIRING_MASTER"
+metadata_database_path = "{tmp_path / 'private' / 'pairing.db'}"
+secret_database_path = "{tmp_path / 'private' / 'secrets.db'}"
+inventory_database_path = "{tmp_path / 'inventory.db'}"
+https_cidr_allowlist = ["100.64.0.0/10"]
+tailscale_cidr_allowlist = ["100.64.0.0/10"]
+trusted_lan_http_cidr_allowlist = []
+""",
+        encoding="utf-8",
+    )
+
+    config = load_config(
+        path,
+        environ={
+            "CLIENT": "client",
+            "ADMIN": "admin",
+            "PAIRING_MASTER": PAIRING_MASTER_KEY,
+        },
+    )
+
+    assert config.pairing.enabled is True
+    assert config.nodes == ()
+    assert config.models == ()
+
+
+def test_static_nodes_can_publish_without_an_explicit_model_mapping(
+    tmp_path,
+) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text(
+        """
+[server]
+api_key_env = "CLIENT"
+admin_api_key_env = "ADMIN"
+poll_interval_seconds = 1
+snapshot_ttl_seconds = 2
+
+[[nodes]]
+node_id = "node"
+url = "http://node"
+fleet_token_env = "FLEET"
+inference_token_env = "INFER"
+""",
+        encoding="utf-8",
+    )
+
+    config = load_config(
+        path,
+        environ={
+            "CLIENT": "client",
+            "ADMIN": "admin",
+            "FLEET": "fleet",
+            "INFER": "infer",
+        },
+    )
+    assert len(config.nodes) == 1
+    assert config.models == ()
+
+
 def test_pairing_is_disabled_by_default_and_static_config_stays_compatible(
     tmp_path,
 ) -> None:

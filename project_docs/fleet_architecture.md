@@ -9,8 +9,10 @@ The Mac pilot now embeds Fleet as an independently launched, opt-in Hub Mode.
 It creates private Hub configuration and credentials outside the app bundle,
 runs the gateway on loopback `:17400`, and optionally asks Tailscale Serve to
 publish that listener through tailnet HTTPS. It does not merge the gateway and
-native manager processes or their mutable state. Signed multi-host acceptance
-is still required before treating this convenience path as production.
+native manager processes or their mutable state. A fresh configuration is
+Hub-only by default; an explicit option separately enrolls the native manager
+as an overflow worker. Signed multi-host acceptance is still required before
+treating this convenience path as production.
 
 ## Purpose
 
@@ -32,7 +34,8 @@ Nyx owns:
 
 - enrollment of trusted nodes and their credentials;
 - polling and expiry of live node snapshots;
-- strict logical-model to deployment mappings;
+- a durable universal catalog that derives strict logical-model mappings from
+  every authoritative Fleet-eligible snapshot deployment;
 - capacity-aware request scheduling and bounded fleet queues;
 - the single public inference endpoint;
 - realtime fleet status and historical usage presentation.
@@ -96,6 +99,31 @@ and token-ledger `reporting_node_id`; persisted snapshots never regain routing
 authority after restart without a fresh poll. Static and paired records share
 the scheduler but retain explicit source and credential ownership.
 
+### Universal routing catalog
+
+Once an enrollment is active and Hub-enabled, each fresh authenticated
+snapshot contributes every deployment whose identity is authoritative and
+whose `fleet_eligible` flag is true. The snapshot alias is only a public-name
+proposal. Routing authority remains the exact deployment ID and exact
+capability set; aliases, node IDs, paths, residency, and capacity never become
+deployment identity.
+
+Candidates with the same deployment ID and capability set collapse into one
+replica group even when nodes use different local aliases. If one proposed
+public alias names different exact deployments, the
+first durable mapping keeps the alias and later mappings receive a stable
+deployment-digest suffix. Managed mappings persist while a node is offline so
+client-facing names remain stable, but stale nodes never regain eligibility.
+An admin removal atomically withdraws an idle mapping and records an exact
+alias/deployment/capability suppression. Polling cannot recreate it until an
+admin explicitly re-adds the live candidate, optionally under a new public
+name. Configured mappings remain compatible and cannot be removed through the
+catalog API.
+
+The catalog tables contain only fixed model identity, capability, queue, and
+suppression metadata. They contain no prompts, responses, paths, credentials,
+token events, arbitrary diagnostics, or snapshot bodies.
+
 The Mac service has the matching durable local pairing journal, private
 credential-file transaction, staged-versus-active authentication rules,
 secret-free status, and Fleet-only path-free model probe. The Swift app renders
@@ -112,7 +140,10 @@ and migration workflows remain target behavior in
 
 ### Nyx-hosted limited compute
 
-Nyx may also run a limited inference worker, but the worker is an ordinary
+Nyx may run only the Fleet Hub with no local inference worker. In that mode it
+owns enrollment, catalog, scheduling, routing, and read-only observability but
+never starts an engine or provisions local-worker credentials. Nyx may also
+run a limited inference worker, but the worker is an ordinary
 enrolled node rather than part of the Fleet gateway. It must have an
 independent service identity, listener, state directory, model-storage roots,
 runtime lifecycle, and snapshot/inference credentials. The gateway must not
@@ -606,8 +637,10 @@ to node inference or control planes.
 
 The existing token ledger remains authoritative for historical usage. For
 static nodes, Nyx's private TOML contains node URLs and environment-variable
-references alongside logical model mappings, queue bounds, and routing
-weights; their secret values live only in its private environment. Dynamic
+references alongside any config-owned logical model mappings, queue bounds,
+and routing weights; their secret values live only in its private environment.
+Auto-published mappings and exact suppressions live in Fleet's bounded route
+database. Dynamic
 pairing metadata lives in a separate private SQLite database and refers to
 locator/credential records in a separate authenticated-encryption database
 whose master key is environment-backed. Neither pairing database is the route

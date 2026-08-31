@@ -153,21 +153,24 @@ through **Settings → Model Library** after preparing the corresponding engine.
 
 Hub Mode is opt-in and is intended for one always-available Mac such as Nyx.
 It runs the gateway as a separate login service on loopback port `17400`; the
-ordinary inference worker remains on `1240` with its own state, process, and
-credentials. Nyx's worker is enrolled automatically as **LIMITED / overflow**,
-so a primary or opportunistic Mac remains preferred whenever it is eligible.
+ordinary inference worker, when enabled separately, remains on `1240` with its
+own state, process, and credentials. Fresh promotion defaults to Hub-only and
+does not enable, restart, credential, or enroll that worker. Turn on **Include
+this Mac as an overflow inference worker** only when Nyx should also serve
+models; primary and opportunistic Macs remain preferred whenever eligible.
 
-Before promotion, install or import at least one Fleet-eligible model on Nyx
-and confirm its local self-test. For the secure default, also install and sign
-in to Tailscale on Nyx, enable tailnet HTTPS, and make the Tailscale CLI
+Hub-only promotion does not require a local model. If the optional worker is
+included, install or import at least one Fleet-eligible model on Nyx and
+confirm its local self-test first. For the secure default, also install and
+sign in to Tailscale on Nyx, enable tailnet HTTPS, and make the Tailscale CLI
 available. Then:
 
 1. Open **Settings → Hub Mode** on Nyx.
-2. Leave **Tailscale HTTPS** selected and choose **Configure and Enable Hub**.
-   Unified Inference creates five distinct private credentials, preserves the
-   existing native `.env`, restarts only its local inference worker, publishes
-   its authoritative model mappings, registers the Hub at login, and asks
-   Tailscale Serve to expose the loopback gateway through private HTTPS.
+2. Leave **Tailscale HTTPS** selected. For a Hub-only deployment, leave the
+   local-worker toggle off, then choose **Configure and Enable Hub**. Unified
+   Inference creates private Hub credentials, preserves the existing native
+   `.env`, registers the Hub at login, and asks Tailscale Serve to expose the
+   loopback gateway through private HTTPS. It does not touch the local worker.
 3. If macOS reports **Needs approval**, approve **Fleet Hub** in **System
    Settings → General → Login Items**, then toggle Hub Mode on again.
 4. Choose **Open Hub Dashboard**, paste the value from **Copy Admin Key**, and
@@ -183,13 +186,16 @@ available. Then:
    Mac's own **Contribute this Mac to the pool** switch remains an independent,
    temporary join/pause control.
 
-Use **Sync Local Model Mappings** after adding or removing a Fleet-eligible
-model on Nyx. Disabling Hub Mode stops routing and its managed Tailscale Serve
-listener but preserves credentials, invitations, enrollments, inventory, route
-metadata, and model mappings. Finder replacement and the preserve-data
-uninstaller retain the same Hub directory. A permanent Mac self-revoke is
-different: it requires a new invitation, but still does not remove models,
-storage bindings, profiles, local inference, or token history.
+After an enrollment is explicitly enabled, every fresh authenticated node
+snapshot publishes all authoritative Fleet-eligible models into the Hub's
+universal catalog automatically. Exact replicas share a route. Use the
+dashboard's **Universal model catalog** to remove and durably suppress a route
+or to re-add that exact live candidate later under a chosen name. Disabling
+Hub Mode stops routing and its managed Tailscale Serve listener but preserves
+credentials, invitations, enrollments, inventory, route metadata, and catalog
+overrides. Finder replacement and the preserve-data uninstaller retain the
+same Hub directory. Token events remain written by the serving node; Hub-only
+Nyx does not create a second token row.
 
 ## 4. Install llama.cpp
 

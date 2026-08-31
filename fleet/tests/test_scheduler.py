@@ -14,7 +14,13 @@ from mnemosyne_fleet.config import (
 )
 from mnemosyne_fleet.protocol import Snapshot
 from mnemosyne_fleet.registry import NodeRecord
-from mnemosyne_fleet.scheduler import FleetBusyError, RoutingControls, Scheduler
+from mnemosyne_fleet.scheduler import (
+    FleetBusyError,
+    ModelMutationError,
+    RoutingControls,
+    Scheduler,
+    UnknownModelError,
+)
 
 from .helpers import capacity, identity, snapshot_payload
 
@@ -147,6 +153,20 @@ async def test_equal_warm_replicas_fan_out_with_local_reservations() -> None:
     assert {first.node_id, second.node_id} == {"a", "b"}
     await first.release()
     await second.release()
+
+
+async def test_model_mapping_cannot_be_removed_while_a_route_holds_it() -> None:
+    target = scheduler([record("a")])
+    held = await target.acquire(public_model="qwen", capability="responses")
+
+    with pytest.raises(ModelMutationError, match="model_mapping_in_use"):
+        await target.remove_model("qwen")
+
+    await held.release()
+    removed = await target.remove_model("qwen")
+    assert removed.name == "qwen"
+    with pytest.raises(UnknownModelError):
+        target.model("qwen")
 
 
 async def test_affinity_prefers_the_requested_enrollment_without_changing_defaults() -> None:

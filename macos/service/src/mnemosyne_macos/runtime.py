@@ -5455,6 +5455,21 @@ class NativeRuntime:
             return
         self._omlx_directory_sync_pending = True
 
+        # oMLX is an independently managed loopback service. A positively
+        # refused connection proves that it is stopped and empty, but there is
+        # no global setting to read or mutate until its owner starts it. Keep
+        # the residency-neutral rescan pending instead of entering a global
+        # maintenance barrier whose operation is guaranteed to fail and would
+        # unnecessarily degrade every other enabled engine. The maintenance
+        # loop retries this path and runs the full empty barrier once oMLX is
+        # authoritatively ready.
+        snapshot = await adapter.inspect(deadline=Deadline.after(5))
+        if (
+            snapshot.authoritative
+            and snapshot.service_state == ServiceState.STOPPED
+        ):
+            return
+
         async def register(deadline) -> None:
             await adapter.register_model_directories(directories, deadline=deadline)
 

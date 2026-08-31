@@ -46,16 +46,18 @@ concurrency, and retention caps; restart expires them and Fleet SQLite remains
 metadata-only.
 
 The macOS pilot now bundles that Fleet gateway behind a separate, explicitly
-enabled **Hub Mode** login service. Promotion creates five distinct private
-credentials, keeps the gateway on loopback `:17400`, publishes authoritative
-local snapshot deployments, and enrolls the existing native worker on `:1240`
-as `overflow`; it does not merge gateway and engine ownership. The guided
-remote path configures Tailscale Serve HTTPS, while an existing HTTPS proxy is
-an advanced alternative. The Hub dashboard now creates one-time invitations,
-approves/rejects claims with exact-locator re-entry, assigns service class, and
-enables/disables/revokes enrollments. Finder replacement refreshes an enabled
-Hub registration, and disable/re-enable plus preserve-data uninstall retain
-Hub credentials, pairings, inventory, mappings, and route metadata.
+enabled **Hub Mode** login service. Fresh promotion is Hub-only by default:
+the gateway stays on loopback `:17400` and does not enable, restart,
+credential, or enroll the native worker. An explicit option enrolls that
+separate worker on `:1240` as `overflow`; gateway and engine ownership remain
+separate. Fresh authenticated snapshots automatically publish every
+authoritative Fleet-eligible deployment into a durable universal routing
+catalog. Exact replicas collapse, alias conflicts receive stable deployment
+suffixes, and the dashboard supports durable remove/suppress plus explicit
+re-add. The guided remote path configures Tailscale Serve HTTPS, while an
+existing HTTPS proxy is an advanced alternative. Finder replacement and
+disable/re-enable retain Hub credentials, pairings, inventory, catalog
+overrides, and route metadata.
 
 Mac-first pool hardening is now an active follow-on milestone. Several
 non-breaking foundations are implemented:

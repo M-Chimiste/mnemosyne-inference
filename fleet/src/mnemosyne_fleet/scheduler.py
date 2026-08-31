@@ -27,6 +27,12 @@ class FleetBusyError(RuntimeError):
         self.retry_after = retry_after
 
 
+class ModelMutationError(RuntimeError):
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
+
+
 RequestPriority = Literal["interactive", "normal", "batch"]
 FallbackPolicy = Literal["allow", "none"]
 _PRIORITY_RANK: dict[RequestPriority, int] = {
@@ -160,6 +166,46 @@ class Scheduler:
             return self._models[name]
         except KeyError as exc:
             raise UnknownModelError(name) from exc
+
+    def models(self) -> tuple[ModelConfig, ...]:
+        return tuple(self._models.values())
+
+    def _model_has_work(self, public_model: str) -> bool:
+        return bool(
+            self._queues.get(public_model)
+            or any(
+                reservation.public_model == public_model
+                for reservation in self._reservations.values()
+            )
+        )
+
+    async def add_model(self, model: ModelConfig) -> None:
+        """Publish or idempotently restore one exact public mapping."""
+
+        async with self._condition:
+            current = self._models.get(model.name)
+            if current == model:
+                return
+            if current is not None:
+                if self._model_has_work(model.name):
+                    raise ModelMutationError("model_mapping_in_use")
+                raise ModelMutationError("model_mapping_conflict")
+            self._models[model.name] = model
+            self._condition.notify_all()
+
+    async def remove_model(self, public_model: str) -> ModelConfig:
+        """Remove one mapping only while no request can still reference it."""
+
+        async with self._condition:
+            current = self._models.get(public_model)
+            if current is None:
+                raise ModelMutationError("model_mapping_unknown")
+            if self._model_has_work(public_model):
+                raise ModelMutationError("model_mapping_in_use")
+            del self._models[public_model]
+            self._queues.pop(public_model, None)
+            self._condition.notify_all()
+            return current
 
     async def wake(self) -> None:
         async with self._condition:
@@ -327,20 +373,20 @@ class Scheduler:
         excluded_enrollment_ids: frozenset[str] = frozenset(),
         controls: RoutingControls = RoutingControls(),
     ) -> Reservation:
-        model = self.model(public_model)
-        if capability not in model.capabilities:
-            raise CapabilityError(capability)
         started = time.monotonic()
         ticket: _Ticket | None = None
-        requested_wait = controls.max_wait_seconds
-        wait_seconds = (
-            model.queue_timeout_seconds
-            if requested_wait is None
-            else max(0.0, min(requested_wait, model.queue_timeout_seconds))
-        )
-        deadline = started + wait_seconds
 
         async with self._condition:
+            model = self.model(public_model)
+            if capability not in model.capabilities:
+                raise CapabilityError(capability)
+            requested_wait = controls.max_wait_seconds
+            wait_seconds = (
+                model.queue_timeout_seconds
+                if requested_wait is None
+                else max(0.0, min(requested_wait, model.queue_timeout_seconds))
+            )
+            deadline = started + wait_seconds
             queue = self._queues[public_model]
             if not queue:
                 candidate = self._select(

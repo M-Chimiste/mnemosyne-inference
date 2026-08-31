@@ -62,14 +62,15 @@ before enrolling the worker.
 
 The macOS pilot can establish these boundaries from **Unified Inference →
 Settings → Hub Mode**. The application embeds the exact Fleet source and runs
-it under its own opt-in login service on `127.0.0.1:17400`; the existing native
-manager stays on `127.0.0.1:1240`. Promotion generates distinct client, admin,
-pairing-master, local-snapshot, and local-dispatch secrets, publishes only
-authoritative deployments from the native snapshot, and configures the local
-worker as `overflow`. The recommended UI path exposes only the loopback Hub
-through Tailscale Serve HTTPS. Hub credentials, enrollments, inventory, model
-mappings, and route metadata live outside the app bundle and survive Finder
-replacement, disable/re-enable, and the preserve-data uninstaller.
+it under its own opt-in login service on `127.0.0.1:17400`. Fresh promotion is
+Hub-only by default: it does not enable, restart, credential, or enroll the
+native manager on `127.0.0.1:1240`. An explicit toggle can also enroll that
+separate worker as `overflow`, in which case promotion generates independent
+local-snapshot and local-dispatch secrets. The recommended UI path exposes
+only the loopback Hub through Tailscale Serve HTTPS. Hub credentials,
+enrollments, inventory, universal-catalog overrides, and route metadata live
+outside the app bundle and survive Finder replacement, disable/re-enable, and
+the preserve-data uninstaller.
 
 The same dashboard now has **Hub enrollment → Invite and manage Macs**. It can
 create a five-minute invitation, approve or reject a claim after the operator
@@ -78,12 +79,17 @@ enable or disable an activated enrollment, and permanently revoke it. The
 one-time invitation secret remains only in the create response/browser
 session, and a new enrollment never routes until its separate enable action.
 
-A logical model maps to one exact `sha256:` deployment ID and an exact
-capability set. A node is eligible only when its authenticated, fresh protocol
-v1 snapshot reports the same ID, an authoritative identity, an immutable
-revision or content digest, and `fleet_eligible=true`. Symbolic revisions and
-unverified local artifacts remain visible at the node but cannot enter an
-automatic replica group.
+Every fresh authenticated node snapshot automatically publishes all of its
+authoritative, `fleet_eligible=true` deployments into the universal routing
+catalog. The node alias suggests the public route name but is not identity: a
+logical route still maps to one exact `sha256:` deployment ID and exact
+capability set. Exact replicas collapse behind one public route, while two
+different deployments claiming the same alias receive a stable deployment-ID
+suffix. An administrator can remove a managed route, which durably suppresses
+that exact alias/deployment/capability candidate across later polls, and can
+explicitly re-add it under a chosen public name. Static `[[models]]` entries
+remain compatible and config-owned. Symbolic revisions and unverified local
+artifacts remain visible in inventory but never enter the routing catalog.
 
 Nyx liveness uses the monotonic time at which a new snapshot sequence was
 received. Replayed snapshots do not extend a node's TTL, and node wall-clock

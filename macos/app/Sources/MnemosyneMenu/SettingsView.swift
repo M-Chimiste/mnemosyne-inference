@@ -389,6 +389,16 @@ struct SettingsView: View {
                             .textSelection(.enabled)
                     }
                 }
+                Toggle(
+                    "Include this Mac as an overflow inference worker",
+                    isOn: $hubMode.includeLocalWorker
+                )
+                .disabled(hubMode.isWorking)
+                Text(
+                    "Leave this off for a Hub-only deployment. Every enrolled node automatically publishes all authoritative Fleet-eligible models into the unified catalog; routing still happens through this Hub."
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
                 Button(
                     hubMode.configuration == nil
                         ? "Configure and Enable Hub…"
@@ -401,39 +411,40 @@ struct SettingsView: View {
             }
 
             if let configuration = hubMode.configuration {
-                Section("Nyx local worker") {
-                    LabeledContent(
-                        "Node identity",
-                        value: configuration.localWorkerNodeID
-                    )
-                    LabeledContent("Scheduling class", value: "LIMITED / overflow")
-                    LabeledContent(
-                        "Published models",
-                        value: configuration.publishedDeployments.count.formatted()
-                    )
-                    ForEach(configuration.publishedDeployments) { model in
-                        VStack(alignment: .leading, spacing: 3) {
-                            Text(model.alias).fontWeight(.medium)
-                            Text(model.deploymentID)
-                                .font(.caption.monospaced())
-                                .foregroundStyle(.secondary)
-                                .lineLimit(1)
-                            Text(model.capabilities.joined(separator: ", "))
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
+                if configuration.includesLocalWorker {
+                    Section("Nyx local worker") {
+                        LabeledContent(
+                            "Node identity",
+                            value: configuration.localWorkerNodeID
+                        )
+                        LabeledContent(
+                            "Scheduling class",
+                            value: "LIMITED / overflow"
+                        )
+                        LabeledContent(
+                            "Eligible models at promotion",
+                            value: configuration.publishedDeployments.count.formatted()
+                        )
+                        ForEach(configuration.publishedDeployments) { model in
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(model.alias).fontWeight(.medium)
+                                Text(model.deploymentID)
+                                    .font(.caption.monospaced())
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                                Text(model.capabilities.joined(separator: ", "))
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
                         }
                     }
-                    Button("Sync Local Model Mappings") {
-                        Task {
-                            await hubMode.syncLocalModels(
-                                registration: registration
-                            )
-                        }
+                } else {
+                    Section("Hub-only gateway") {
+                        Text(
+                            "Nyx is not enrolled as an inference worker. It manages enrollment, the universal model catalog, scheduling, and routing without loading models locally."
+                        )
+                        .foregroundStyle(.secondary)
                     }
-                    .disabled(
-                        hubMode.isWorking
-                            || registration.hubAgentStatus != .enabled
-                    )
                 }
 
                 Section("Hub administration") {
@@ -447,7 +458,7 @@ struct SettingsView: View {
                         Button("Copy Client API Key") { hubMode.copyClientKey() }
                     }
                     Text(
-                        "Create invitations, approve Macs, assign primary/opportunistic/LIMITED service classes, and enable or revoke enrollments from the Hub dashboard. Credentials are revealed only by an explicit copy action."
+                        "Create invitations, approve Macs, assign service classes, manage automatically published model routes, and enable or revoke enrollments from the Hub dashboard. Credentials are revealed only by an explicit copy action."
                     )
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -456,7 +467,7 @@ struct SettingsView: View {
 
             Section("Preservation") {
                 Text(
-                    "Replacing Unified Inference.app preserves Hub credentials, pairings, inventory, routing metadata, local model mappings, and the Mac's existing .env. Disabling Hub Mode stops routing but keeps that state for re-enable. The preserve-data uninstaller also retains the Hub directory."
+                    "Replacing Unified Inference.app preserves Hub credentials, pairings, inventory, routing metadata, universal catalog overrides, and the Mac's existing .env. Disabling Hub Mode stops routing but keeps that state for re-enable. The preserve-data uninstaller also retains the Hub directory."
                 )
                 .foregroundStyle(.secondary)
             }
@@ -482,10 +493,16 @@ struct SettingsView: View {
     }
 
     private var hubPromotionConfirmationMessage: String {
-        if hubMode.exposureMode == .tailscale {
-            return "Unified Inference will generate private Hub credentials, restart this Mac's local inference worker, enroll it as LIMITED / overflow, register Fleet Hub at login, and ask Tailscale Serve to publish port 17400 through private HTTPS. Model files and token history are not changed."
+        if !hubMode.includeLocalWorker {
+            if hubMode.exposureMode == .tailscale {
+                return "Unified Inference will generate private Hub credentials, register Fleet Hub at login, and ask Tailscale Serve to publish port 17400 through private HTTPS. The local inference worker will not be enabled, restarted, or enrolled. Enrolled nodes publish their eligible models automatically."
+            }
+            return "Unified Inference will generate private Hub credentials and register Fleet Hub at login. The local inference worker will not be enabled, restarted, or enrolled. The entered HTTPS proxy must already forward to 127.0.0.1:17400. Enrolled nodes publish their eligible models automatically."
         }
-        return "Unified Inference will generate private Hub credentials, restart this Mac's local inference worker, enroll it as LIMITED / overflow, and register Fleet Hub at login. The entered HTTPS proxy must already forward to 127.0.0.1:17400. Model files and token history are not changed."
+        if hubMode.exposureMode == .tailscale {
+            return "Unified Inference will generate private Hub credentials, restart this Mac's local inference worker, enroll it as LIMITED / overflow, register Fleet Hub at login, and ask Tailscale Serve to publish port 17400 through private HTTPS. Every enrolled node publishes its eligible models automatically. Model files and token history are not changed."
+        }
+        return "Unified Inference will generate private Hub credentials, restart this Mac's local inference worker, enroll it as LIMITED / overflow, and register Fleet Hub at login. The entered HTTPS proxy must already forward to 127.0.0.1:17400. Every enrolled node publishes its eligible models automatically. Model files and token history are not changed."
     }
 
     private var setupPage: some View {

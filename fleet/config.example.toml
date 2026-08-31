@@ -133,6 +133,9 @@ inference_token_env = "MNEMOSYNE_CUDA_INFERENCE_KEY"
 # inference_token_env = "MNEMOSYNE_NYX_WORKER_INFERENCE_KEY"
 # service_class = "overflow"
 
+# [[models]] is optional: every fresh enrolled node automatically publishes all
+# authoritative Fleet-eligible deployments. Keep an explicit entry only when
+# this public route must remain config-owned.
 [[models]]
 name = "qwen-coder"
 # Copy the exact authoritative deployment ID advertised by enrolled nodes.
