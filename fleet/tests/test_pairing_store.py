@@ -360,6 +360,37 @@ async def test_claim_approval_and_provision_are_exactly_idempotent(
 
 
 @pytest.mark.asyncio
+async def test_claim_status_requires_exact_request_and_reconciles_expiry(
+    tmp_path: Path,
+) -> None:
+    _, store, clock, _, _ = await _stores(tmp_path)
+    invitation, claim, claim_request = await _issue_and_claim(store)
+
+    active = await store.claim_status(
+        claim_id=claim.claim_id,
+        claim_request_id=claim_request.request_id,
+    )
+    assert active.state == "claimed"
+    assert active.invitation_id == invitation.invitation_id
+    assert active.reporting_node_id == "metis"
+
+    with pytest.raises(PairingStoreTerminalError) as hidden:
+        await store.claim_status(
+            claim_id=claim.claim_id,
+            claim_request_id=_uuid(),
+        )
+    assert hidden.value.code == "pairing_claim_unknown"
+
+    clock.advance(301)
+    expired = await store.claim_status(
+        claim_id=claim.claim_id,
+        claim_request_id=claim_request.request_id,
+    )
+    assert expired.state == "expired"
+    assert await store.pending_claims() == ()
+
+
+@pytest.mark.asyncio
 async def test_provision_requires_bound_secret_on_every_replay(tmp_path: Path) -> None:
     _, store, _, _, metadata_path = await _stores(tmp_path)
     invitation, claim, _ = await _issue_and_claim(store)

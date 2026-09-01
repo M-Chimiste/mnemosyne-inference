@@ -486,6 +486,66 @@ async def test_ambiguous_unclaimed_attempt_cannot_be_discarded(
 
 
 @pytest.mark.asyncio
+async def test_hub_confirmed_terminal_claim_can_be_refreshed_and_discarded(
+    tmp_path: Path,
+) -> None:
+    status_requests: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        if request.url.path == "/fleet/pairing/v1/claims":
+            return httpx.Response(200, json=_claim(payload["request_id"]))
+        if request.url.path.endswith("/provision"):
+            return httpx.Response(
+                410,
+                json={"detail": {"code": "pairing_claim_terminal"}},
+            )
+        if request.url.path.endswith("/status"):
+            status_requests.append(payload)
+            return httpx.Response(
+                200,
+                json={
+                    "schema_version": 1,
+                    "claim_id": CLAIM_ID,
+                    "invitation_id": INVITATION_ID,
+                    "pairing_id": PAIRING_ID,
+                    "reporting_node_id": REPORTING_NODE_ID,
+                    "state": "expired",
+                    "expires_at": 4_000_000_000.0,
+                },
+            )
+        raise AssertionError(request.url.path)
+
+    pairing, client, environment = await _stores(tmp_path, handler)
+    try:
+        with pytest.raises(PairingClientError) as pending:
+            await client.begin(_invitation())
+        assert pending.value.code == PairingClientErrorCode.APPROVAL_PENDING
+        awaiting = await client.status()
+        assert awaiting is not None
+
+        confirmed = await client.refresh_pending_attempt()
+        assert confirmed is not None
+        assert confirmed.last_error_code == (
+            PairingClientErrorCode.REMOTE_ATTEMPT_TERMINAL
+        )
+        assert status_requests == [
+            {
+                "schema_version": 1,
+                "claim_request_id": awaiting.claim_request_id,
+            }
+        ]
+
+        await client.discard_terminal_uncredentialed_attempt()
+        assert await client.status() is None
+        assert (await pairing.status()).state == PairingState.UNPAIRED
+        assert not environment.exists()
+    finally:
+        await client.close()
+        await pairing.close()
+
+
+@pytest.mark.asyncio
 async def test_ambiguous_transports_replay_exact_request_ids_and_staged_bundle(
     tmp_path: Path,
 ) -> None:

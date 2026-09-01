@@ -225,7 +225,7 @@ final class SettingsViewModel: ObservableObject {
     }
 
     var canDiscardRejectedFleetPairingAttempt: Bool {
-        fleetPairing?.canDiscardRejectedAttempt == true
+        fleetPairing?.canDiscardTerminalAttempt == true
     }
 
     var canRequestFleetPairing: Bool {
@@ -591,7 +591,7 @@ final class SettingsViewModel: ObservableObject {
 
     func refreshFleetPairing() async {
         do {
-            let snapshot = try await client.fleetPairing()
+            let snapshot = try await client.refreshFleetPairingAttempt()
             updateFleetPairing(snapshot)
             setPairingStatusMessage()
             if snapshot.state == "paired" {
@@ -830,11 +830,11 @@ final class SettingsViewModel: ObservableObject {
         defer { isDiscardingFleetPairingAttempt = false }
 
         do {
-            let snapshot = try await client.discardRejectedFleetPairingAttempt()
+            let snapshot = try await client.discardTerminalFleetPairingAttempt()
             fleetPairingCeremony = FleetPairingCeremonyState()
             updateFleetPairing(snapshot)
             setStatus(
-                "Rejected pairing attempt discarded. Create and enter a new Hub invitation.",
+                "Stale pairing attempt discarded. Request a new pairing code.",
                 tone: .success
             )
         } catch {
@@ -842,7 +842,7 @@ final class SettingsViewModel: ObservableObject {
                 updateFleetPairing(refreshed)
             }
             setStatus(
-                "Could not discard the pairing attempt: \(error.localizedDescription)",
+                "Could not discard the stale pairing attempt: \(error.localizedDescription)",
                 tone: .error
             )
         }

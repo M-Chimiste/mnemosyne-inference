@@ -3,6 +3,7 @@ import Foundation
 public protocol ControlAPI: NativeLifecycleAuthorizationServicing, Sendable {
     func status() async throws -> ServiceSnapshot
     func fleetPairing() async throws -> FleetPairingSnapshot
+    func refreshFleetPairingAttempt() async throws -> FleetPairingSnapshot
     func requestFleetPairing(
         _ request: FleetPairingPresenceRequest
     ) async throws -> FleetPairingPresenceResponse
@@ -13,6 +14,7 @@ public protocol ControlAPI: NativeLifecycleAuthorizationServicing, Sendable {
         _ request: FleetPairingControlRequest
     ) async throws -> FleetPairingOperationResponse
     func discardRejectedFleetPairingAttempt() async throws -> FleetPairingSnapshot
+    func discardTerminalFleetPairingAttempt() async throws -> FleetPairingSnapshot
     func revokeFleetPairing(
         requestID: String
     ) async throws -> FleetPairingManagementResponse
@@ -112,6 +114,10 @@ public protocol ControlAPI: NativeLifecycleAuthorizationServicing, Sendable {
 }
 
 public extension ControlAPI {
+    func refreshFleetPairingAttempt() async throws -> FleetPairingSnapshot {
+        try await fleetPairing()
+    }
+
     func requestFleetPairing(
         _ request: FleetPairingPresenceRequest
     ) async throws -> FleetPairingPresenceResponse {
@@ -128,6 +134,10 @@ public extension ControlAPI {
             code: "pairing_local_control_required",
             retryable: false
         )
+    }
+
+    func discardTerminalFleetPairingAttempt() async throws -> FleetPairingSnapshot {
+        try await discardRejectedFleetPairingAttempt()
     }
 
     func revokeFleetPairing(
@@ -455,6 +465,15 @@ public struct ControlAPIClient: ControlAPI, Sendable {
         return try JSONDecoder().decode(FleetPairingSnapshot.self, from: data)
     }
 
+    public func refreshFleetPairingAttempt() async throws
+        -> FleetPairingSnapshot
+    {
+        let request = fleetPairingRefreshRequest()
+        let (data, response) = try await session.data(for: request)
+        try validate(response, data: data)
+        return try JSONDecoder().decode(FleetPairingSnapshot.self, from: data)
+    }
+
     public func requestFleetPairing(
         _ payload: FleetPairingPresenceRequest
     ) async throws -> FleetPairingPresenceResponse {
@@ -488,6 +507,15 @@ public struct ControlAPIClient: ControlAPI, Sendable {
         return try JSONDecoder().decode(FleetPairingSnapshot.self, from: data)
     }
 
+    public func discardTerminalFleetPairingAttempt() async throws
+        -> FleetPairingSnapshot
+    {
+        let request = fleetPairingDiscardTerminalRequest()
+        let (data, response) = try await session.data(for: request)
+        try validate(response, data: data)
+        return try JSONDecoder().decode(FleetPairingSnapshot.self, from: data)
+    }
+
     public func revokeFleetPairing(
         requestID: String
     ) async throws -> FleetPairingManagementResponse {
@@ -497,6 +525,13 @@ public struct ControlAPIClient: ControlAPI, Sendable {
 
     func fleetPairingRequest() -> URLRequest {
         makeRequest(path: "/manager/fleet/pairing")
+    }
+
+    func fleetPairingRefreshRequest() -> URLRequest {
+        makeRequest(
+            path: "/manager/fleet/pairing/refresh",
+            method: "POST"
+        )
     }
 
     func fleetPairingPresenceRequest(
@@ -532,6 +567,13 @@ public struct ControlAPIClient: ControlAPI, Sendable {
     func fleetPairingDiscardRejectedRequest() -> URLRequest {
         makeRequest(
             path: "/manager/fleet/pairing/discard-rejected",
+            method: "POST"
+        )
+    }
+
+    func fleetPairingDiscardTerminalRequest() -> URLRequest {
+        makeRequest(
+            path: "/manager/fleet/pairing/discard-terminal",
             method: "POST"
         )
     }

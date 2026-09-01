@@ -74,6 +74,7 @@ class PairingClientErrorCode(StrEnum):
     HUB_RESPONSE_INVALID = "pairing_hub_response_invalid"
     CLAIM_REJECTED = "pairing_claim_rejected"
     APPROVAL_PENDING = "pairing_approval_pending"
+    REMOTE_ATTEMPT_TERMINAL = "pairing_remote_attempt_terminal"
     ACTIVATION_REJECTED = "pairing_activation_rejected"
     MANAGEMENT_REJECTED = "pairing_management_rejected"
     MANAGEMENT_OUTCOME_UNKNOWN = "pairing_management_outcome_unknown"
@@ -145,6 +146,9 @@ _ERROR_MESSAGES: dict[PairingClientErrorCode, str] = {
     ),
     PairingClientErrorCode.APPROVAL_PENDING: (
         "The pairing claim is waiting for Hub approval."
+    ),
+    PairingClientErrorCode.REMOTE_ATTEMPT_TERMINAL: (
+        "The Hub confirmed that this pairing attempt is no longer active."
     ),
     PairingClientErrorCode.ACTIVATION_REJECTED: (
         "The Hub did not confirm pairing activation."
@@ -293,6 +297,25 @@ class _ClaimResponse(_StrictResponse):
     claimed_at: float
     expires_at: float
     locator_accepted: Literal[True]
+
+
+class _ClaimStatusResponse(_StrictResponse):
+    schema_version: Literal[1]
+    claim_id: str = Field(min_length=36, max_length=36)
+    invitation_id: str = Field(min_length=36, max_length=36)
+    pairing_id: str = Field(min_length=36, max_length=36)
+    reporting_node_id: str = Field(min_length=1, max_length=128)
+    state: Literal[
+        "claimed",
+        "approved",
+        "provisioning",
+        "activating",
+        "completed",
+        "expired",
+        "rejected",
+        "failed",
+    ]
+    expires_at: float
 
 
 class _PresenceRequestResponse(_StrictResponse):
@@ -1193,18 +1216,65 @@ class _PairingClientJournal:
             )
             return self._record(self._row(connection))
 
+    def record_remote_terminal(
+        self,
+        response: _ClaimStatusResponse,
+    ) -> PairingClientRecord:
+        """Persist only an exact terminal disposition returned by the Hub."""
+
+        if response.state not in {"expired", "rejected", "failed"}:
+            raise self._conflict()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = self._require_row(connection)
+            exact_claim = (
+                row["phase"] == PairingClientPhase.AWAITING_APPROVAL.value
+                and row["claim_id"] == response.claim_id
+                and row["invitation_id"] == response.invitation_id
+                and row["pairing_id"] == response.pairing_id
+                and row["reporting_node_id"] == response.reporting_node_id
+                and row["credential_generation"] is None
+                and row["expires_at"] == response.expires_at
+            )
+            if not exact_claim:
+                raise self._conflict()
+            connection.execute(
+                """
+                UPDATE native_fleet_pairing_client_v1
+                   SET last_error_code=?, updated_at=? WHERE singleton=1
+                """,
+                (
+                    PairingClientErrorCode.REMOTE_ATTEMPT_TERMINAL.value,
+                    time.time(),
+                ),
+            )
+            return self._required_record(self._require_row(connection))
+
     def discard_rejected_unclaimed_attempt(
         self,
         connection: sqlite3.Connection,
         pairing_row: sqlite3.Row,
         attempt_id: str,
     ) -> None:
-        """Delete only the journal row proven to have no remote claim.
+        """Backward-compatible wrapper for terminal-attempt retirement."""
+
+        self.discard_terminal_uncredentialed_attempt(
+            connection,
+            pairing_row,
+            attempt_id,
+        )
+
+    def discard_terminal_uncredentialed_attempt(
+        self,
+        connection: sqlite3.Connection,
+        pairing_row: sqlite3.Row,
+        attempt_id: str,
+    ) -> None:
+        """Delete a rejected pre-claim or Hub-confirmed terminal claim.
 
         The caller owns the shared SQLite transaction and independently proves
-        that the pairing store names the same credential-free attempt.  A
-        transport-ambiguous error is deliberately ineligible because Nyx may
-        already have committed its claim.
+        that the pairing store names the same credential-free attempt. A
+        transport-ambiguous result is deliberately ineligible.
         """
 
         row = self._row(connection)
@@ -1222,7 +1292,20 @@ class _PairingClientJournal:
             and row["last_error_code"]
             == PairingClientErrorCode.CLAIM_REJECTED.value
         )
-        if not exact_rejected_claim:
+        exact_confirmed_terminal = (
+            row is not None
+            and self_revoke is None
+            and row["attempt_id"] == attempt_id
+            and pairing_row["attempt_id"] == attempt_id
+            and row["phase"] == PairingClientPhase.AWAITING_APPROVAL.value
+            and row["claim_id"] is not None
+            and row["pairing_id"] is not None
+            and row["credential_generation"] is None
+            and row["expires_at"] is not None
+            and row["last_error_code"]
+            == PairingClientErrorCode.REMOTE_ATTEMPT_TERMINAL.value
+        )
+        if not (exact_rejected_claim or exact_confirmed_terminal):
             raise PairingClientError(
                 PairingClientErrorCode.STATE_CONFLICT,
                 status_code=409,
@@ -1520,6 +1603,84 @@ class FleetPairingClient:
             self._ensure_ready()
             return await _await_blocking(self._journal.status)
 
+    async def refresh_pending_attempt(self) -> PairingClientRecord | None:
+        """Reconcile one waiting claim with its exact Hub disposition.
+
+        This is deliberately read-only at the Hub. A terminal result becomes
+        local discard authority only after the response matches every durable
+        claim identity field. Network ambiguity never changes that authority.
+        """
+
+        async with self._lock:
+            self._ensure_ready()
+            record = await _await_blocking(self._journal.status)
+            if record is None or (
+                record.phase is not PairingClientPhase.AWAITING_APPROVAL
+            ):
+                return record
+            if (
+                record.claim_id is None
+                or record.pairing_id is None
+                or record.credential_generation is not None
+            ):
+                raise PairingClientError(
+                    PairingClientErrorCode.STATE_CONFLICT,
+                    status_code=409,
+                    retryable=False,
+                )
+
+            pairing = await self._pairing_store.status()
+            if (
+                pairing.state is not PairingState.PENDING
+                or pairing.attempt_id != record.attempt_id
+                or pairing.pairing_id is not None
+                or pairing.node_id is not None
+                or pairing.credential_epoch is not None
+                or pairing.credentials_owned
+                or pairing.credential_write_pending
+                or not pairing.hub_origin
+            ):
+                raise PairingClientError(
+                    PairingClientErrorCode.STATE_CONFLICT,
+                    status_code=409,
+                    retryable=False,
+                )
+
+            response = await self._post(
+                _verified_https_origin(pairing.hub_origin),
+                f"/fleet/pairing/v1/claims/{record.claim_id}/status",
+                {
+                    "schema_version": 1,
+                    "claim_request_id": record.claim_request_id,
+                },
+            )
+            if response.status_code != 200:
+                if response.status_code in {404, 429, 500, 502, 503, 504}:
+                    raise self._hub_unavailable()
+                raise PairingClientError(
+                    PairingClientErrorCode.HUB_RESPONSE_INVALID,
+                    status_code=502,
+                    retryable=False,
+                )
+            disposition = self._response_model(
+                response,
+                _ClaimStatusResponse,
+            )
+            if (
+                disposition.claim_id != record.claim_id
+                or disposition.invitation_id != record.invitation_id
+                or disposition.pairing_id != record.pairing_id
+                or disposition.reporting_node_id != record.reporting_node_id
+                or disposition.expires_at != record.expires_at
+            ):
+                raise self._invalid_response()
+            if disposition.state in {"expired", "rejected", "failed"}:
+                return await _await_blocking(
+                    self._journal.record_remote_terminal,
+                    disposition,
+                )
+            return record
+
     async def self_revoke_authority_denied(self) -> bool:
         """Return the durable local denial fence for this pairing identity."""
 
@@ -1646,11 +1807,17 @@ class FleetPairingClient:
             )
 
     async def discard_rejected_unclaimed_attempt(self) -> None:
-        """Forget a claim that Nyx conclusively rejected before enrollment.
+        """Backward-compatible wrapper for terminal-attempt retirement."""
 
-        This cannot discard an ambiguous request, an approved claim, staged
-        credentials, or a completed pairing.  The pairing store and client
-        journal are reset in one shared SQLite transaction.
+        await self.discard_terminal_uncredentialed_attempt()
+
+    async def discard_terminal_uncredentialed_attempt(self) -> None:
+        """Forget a conclusively terminal attempt before credentials exist.
+
+        This accepts only a pre-claim rejection or a terminal disposition
+        confirmed by the exact Hub status endpoint. It cannot discard an
+        ambiguous request, an active claim, staged credentials, or a completed
+        pairing. The pairing store and client journal reset atomically.
         """
 
         async with self._lock:
@@ -1667,20 +1834,23 @@ class FleetPairingClient:
                 connection: sqlite3.Connection,
                 pairing_row: sqlite3.Row,
             ) -> None:
-                self._journal.discard_rejected_unclaimed_attempt(
+                self._journal.discard_terminal_uncredentialed_attempt(
                     connection,
                     pairing_row,
                     record.attempt_id,
                 )
 
             try:
+                discard_operation = (
+                    self._pairing_store._discard_terminal_uncredentialed_attempt
+                )
                 await _await_async_outcome(
                     asyncio.create_task(
-                        self._pairing_store._discard_rejected_unclaimed_attempt(
+                        discard_operation(
                             record.attempt_id,
                             discard,
                         ),
-                        name="mnemosyne-fleet-discard-rejected-claim",
+                        name="mnemosyne-fleet-discard-terminal-attempt",
                     )
                 )
             except PairingClientError:

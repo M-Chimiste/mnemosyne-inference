@@ -131,10 +131,13 @@ engine process.
   management credentials. The service exposes only secret-free status and
   staged/active authentication gates. Its outbound client and the Swift
   Inference Pool page drive invitation claim, approval resume, provisioning,
-  staging, and activation with a memory-only invitation secret. They also own
-  an explicit discard action for a conclusively rejected, unclaimed,
-  uncredentialed attempt; it atomically clears only the exact local attempt and
-  must remain unavailable for ambiguous outcomes. They also own
+  staging, and activation with a memory-only invitation secret. Refresh uses a
+  read-only, exact-request-correlated Hub disposition check so a restarted app
+  can distinguish an expired/rejected claim from an ambiguous local wait. They
+  also own an explicit discard action for either a conclusively rejected,
+  unclaimed attempt or an exact Hub-confirmed terminal claim, and only while no
+  pairing credential was assigned locally; it atomically clears only the exact
+  local attempt and must remain unavailable for ambiguous outcomes. They also own
   an explicitly confirmed permanent self-revoke path with a durable exact-
   request recovery fence, pairing-only credential retirement, and safe new-
   invitation re-pair. Revoke must never alter models, exact weight paths,

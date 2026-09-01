@@ -389,10 +389,17 @@ Hub origin, and normalized locator but never the invitation secret. A restart
 therefore resumes only that exact attempt and refuses different invitation
 data. When the Hub conclusively rejects the claim and the Mac has received no
 claim ID, pairing ID, credential generation, or pairing-owned credential, the
-signed Settings UI may explicitly discard that failed attempt. The local
-pairing store and client journal must clear atomically, and the private
-credential environment must be proven unchanged. Ambiguous network or Hub
-outcomes remain fenced to the exact recorded attempt and are never discardable.
+signed Settings UI may explicitly discard that failed attempt. For a claimed
+attempt, **Refresh Status** submits the durable high-entropy claim request ID to
+the exact Hub's read-only status route. The Hub correlates it with the exact
+claim, reconciles invitation expiry, and returns only bounded IDs, state, and
+expiry; it exposes no locator, display name, secret reference, credential, or
+policy. Only a terminal `expired`, `rejected`, or `failed` response whose
+invitation, claim, pairing, reporting identity, and expiry all match the local
+journal authorizes **Discard Stale Attempt**. The local pairing store and client
+journal clear atomically, and the private credential environment must be proven
+unchanged. Ambiguous network, unknown-Hub, malformed, or nonterminal outcomes
+remain fenced to the exact recorded attempt and are never discardable.
 
 The response contains only bounded non-secret status:
 
@@ -406,6 +413,26 @@ The response contains only bounded non-secret status:
   "locator_accepted": true
 }
 ```
+
+After an app restart, the local **Refresh Status** action uses the separate
+read-only reconciliation route:
+
+```http
+POST /fleet/pairing/v1/claims/{claim_id}/status
+Content-Type: application/json
+```
+
+```json
+{
+  "schema_version": 1,
+  "claim_request_id": "e65c3b08-e476-4057-a0be-f57de2fbfbec"
+}
+```
+
+The successful response adds the exact `invitation_id`, `reporting_node_id`,
+and current invitation state to the bounded claim identity above. The request
+ID is used only for read-only correlation and never grants approval,
+provisioning, activation, enrollment policy, revocation, or inference access.
 
 The pairing secret must be stripped from access logs before request logging,
 never included in exception text, and never included in an idempotency digest

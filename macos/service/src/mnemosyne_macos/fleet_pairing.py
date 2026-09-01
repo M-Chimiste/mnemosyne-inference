@@ -455,13 +455,24 @@ class FleetPairingStore:
         attempt_id: str,
         journal_transition: Callable[[sqlite3.Connection, sqlite3.Row], T],
     ) -> T:
-        """Atomically forget one definitively rejected, credential-free claim.
+        """Backward-compatible wrapper for terminal-attempt retirement."""
 
-        This private seam is intentionally narrower than ``clear_pairing``.
-        It is available only to ``FleetPairingClient`` after the Hub returned
-        a conclusive claim rejection, before a claim ID, pairing ID, or any
-        credential generation exists.  Ambiguous transport failures and later
-        ceremony phases remain exact-retry-only.
+        return await self._discard_terminal_uncredentialed_attempt(
+            attempt_id,
+            journal_transition,
+        )
+
+    async def _discard_terminal_uncredentialed_attempt(
+        self,
+        attempt_id: str,
+        journal_transition: Callable[[sqlite3.Connection, sqlite3.Row], T],
+    ) -> T:
+        """Atomically forget one conclusively terminal, credential-free attempt.
+
+        The client journal callback must independently prove either a Hub
+        rejection before claim creation or a terminal disposition confirmed by
+        the exact Hub over verified HTTPS. Ambiguous transport failures,
+        assigned credentials, and later ceremony phases remain retry-only.
         """
 
         normalized_attempt = _canonical_uuid(attempt_id, field="attempt_id")

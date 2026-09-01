@@ -60,6 +60,7 @@ from .pairing_api import (
     ClaimApproval,
     ClaimProvision,
     ClaimRejection,
+    ClaimStatusRequest,
     EnrollmentPolicyUpdate,
     EnrollmentRevocation,
     EnrollmentSelfManagement,
@@ -1586,6 +1587,32 @@ def create_app(
                 "schema_version": 1,
                 "claims": [_claim_payload(claim) for claim in claims],
             }
+
+        @app.post("/fleet/pairing/v1/claims/{claim_id}/status")
+        async def pairing_claim_status(claim_id: str, request: Request):
+            try:
+                payload = await parse_pairing_payload(
+                    request,
+                    ClaimStatusRequest,
+                )
+                status = await pairing_service().claim_status(
+                    claim_id=claim_id,
+                    payload=payload,
+                )
+            except Exception as error:
+                return _pairing_exception_response(error, public=True)
+            return JSONResponse(
+                headers={"Cache-Control": "no-store"},
+                content={
+                    "schema_version": 1,
+                    "claim_id": status.claim_id,
+                    "invitation_id": status.invitation_id,
+                    "pairing_id": status.pairing_id,
+                    "reporting_node_id": status.reporting_node_id,
+                    "state": status.state,
+                    "expires_at": status.expires_at,
+                },
+            )
 
         @app.post(
             "/fleet/api/v1/pairing/claims/{claim_id}/approve",

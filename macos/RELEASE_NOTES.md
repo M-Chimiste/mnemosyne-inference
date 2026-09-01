@@ -43,10 +43,13 @@ read-only discovery hint.
   resumes automatically, and the Hub waits for activation proof before its
   separate enable transaction. The original manual ceremony remains under
   Advanced.
-- A Mac can explicitly discard a conclusively rejected pre-claim pairing
-  attempt and submit one fresh invitation. The recovery remains unavailable
-  after any claim or credential is issued and for ambiguous network outcomes;
-  those retain their exact-retry fence.
+- **Refresh Status** now asks the exact Hub for the old claim's bounded
+  disposition instead of rereading only local state. A conclusively rejected
+  pre-claim attempt or a fully matched Hub-confirmed expired/rejected claim can
+  be removed with **Discard Stale Attempt** and replaced with a fresh code. The
+  recovery remains unavailable for active claims, locally assigned
+  credentials, or ambiguous network outcomes; models, storage, inference,
+  usage, and token accounting remain unchanged.
 - The menu-bar pool participation control uses the native macOS switch style
   while retaining the same durable join, drain, pause, and rejoin behavior.
 - Fresh installations request both the inference LaunchAgent and menu-app login

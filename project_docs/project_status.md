@@ -106,6 +106,15 @@ and locator entry remain under the Advanced dashboard. Pairing does not change
 model/storage state, token accounting, or
 the default universal-catalog publication path.
 
+Pairing status refresh now reconciles a waiting Mac with a read-only Hub claim
+disposition using the exact durable claim request correlation. A restarted app
+can therefore recognize an expired or rejected old claim even though the
+invitation secret was correctly discarded from memory. Only a fully matching
+terminal response enables the atomic **Discard Stale Attempt** recovery; Hub
+unavailability, response ambiguity, active claims, and any locally assigned
+credential remain fail-closed. The recovery path does not touch inference,
+models, storage, participation, usage, or the token outbox.
+
 Mac-initiated self-revocation now commits a secret-free fence for the exact
 client attempt, invitation, pairing, generation, credential-bundle fingerprint,
 and request ID before contacting Nyx. That fence closes snapshot and dispatch

@@ -77,6 +77,20 @@ public struct FleetPairingSnapshot: Codable, Equatable, Sendable {
             && workflow?.lastErrorCode == "pairing_claim_rejected"
     }
 
+    /// A claimed attempt is discardable only after the exact Hub has returned
+    /// a terminal disposition over the service's verified HTTPS client.
+    public var canDiscardTerminalAttempt: Bool {
+        if canDiscardRejectedAttempt { return true }
+        return state == "pending"
+            && credentialsConfigured != true
+            && pairingId == nil
+            && workflow?.phase == "awaiting_approval"
+            && workflow?.claimID != nil
+            && workflow?.pairingID != nil
+            && workflow?.credentialGeneration == nil
+            && workflow?.lastErrorCode == "pairing_remote_attempt_terminal"
+    }
+
     /// Whether the pairing transaction, rather than the generic credential
     /// editor, owns the Fleet snapshot and dispatch credential slots.
     ///

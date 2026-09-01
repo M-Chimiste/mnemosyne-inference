@@ -104,11 +104,12 @@ async def test_pairing_http_ceremony_stays_disabled_until_admin_enable(
             pairing_secret = invitation["pairing_secret"]
             assert invitation["hub_origin"] == "https://nyx.example.internal"
 
+            claim_request_id = _uuid()
             claim_response = await client.post(
                 "/fleet/pairing/v1/claims",
                 json={
                     "schema_version": 1,
-                    "request_id": _uuid(),
+                    "request_id": claim_request_id,
                     "invitation_id": invitation["invitation_id"],
                     "pairing_secret": pairing_secret,
                     "mac": {
@@ -123,6 +124,36 @@ async def test_pairing_http_ceremony_stays_disabled_until_admin_enable(
             )
             assert claim_response.status_code == 200
             claim = claim_response.json()
+
+            status = await client.post(
+                f"/fleet/pairing/v1/claims/{claim['claim_id']}/status",
+                json={
+                    "schema_version": 1,
+                    "claim_request_id": claim_request_id,
+                },
+            )
+            assert status.status_code == 200
+            assert status.headers["cache-control"] == "no-store"
+            assert status.json() == {
+                "schema_version": 1,
+                "claim_id": claim["claim_id"],
+                "invitation_id": claim["invitation_id"],
+                "pairing_id": claim["pairing_id"],
+                "reporting_node_id": "studio-mac",
+                "state": "claimed",
+                "expires_at": claim["expires_at"],
+            }
+            hidden = await client.post(
+                f"/fleet/pairing/v1/claims/{claim['claim_id']}/status",
+                json={
+                    "schema_version": 1,
+                    "claim_request_id": _uuid(),
+                },
+            )
+            assert hidden.status_code == 410
+            assert hidden.json()["detail"]["code"] == (
+                "pairing_transaction_terminal"
+            )
             assert claim["locator_accepted"] is True
 
             pending_response = await client.get(

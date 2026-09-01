@@ -2261,10 +2261,32 @@ def create_control_app(runtime: NativeRuntime) -> FastAPI:
             },
         )
 
+    @app.post("/manager/fleet/pairing/refresh")
+    async def refresh_fleet_pairing() -> JSONResponse:
+        try:
+            pairing = await runtime.refresh_fleet_pairing_attempt()
+        except PairingClientError as exc:
+            return await _pairing_client_error_response(runtime, exc)
+        return JSONResponse(
+            headers={"Cache-Control": "no-store"},
+            content=pairing,
+        )
+
     @app.post("/manager/fleet/pairing/discard-rejected")
     async def discard_rejected_fleet_pairing() -> JSONResponse:
         try:
             pairing = await runtime.discard_rejected_fleet_pairing_attempt()
+        except PairingClientError as exc:
+            return await _pairing_client_error_response(runtime, exc)
+        return JSONResponse(
+            headers={"Cache-Control": "no-store"},
+            content=pairing,
+        )
+
+    @app.post("/manager/fleet/pairing/discard-terminal")
+    async def discard_terminal_fleet_pairing() -> JSONResponse:
+        try:
+            pairing = await runtime.discard_terminal_fleet_pairing_attempt()
         except PairingClientError as exc:
             return await _pairing_client_error_response(runtime, exc)
         return JSONResponse(

@@ -128,6 +128,22 @@ func fleetPairingRequestEncoding() {
     )
 }
 
+@Test("Fleet pairing refresh reconciles through a body-free local mutation")
+func fleetPairingRefreshRequestEncoding() {
+    let client = ControlAPIClient(
+        baseURL: URL(string: "http://localhost:17321")!,
+        adminPassword: "secret"
+    )
+    let request = client.fleetPairingRefreshRequest()
+
+    #expect(
+        request.url?.absoluteString
+            == "http://localhost:17321/manager/fleet/pairing/refresh"
+    )
+    #expect(request.httpMethod == "POST")
+    #expect(request.httpBody == nil)
+}
+
 @Test("Discarding a rejected claim uses a body-free local control mutation")
 func fleetPairingDiscardRejectedRequestEncoding() {
     let client = ControlAPIClient(
@@ -146,6 +162,22 @@ func fleetPairingDiscardRejectedRequestEncoding() {
         request.value(forHTTPHeaderField: "Authorization")
             == "Basic YWRtaW46c2VjcmV0"
     )
+}
+
+@Test("Discarding a Hub-confirmed terminal claim uses its dedicated endpoint")
+func fleetPairingDiscardTerminalRequestEncoding() {
+    let client = ControlAPIClient(
+        baseURL: URL(string: "http://localhost:17321")!,
+        adminPassword: "secret"
+    )
+    let request = client.fleetPairingDiscardTerminalRequest()
+
+    #expect(
+        request.url?.absoluteString
+            == "http://localhost:17321/manager/fleet/pairing/discard-terminal"
+    )
+    #expect(request.httpMethod == "POST")
+    #expect(request.httpBody == nil)
 }
 
 @Test("Fleet self-revocation carries only one restart-safe request identity")

@@ -400,6 +400,8 @@ public struct FleetPairingAPIError: Error, Equatable, LocalizedError, Sendable {
             "Existing static Fleet credentials require explicit migration."
         case "pairing_expired":
             "The pairing invitation expired."
+        case "pairing_remote_attempt_terminal":
+            "The Hub confirmed that this pairing attempt is no longer active."
         case "pairing_claim_rejected", "pairing_activation_rejected":
             "The Hub rejected this pairing request."
         case "pairing_hub_unavailable":
@@ -429,6 +431,7 @@ public struct FleetPairingAPIError: Error, Equatable, LocalizedError, Sendable {
         "pairing_hub_response_invalid",
         "pairing_claim_rejected",
         "pairing_approval_pending",
+        "pairing_remote_attempt_terminal",
         "pairing_activation_rejected",
         "pairing_management_rejected",
         "pairing_management_outcome_unknown",
@@ -637,7 +640,14 @@ public struct FleetPairingCeremonyState: Equatable, Sendable,
         workflowPhase = phase
         durableAttemptExists = phase != nil || snapshot.state == "pending"
         if durableAttemptExists {
-            if phase == "awaiting_approval" {
+            if snapshot.workflow?.lastErrorCode
+                == "pairing_remote_attempt_terminal"
+            {
+                stage = .failed
+                statusText = "Pairing attempt expired"
+                nextActionText =
+                    "Discard this stale attempt, then request a new pairing code."
+            } else if phase == "awaiting_approval" {
                 stage = .awaitingApproval
                 statusText = "Waiting for Hub approval"
             } else {

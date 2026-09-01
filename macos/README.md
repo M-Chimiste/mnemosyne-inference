@@ -701,12 +701,15 @@ value differs from the invitation is rejected. The original explicit
 invitation-ID/secret ceremony remains under Advanced on both sides.
 
 A conclusive pre-claim rejection leaves no Hub claim, pairing ID, credential
-generation, or pairing-owned bearer. In that exact state, **Settings →
-Inference Pool → Discard Failed Attempt…** atomically removes only the local
-failed-attempt journal and returns the Mac to unpaired state so a fresh
-invitation can be submitted. Ambiguous transport, timeout, redirect, `429`,
-`5xx`, oversized, or malformed-success outcomes remain exact-attempt retry
-fences and cannot use this recovery action.
+generation, or pairing-owned bearer. A claimed attempt may also outlive the
+app's memory-only invitation secret. **Refresh Status** now asks the exact Hub
+for that claim's bounded disposition using the durable high-entropy request
+correlation. If every returned identity field matches and the Hub reports the
+claim expired, rejected, or failed, **Settings → Inference Pool → Discard Stale
+Attempt…** atomically removes only the local attempt journal and returns the Mac
+to unpaired state. Ambiguous transport, timeout, redirect, unknown-Hub, `429`,
+`5xx`, oversized, malformed-success, or active-claim outcomes remain exact-
+attempt retry fences and cannot use this recovery action.
 
 Enrollment and participation are deliberately separate. Existing enrolled
 Macs start joined for backward compatibility. The menu bar's **Contribute this

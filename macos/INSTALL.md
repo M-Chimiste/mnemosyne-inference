@@ -198,12 +198,15 @@ the Advanced Hub dashboard and **Advanced manual pairing** on the Mac preserve
 the original invitation-ID/secret workflow and its explicit post-activation
 Enable step.
 
-If the Hub conclusively rejects the invitation before it creates a claim or
-issues credentials, the Mac preserves the failed attempt so a restart cannot
-silently substitute different invitation data. Choose **Discard Failed
-Attempt…** in **Inference Pool**, confirm, and then create and submit one fresh
-invitation. This recovery action is unavailable for an ambiguous network or
-Hub response; those attempts remain fenced to an exact retry.
+If a Mac still says **Waiting for Hub approval** after the five-minute request
+has disappeared from Nyx, choose **Refresh Status**. The Mac asks the exact Hub
+for the old claim's bounded disposition. Once Nyx conclusively confirms the
+attempt is expired, rejected, or failed, choose **Discard Stale Attempt…**,
+confirm, and request one fresh code. A pre-claim rejection can use the same
+action. It remains unavailable for an active claim, any locally assigned
+pairing credential, or an ambiguous network/Hub response; those attempts stay
+fenced to an exact retry. This changes no model, storage, inference, usage, or
+token-counting state.
 
 After an enrollment is explicitly enabled, every fresh authenticated node
 snapshot publishes all authoritative Fleet-eligible models into the Hub's

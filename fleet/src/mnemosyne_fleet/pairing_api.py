@@ -145,6 +145,12 @@ class ClaimRejection(PairingPayload):
     request_id: CanonicalUUID
 
 
+class ClaimStatusRequest(PairingPayload):
+    """Read-only proof that the caller owns one exact claim request ID."""
+
+    claim_request_id: CanonicalUUID
+
+
 class ClaimProvision(PairingPayload):
     request_id: CanonicalUUID
     pairing_secret: SecretStr = Field(min_length=32, max_length=4096, repr=False)

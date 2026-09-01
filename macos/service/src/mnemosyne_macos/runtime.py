@@ -2046,8 +2046,8 @@ class NativeRuntime:
         await self.fleet_pairing_status()
         return await self._fleet_pairing_workflow_status()
 
-    async def discard_rejected_fleet_pairing_attempt(self) -> dict[str, object]:
-        """Discard one definitively rejected claim before credentials exist."""
+    async def refresh_fleet_pairing_attempt(self) -> dict[str, object]:
+        """Ask the exact Hub for a pending claim's current disposition."""
 
         if not self._fleet_pairing_client_available:
             raise PairingClientError(
@@ -2055,7 +2055,24 @@ class NativeRuntime:
                 status_code=503,
                 retryable=False,
             )
-        await self.fleet_pairing_client.discard_rejected_unclaimed_attempt()
+        await self.fleet_pairing_client.refresh_pending_attempt()
+        return await self.fleet_pairing_status()
+
+    async def discard_rejected_fleet_pairing_attempt(self) -> dict[str, object]:
+        """Backward-compatible terminal-attempt discard entrypoint."""
+
+        return await self.discard_terminal_fleet_pairing_attempt()
+
+    async def discard_terminal_fleet_pairing_attempt(self) -> dict[str, object]:
+        """Discard a conclusively terminal attempt before credentials exist."""
+
+        if not self._fleet_pairing_client_available:
+            raise PairingClientError(
+                PairingClientErrorCode.STATE_CONFLICT,
+                status_code=503,
+                retryable=False,
+            )
+        await self.fleet_pairing_client.discard_terminal_uncredentialed_attempt()
         return await self.fleet_pairing_status()
 
     async def revoke_fleet_pairing(

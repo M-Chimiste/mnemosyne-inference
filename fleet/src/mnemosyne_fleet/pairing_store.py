@@ -178,6 +178,16 @@ class ClaimRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class ClaimStatusRecord:
+    claim_id: str
+    invitation_id: str
+    pairing_id: str
+    reporting_node_id: str
+    state: InvitationState
+    expires_at: float
+
+
+@dataclass(frozen=True, slots=True)
 class ApprovalRequest:
     request_id: str
     claim_id: str
@@ -530,6 +540,29 @@ class PairingStore:
         self._require_initialized()
         claim_id = _canonical_uuid(claim_id)
         return await self._run_sync(lambda: self._claim_record_sync(claim_id))
+
+    async def claim_status(
+        self,
+        *,
+        claim_id: str,
+        claim_request_id: str,
+    ) -> ClaimStatusRecord:
+        """Return one claim's disposition after exact request correlation.
+
+        The claim request ID is a high-entropy correlation value known to the
+        claiming Mac and this store.  This read-only result exposes no locator,
+        display name, secret reference, credential, or enrollment policy.
+        Expiration is reconciled before the disposition is returned so a Mac
+        can distinguish a terminal claim from a merely ambiguous local wait.
+        """
+
+        self._require_initialized()
+        claim_id = _canonical_uuid(claim_id)
+        claim_request_id = _canonical_uuid(claim_request_id)
+        await self.expire_invitations()
+        return await self._run_sync(
+            lambda: self._claim_status_sync(claim_id, claim_request_id)
+        )
 
     async def pending_claims(self, *, limit: int = 100) -> tuple[ClaimRecord, ...]:
         """Return a bounded admin-safe view with no locator or secret refs."""
@@ -3269,6 +3302,39 @@ class PairingStore:
     def _claim_record_sync(self, claim_id: str) -> ClaimRecord | None:
         with self._connect() as conn:
             return self._claim_record_with_conn(conn, claim_id)
+
+    def _claim_status_sync(
+        self,
+        claim_id: str,
+        claim_request_id: str,
+    ) -> ClaimStatusRecord:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT c.claim_id, c.invitation_id, i.pairing_id,
+                       c.reporting_node_id, i.state, i.expires_at
+                FROM claims c
+                JOIN invitations i ON i.invitation_id=c.invitation_id
+                JOIN idempotency d
+                  ON d.request_id=?
+                 AND d.operation='claim_invitation'
+                 AND d.result_id=c.claim_id
+                WHERE c.claim_id=?
+                """,
+                (claim_request_id, claim_id),
+            ).fetchone()
+        if row is None:
+            # Unknown claims and mismatched correlation values deliberately
+            # collapse to the same fixed response.
+            raise PairingStoreTerminalError("pairing_claim_unknown")
+        return ClaimStatusRecord(
+            claim_id=str(row["claim_id"]),
+            invitation_id=str(row["invitation_id"]),
+            pairing_id=str(row["pairing_id"]),
+            reporting_node_id=str(row["reporting_node_id"]),
+            state=str(row["state"]),  # type: ignore[arg-type]
+            expires_at=float(row["expires_at"]),
+        )
 
     def _pending_claims_sync(self, limit: int) -> tuple[ClaimRecord, ...]:
         with self._connect() as conn:

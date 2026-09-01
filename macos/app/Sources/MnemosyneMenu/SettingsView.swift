@@ -1289,7 +1289,7 @@ struct SettingsView: View {
                         .disabled(viewModel.isAdvancingFleetPairing)
                     }
                     if viewModel.canDiscardRejectedFleetPairingAttempt {
-                        Button("Discard Failed Attempt…", role: .destructive) {
+                        Button("Discard Stale Attempt…", role: .destructive) {
                             viewModel.confirmDiscardRejectedFleetPairingAttempt = true
                         }
                         .disabled(
@@ -1545,17 +1545,17 @@ struct SettingsView: View {
             )
         }
         .confirmationDialog(
-            "Discard this failed pairing attempt?",
+            "Discard this stale pairing attempt?",
             isPresented: $viewModel.confirmDiscardRejectedFleetPairingAttempt,
             titleVisibility: .visible
         ) {
-            Button("Discard Failed Attempt", role: .destructive) {
+            Button("Discard Stale Attempt", role: .destructive) {
                 Task { await viewModel.discardRejectedFleetPairingAttempt() }
             }
             Button("Cancel", role: .cancel) {}
         } message: {
             Text(
-                "This is available only because the Hub conclusively rejected the claim before creating an enrollment or issuing credentials. Local inference, models, storage, participation, and token history are unchanged."
+                "This is available only after the Hub conclusively confirms the old attempt is terminal, or rejects it before creating a claim. No credentials were issued locally. Local inference, models, storage, participation, usage, and token history are unchanged."
             )
         }
     }

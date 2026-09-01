@@ -371,6 +371,46 @@ func rejectedUnclaimedAttemptDiscardEligibility() throws {
 
     let awaitingApproval = try pendingPairingSnapshot()
     #expect(!awaitingApproval.canDiscardRejectedAttempt)
+    #expect(!awaitingApproval.canDiscardTerminalAttempt)
+
+    let terminalPayload = #"""
+    {
+      "schema_version": 1,
+      "available": true,
+      "state": "pending",
+      "pairing_id": null,
+      "credentials_configured": false,
+      "legacy_credentials_present": false,
+      "last_error_code": null,
+      "workflow": {
+        "schema_version": 1,
+        "available": true,
+        "phase": "awaiting_approval",
+        "attempt_id": "22222222-2222-4222-8222-222222222222",
+        "invitation_id": "11111111-1111-4111-8111-111111111111",
+        "claim_request_id": "33333333-3333-4333-8333-333333333333",
+        "provision_request_id": "44444444-4444-4444-8444-444444444444",
+        "activation_request_id": "55555555-5555-4555-8555-555555555555",
+        "claim_id": "66666666-6666-4666-8666-666666666666",
+        "pairing_id": "77777777-7777-4777-8777-777777777777",
+        "reporting_node_id": "studio-mac",
+        "credential_generation": null,
+        "expires_at": 1788031200.0,
+        "last_error_code": "pairing_remote_attempt_terminal",
+        "updated_at": 1788027600.0
+      }
+    }
+    """#.data(using: .utf8)!
+    let terminal = try JSONDecoder().decode(
+        FleetPairingSnapshot.self,
+        from: terminalPayload
+    )
+    #expect(terminal.canDiscardTerminalAttempt)
+
+    var state = FleetPairingCeremonyState()
+    state.synchronize(with: terminal)
+    #expect(state.stage == .failed)
+    #expect(state.statusText == "Pairing attempt expired")
 }
 
 private func enterInvitation(into state: inout FleetPairingCeremonyState) {

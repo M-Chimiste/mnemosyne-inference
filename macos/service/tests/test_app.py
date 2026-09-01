@@ -5318,6 +5318,114 @@ async def test_rejected_claim_can_be_discarded_through_local_control(
 
 
 @pytest.mark.asyncio
+async def test_refresh_confirms_and_discards_terminal_pairing_only(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    for key in (
+        "FLEET_API_KEY",
+        "FLEET_INFERENCE_API_KEY",
+        "FLEET_MANAGEMENT_API_KEY",
+    ):
+        monkeypatch.setenv(key, "")
+
+    claim_id = "22222222-2222-4222-8222-222222222222"
+    pairing_id = "33333333-3333-4333-8333-333333333333"
+    invitation_id = "11111111-1111-4111-8111-111111111111"
+    expires_at = 4_000_000_000.0
+    claim_request_ids: list[str] = []
+    runtime: NativeRuntime
+
+    def hub(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        if request.url.path == "/fleet/pairing/v1/claims":
+            claim_request_ids.append(payload["request_id"])
+            return httpx.Response(
+                200,
+                json={
+                    "schema_version": 1,
+                    "claim_id": claim_id,
+                    "invitation_id": invitation_id,
+                    "pairing_id": pairing_id,
+                    "display_name": runtime.usage.identity.node_id,
+                    "reporting_node_id": runtime.usage.identity.node_id,
+                    "service_version": "0.9.0",
+                    "platform": "macos",
+                    "protocol_version": 1,
+                    "state": "claimed",
+                    "claimed_at": 100.0,
+                    "expires_at": expires_at,
+                    "locator_accepted": True,
+                },
+            )
+        if request.url.path.endswith("/provision"):
+            return httpx.Response(
+                410,
+                json={"detail": {"code": "pairing_claim_terminal"}},
+            )
+        if request.url.path.endswith("/status"):
+            assert payload == {
+                "schema_version": 1,
+                "claim_request_id": claim_request_ids[0],
+            }
+            return httpx.Response(
+                200,
+                json={
+                    "schema_version": 1,
+                    "claim_id": claim_id,
+                    "invitation_id": invitation_id,
+                    "pairing_id": pairing_id,
+                    "reporting_node_id": runtime.usage.identity.node_id,
+                    "state": "expired",
+                    "expires_at": expires_at,
+                },
+            )
+        raise AssertionError(request.url.path)
+
+    runtime = NativeRuntime(
+        _config(tmp_path),
+        env_path=tmp_path / "private" / ".env",
+        adapters=_adapters(),
+        pairing_transport=httpx.MockTransport(hub),
+    )
+    await runtime.start(raise_on_degraded=True)
+    control = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=create_control_app(runtime)),
+        base_url="http://control.test",
+    )
+    request = {
+        "schema_version": 1,
+        "invitation_id": invitation_id,
+        "pairing_secret": "invitation-secret-that-is-long-enough-1234567890",
+        "hub_origin": "https://nyx.private.example",
+        "locator": "http://metis.private.example:1240",
+    }
+    try:
+        usage_before = await runtime.usage.status()
+        pending = await control.post("/manager/fleet/pairing/begin", json=request)
+        assert pending.status_code == 202
+
+        refreshed = await control.post("/manager/fleet/pairing/refresh")
+        assert refreshed.status_code == 200
+        assert refreshed.json()["workflow"]["last_error_code"] == (
+            "pairing_remote_attempt_terminal"
+        )
+
+        discarded = await control.post(
+            "/manager/fleet/pairing/discard-terminal"
+        )
+        assert discarded.status_code == 200
+        assert discarded.json()["state"] == "unpaired"
+        assert discarded.json()["workflow"]["phase"] is None
+        usage_after = await runtime.usage.status()
+        assert usage_after["outbox_depth"] == usage_before["outbox_depth"]
+        assert all(adapter.loads == 0 for adapter in runtime.adapters.values())
+    finally:
+        await control.aclose()
+        await runtime.stop()
+
+
+@pytest.mark.asyncio
 async def test_pairing_staging_is_probe_visible_before_activation_ack(
     tmp_path,
     monkeypatch,

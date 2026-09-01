@@ -13,6 +13,7 @@ from .pairing_api import (
     ActivationAcknowledgement,
     ClaimApproval,
     ClaimProvision,
+    ClaimStatusRequest,
     InvitationClaim,
     InvitationCreate,
     EnrollmentSelfManagement,
@@ -22,6 +23,7 @@ from .pairing_api import (
 from .pairing_store import (
     ApprovalRequest,
     ClaimRecord,
+    ClaimStatusRecord,
     ClaimRequest,
     EnrollmentBinding,
     EnrollmentRecord,
@@ -254,6 +256,17 @@ class PairingCoordinator:
 
     async def pending_claims(self, *, limit: int = 100) -> tuple[ClaimRecord, ...]:
         return await self.pairing_store.pending_claims(limit=limit)
+
+    async def claim_status(
+        self,
+        *,
+        claim_id: str,
+        payload: ClaimStatusRequest,
+    ) -> ClaimStatusRecord:
+        return await self.pairing_store.claim_status(
+            claim_id=claim_id,
+            claim_request_id=payload.claim_request_id,
+        )
 
     async def enrollments(self) -> tuple[EnrollmentRecord, ...]:
         return await self.pairing_store.enrollments()
