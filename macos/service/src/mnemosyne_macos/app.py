@@ -12,7 +12,7 @@ import os
 from pathlib import Path
 import re
 import time
-from typing import Any, Literal, Mapping
+from typing import Any, Literal, Mapping, TypeVar
 from uuid import UUID, uuid4
 
 import httpx
@@ -145,6 +145,29 @@ class FleetPairingControlRequest(BaseModel):
     pairing_secret: SecretStr = Field(min_length=32, max_length=4096, repr=False)
     hub_origin: str = Field(min_length=1, max_length=2048)
     locator: SecretStr = Field(min_length=1, max_length=2048, repr=False)
+
+
+class FleetPairingPresenceRequest(BaseModel):
+    """Secret-free local request to start a short-code Hub ceremony."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        str_strip_whitespace=False,
+    )
+
+    schema_version: Literal[1]
+    request_id: str = Field(
+        min_length=36,
+        max_length=36,
+        pattern=(
+            r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+            r"[0-9a-f]{4}-[0-9a-f]{12}$"
+        ),
+    )
+    hub_origin: str = Field(min_length=1, max_length=2048)
+    locator: SecretStr = Field(min_length=1, max_length=2048, repr=False)
+    transport: Literal["https", "tailscale", "trusted_lan_http"]
 
 
 class FleetPairingManagementRequest(BaseModel):
@@ -1138,9 +1161,16 @@ def _fleet_participation_payload(
     }
 
 
-async def _parse_fleet_pairing_control_request(
+_FleetPairingLocalPayloadT = TypeVar(
+    "_FleetPairingLocalPayloadT",
+    bound=BaseModel,
+)
+
+
+async def _parse_fleet_pairing_local_request(
     request: Request,
-) -> FleetPairingControlRequest:
+    payload_type: type[_FleetPairingLocalPayloadT],
+) -> _FleetPairingLocalPayloadT:
     """Parse a bounded secret-bearing body without echoing invalid input."""
 
     content_encoding = request.headers.get("content-encoding", "identity").lower()
@@ -1190,7 +1220,7 @@ async def _parse_fleet_pairing_control_request(
                 },
             )
     try:
-        return FleetPairingControlRequest.model_validate_json(bytes(body))
+        return payload_type.model_validate_json(bytes(body))
     except (ValidationError, ValueError, TypeError):
         raise HTTPException(
             status_code=400,
@@ -1199,6 +1229,24 @@ async def _parse_fleet_pairing_control_request(
                 "message": "The pairing request is invalid.",
             },
         ) from None
+
+
+async def _parse_fleet_pairing_control_request(
+    request: Request,
+) -> FleetPairingControlRequest:
+    return await _parse_fleet_pairing_local_request(
+        request,
+        FleetPairingControlRequest,
+    )
+
+
+async def _parse_fleet_pairing_presence_request(
+    request: Request,
+) -> FleetPairingPresenceRequest:
+    return await _parse_fleet_pairing_local_request(
+        request,
+        FleetPairingPresenceRequest,
+    )
 
 
 def _pairing_invitation(payload: FleetPairingControlRequest) -> PairingInvitation:
@@ -2158,6 +2206,23 @@ def create_control_app(runtime: NativeRuntime) -> FastAPI:
             content=await runtime.check_compatibility_catalog(),
         )
 
+    @app.post("/manager/fleet/pairing/request")
+    async def request_fleet_pairing(request: Request):
+        payload = await _parse_fleet_pairing_presence_request(request)
+        try:
+            issued = await runtime.request_fleet_pairing_invitation(
+                request_id=payload.request_id,
+                hub_origin=payload.hub_origin,
+                locator=payload.locator.get_secret_value(),
+                transport=payload.transport,
+            )
+        except PairingClientError as exc:
+            return await _pairing_client_error_response(runtime, exc)
+        return JSONResponse(
+            headers={"Cache-Control": "no-store"},
+            content=issued,
+        )
+
     @app.post("/manager/fleet/pairing/begin")
     async def begin_fleet_pairing(request: Request):
         payload = await _parse_fleet_pairing_control_request(request)
@@ -2194,6 +2259,17 @@ def create_control_app(runtime: NativeRuntime) -> FastAPI:
                 "next_action": None,
                 "workflow": workflow,
             },
+        )
+
+    @app.post("/manager/fleet/pairing/discard-rejected")
+    async def discard_rejected_fleet_pairing() -> JSONResponse:
+        try:
+            pairing = await runtime.discard_rejected_fleet_pairing_attempt()
+        except PairingClientError as exc:
+            return await _pairing_client_error_response(runtime, exc)
+        return JSONResponse(
+            headers={"Cache-Control": "no-store"},
+            content=pairing,
         )
 
     @app.post("/manager/fleet/pairing/revoke")

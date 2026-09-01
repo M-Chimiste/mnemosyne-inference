@@ -447,18 +447,168 @@ struct SettingsView: View {
                     }
                 }
 
+                Section("Pair Macs") {
+                    HStack(alignment: .firstTextBaseline) {
+                        Text(
+                            "On the other Mac, enter this Hub's public origin and choose Request to Join. Its request appears here automatically."
+                        )
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        Spacer()
+                        if hubMode.isRefreshingPairing {
+                            ProgressView().controlSize(.small)
+                        }
+                        Button("Refresh") {
+                            Task {
+                                await hubMode.refreshPairingAdministration()
+                            }
+                        }
+                        .disabled(
+                            !hubMode.hubHealthy
+                                || hubMode.isRefreshingPairing
+                        )
+                    }
+
+                    if !hubMode.hubHealthy {
+                        Text("Start the Hub before pairing another Mac.")
+                            .foregroundStyle(.secondary)
+                    } else if hubMode.pendingPairingClaims.isEmpty {
+                        Text("No Macs are waiting for approval.")
+                            .foregroundStyle(.secondary)
+                    } else {
+                        ForEach(hubMode.pendingPairingClaims) { claim in
+                            VStack(alignment: .leading, spacing: 8) {
+                                HStack(alignment: .firstTextBaseline) {
+                                    Text(claim.displayName)
+                                        .fontWeight(.semibold)
+                                    Text(claim.reportingNodeID)
+                                        .font(.caption.monospaced())
+                                        .foregroundStyle(.secondary)
+                                    Spacer()
+                                    Text("Primary")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                                HStack {
+                                    TextField(
+                                        "6-digit code",
+                                        text: Binding(
+                                            get: {
+                                                hubMode.presencePIN(
+                                                    for: claim.claimID
+                                                )
+                                            },
+                                            set: {
+                                                hubMode.setPresencePIN(
+                                                    $0,
+                                                    for: claim.claimID
+                                                )
+                                            }
+                                        )
+                                    )
+                                    .textFieldStyle(.roundedBorder)
+                                    .font(.body.monospacedDigit())
+                                    .frame(width: 150)
+                                    .onSubmit {
+                                        guard hubMode.canPair(claim) else {
+                                            return
+                                        }
+                                        Task {
+                                            await hubMode.pairAndEnable(claim)
+                                        }
+                                    }
+                                    Button("Pair & Enable") {
+                                        Task {
+                                            await hubMode.pairAndEnable(claim)
+                                        }
+                                    }
+                                    .buttonStyle(.borderedProminent)
+                                    .disabled(!hubMode.canPair(claim))
+                                    if hubMode.pairingInFlightClaimIDs.contains(
+                                        claim.claimID
+                                    ) {
+                                        ProgressView().controlSize(.small)
+                                    }
+                                }
+                                Text(
+                                    "Code expires \(Date(timeIntervalSince1970: claim.expiresAt).formatted(date: .omitted, time: .shortened)). Keep Inference Pool open on \(claim.displayName) until activation finishes."
+                                )
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+
+                    if !hubMode.pairingStatusMessage.isEmpty {
+                        Text(hubMode.pairingStatusMessage)
+                            .font(.caption)
+                            .foregroundStyle(
+                                hubMode.pairingIsError
+                                    ? Color.red : Color.secondary
+                            )
+                            .textSelection(.enabled)
+                    }
+                }
+                .task {
+                    await hubMode.monitorPairingAdministration()
+                }
+
+                if !hubMode.pairingEnrollments.isEmpty {
+                    Section("Paired Macs") {
+                        ForEach(hubMode.pairingEnrollments) { enrollment in
+                            HStack(alignment: .firstTextBaseline) {
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text(enrollment.displayName)
+                                        .fontWeight(.medium)
+                                    Text(
+                                        "\(enrollment.reportingNodeID) · \(enrollment.serviceClass) · \(enrollment.state)"
+                                    )
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                }
+                                Spacer()
+                                if let failureCode = enrollment.failureCode {
+                                    Text(failureCode)
+                                        .font(.caption)
+                                        .foregroundStyle(.red)
+                                } else if enrollment.state == "disabled",
+                                          !enrollment.hubEnabled
+                                {
+                                    Button("Enable") {
+                                        Task {
+                                            await hubMode.enableEnrollment(
+                                                enrollment
+                                            )
+                                        }
+                                    }
+                                    .disabled(
+                                        hubMode.enrollmentInFlightIDs.contains(
+                                            enrollment.pairingID
+                                        )
+                                    )
+                                } else if enrollment.hubEnabled {
+                                    Label("Enabled", systemImage: "checkmark.circle.fill")
+                                        .foregroundStyle(.green)
+                                } else {
+                                    Text(enrollment.state.capitalized)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                        }
+                    }
+                }
+
                 Section("Hub administration") {
                     HStack {
-                        Button("Open Hub Dashboard") {
+                        Button("Open Advanced Dashboard") {
                             hubMode.openDashboard()
                         }
-                        .buttonStyle(.borderedProminent)
                         .disabled(!hubMode.hubHealthy)
                         Button("Copy Admin Key") { hubMode.copyAdminKey() }
                         Button("Copy Client API Key") { hubMode.copyClientKey() }
                     }
                     Text(
-                        "Create invitations, approve Macs, assign service classes, manage automatically published model routes, and enable or revoke enrollments from the Hub dashboard. Credentials are revealed only by an explicit copy action."
+                        "Routine PIN pairing happens above. Use the advanced dashboard to change service classes, manage automatically published model routes, or revoke enrollments. Credentials are revealed only by an explicit copy action."
                     )
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -1138,6 +1288,15 @@ struct SettingsView: View {
                         }
                         .disabled(viewModel.isAdvancingFleetPairing)
                     }
+                    if viewModel.canDiscardRejectedFleetPairingAttempt {
+                        Button("Discard Failed Attempt…", role: .destructive) {
+                            viewModel.confirmDiscardRejectedFleetPairingAttempt = true
+                        }
+                        .disabled(
+                            viewModel.isAdvancingFleetPairing
+                                || viewModel.isDiscardingFleetPairingAttempt
+                        )
+                    }
                 }
                 if let pairing = viewModel.fleetPairing,
                    pairing.legacyCredentialsPresent != true,
@@ -1178,47 +1337,117 @@ struct SettingsView: View {
                 }
             }
 
-            if viewModel.fleetPairingCeremony.showsInvitationEntry {
-                Section("Pair this Mac") {
-                    TextField(
-                        "Invitation ID",
-                        text: viewModel.fleetPairingInvitationIDBinding
-                    )
-                    .textFieldStyle(.roundedBorder)
-                    SecureField(
-                        "Pairing secret",
-                        text: viewModel.fleetPairingSecretBinding
-                    )
-                    .textFieldStyle(.roundedBorder)
-                    .privacySensitive()
-                    TextField(
-                        "Hub HTTPS origin (https://hub.example)",
-                        text: viewModel.fleetPairingHubOriginBinding
-                    )
-                    .textFieldStyle(.roundedBorder)
-                    TextField(
-                        "This Mac's pool address (https://mac.example:1240)",
-                        text: viewModel.fleetPairingLocatorBinding
-                    )
-                    .textFieldStyle(.roundedBorder)
-                    Text(
-                        "The invitation secret is sent only to the local control service. After submission it is hidden and kept only in memory long enough to resume this open ceremony. Closing Settings clears it and requires re-entry."
-                    )
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    HStack {
-                        Spacer()
-                        Button(pairingSubmissionButtonTitle) {
-                            viewModel.advanceFleetPairing()
+            if viewModel.fleetPairingCeremony.showsInvitationEntry
+                || viewModel.fleetPairingPresencePIN != nil
+            {
+                Section("Join a Hub") {
+                    if let pin = viewModel.fleetPairingPresencePINDisplay {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Enter this code in the Hub dashboard")
+                                .fontWeight(.medium)
+                            Text(pin)
+                                .font(.system(size: 30, weight: .semibold, design: .monospaced))
+                                .textSelection(.enabled)
+                                .privacySensitive()
+                            if let expiresAt = viewModel.fleetPairingPresenceExpiresAt {
+                                Text(
+                                    "Expires \(Date(timeIntervalSince1970: expiresAt).formatted(date: .omitted, time: .shortened))."
+                                )
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            }
+                            Text(
+                                "Keep this window open. After the Hub accepts the code, this Mac exchanges its private credentials and finishes automatically."
+                            )
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                         }
-                        .buttonStyle(.borderedProminent)
-                        .disabled(
-                            !viewModel.fleetPairingCeremony.canSubmit
-                                || viewModel.isAdvancingFleetPairing
+                        if viewModel.isAdvancingFleetPairing {
+                            HStack(spacing: 8) {
+                                ProgressView().controlSize(.small)
+                                Text("Waiting for the Hub…")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        } else if viewModel.fleetPairingCeremony.canResumeWithoutReentry {
+                            HStack {
+                                Spacer()
+                                Button("Retry Pairing") {
+                                    viewModel.advanceFleetPairing()
+                                }
+                                .buttonStyle(.borderedProminent)
+                            }
+                        }
+                    } else {
+                        TextField(
+                            "Hub address (https://nyx.example.ts.net)",
+                            text: $viewModel.fleetPairingHubAddress
                         )
+                        .textFieldStyle(.roundedBorder)
+                        Text(
+                            "Unified Inference uses Tailscale to discover this Mac's pool address. You only enter the Hub address; the long-lived credentials are exchanged privately."
+                        )
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        HStack {
+                            Spacer()
+                            Button("Request to Join") {
+                                Task { await viewModel.requestFleetPairing() }
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .disabled(!viewModel.canRequestFleetPairing)
+                        }
+
+                        DisclosureGroup(
+                            "Advanced manual pairing",
+                            isExpanded: $viewModel.showAdvancedFleetPairing
+                        ) {
+                            VStack(alignment: .leading, spacing: 8) {
+                                TextField(
+                                    "Invitation ID",
+                                    text: viewModel.fleetPairingInvitationIDBinding
+                                )
+                                .textFieldStyle(.roundedBorder)
+                                SecureField(
+                                    "Pairing secret",
+                                    text: viewModel.fleetPairingSecretBinding
+                                )
+                                .textFieldStyle(.roundedBorder)
+                                .privacySensitive()
+                                TextField(
+                                    "Hub HTTPS origin (https://hub.example)",
+                                    text: viewModel.fleetPairingHubOriginBinding
+                                )
+                                .textFieldStyle(.roundedBorder)
+                                TextField(
+                                    "This Mac's pool address (http://mac.example:1240 for Tailscale)",
+                                    text: viewModel.fleetPairingLocatorBinding
+                                )
+                                .textFieldStyle(.roundedBorder)
+                                Text(
+                                    "Manual invitation values are kept only in memory while this Settings window remains open."
+                                )
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                HStack {
+                                    Spacer()
+                                    Button(pairingSubmissionButtonTitle) {
+                                        viewModel.advanceFleetPairing()
+                                    }
+                                    .buttonStyle(.bordered)
+                                    .disabled(
+                                        !viewModel.fleetPairingCeremony.canSubmit
+                                            || viewModel.isAdvancingFleetPairing
+                                    )
+                                }
+                            }
+                            .padding(.top, 6)
+                        }
                     }
                 }
-            } else if viewModel.fleetPairingCeremony.canResumeWithoutReentry {
+            } else if viewModel.fleetPairingCeremony.canResumeWithoutReentry,
+                      !viewModel.fleetPairingCeremony.isPresenceCeremony
+            {
                 Section("Current ceremony") {
                     Text(
                         "The submitted invitation is no longer shown. Resume reuses its in-memory value only for this open Settings window."
@@ -1313,6 +1542,20 @@ struct SettingsView: View {
         } message: {
             Text(
                 "The current enrollment credentials will be revoked. Models, user-selected weight locations, local inference, and token history stay on this Mac. Re-enrollment requires a new Hub invitation."
+            )
+        }
+        .confirmationDialog(
+            "Discard this failed pairing attempt?",
+            isPresented: $viewModel.confirmDiscardRejectedFleetPairingAttempt,
+            titleVisibility: .visible
+        ) {
+            Button("Discard Failed Attempt", role: .destructive) {
+                Task { await viewModel.discardRejectedFleetPairingAttempt() }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(
+                "This is available only because the Hub conclusively rejected the claim before creating an enrollment or issuing credentials. Local inference, models, storage, participation, and token history are unchanged."
             )
         }
     }

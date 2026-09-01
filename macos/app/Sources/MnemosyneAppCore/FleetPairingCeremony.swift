@@ -82,6 +82,148 @@ public struct FleetPairingControlRequest: Encodable, Equatable, Sendable,
     }
 }
 
+/// Secret-free request for a short-code ceremony. The locator is redacted from
+/// diagnostics because it is transport metadata, not browser-facing state.
+public struct FleetPairingPresenceRequest: Encodable, Equatable, Sendable,
+    CustomStringConvertible, CustomDebugStringConvertible, CustomReflectable
+{
+    public static let supportedSchemaVersion = 1
+
+    public let schemaVersion: Int
+    public let requestID: String
+    public let hubOrigin: String
+    public let transport: String
+    private let locator: String
+
+    public init(
+        schemaVersion: Int = supportedSchemaVersion,
+        requestID: String,
+        hubOrigin: String,
+        locator: String,
+        transport: String = "tailscale"
+    ) {
+        self.schemaVersion = schemaVersion
+        self.requestID = requestID
+        self.hubOrigin = hubOrigin
+        self.locator = locator
+        self.transport = transport
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case schemaVersion
+        case requestID
+        case hubOrigin
+        case locator
+        case transport
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encode(schemaVersion, forKey: .schemaVersion)
+        try values.encode(requestID, forKey: .requestID)
+        try values.encode(hubOrigin, forKey: .hubOrigin)
+        try values.encode(locator, forKey: .locator)
+        try values.encode(transport, forKey: .transport)
+    }
+
+    public var description: String {
+        "FleetPairingPresenceRequest(schemaVersion: \(schemaVersion), "
+            + "requestID: \(requestID), hubOrigin: \(hubOrigin), "
+            + "locator: <redacted>, transport: \(transport))"
+    }
+
+    public var debugDescription: String { description }
+
+    public var customMirror: Mirror {
+        Mirror(
+            self,
+            children: [
+                "schemaVersion": schemaVersion,
+                "requestID": requestID,
+                "hubOrigin": hubOrigin,
+                "locator": "<redacted>",
+                "transport": transport,
+            ],
+            displayStyle: .struct
+        )
+    }
+}
+
+/// The loopback service returns this hidden invitation only to the signed app.
+/// UI code displays the PIN and retains the strong secret only in memory.
+public struct FleetPairingPresenceResponse: Decodable, Equatable, Sendable,
+    CustomStringConvertible, CustomDebugStringConvertible, CustomReflectable
+{
+    public let schemaVersion: Int
+    public let presencePIN: String
+    public let expiresAt: Double
+    public let invitationID: String
+    public let hubOrigin: String
+    public let locator: String
+    private let pairingSecret: String
+
+    public init(
+        schemaVersion: Int = 1,
+        presencePIN: String,
+        expiresAt: Double,
+        invitationID: String,
+        pairingSecret: String,
+        hubOrigin: String,
+        locator: String
+    ) {
+        self.schemaVersion = schemaVersion
+        self.presencePIN = presencePIN
+        self.expiresAt = expiresAt
+        self.invitationID = invitationID
+        self.pairingSecret = pairingSecret
+        self.hubOrigin = hubOrigin
+        self.locator = locator
+    }
+
+    public func pairingControlRequest() -> FleetPairingControlRequest {
+        FleetPairingControlRequest(
+            invitationID: invitationID,
+            pairingSecret: pairingSecret,
+            hubOrigin: hubOrigin,
+            locator: locator
+        )
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case schemaVersion = "schema_version"
+        case presencePIN = "presence_pin"
+        case expiresAt = "expires_at"
+        case invitationID = "invitation_id"
+        case pairingSecret = "pairing_secret"
+        case hubOrigin = "hub_origin"
+        case locator
+    }
+
+    public var description: String {
+        "FleetPairingPresenceResponse(schemaVersion: \(schemaVersion), "
+            + "presencePIN: <redacted>, invitationID: \(invitationID), "
+            + "pairingSecret: <redacted>, hubOrigin: \(hubOrigin), "
+            + "locator: <redacted>)"
+    }
+
+    public var debugDescription: String { description }
+
+    public var customMirror: Mirror {
+        Mirror(
+            self,
+            children: [
+                "schemaVersion": schemaVersion,
+                "presencePIN": "<redacted>",
+                "invitationID": invitationID,
+                "pairingSecret": "<redacted>",
+                "hubOrigin": hubOrigin,
+                "locator": "<redacted>",
+            ],
+            displayStyle: .struct
+        )
+    }
+}
+
 /// Secret-free progress journal returned by the local control service.
 public struct FleetPairingWorkflowSnapshot: Codable, Equatable, Sendable {
     public let schemaVersion: Int?
@@ -325,6 +467,7 @@ public struct FleetPairingCeremonyState: Equatable, Sendable,
     private var pairingSecretEntry = ""
     private var retainedRequest: FleetPairingControlRequest?
     private var durableAttemptExists = false
+    private var presenceCeremony = false
 
     public init() {}
 
@@ -333,6 +476,8 @@ public struct FleetPairingCeremonyState: Equatable, Sendable,
     public var hasSecretInMemory: Bool {
         !pairingSecretEntry.isEmpty || retainedRequest != nil
     }
+
+    public var isPresenceCeremony: Bool { presenceCeremony }
 
     public var showsInvitationEntry: Bool {
         retainedRequest == nil && stage != .paired && stage != .blocked
@@ -408,6 +553,17 @@ public struct FleetPairingCeremonyState: Equatable, Sendable,
         )
     }
 
+    public mutating func preparePresenceSubmission(
+        _ response: FleetPairingPresenceResponse
+    ) throws -> FleetPairingCeremonySubmission {
+        clearInvitationMaterial()
+        retainedRequest = response.pairingControlRequest()
+        presenceCeremony = true
+        durableAttemptExists = false
+        stage = .collecting
+        return try prepareSubmission()
+    }
+
     public mutating func apply(_ response: FleetPairingOperationResponse) {
         durableAttemptExists = true
         if response.pairing?.state == "paired"
@@ -423,8 +579,9 @@ public struct FleetPairingCeremonyState: Equatable, Sendable,
         {
             stage = .awaitingApproval
             statusText = "Waiting for Hub approval"
-            nextActionText =
-                "Approve this Mac in the Hub, then return here and choose Resume Pairing."
+            nextActionText = presenceCeremony
+                ? "Enter the displayed code in the Hub. This Mac will finish automatically."
+                : "Approve this Mac in the Hub, then return here and choose Resume Pairing."
         } else {
             stage = .activating
             statusText = phaseLabel(phase)
@@ -487,9 +644,15 @@ public struct FleetPairingCeremonyState: Equatable, Sendable,
                 stage = .activating
                 statusText = phaseLabel(phase)
             }
-            nextActionText = retainedRequest == nil
-                ? "Re-enter the original invitation details to resume; this app does not store them."
-                : "Resume this exact pairing attempt."
+            if retainedRequest == nil {
+                nextActionText =
+                    "Re-enter the original invitation details to resume; this app does not store them."
+            } else if presenceCeremony && phase == "awaiting_approval" {
+                nextActionText =
+                    "Enter the displayed code in the Hub. This Mac will finish automatically."
+            } else {
+                nextActionText = "Resume this exact pairing attempt."
+            }
         } else if snapshot.state == "recovery_required" {
             stage = .failed
             statusText = "Pairing needs recovery"
@@ -533,6 +696,7 @@ public struct FleetPairingCeremonyState: Equatable, Sendable,
 
     public mutating func cancel() {
         clearInvitationMaterial()
+        presenceCeremony = false
         workflowPhase = nil
         durableAttemptExists = false
         stage = .collecting
@@ -566,13 +730,15 @@ public struct FleetPairingCeremonyState: Equatable, Sendable,
     }
 
     private mutating func complete() {
+        let completedWithPresence = presenceCeremony
         clearInvitationMaterial()
         durableAttemptExists = true
         workflowPhase = "complete"
         stage = .paired
         statusText = "Paired with Hub"
-        nextActionText =
-            "The Hub must enable this Mac before it can receive pooled requests."
+        nextActionText = completedWithPresence
+            ? "This Mac is enrolled. The Hub is finishing enablement and model publication."
+            : "The Hub must enable this Mac before it can receive pooled requests."
     }
 
     private mutating func clearInvitationMaterial() {

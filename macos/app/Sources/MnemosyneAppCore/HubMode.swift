@@ -654,6 +654,14 @@ public struct HubTailscaleManager: Sendable {
     public struct Discovery: Equatable, Sendable {
         public let executableURL: URL
         public let publicOrigin: String
+        public let dnsName: String
+
+        public func inferenceOrigin(port: Int) throws -> String {
+            guard (1 ... 65_535).contains(port) else {
+                throw HubModeError.invalidPublicOrigin
+            }
+            return "http://\(dnsName):\(port)"
+        }
     }
 
     public init() {}
@@ -671,7 +679,11 @@ public struct HubTailscaleManager: Sendable {
         let origin = try HubConfigurationStore.normalizedHTTPSOrigin(
             "https://\(dns)"
         )
-        return Discovery(executableURL: executable, publicOrigin: origin)
+        return Discovery(
+            executableURL: executable,
+            publicOrigin: origin,
+            dnsName: dns
+        )
     }
 
     public func enableServe(using discovery: Discovery) async throws {

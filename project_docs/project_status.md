@@ -91,6 +91,21 @@ separately confirmed **Remove this Mac from Hub** action plus exact-request
 notification, adopt-static cutover, signed-artifact evidence, and multi-host
 acceptance remain open.
 
+The default interactive ceremony now wraps that boundary in a six-digit
+presence-code flow. The Mac owner enters only the Hub's HTTPS origin; the app
+discovers the Mac's Tailscale DNS name, requests a bounded five-minute hidden
+invitation, submits the existing claim, displays the derived code, and polls
+the exact attempt. An authenticated Hub operator enters the code in the Hub
+Mac's native settings and chooses **Pair & Enable**. A wrong code consumes the
+existing attempt budget, the code is never a credential, and the three role
+credentials remain hidden from the browser and Swift diagnostics. The native
+UI uses the private admin bearer only for loopback, redirect-free requests and
+waits for the existing pinned activation probe to leave the enrollment
+disabled before it issues the separate enable transaction. Manual invitation
+and locator entry remain under the Advanced dashboard. Pairing does not change
+model/storage state, token accounting, or
+the default universal-catalog publication path.
+
 Mac-initiated self-revocation now commits a secret-free fence for the exact
 client attempt, invitation, pairing, generation, credential-bundle fingerprint,
 and request ID before contacting Nyx. That fence closes snapshot and dispatch
@@ -938,24 +953,24 @@ see
 
 ## Verification
 
-Latest Mac-first host verification on 2026-08-30:
+Latest Mac-first host verification on 2026-08-31:
 
-- Native service suite: `1130 passed, 2 skipped`, including all adapters, routes, JIT
+- Native service suite: `1131 passed, 2 skipped`, including all adapters, routes, JIT
   residency, full-stream leasing, usage accounting, pairing, inventory,
   selected-node installs, exact storage bindings, and inert lifecycle work.
 - Dedicated inference/storage non-regression slice: `29 passed`, including all
   six current Mac engines and nested external/symlink lexical destinations
   with no default-location fallback, storage-rebind laundering, or stale retry
   transition.
-- Nyx Fleet suite: `388 passed`; cross-component catalog, inventory,
+- Nyx Fleet suite: `396 passed`; cross-component catalog, inventory,
   DesiredInstall, catalog-ceremony, and live-acceptance contracts: `127 passed`.
-- Isolated MFLUX worker suite: `23 passed`; Swift app suite: `164 passed`;
+- Isolated MFLUX worker suite: `23 passed`; Swift app suite: `170 passed`;
   packaging logic: `73 passed`.
-- The complete ad-hoc `Unified Inference 0.9.0 (73)` app was rebuilt from the
+- The complete ad-hoc `Unified Inference 0.9.0 (77)` app was rebuilt from the
   final sources. The isolated packaged verifier and secret-redacted acceptance
   collector passed and it contains zero `.pyc` or `.pyo` files. The canonical
   arm64 pilot DMG passed disk-image and artifact acceptance with SHA-256
-  `d5bdc87b06629d87c7a05d53e010f4cb0efac8401edc65bf26e968f6a4bc3fc3`.
+  `625129d7651edf9e0197d950137807ed1339b0a8bd56aef3008dbf23b0d6712c`.
   The mounted image also proves the preserve-data uninstall assistant, native
   service helper, and separate Hub helper/LaunchAgent are present and valid.
   The nested lifecycle-helper wrapper is present, but no provisioning profile,

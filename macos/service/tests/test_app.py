@@ -48,6 +48,7 @@ from mnemosyne_macos.fleet_pairing_client import (
     PairingInvitation,
     _ClaimResponse,
     _ProvisionResponse,
+    _presence_pin,
 )
 from mnemosyne_macos.install_provenance import (
     DestinationStateBefore,
@@ -1083,10 +1084,12 @@ async def test_cancelled_buffered_image_body_fences_and_unloads_before_successor
         successor = asyncio.create_task(
             runtime.coordinator.acquire(runtime.profiles["qwen-image"])
         )
-        for _ in range(50):
-            if (await runtime.coordinator.status()).queued == 1:
-                break
-            await asyncio.sleep(0)
+        deadline = asyncio.get_running_loop().time() + 1.0
+        while (
+            (await runtime.coordinator.status()).queued != 1
+            and asyncio.get_running_loop().time() < deadline
+        ):
+            await asyncio.sleep(0.001)
 
         request_task.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -5051,6 +5054,87 @@ async def test_self_revoke_pending_denies_immediately_and_across_restart(
 
 
 @pytest.mark.asyncio
+async def test_presence_pairing_request_is_bounded_and_does_not_start_locally(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    for key in (
+        "FLEET_API_KEY",
+        "FLEET_INFERENCE_API_KEY",
+        "FLEET_MANAGEMENT_API_KEY",
+    ):
+        monkeypatch.setenv(key, "")
+
+    pairing_secret = "presence-invitation-secret-that-is-long-enough-1234"
+    hub_requests: list[dict[str, object]] = []
+
+    def hub(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        hub_requests.append(payload)
+        return httpx.Response(
+            201,
+            json={
+                "schema_version": 1,
+                "invitation_id": "11111111-1111-4111-8111-111111111111",
+                "pairing_secret": pairing_secret,
+                "presence_pin": _presence_pin(pairing_secret),
+                "hub_origin": "https://nyx.private.example",
+                "expires_at": 4_000_000_000.0,
+                "state": "issued",
+            },
+        )
+
+    runtime = NativeRuntime(
+        _config(tmp_path),
+        env_path=tmp_path / "private" / ".env",
+        adapters=_adapters(),
+        pairing_transport=httpx.MockTransport(hub),
+    )
+    await runtime.start(raise_on_degraded=True)
+    control = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=create_control_app(runtime)),
+        base_url="http://control.test",
+    )
+    request = {
+        "schema_version": 1,
+        "request_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        "hub_origin": "https://nyx.private.example",
+        "locator": "http://metis.private.example:1240",
+        "transport": "tailscale",
+    }
+    try:
+        response = await control.post(
+            "/manager/fleet/pairing/request",
+            json=request,
+        )
+        assert response.status_code == 200
+        assert response.headers["cache-control"] == "no-store"
+        assert response.json() == {
+            "schema_version": 1,
+            "presence_pin": _presence_pin(pairing_secret),
+            "expires_at": 4_000_000_000.0,
+            "invitation_id": "11111111-1111-4111-8111-111111111111",
+            "pairing_secret": pairing_secret,
+            "hub_origin": "https://nyx.private.example",
+            "locator": "http://metis.private.example:1240",
+        }
+        assert hub_requests[0]["request_id"] == request["request_id"]
+        assert hub_requests[0]["locator"] == request["locator"]
+        assert (await runtime.fleet_pairing_status())["state"] == "unpaired"
+
+        private_locator = "http://must-not-reflect.private:1240"
+        malformed = await control.post(
+            "/manager/fleet/pairing/request",
+            json={**request, "locator": private_locator, "unexpected": "value"},
+        )
+        assert malformed.status_code == 400
+        assert private_locator not in malformed.text
+    finally:
+        await control.aclose()
+        await runtime.stop()
+
+
+@pytest.mark.asyncio
 async def test_pairing_hub_failure_is_secret_safe_and_inference_neutral(
     tmp_path,
     monkeypatch,
@@ -5149,6 +5233,86 @@ async def test_pairing_hub_failure_is_secret_safe_and_inference_neutral(
         assert runtime.startup_error is None
     finally:
         await inference.aclose()
+        await control.aclose()
+        await runtime.stop()
+
+
+@pytest.mark.asyncio
+async def test_rejected_claim_can_be_discarded_through_local_control(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    for key in (
+        "FLEET_API_KEY",
+        "FLEET_INFERENCE_API_KEY",
+        "FLEET_MANAGEMENT_API_KEY",
+    ):
+        monkeypatch.setenv(key, "")
+
+    hub_invitation_ids: list[str] = []
+
+    def rejecting_hub(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        hub_invitation_ids.append(payload["invitation_id"])
+        return httpx.Response(
+            401,
+            json={"detail": {"code": "pairing_claim_rejected"}},
+        )
+
+    runtime = NativeRuntime(
+        _config(tmp_path),
+        env_path=tmp_path / "private" / ".env",
+        adapters=_adapters(),
+        pairing_transport=httpx.MockTransport(rejecting_hub),
+    )
+    await runtime.start(raise_on_degraded=True)
+    control = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=create_control_app(runtime)),
+        base_url="http://control.test",
+    )
+    first = {
+        "schema_version": 1,
+        "invitation_id": "11111111-1111-4111-8111-111111111111",
+        "pairing_secret": "first-invitation-secret-that-is-long-enough-1234",
+        "hub_origin": "https://nyx.private.example",
+        "locator": "http://metis.private.example:1240",
+    }
+    second = {
+        **first,
+        "invitation_id": "22222222-2222-4222-8222-222222222222",
+        "pairing_secret": "second-invitation-secret-that-is-long-enough-123",
+    }
+    try:
+        rejected = await control.post(
+            "/manager/fleet/pairing/begin",
+            json=first,
+        )
+        assert rejected.status_code == 401
+        pending = await control.get("/manager/fleet/pairing")
+        assert pending.json()["state"] == "pending"
+        assert pending.json()["workflow"]["phase"] == "claiming"
+        assert pending.json()["workflow"]["last_error_code"] == (
+            "pairing_claim_rejected"
+        )
+
+        discarded = await control.post(
+            "/manager/fleet/pairing/discard-rejected"
+        )
+        assert discarded.status_code == 200
+        assert discarded.json()["state"] == "unpaired"
+        assert discarded.json()["credentials_configured"] is False
+        assert discarded.json()["workflow"]["phase"] is None
+
+        second_rejected = await control.post(
+            "/manager/fleet/pairing/begin",
+            json=second,
+        )
+        assert second_rejected.status_code == 401
+        assert hub_invitation_ids == [
+            first["invitation_id"],
+            second["invitation_id"],
+        ]
+    finally:
         await control.aclose()
         await runtime.stop()
 

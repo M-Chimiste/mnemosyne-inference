@@ -1999,6 +1999,39 @@ class NativeRuntime:
         await self.fleet_pairing_status()
         return await self._fleet_pairing_workflow_status()
 
+    async def request_fleet_pairing_invitation(
+        self,
+        *,
+        request_id: str,
+        hub_origin: str,
+        locator: str,
+        transport: str,
+    ) -> dict[str, object]:
+        """Request a hidden high-entropy invitation for short-code pairing."""
+
+        if not self._fleet_pairing_client_available:
+            raise PairingClientError(
+                PairingClientErrorCode.STATE_CONFLICT,
+                status_code=503,
+                retryable=False,
+            )
+        issued = await self.fleet_pairing_client.request_presence_invitation(
+            request_id=request_id,
+            hub_origin=hub_origin,
+            locator=locator,
+            transport=transport,
+        )
+        invitation = issued.invitation
+        return {
+            "schema_version": 1,
+            "presence_pin": issued.presence_pin,
+            "expires_at": issued.expires_at,
+            "invitation_id": invitation.invitation_id,
+            "pairing_secret": invitation.pairing_secret,
+            "hub_origin": invitation.hub_origin,
+            "locator": invitation.locator,
+        }
+
     async def resume_fleet_pairing(
         self,
         invitation: PairingInvitation,
@@ -2012,6 +2045,18 @@ class NativeRuntime:
         await self.fleet_pairing_client.resume(invitation)
         await self.fleet_pairing_status()
         return await self._fleet_pairing_workflow_status()
+
+    async def discard_rejected_fleet_pairing_attempt(self) -> dict[str, object]:
+        """Discard one definitively rejected claim before credentials exist."""
+
+        if not self._fleet_pairing_client_available:
+            raise PairingClientError(
+                PairingClientErrorCode.STATE_CONFLICT,
+                status_code=503,
+                retryable=False,
+            )
+        await self.fleet_pairing_client.discard_rejected_unclaimed_attempt()
+        return await self.fleet_pairing_status()
 
     async def revoke_fleet_pairing(
         self,

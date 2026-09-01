@@ -79,8 +79,12 @@ engine process.
   `pairing_coordinator.py`, and `pairing_api.py` implement the opt-in Hub-side
   bearer-pairing foundation: strict/idempotent lifecycle metadata, encrypted
   secrets, bounded locator policy, peer-pinned non-loading activation, and
-  dynamic registry publication. This is not the signed Mac ceremony; pairing
-  remains disabled by default and static enrollment must remain compatible.
+  dynamic registry publication. The default signed-app ceremony lets a Mac
+  request a five-minute invitation from one HTTPS Hub origin and display a
+  derived six-digit presence code; authenticated Hub approval consumes the
+  existing attempt budget and never turns the code into a credential. This is
+  not the signed Mac ceremony; pairing remains disabled by default and static
+  enrollment must remain compatible.
 - `downloader.py` and `download_worker.py` implement install/download orchestration. Installs run as killable subprocesses and persist state in SQLite.
 - `hf_search.py`, `repo_probe.py`, `vllm_supported_architectures.json`, and `scripts/refresh_arch_list.py` support HuggingFace discovery, vLLM architecture filtering, and GGUF probing.
 - `ui/` contains the React/Vite/TypeScript/Tailwind admin UI that is built into `/app/static` by the Dockerfile and served from the admin plane.
@@ -128,6 +132,9 @@ engine process.
   staged/active authentication gates. Its outbound client and the Swift
   Inference Pool page drive invitation claim, approval resume, provisioning,
   staging, and activation with a memory-only invitation secret. They also own
+  an explicit discard action for a conclusively rejected, unclaimed,
+  uncredentialed attempt; it atomically clears only the exact local attempt and
+  must remain unavailable for ambiguous outcomes. They also own
   an explicitly confirmed permanent self-revoke path with a durable exact-
   request recovery fence, pairing-only credential retirement, and safe new-
   invitation re-pair. Revoke must never alter models, exact weight paths,
@@ -209,6 +216,12 @@ engine process.
   configuration, pairing stores, inventory, and route database below the
   private Application Support `hub` tree; the gateway remains a separate
   process on loopback `:17400` and never owns the native worker on `:1240`.
+  Routine presence-code approval lives in the native Hub Mode page: it reads
+  the private admin bearer just in time, contacts only fixed loopback `:17400`
+  without ambient proxies or redirects, waits for the existing activation
+  proof, and only then performs the separate enrollment-enable transaction.
+  The PIN and admin bearer must never enter preferences or durable UI state;
+  the dashboard remains the Advanced manual and administration surface.
   Fresh promotion defaults to Hub-only and must not enable, restart,
   credential, or enroll the native worker. An explicit option may enroll that
   independent worker as `overflow`, and then requires an authoritative
@@ -306,7 +319,10 @@ The live `docker-compose.yml` is intentionally machine-specific and may live out
   per-role credentials, pinned non-loading activation probes, explicit
   enable/disable/revoke, restart reconciliation, and paired registry
   membership. A production pairing starts Hub-disabled and requires a separate
-  admin enable after activation. Do not claim a complete product workflow
+  admin enable after activation. The dashboard's PIN-based **Pair & Enable**
+  control may automate those two ordered admin-authorized transactions, but it
+  must never enable before the pinned activation probe succeeds. Do not claim
+  a complete product workflow
   until the implemented Swift ceremony passes signed-artifact acceptance and
   lifecycle integration, routine rotation, static adoption, and multi-host
   artifact acceptance exist.

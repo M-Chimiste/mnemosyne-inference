@@ -26,6 +26,7 @@ from mnemosyne_macos.fleet_pairing_client import (
     PairingManagementState,
     _ClaimResponse,
     _ProvisionResponse,
+    _presence_pin,
 )
 
 
@@ -267,6 +268,73 @@ async def _stores(
 
 
 @pytest.mark.asyncio
+async def test_presence_request_returns_hidden_invitation_and_display_pin(
+    tmp_path: Path,
+) -> None:
+    requests: list[tuple[str, dict[str, Any]]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        requests.append((request.url.path, payload))
+        if request.url.path == "/fleet/pairing/v1/requests":
+            return httpx.Response(
+                201,
+                json={
+                    "schema_version": 1,
+                    "invitation_id": INVITATION_ID,
+                    "pairing_secret": PAIRING_SECRET,
+                    "presence_pin": _presence_pin(PAIRING_SECRET),
+                    "hub_origin": HUB_ORIGIN,
+                    "expires_at": 4_000_000_000.0,
+                    "state": "issued",
+                },
+            )
+        if request.url.path == "/fleet/pairing/v1/claims":
+            return httpx.Response(200, json=_claim(payload["request_id"]))
+        return httpx.Response(
+            410,
+            json={"detail": {"code": "pairing_transaction_terminal"}},
+        )
+
+    pairing, client, _ = await _stores(tmp_path, handler)
+    try:
+        issued = await client.request_presence_invitation(
+            request_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            hub_origin=HUB_ORIGIN,
+            locator=LOCATOR,
+            transport="https",
+        )
+        assert issued.presence_pin == _presence_pin(PAIRING_SECRET)
+        assert issued.invitation == _invitation()
+        assert PAIRING_SECRET not in repr(issued)
+        assert issued.presence_pin not in repr(issued)
+        assert await client.status() is None
+        assert (await pairing.status()).state == PairingState.UNPAIRED
+
+        with pytest.raises(PairingClientError) as pending:
+            await client.begin(issued.invitation)
+        assert pending.value.code == PairingClientErrorCode.APPROVAL_PENDING
+        assert requests[0] == (
+            "/fleet/pairing/v1/requests",
+            {
+                "schema_version": 1,
+                "request_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                "mac": {
+                    "platform": "macos",
+                    "service_version": "0.9.0",
+                    "display_name": REPORTING_NODE_ID,
+                    "reporting_node_id": REPORTING_NODE_ID,
+                },
+                "locator": LOCATOR,
+                "transport": "https",
+                "supported_protocol": {"minimum": 1, "maximum": 1},
+            },
+        )
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
 async def test_claim_provision_and_activation_are_durable_and_secret_free(
     tmp_path: Path,
 ) -> None:
@@ -335,6 +403,83 @@ async def test_claim_provision_and_activation_are_durable_and_secret_free(
         if wal_path.exists():
             database_bytes += wal_path.read_bytes()
         assert PAIRING_SECRET.encode() not in database_bytes
+    finally:
+        await client.close()
+        await pairing.close()
+
+
+@pytest.mark.asyncio
+async def test_conclusively_rejected_unclaimed_attempt_can_be_discarded(
+    tmp_path: Path,
+) -> None:
+    requests: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        requests.append(request.url.path)
+        if (
+            request.url.path == "/fleet/pairing/v1/claims"
+            and payload["invitation_id"] == INVITATION_ID
+        ):
+            return httpx.Response(
+                401,
+                json={"detail": {"code": "pairing_claim_rejected"}},
+            )
+        return _complete_ceremony_response(request)
+
+    pairing, client, environment = await _stores(tmp_path, handler)
+    try:
+        with pytest.raises(PairingClientError) as rejected:
+            await client.begin(_invitation())
+        assert rejected.value.code == PairingClientErrorCode.CLAIM_REJECTED
+        failed = await client.status()
+        assert failed is not None
+        assert failed.phase == PairingClientPhase.CLAIMING
+        assert failed.claim_id is None
+        assert failed.pairing_id is None
+        assert failed.last_error_code == PairingClientErrorCode.CLAIM_REJECTED
+        assert (await pairing.status()).state == PairingState.PENDING
+
+        calls_before_mismatch = len(requests)
+        with pytest.raises(PairingClientError) as mismatch:
+            await client.begin(_second_invitation())
+        assert mismatch.value.code == PairingClientErrorCode.PAYLOAD_MISMATCH
+        assert len(requests) == calls_before_mismatch
+
+        await client.discard_rejected_unclaimed_attempt()
+        assert await client.status() is None
+        reset = await pairing.status()
+        assert reset.state == PairingState.UNPAIRED
+        assert reset.attempt_id is None
+        assert reset.pairing_id is None
+        assert not environment.exists()
+
+        completed = await client.begin(_second_invitation())
+        assert completed.phase == PairingClientPhase.COMPLETE
+        assert (await pairing.status()).state == PairingState.PAIRED
+    finally:
+        await client.close()
+        await pairing.close()
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_unclaimed_attempt_cannot_be_discarded(
+    tmp_path: Path,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("ambiguous", request=request)
+
+    pairing, client, _environment = await _stores(tmp_path, handler)
+    try:
+        with pytest.raises(PairingClientError) as unavailable:
+            await client.begin(_invitation())
+        assert unavailable.value.code == PairingClientErrorCode.HUB_UNAVAILABLE
+
+        with pytest.raises(PairingClientError) as refused:
+            await client.discard_rejected_unclaimed_attempt()
+        assert refused.value.code == PairingClientErrorCode.STATE_CONFLICT
+        assert await client.status() is not None
+        assert (await pairing.status()).state == PairingState.PENDING
     finally:
         await client.close()
         await pairing.close()

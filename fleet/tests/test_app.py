@@ -485,7 +485,14 @@ async def test_inference_and_admin_endpoints_require_separate_client_keys(tmp_pa
             assert "DesiredInstall delivery and progress" in dashboard.text
             assert "LIMITED / overflow" in dashboard.text
             assert "Hub enrollment" in dashboard.text
-            assert "Invite and manage Macs" in dashboard.text
+            assert "Pair and manage Macs" in dashboard.text
+            assert "Pair &amp; Enable" in dashboard.text
+            assert "approve-presence" in dashboard.text
+            assert (
+                "function renderPool(){renderFeatures();renderPairingAdmin()"
+                not in dashboard.text
+            )
+            assert "Advanced manual invitation" in dashboard.text
             assert "/fleet/api/v1/pairing/invitations" in dashboard.text
             assert "/fleet/api/v1/pairing/claims/" in dashboard.text
             assert "/fleet/api/v1/pairing/enrollments/" in dashboard.text

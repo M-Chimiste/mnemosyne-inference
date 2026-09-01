@@ -20,6 +20,14 @@ final class HubModeViewModel: ObservableObject {
     @Published private(set) var hubHealthy = false
     @Published private(set) var statusMessage = "Hub Mode has not been configured."
     @Published private(set) var isError = false
+    @Published private(set) var pendingPairingClaims: [HubPairingClaim] = []
+    @Published private(set) var pairingEnrollments: [HubPairingEnrollment] = []
+    @Published private(set) var presencePINs: [String: String] = [:]
+    @Published private(set) var pairingInFlightClaimIDs: Set<String> = []
+    @Published private(set) var enrollmentInFlightIDs: Set<String> = []
+    @Published private(set) var isRefreshingPairing = false
+    @Published private(set) var pairingStatusMessage = ""
+    @Published private(set) var pairingIsError = false
 
     private let controlConfiguration: ControlConnectionConfiguration
     private let store: HubConfigurationStore
@@ -51,6 +59,11 @@ final class HubModeViewModel: ObservableObject {
         }
         hubHealthy = await healthCheck()
         updateStatus(registration: registration)
+        if hubHealthy {
+            await refreshPairingAdministration(reportFailure: false)
+        } else {
+            clearPairingAdministration()
+        }
     }
 
     func promote(
@@ -153,6 +166,7 @@ final class HubModeViewModel: ObservableObject {
             statusMessage = includeLocalWorker
                 ? "This Mac is running Fleet Hub with its local worker enrolled as LIMITED / overflow."
                 : "This Mac is running Fleet Hub without local inference overhead. Enrolled nodes publish their eligible models automatically."
+            await refreshPairingAdministration(reportFailure: false)
         } catch {
             hubHealthy = await healthCheck()
             isError = true
@@ -171,6 +185,7 @@ final class HubModeViewModel: ObservableObject {
         if registration.hubAgentStatus == .notRegistered {
             if managedServe { await tailscale.disableServeIfAvailable() }
             hubHealthy = false
+            clearPairingAdministration()
             statusMessage = "Fleet Hub is disabled. Its configuration, invitations, enrollments, and route history are preserved."
         } else {
             isError = true
@@ -209,6 +224,181 @@ final class HubModeViewModel: ObservableObject {
         statusMessage = hubHealthy
             ? "Fleet Hub is running with its preserved identity and enrollments."
             : "Fleet Hub was registered but did not become healthy."
+        if hubHealthy {
+            await refreshPairingAdministration(reportFailure: false)
+        } else {
+            clearPairingAdministration()
+        }
+    }
+
+    func presencePIN(for claimID: String) -> String {
+        presencePINs[claimID] ?? ""
+    }
+
+    func setPresencePIN(_ rawValue: String, for claimID: String) {
+        let digits = rawValue.unicodeScalars.compactMap { scalar -> Character? in
+            guard (48 ... 57).contains(scalar.value) else { return nil }
+            return Character(scalar)
+        }
+        presencePINs[claimID] = String(digits.prefix(6))
+        if pairingIsError {
+            pairingIsError = false
+            pairingStatusMessage = ""
+        }
+    }
+
+    func canPair(_ claim: HubPairingClaim) -> Bool {
+        let pin = presencePIN(for: claim.claimID)
+        return hubHealthy
+            && pin.utf8.count == 6
+            && pin.utf8.allSatisfy { (48 ... 57).contains($0) }
+            && !pairingInFlightClaimIDs.contains(claim.claimID)
+    }
+
+    func monitorPairingAdministration() async {
+        while !Task.isCancelled {
+            await refreshPairingAdministration(reportFailure: false)
+            do {
+                try await Task.sleep(for: .seconds(2))
+            } catch {
+                return
+            }
+        }
+    }
+
+    func refreshPairingAdministration(reportFailure: Bool = true) async {
+        guard hubHealthy, configuration != nil, !isRefreshingPairing else {
+            return
+        }
+        isRefreshingPairing = true
+        defer { isRefreshingPairing = false }
+        do {
+            let client = try pairingAdminClient()
+            async let claimsRequest = client.pendingClaims()
+            async let enrollmentsRequest = client.enrollments()
+            let claims = try await claimsRequest
+            let enrollments = try await enrollmentsRequest
+            pendingPairingClaims = claims
+            pairingEnrollments = enrollments
+            let liveClaimIDs = Set(claims.map(\.claimID))
+                .union(pairingInFlightClaimIDs)
+            presencePINs = presencePINs.filter {
+                liveClaimIDs.contains($0.key)
+            }
+        } catch {
+            if reportFailure {
+                pairingIsError = true
+                pairingStatusMessage = error.localizedDescription
+            }
+        }
+    }
+
+    func pairAndEnable(_ claim: HubPairingClaim) async {
+        guard canPair(claim) else {
+            pairingIsError = true
+            pairingStatusMessage = HubPairingAdminError.invalidPIN
+                .localizedDescription
+            return
+        }
+        let pin = presencePIN(for: claim.claimID)
+        pairingInFlightClaimIDs.insert(claim.claimID)
+        pairingIsError = false
+        pairingStatusMessage = "Checking the code shown on \(claim.displayName)…"
+        defer {
+            pairingInFlightClaimIDs.remove(claim.claimID)
+            presencePINs.removeValue(forKey: claim.claimID)
+        }
+
+        do {
+            let client = try pairingAdminClient()
+            let approved = try await client.approvePresence(
+                claimID: claim.claimID,
+                pin: pin
+            )
+            pendingPairingClaims.removeAll { $0.claimID == claim.claimID }
+            pairingStatusMessage = "Code accepted. Waiting for \(claim.displayName) to finish its private credential exchange…"
+
+            let deadline = Date().addingTimeInterval(90)
+            var lastEnrollment = approved
+            while Date() < deadline, !Task.isCancelled {
+                do {
+                    if let current = try await client.enrollments().first(
+                        where: { $0.pairingID == approved.pairingID }
+                    ) {
+                        lastEnrollment = current
+                    }
+                    if let failureCode = lastEnrollment.failureCode {
+                        throw HubModePresentationError.pairingState(
+                            failureCode
+                        )
+                    }
+                    switch lastEnrollment.state {
+                    case "active":
+                        pairingIsError = false
+                        pairingStatusMessage = "\(claim.displayName) is paired and enabled. Its eligible models will publish automatically."
+                        await refreshPairingAdministration(reportFailure: false)
+                        return
+                    case "disabled":
+                        _ = try await client.setEnrollmentEnabled(
+                            pairingID: approved.pairingID,
+                            enabled: true
+                        )
+                        pairingIsError = false
+                        pairingStatusMessage = "\(claim.displayName) is paired and enabled. Its eligible models will publish automatically."
+                        await refreshPairingAdministration(reportFailure: false)
+                        return
+                    case "failed", "revoked", "recovery_required":
+                        throw HubModePresentationError.pairingState(
+                            lastEnrollment.failureCode ?? lastEnrollment.state
+                        )
+                    default:
+                        break
+                    }
+                } catch let error as HubModePresentationError {
+                    throw error
+                } catch let error as HubPairingAdminError {
+                    if case let .rejected(statusCode, _) = error,
+                       statusCode < 500
+                    {
+                        throw error
+                    }
+                    // A transient loopback read must not abandon a code that
+                    // the Hub already accepted. Keep polling to a fixed bound.
+                }
+                try await Task.sleep(for: .seconds(1))
+            }
+            throw HubModePresentationError.activationTimedOut
+        } catch {
+            pairingIsError = true
+            pairingStatusMessage = error.localizedDescription
+            await refreshPairingAdministration(reportFailure: false)
+        }
+    }
+
+    func enableEnrollment(_ enrollment: HubPairingEnrollment) async {
+        guard
+            hubHealthy,
+            enrollment.state == "disabled",
+            !enrollment.hubEnabled,
+            enrollment.failureCode == nil,
+            !enrollmentInFlightIDs.contains(enrollment.pairingID)
+        else { return }
+        enrollmentInFlightIDs.insert(enrollment.pairingID)
+        pairingIsError = false
+        pairingStatusMessage = "Enabling \(enrollment.displayName)…"
+        defer { enrollmentInFlightIDs.remove(enrollment.pairingID) }
+        do {
+            let client = try pairingAdminClient()
+            _ = try await client.setEnrollmentEnabled(
+                pairingID: enrollment.pairingID,
+                enabled: true
+            )
+            pairingStatusMessage = "\(enrollment.displayName) is enabled. Its eligible models will publish automatically."
+            await refreshPairingAdministration(reportFailure: false)
+        } catch {
+            pairingIsError = true
+            pairingStatusMessage = error.localizedDescription
+        }
     }
 
     func copyAdminKey() {
@@ -236,6 +426,20 @@ final class HubModeViewModel: ObservableObject {
             isError = true
             statusMessage = error.localizedDescription
         }
+    }
+
+    private func pairingAdminClient() throws -> HubPairingAdminClient {
+        try HubPairingAdminClient(adminKey: store.adminKey())
+    }
+
+    private func clearPairingAdministration() {
+        pendingPairingClaims = []
+        pairingEnrollments = []
+        presencePINs = [:]
+        pairingInFlightClaimIDs = []
+        enrollmentInFlightIDs = []
+        pairingStatusMessage = ""
+        pairingIsError = false
     }
 
     private func updateStatus(registration: LaunchAgentRegistration) {
@@ -282,12 +486,18 @@ final class HubModeViewModel: ObservableObject {
 private enum HubModePresentationError: Error, LocalizedError {
     case registration(String)
     case health
+    case activationTimedOut
+    case pairingState(String)
 
     var errorDescription: String? {
         switch self {
         case let .registration(message): message
         case .health:
             "Fleet Hub did not become healthy. Its preserved configuration remains available for retry."
+        case .activationTimedOut:
+            "The code was accepted, but the Mac has not completed activation yet. Keep its Inference Pool settings open; when it appears below as disabled, choose Enable."
+        case let .pairingState(code):
+            "The Mac could not complete pairing (\(code))."
         }
     }
 }

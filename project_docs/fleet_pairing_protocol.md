@@ -7,9 +7,11 @@ Mac-local pairing state/authentication foundation are implemented. Pairing is
 disabled by default, and existing static Fleet enrollment plus native macOS
 inference remain authoritative and compatible.
 
-This is not yet production pairing. The Mac service and Swift UI now claim an
-invitation, resume after approval, stage the provisioned bundle, and acknowledge
-activation while retaining the invitation secret only in view-model memory.
+This is not yet signed-release production pairing. The Mac service and Swift UI
+now request a hidden invitation from one entered Hub URL, display a six-digit
+presence code, claim the invitation, poll after approval, stage the provisioned
+bundle, and acknowledge activation while retaining the invitation secret only
+in view-model memory. The original manual invitation flow remains available.
 The same **Inference Pool** page now exposes an explicitly confirmed permanent
 **Remove this Mac from Nyx** action backed by the loopback
 `POST /manager/fleet/pairing/revoke` route. The existing native control-plane
@@ -35,9 +37,11 @@ are not evidence of signed multi-host acceptance.
 
 This document defines the Mac-first pairing boundary between one Mnemosyne Mac
 worker and the Nyx Hub. It deliberately separates an initial bearer-based slice
-that can be implemented on the current architecture from later device-key,
-short-authentication-string, and short-lived-token hardening. A schema or UI
-placeholder must never be reported as implemented behavior.
+that can be implemented on the current architecture from later device-key and
+short-lived-token hardening. The six-digit presence code is now an implemented
+authenticated-admin wrapper around the high-entropy invitation; it is not a
+credential or a substitute for those later layers. A schema or UI placeholder
+must never be reported as implemented behavior.
 
 ## Goals and non-regression boundary
 
@@ -250,11 +254,12 @@ uses only the generation selected by its durable enrollment record.
 The Hub routes in steps 1-4 and 7 are implemented only when `[pairing]` is
 explicitly enabled, as is the management activation-ack route in step 5. The
 Hub then performs the pinned probes in step 6 and can publish a separately
-enabled paired enrollment into the dynamic registry. The Mac service can
-durably stage/activate credentials and enforce pending-versus-active authority,
-but no signed-app outbound ceremony currently drives those local transitions.
-Later lifecycle behavior in this document remains target contract unless the
-implementation-status text above says otherwise.
+enabled paired enrollment into the dynamic registry. The Mac service and
+signed app drive both the default presence-code wrapper and the manual
+begin/resume ceremony, durably stage/activate credentials, and enforce
+pending-versus-active authority. Later lifecycle behavior in this document
+remains target contract unless the implementation-status text above says
+otherwise.
 
 ### 1. Administrator creates an invitation
 
@@ -308,6 +313,44 @@ invitation and global rate limits, and a bounded total pending count. Rate
 limiting cannot rely solely on a forwarded source IP unless the exact trusted
 reverse proxy is configured.
 
+#### Default client-initiated presence-code wrapper
+
+The signed Mac app normally asks its loopback service to start with only one
+administrator-supplied HTTPS Hub origin. The app obtains the Mac's exact
+MagicDNS name from the installed Tailscale CLI and derives the private worker
+locator as `http://<magic-dns-name>:1240`. The service submits its bounded
+identity, locator, transport, and one idempotent request ID to:
+
+```http
+POST /fleet/pairing/v1/requests
+Content-Type: application/json
+```
+
+The Hub applies the same locator policy and creates an ordinary five-minute,
+high-entropy invitation. Its response is `Cache-Control: no-store` and is
+accepted only by the local loopback service. A six-digit display code is
+derived from the first eight big-endian bytes of
+`HMAC-SHA256(invitation_secret,
+"mnemosyne-fleet-presence-pin-v1") mod 1_000_000`; it shares the invitation's
+expiry and fixed attempt budget and is never a credential. The strong secret
+continues through the ordinary claim/provisioning path only in bounded memory.
+The browser never receives it.
+
+After the claim appears, an authenticated Hub administrator submits the code
+to `POST /fleet/api/v1/pairing/claims/{claim_id}/approve-presence`. Comparison
+is constant-time. A mismatch consumes the ordinary invitation attempt budget.
+Successful presence approval still commits `hub_enabled=false`. The Mac polls
+and completes provisioning and activation, after which the Hub Mac's native
+**Pair & Enable** action issues the existing separate authenticated enable
+transaction. The native UI reads the private admin bearer just in time from
+Hub private state and sends it only to the fixed loopback origin with proxies
+and redirects disabled. The bearer never enters view state, while the PIN
+exists only in ephemeral view-model memory and never enters preferences or
+disk. A timeout leaves the activated enrollment disabled and visible with a native
+**Enable** recovery action; it never enables speculatively. Manual invitation
+creation and exact-locator approval remain available in the dashboard as an
+Advanced recovery/interoperability surface.
+
 ### 2. The Mac claims the invitation
 
 The signed menu app connects to the exact HTTPS `hub_origin` and verifies the
@@ -340,6 +383,16 @@ attempt limits, negotiates one version, and requires the normalized locator to
 equal the administrator-authorized locator exactly. For an adoption, the
 reporting identity must also equal the static enrollment. It then atomically
 binds the invitation to this request and assigns `claim_id` and `pairing_id`.
+
+Before the first outbound claim, the Mac durably records the exact invitation,
+Hub origin, and normalized locator but never the invitation secret. A restart
+therefore resumes only that exact attempt and refuses different invitation
+data. When the Hub conclusively rejects the claim and the Mac has received no
+claim ID, pairing ID, credential generation, or pairing-owned credential, the
+signed Settings UI may explicitly discard that failed attempt. The local
+pairing store and client journal must clear atomically, and the private
+credential environment must be proven unchanged. Ambiguous network or Hub
+outcomes remain fenced to the exact recorded attempt and are never discardable.
 
 The response contains only bounded non-secret status:
 

@@ -16,6 +16,8 @@ from .pairing_api import (
     InvitationClaim,
     InvitationCreate,
     EnrollmentSelfManagement,
+    PresenceClaimApproval,
+    PresencePairingRequest,
 )
 from .pairing_store import (
     ApprovalRequest,
@@ -29,6 +31,7 @@ from .pairing_store import (
     PairingStoreIntegrityError,
     PairingStoreTerminalError,
     PairingStoreValidationError,
+    PresenceApprovalRequest,
     ProvisionRequest,
     ProvisioningRecord,
 )
@@ -139,6 +142,29 @@ class PairingCoordinator:
             )
         )
 
+    async def request_presence_pairing(
+        self,
+        payload: PresencePairingRequest,
+    ) -> InvitationIssue:
+        """Issue a hidden invitation requested by one exact Mac locator."""
+
+        resolved = await self.locator_policy.resolve(
+            payload.locator.get_secret_value(),
+            transport=payload.transport,
+        )
+        return await self.pairing_store.issue_invitation(
+            InvitationRequest(
+                request_id=payload.request_id,
+                locator=resolved.origin,
+                intent="new",
+                expected_platform=payload.mac.platform,
+                expected_reporting_node_id=payload.mac.reporting_node_id,
+                transport=payload.transport,
+                service_class="primary",
+                expires_in_seconds=300.0,
+            )
+        )
+
     async def claim_invitation(self, payload: InvitationClaim) -> ClaimRecord:
         invitation = await self.pairing_store.invitation(payload.invitation_id)
         if invitation is None:
@@ -182,6 +208,21 @@ class PairingCoordinator:
                 request_id=payload.request_id,
                 claim_id=claim_id,
                 locator=resolved.origin,
+                service_class=payload.service_class,
+                hub_enabled=payload.hub_enabled,
+            )
+        )
+
+    async def approve_claim_with_presence(
+        self,
+        claim_id: str,
+        payload: PresenceClaimApproval,
+    ) -> EnrollmentRecord:
+        return await self.pairing_store.approve_claim_with_presence(
+            PresenceApprovalRequest(
+                request_id=payload.request_id,
+                claim_id=claim_id,
+                presence_pin=payload.presence_pin,
                 service_class=payload.service_class,
                 hub_enabled=payload.hub_enabled,
             )

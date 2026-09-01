@@ -209,6 +209,13 @@ class PairingInvitation:
 
 
 @dataclass(frozen=True, slots=True)
+class PresencePairingInvitation:
+    invitation: PairingInvitation = field(repr=False)
+    presence_pin: str = field(repr=False)
+    expires_at: float
+
+
+@dataclass(frozen=True, slots=True)
 class PairingClientRecord:
     phase: PairingClientPhase
     attempt_id: str
@@ -286,6 +293,16 @@ class _ClaimResponse(_StrictResponse):
     claimed_at: float
     expires_at: float
     locator_accepted: Literal[True]
+
+
+class _PresenceRequestResponse(_StrictResponse):
+    schema_version: Literal[1]
+    invitation_id: str = Field(min_length=36, max_length=36)
+    pairing_secret: SecretStr = Field(min_length=32, max_length=4096, repr=False)
+    presence_pin: str = Field(pattern=r"^[0-9]{6}$", repr=False)
+    hub_origin: str = Field(min_length=1, max_length=2048)
+    expires_at: float
+    state: Literal["issued"]
 
 
 class _ProvisionCredentials(_StrictResponse):
@@ -1176,6 +1193,45 @@ class _PairingClientJournal:
             )
             return self._record(self._row(connection))
 
+    def discard_rejected_unclaimed_attempt(
+        self,
+        connection: sqlite3.Connection,
+        pairing_row: sqlite3.Row,
+        attempt_id: str,
+    ) -> None:
+        """Delete only the journal row proven to have no remote claim.
+
+        The caller owns the shared SQLite transaction and independently proves
+        that the pairing store names the same credential-free attempt.  A
+        transport-ambiguous error is deliberately ineligible because Nyx may
+        already have committed its claim.
+        """
+
+        row = self._row(connection)
+        self_revoke = self._self_revoke_row(connection)
+        exact_rejected_claim = (
+            row is not None
+            and self_revoke is None
+            and row["attempt_id"] == attempt_id
+            and pairing_row["attempt_id"] == attempt_id
+            and row["phase"] == PairingClientPhase.CLAIMING.value
+            and row["claim_id"] is None
+            and row["pairing_id"] is None
+            and row["credential_generation"] is None
+            and row["expires_at"] is None
+            and row["last_error_code"]
+            == PairingClientErrorCode.CLAIM_REJECTED.value
+        )
+        if not exact_rejected_claim:
+            raise PairingClientError(
+                PairingClientErrorCode.STATE_CONFLICT,
+                status_code=409,
+                retryable=False,
+            )
+        connection.execute(
+            "DELETE FROM native_fleet_pairing_client_v1 WHERE singleton=1"
+        )
+
     def _set_phase(self, phase: PairingClientPhase) -> PairingClientRecord:
         with self._connect() as connection:
             row = self._require_row(connection)
@@ -1495,6 +1551,147 @@ class FleetPairingClient:
 
     async def resume(self, invitation: PairingInvitation) -> PairingClientRecord:
         return await self._advance(invitation, allow_create=False)
+
+    async def request_presence_invitation(
+        self,
+        *,
+        request_id: str,
+        hub_origin: str,
+        locator: str,
+        transport: str = "tailscale",
+    ) -> PresencePairingInvitation:
+        """Ask the Hub for a hidden invitation and short display code."""
+
+        try:
+            request_id = _canonical_uuid(request_id, field_name="request_id")
+            hub_origin = _verified_https_origin(hub_origin)
+            locator = _safe_node_url(locator)
+            reporting_node_id = _bounded_identifier(self._reporting_node_id)
+            display_name = _bounded_display_name(self._display_name)
+            service_version = _bounded_identifier(
+                self._service_version,
+                maximum=64,
+            )
+            if transport not in {"https", "tailscale", "trusted_lan_http"}:
+                raise ValueError("invalid pairing transport")
+        except ValueError:
+            raise PairingClientError(
+                PairingClientErrorCode.PAYLOAD_MISMATCH,
+                status_code=400,
+                retryable=False,
+            ) from None
+
+        async with self._lock:
+            self._ensure_ready()
+            if await _await_blocking(self._journal.status) is not None:
+                raise PairingClientError(
+                    PairingClientErrorCode.STATE_CONFLICT,
+                    status_code=409,
+                    retryable=False,
+                )
+            pairing = await self._pairing_store.status()
+            if pairing.state not in {PairingState.UNPAIRED, PairingState.REVOKED}:
+                raise PairingClientError(
+                    PairingClientErrorCode.STATE_CONFLICT,
+                    status_code=409,
+                    retryable=False,
+                )
+            response = await self._post(
+                hub_origin,
+                "/fleet/pairing/v1/requests",
+                {
+                    "schema_version": 1,
+                    "request_id": request_id,
+                    "mac": {
+                        "platform": "macos",
+                        "service_version": service_version,
+                        "display_name": display_name,
+                        "reporting_node_id": reporting_node_id,
+                    },
+                    "locator": locator,
+                    "transport": transport,
+                    "supported_protocol": {"minimum": 1, "maximum": 1},
+                },
+            )
+            if response.status_code != 201:
+                if response.status_code in {429, 500, 502, 503, 504}:
+                    raise self._hub_unavailable()
+                raise PairingClientError(
+                    PairingClientErrorCode.CLAIM_REJECTED,
+                    status_code=401,
+                    retryable=False,
+                )
+            issued = self._response_model(response, _PresenceRequestResponse)
+            invitation = PairingInvitation(
+                invitation_id=issued.invitation_id,
+                pairing_secret=issued.pairing_secret.get_secret_value(),
+                hub_origin=issued.hub_origin,
+                locator=locator,
+            ).validated()
+            if (
+                invitation.hub_origin != hub_origin
+                or issued.expires_at <= time.time()
+                or issued.presence_pin
+                != _presence_pin(invitation.pairing_secret)
+            ):
+                raise PairingClientError(
+                    PairingClientErrorCode.HUB_RESPONSE_INVALID,
+                    status_code=502,
+                    retryable=False,
+                )
+            return PresencePairingInvitation(
+                invitation=invitation,
+                presence_pin=issued.presence_pin,
+                expires_at=issued.expires_at,
+            )
+
+    async def discard_rejected_unclaimed_attempt(self) -> None:
+        """Forget a claim that Nyx conclusively rejected before enrollment.
+
+        This cannot discard an ambiguous request, an approved claim, staged
+        credentials, or a completed pairing.  The pairing store and client
+        journal are reset in one shared SQLite transaction.
+        """
+
+        async with self._lock:
+            self._ensure_ready()
+            record = await _await_blocking(self._journal.status)
+            if record is None:
+                raise PairingClientError(
+                    PairingClientErrorCode.NO_ATTEMPT,
+                    status_code=409,
+                    retryable=False,
+                )
+
+            def discard(
+                connection: sqlite3.Connection,
+                pairing_row: sqlite3.Row,
+            ) -> None:
+                self._journal.discard_rejected_unclaimed_attempt(
+                    connection,
+                    pairing_row,
+                    record.attempt_id,
+                )
+
+            try:
+                await _await_async_outcome(
+                    asyncio.create_task(
+                        self._pairing_store._discard_rejected_unclaimed_attempt(
+                            record.attempt_id,
+                            discard,
+                        ),
+                        name="mnemosyne-fleet-discard-rejected-claim",
+                    )
+                )
+            except PairingClientError:
+                raise
+            except (FleetPairingError, ValueError):
+                raise PairingClientError(
+                    PairingClientErrorCode.STATE_CONFLICT,
+                    status_code=409,
+                    retryable=False,
+                ) from None
+            await self._notify_pairing_authority_changed()
 
     async def self_disable_enrollment(
         self,
@@ -2508,6 +2705,15 @@ def _credentials_from_response(response: _ProvisionResponse) -> PairingCredentia
     )
 
 
+def _presence_pin(pairing_secret: str) -> str:
+    digest = hmac.new(
+        pairing_secret.encode("utf-8"),
+        b"mnemosyne-fleet-presence-pin-v1",
+        hashlib.sha256,
+    ).digest()
+    return f"{int.from_bytes(digest[:8], 'big') % 1_000_000:06d}"
+
+
 __all__ = [
     "FleetPairingClient",
     "PairingClientError",
@@ -2515,6 +2721,7 @@ __all__ = [
     "PairingClientPhase",
     "PairingClientRecord",
     "PairingInvitation",
+    "PresencePairingInvitation",
     "PairingManagementResult",
     "PairingManagementState",
 ]

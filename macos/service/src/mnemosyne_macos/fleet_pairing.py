@@ -450,6 +450,29 @@ class FleetPairingStore:
                 journal_transition,
             )
 
+    async def _discard_rejected_unclaimed_attempt(
+        self,
+        attempt_id: str,
+        journal_transition: Callable[[sqlite3.Connection, sqlite3.Row], T],
+    ) -> T:
+        """Atomically forget one definitively rejected, credential-free claim.
+
+        This private seam is intentionally narrower than ``clear_pairing``.
+        It is available only to ``FleetPairingClient`` after the Hub returned
+        a conclusive claim rejection, before a claim ID, pairing ID, or any
+        credential generation exists.  Ambiguous transport failures and later
+        ceremony phases remain exact-retry-only.
+        """
+
+        normalized_attempt = _canonical_uuid(attempt_id, field="attempt_id")
+        async with self._lock:
+            self._ensure_ready()
+            return await _await_blocking_outcome(
+                self._discard_rejected_unclaimed_attempt_sync,
+                normalized_attempt,
+                journal_transition,
+            )
+
     async def close(self) -> None:
         async with self._lock:
             self._closed = True
@@ -803,6 +826,85 @@ class FleetPairingStore:
                 ):
                     raise PrivateEnvironmentInvalid(
                         "private Fleet credentials changed during re-pairing reset"
+                    )
+                self._validate_locked_paths(
+                    parent_descriptor,
+                    lock_descriptor,
+                    lock_identity,
+                )
+                connection.commit()
+                return result
+
+    def _discard_rejected_unclaimed_attempt_sync(
+        self,
+        attempt_id: str,
+        journal_transition: Callable[[sqlite3.Connection, sqlite3.Row], T],
+    ) -> T:
+        with self._locked_environment(
+            exclusive=True,
+            create_parent=True,
+        ) as locked:
+            assert locked is not None
+            parent_descriptor, lock_descriptor, lock_identity = locked
+            original_text, original_identity = self._read_environment_locked(
+                parent_descriptor
+            )
+            file_values = self._managed_credentials_from_text(original_text)
+            if self._effective_managed_credentials(file_values=file_values):
+                raise LegacyFleetCredentialsPresent(
+                    "a rejected claim cannot be discarded while Fleet credentials exist"
+                )
+
+            with self._connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                row = self._row(connection)
+                exact_unclaimed_attempt = (
+                    PairingState(row["state"]) is PairingState.PENDING
+                    and row["attempt_id"] == attempt_id
+                    and row["pairing_id"] is None
+                    and row["node_id"] is None
+                    and row["credential_epoch"] is None
+                    and not bool(row["credentials_owned"])
+                    and not bool(row["credential_write_pending"])
+                    and row["credential_fingerprint"] is None
+                    and row["hub_origin"] is not None
+                    and row["node_url"] is not None
+                    and row["paired_at"] is None
+                    and row["revoked_at"] is None
+                )
+                if not exact_unclaimed_attempt:
+                    raise InvalidPairingTransition(
+                        "only an exact unclaimed, credential-free attempt can be discarded"
+                    )
+
+                result = journal_transition(connection, row)
+                now = time.time()
+                connection.execute(
+                    """
+                    UPDATE native_fleet_pairing
+                       SET state=?, attempt_id=NULL, pairing_id=NULL, node_id=NULL,
+                           hub_origin=NULL, node_url=NULL, credential_epoch=NULL,
+                           credentials_owned=0, credential_write_pending=0,
+                           credential_fingerprint=NULL, paired_at=NULL,
+                           revoked_at=NULL, last_error_code=NULL, updated_at=?
+                     WHERE singleton=1
+                    """,
+                    (PairingState.UNPAIRED.value, now),
+                )
+
+                current_text, current_identity = self._read_environment_locked(
+                    parent_descriptor
+                )
+                current_values = self._managed_credentials_from_text(current_text)
+                if (
+                    current_text != original_text
+                    or current_identity != original_identity
+                    or self._effective_managed_credentials(
+                        file_values=current_values
+                    )
+                ):
+                    raise PrivateEnvironmentInvalid(
+                        "private Fleet credentials changed while discarding a rejected claim"
                     )
                 self._validate_locked_paths(
                     parent_descriptor,

@@ -365,6 +365,162 @@ async def test_pairing_http_ceremony_stays_disabled_until_admin_enable(
             assert app.state.registry.enrollment(claim["pairing_id"]) is None
 
 
+async def test_presence_pairing_requests_pin_then_explicitly_enables(
+    tmp_path,
+) -> None:
+    probes = []
+
+    async def activation_probe(candidate) -> None:
+        probes.append(candidate)
+
+    app = create_app(
+        _pairing_config(tmp_path),
+        start_polling=False,
+        pairing_locator_policy=_locator_policy(),
+        pairing_activation_probe=activation_probe,
+    )
+    admin = {"Authorization": "Bearer admin-key"}
+    locator = "https://studio.example.internal:1240"
+    mac = {
+        "platform": "macos",
+        "service_version": "0.9.0",
+        "display_name": "Studio Mac",
+        "reporting_node_id": "studio-mac",
+    }
+
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="https://nyx.example.internal",
+        ) as client:
+            requested = await client.post(
+                "/fleet/pairing/v1/requests",
+                json={
+                    "schema_version": 1,
+                    "request_id": _uuid(),
+                    "mac": mac,
+                    "locator": locator,
+                    "transport": "https",
+                    "supported_protocol": {"minimum": 1, "maximum": 1},
+                },
+            )
+            assert requested.status_code == 201
+            assert requested.headers["cache-control"] == "no-store"
+            invitation = requested.json()
+            assert invitation["hub_origin"] == "https://nyx.example.internal"
+            assert len(invitation["presence_pin"]) == 6
+            assert invitation["presence_pin"].isdigit()
+            assert locator not in requested.text
+
+            claim_response = await client.post(
+                "/fleet/pairing/v1/claims",
+                json={
+                    "schema_version": 1,
+                    "request_id": _uuid(),
+                    "invitation_id": invitation["invitation_id"],
+                    "pairing_secret": invitation["pairing_secret"],
+                    "mac": mac,
+                    "locator": locator,
+                    "supported_protocol": {"minimum": 1, "maximum": 1},
+                },
+            )
+            assert claim_response.status_code == 200
+            claim = claim_response.json()
+
+            wrong_pin = (
+                "000000"
+                if invitation["presence_pin"] != "000000"
+                else "999999"
+            )
+            rejected = await client.post(
+                (
+                    "/fleet/api/v1/pairing/claims/"
+                    f"{claim['claim_id']}/approve-presence"
+                ),
+                headers=admin,
+                json={
+                    "schema_version": 1,
+                    "request_id": _uuid(),
+                    "presence_pin": wrong_pin,
+                    "service_class": "primary",
+                    "hub_enabled": False,
+                },
+            )
+            assert rejected.status_code == 401
+            assert rejected.json()["detail"]["code"] == (
+                "pairing_presence_pin_rejected"
+            )
+
+            approved = await client.post(
+                (
+                    "/fleet/api/v1/pairing/claims/"
+                    f"{claim['claim_id']}/approve-presence"
+                ),
+                headers=admin,
+                json={
+                    "schema_version": 1,
+                    "request_id": _uuid(),
+                    "presence_pin": invitation["presence_pin"],
+                    "service_class": "primary",
+                    "hub_enabled": False,
+                },
+            )
+            assert approved.status_code == 200
+            assert approved.json()["state"] == "pending"
+            assert approved.json()["hub_enabled"] is False
+
+            provisioned = (
+                await client.post(
+                    f"/fleet/pairing/v1/claims/{claim['claim_id']}/provision",
+                    json={
+                        "schema_version": 1,
+                        "request_id": _uuid(),
+                        "pairing_secret": invitation["pairing_secret"],
+                    },
+                )
+            ).json()
+            activated = await client.post(
+                (
+                    "/fleet/management/v1/pairings/"
+                    f"{claim['pairing_id']}/activation-ack"
+                ),
+                headers={
+                    "Authorization": (
+                        "Bearer " + provisioned["credentials"]["management_bearer"]
+                    )
+                },
+                json={
+                    "schema_version": 1,
+                    "request_id": _uuid(),
+                    "credential_generation": provisioned[
+                        "credential_generation"
+                    ],
+                    "reporting_node_id": "studio-mac",
+                    "service_instance_id": "service-instance-1",
+                },
+            )
+            assert activated.status_code == 200
+            assert activated.json()["state"] == "disabled"
+            assert len(probes) == 1
+            assert app.state.registry.enrollment(claim["pairing_id"]) is None
+
+            enabled = await client.put(
+                (
+                    "/fleet/api/v1/pairing/enrollments/"
+                    f"{claim['pairing_id']}/enabled"
+                ),
+                headers=admin,
+                json={
+                    "schema_version": 1,
+                    "request_id": _uuid(),
+                    "enabled": True,
+                },
+            )
+            assert enabled.status_code == 200
+            assert enabled.json()["state"] == "active"
+            assert app.state.registry.enrollment(claim["pairing_id"]) is not None
+
+
 async def test_pairing_routes_are_absent_when_disabled(tmp_path) -> None:
     app = create_app(fleet_config(tmp_path), start_polling=False)
     async with app.router.lifespan_context(app):

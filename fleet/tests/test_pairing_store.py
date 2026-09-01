@@ -20,7 +20,9 @@ from mnemosyne_fleet.pairing_store import (
     PairingStoreIntegrityError,
     PairingStoreTerminalError,
     PairingStoreValidationError,
+    PresenceApprovalRequest,
     ProvisionRequest,
+    pairing_presence_pin,
 )
 from mnemosyne_fleet.secret_store import (
     SecretStore,
@@ -212,6 +214,42 @@ async def test_expiry_and_failed_attempt_budget_are_durable(tmp_path: Path) -> N
     assert exhausted.state == "failed"
     assert exhausted.attempts_remaining == 0
     assert exhausted.failure_code == "attempt_budget_exhausted"
+
+
+@pytest.mark.asyncio
+async def test_presence_pin_approves_exact_claim_and_uses_attempt_budget(
+    tmp_path: Path,
+) -> None:
+    _, store, _, _, _ = await _stores(tmp_path)
+    invitation, claim, _ = await _issue_and_claim(store)
+    presence_pin = pairing_presence_pin(invitation.pairing_secret)
+    assert len(presence_pin) == 6
+    assert presence_pin.isascii() and presence_pin.isdigit()
+
+    with pytest.raises(PairingStoreTerminalError) as rejected:
+        await store.approve_claim_with_presence(
+            PresenceApprovalRequest(
+                request_id=_uuid(),
+                claim_id=claim.claim_id,
+                presence_pin=("000000" if presence_pin != "000000" else "999999"),
+            )
+        )
+    assert rejected.value.code == "pairing_presence_pin_rejected"
+    pending = await store.invitation(invitation.invitation_id)
+    assert pending is not None and pending.attempts_remaining == 4
+
+    request = PresenceApprovalRequest(
+        request_id=_uuid(),
+        claim_id=claim.claim_id,
+        presence_pin=presence_pin,
+    )
+    approved = await store.approve_claim_with_presence(request)
+    replay = await store.approve_claim_with_presence(request)
+    assert replay == approved
+    assert approved.lifecycle_state == "pending"
+    assert approved.hub_enabled is False
+    assert invitation.pairing_secret not in repr(request)
+    assert presence_pin not in repr(request)
 
 
 @pytest.mark.asyncio

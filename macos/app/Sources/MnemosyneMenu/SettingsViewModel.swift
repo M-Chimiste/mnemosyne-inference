@@ -80,7 +80,10 @@ final class SettingsViewModel: ObservableObject {
     @Published var confirmDS4GLM53PreviewInstall = false
     @Published var confirmAppleDeveloperToolsInstall = false
     @Published var confirmOMLXCacheReset = false
+    @Published var confirmDiscardRejectedFleetPairingAttempt = false
     @Published var confirmRevokeFleetPairing = false
+    @Published var fleetPairingHubAddress = ""
+    @Published var showAdvancedFleetPairing = false
     @Published var confirmPrepareNativeLifecycle = false
     @Published var pendingOMLXUpgrade: EngineRuntimeUpdate?
     @Published var showLocalModelImporter = false
@@ -127,6 +130,10 @@ final class SettingsViewModel: ObservableObject {
         [String: NativeLifecycleAuthorizationStatus] = [:]
     @Published private(set) var nativeLifecycleMessage = ""
     @Published private(set) var isAdvancingFleetPairing = false
+    @Published private(set) var isRequestingFleetPairing = false
+    @Published private(set) var fleetPairingPresencePIN: String?
+    @Published private(set) var fleetPairingPresenceExpiresAt: Double?
+    @Published private(set) var isDiscardingFleetPairingAttempt = false
     @Published private(set) var isRevokingFleetPairing = false
     @Published private(set) var isRefreshingDesiredInstalls = false
     @Published private(set) var isRefreshingNativeLifecycle = false
@@ -172,7 +179,9 @@ final class SettingsViewModel: ObservableObject {
     private var pendingModelCleanupProfile: ModelProfileSettings?
     private var fleetPairingTask: Task<Void, Never>?
     private var fleetPairingTaskGeneration = 0
+    private var fleetPairingPresenceRequestID: String?
     private var fleetSelfRevokeRequestID: String?
+    private let tailscale = HubTailscaleManager()
     private var configurationRefreshPending = false
     private var pendingNativeLifecyclePreview: NativeLifecycleUninstallPreview?
 
@@ -213,6 +222,24 @@ final class SettingsViewModel: ObservableObject {
 
     var pairingOwnsFleetCredentials: Bool {
         fleetPairing?.ownsFleetCredentials == true
+    }
+
+    var canDiscardRejectedFleetPairingAttempt: Bool {
+        fleetPairing?.canDiscardRejectedAttempt == true
+    }
+
+    var canRequestFleetPairing: Bool {
+        !fleetPairingHubAddress.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        ).isEmpty
+            && !isRequestingFleetPairing
+            && !isAdvancingFleetPairing
+    }
+
+    var fleetPairingPresencePINDisplay: String? {
+        fleetPairingPresencePIN.map {
+            $0.map(String.init).joined(separator: " ")
+        }
     }
 
     var pendingNativeLifecycleMode: NativeLifecycleRetentionMode? {
@@ -637,19 +664,77 @@ final class SettingsViewModel: ObservableObject {
 
         fleetPairingTaskGeneration += 1
         let generation = fleetPairingTaskGeneration
+        let autoResume = fleetPairingCeremony.isPresenceCeremony
         isAdvancingFleetPairing = true
         setPairingStatusMessage()
         fleetPairingTask = Task { [weak self] in
             await self?.performFleetPairing(
                 submission,
-                generation: generation
+                generation: generation,
+                autoResume: autoResume
             )
+        }
+    }
+
+    func requestFleetPairing() async {
+        guard !isRequestingFleetPairing, !isAdvancingFleetPairing else { return }
+        guard settings.server.allowsLocalNetworkInference,
+              savedSettings.server.allowsLocalNetworkInference,
+              !requiresRestart
+        else {
+            setStatus(
+                "Enable ‘Allow inference from the local network’ in General, save, and restart the service before pairing this Mac.",
+                tone: .warning
+            )
+            return
+        }
+
+        let requestID = fleetPairingPresenceRequestID
+            ?? UUID().uuidString.lowercased()
+        fleetPairingPresenceRequestID = requestID
+        isRequestingFleetPairing = true
+        setStatus("Contacting the Hub and preparing a pairing code…", tone: .normal)
+        defer { isRequestingFleetPairing = false }
+
+        do {
+            let discovery = try await tailscale.discover()
+            let locator = try discovery.inferenceOrigin(
+                port: settings.server.inferencePort
+            )
+            let response = try await client.requestFleetPairing(
+                FleetPairingPresenceRequest(
+                    requestID: requestID,
+                    hubOrigin: fleetPairingHubAddress,
+                    locator: locator
+                )
+            )
+            fleetPairingPresenceRequestID = nil
+            fleetPairingPresencePIN = response.presencePIN
+            fleetPairingPresenceExpiresAt = response.expiresAt
+            let submission = try fleetPairingCeremony.preparePresenceSubmission(
+                response
+            )
+            fleetPairingTaskGeneration += 1
+            let generation = fleetPairingTaskGeneration
+            isAdvancingFleetPairing = true
+            setPairingStatusMessage()
+            fleetPairingTask = Task { [weak self] in
+                await self?.performFleetPairing(
+                    submission,
+                    generation: generation,
+                    autoResume: true
+                )
+            }
+        } catch {
+            fleetPairingCeremony.recordFailure(fleetPairingFailure(for: error))
+            setPairingStatusMessage(tone: .error)
         }
     }
 
     private func performFleetPairing(
         _ submission: FleetPairingCeremonySubmission,
-        generation: Int
+        generation: Int,
+        autoResume: Bool
     ) async {
         defer {
             if fleetPairingTaskGeneration == generation {
@@ -658,7 +743,7 @@ final class SettingsViewModel: ObservableObject {
             }
         }
         do {
-            let response: FleetPairingOperationResponse
+            var response: FleetPairingOperationResponse
             switch submission.operation {
             case .begin:
                 response = try await client.beginFleetPairing(
@@ -669,25 +754,44 @@ final class SettingsViewModel: ObservableObject {
                     submission.request
                 )
             }
-            guard !Task.isCancelled,
-                  fleetPairingTaskGeneration == generation
-            else { return }
-            fleetPairingCeremony.apply(response)
-            if let returnedPairing = response.pairing {
-                updateFleetPairing(returnedPairing)
-            }
-            if let refreshed = try? await client.fleetPairing() {
+            while true {
                 guard !Task.isCancelled,
                       fleetPairingTaskGeneration == generation
                 else { return }
-                updateFleetPairing(refreshed)
-            }
-            setPairingStatusMessage(
-                tone: fleetPairingCeremony.stage == .paired
-                    ? .success : .warning
-            )
-            if fleetPairingCeremony.stage == .paired {
-                await refreshDesiredInstalls()
+                fleetPairingCeremony.apply(response)
+                if let returnedPairing = response.pairing {
+                    updateFleetPairing(returnedPairing)
+                }
+                if let refreshed = try? await client.fleetPairing() {
+                    guard !Task.isCancelled,
+                          fleetPairingTaskGeneration == generation
+                    else { return }
+                    updateFleetPairing(refreshed)
+                }
+                setPairingStatusMessage(
+                    tone: fleetPairingCeremony.stage == .paired
+                        ? .success : .warning
+                )
+                if fleetPairingCeremony.stage == .paired {
+                    fleetPairingPresencePIN = nil
+                    fleetPairingPresenceExpiresAt = nil
+                    await refreshDesiredInstalls()
+                    return
+                }
+                guard autoResume else { return }
+                if let expiresAt = fleetPairingPresenceExpiresAt,
+                   Date().timeIntervalSince1970 >= expiresAt
+                {
+                    throw FleetPairingAPIError(
+                        statusCode: 410,
+                        code: "pairing_expired",
+                        retryable: false
+                    )
+                }
+                try await Task.sleep(for: .seconds(2))
+                response = try await client.resumeFleetPairing(
+                    submission.request
+                )
             }
         } catch is CancellationError {
             return
@@ -705,15 +809,51 @@ final class SettingsViewModel: ObservableObject {
     func clearFleetPairingCeremony() {
         cancelFleetPairingTask()
         fleetPairingCeremony.cancel()
+        fleetPairingPresencePIN = nil
+        fleetPairingPresenceExpiresAt = nil
+        fleetPairingPresenceRequestID = nil
         setStatus(
             "Pairing invitation details were cleared from this app.",
             tone: .normal
         )
     }
 
+    func discardRejectedFleetPairingAttempt() async {
+        guard canDiscardRejectedFleetPairingAttempt,
+              !isDiscardingFleetPairingAttempt,
+              !isAdvancingFleetPairing
+        else { return }
+
+        cancelFleetPairingTask()
+        isDiscardingFleetPairingAttempt = true
+        setStatus("Discarding the rejected pairing attempt…", tone: .normal)
+        defer { isDiscardingFleetPairingAttempt = false }
+
+        do {
+            let snapshot = try await client.discardRejectedFleetPairingAttempt()
+            fleetPairingCeremony = FleetPairingCeremonyState()
+            updateFleetPairing(snapshot)
+            setStatus(
+                "Rejected pairing attempt discarded. Create and enter a new Hub invitation.",
+                tone: .success
+            )
+        } catch {
+            if let refreshed = try? await client.fleetPairing() {
+                updateFleetPairing(refreshed)
+            }
+            setStatus(
+                "Could not discard the pairing attempt: \(error.localizedDescription)",
+                tone: .error
+            )
+        }
+    }
+
     func fleetPairingViewDidDisappear() {
         cancelFleetPairingTask()
         fleetPairingCeremony.viewDidDisappear()
+        fleetPairingPresencePIN = nil
+        fleetPairingPresenceExpiresAt = nil
+        fleetPairingPresenceRequestID = nil
     }
 
     private func cancelFleetPairingTask() {

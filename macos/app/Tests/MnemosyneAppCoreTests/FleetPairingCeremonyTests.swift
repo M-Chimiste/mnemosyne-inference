@@ -7,6 +7,38 @@ private let pairingSecret = "pairing-secret-value-that-is-never-persisted"
 private let hubOrigin = "https://hub.example"
 private let macLocator = "http://studio-mac.local:1240"
 
+@Test("Short-code pairing requests carry only the Hub and discovered Mac address")
+func presencePairingRequestEncoding() throws {
+    let client = ControlAPIClient(
+        baseURL: URL(string: "http://localhost:17321")!,
+        adminPassword: "control-password"
+    )
+    let requestID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    let payload = FleetPairingPresenceRequest(
+        requestID: requestID,
+        hubOrigin: hubOrigin,
+        locator: macLocator
+    )
+    let request = try client.fleetPairingPresenceRequest(payload)
+
+    #expect(
+        request.url?.absoluteString
+            == "http://localhost:17321/manager/fleet/pairing/request"
+    )
+    #expect(request.httpMethod == "POST")
+    let body = try #require(request.httpBody)
+    let object = try #require(
+        JSONSerialization.jsonObject(with: body) as? [String: Any]
+    )
+    #expect(object.count == 5)
+    #expect(object["schema_version"] as? Int == 1)
+    #expect(object["request_id"] as? String == requestID)
+    #expect(object["hub_origin"] as? String == hubOrigin)
+    #expect(object["locator"] as? String == macLocator)
+    #expect(object["transport"] as? String == "tailscale")
+    #expect(!String(reflecting: payload).contains(macLocator))
+}
+
 @Test("Pairing mutations encode only the version-one ceremony fields")
 func pairingMutationRequestEncoding() throws {
     let client = ControlAPIClient(
@@ -119,6 +151,37 @@ func pairingCeremonyStateFlow() throws {
     #expect(!state.hasSecretInMemory)
     #expect(!state.showsInvitationEntry)
     #expect(NativeSettings() == settingsBefore)
+}
+
+@Test("A short-code ceremony waits automatically and clears hidden material")
+func presencePairingCeremonyStateFlow() throws {
+    let pin = "314159"
+    let response = FleetPairingPresenceResponse(
+        presencePIN: pin,
+        expiresAt: 1_788_031_200,
+        invitationID: invitationID,
+        pairingSecret: pairingSecret,
+        hubOrigin: hubOrigin,
+        locator: macLocator
+    )
+    var state = FleetPairingCeremonyState()
+
+    let submission = try state.preparePresenceSubmission(response)
+    #expect(submission.operation == .begin)
+    #expect(state.isPresenceCeremony)
+    #expect(state.hasSecretInMemory)
+    #expect(!String(reflecting: response).contains(pairingSecret))
+    #expect(!String(reflecting: response).contains(macLocator))
+    #expect(!String(reflecting: response).contains(pin))
+
+    state.apply(try pendingOperationResponse())
+    #expect(state.stage == .awaitingApproval)
+    #expect(state.nextActionText.contains("finish automatically"))
+
+    state.apply(try completeOperationResponse())
+    #expect(state.stage == .paired)
+    #expect(!state.hasSecretInMemory)
+    #expect(state.nextActionText.contains("finishing enablement"))
 }
 
 @Test("Closing Settings clears invitation material and restart requires re-entry")
@@ -268,6 +331,46 @@ func pairingCeremonyFailureRedaction() throws {
     #expect(!String(reflecting: state).contains(pairingSecret))
     // A retry in the same open view can reuse memory without revealing it.
     #expect(state.canResumeWithoutReentry)
+}
+
+@Test("Only a conclusively rejected unclaimed attempt offers discard recovery")
+func rejectedUnclaimedAttemptDiscardEligibility() throws {
+    let payload = #"""
+    {
+      "schema_version": 1,
+      "available": true,
+      "state": "pending",
+      "pairing_id": null,
+      "credentials_configured": false,
+      "legacy_credentials_present": false,
+      "last_error_code": null,
+      "workflow": {
+        "schema_version": 1,
+        "available": true,
+        "phase": "claiming",
+        "attempt_id": "22222222-2222-4222-8222-222222222222",
+        "invitation_id": "11111111-1111-4111-8111-111111111111",
+        "claim_request_id": "33333333-3333-4333-8333-333333333333",
+        "provision_request_id": "44444444-4444-4444-8444-444444444444",
+        "activation_request_id": "55555555-5555-4555-8555-555555555555",
+        "claim_id": null,
+        "pairing_id": null,
+        "reporting_node_id": "studio-mac",
+        "credential_generation": null,
+        "expires_at": null,
+        "last_error_code": "pairing_claim_rejected",
+        "updated_at": 1788027600.0
+      }
+    }
+    """#.data(using: .utf8)!
+    let rejected = try JSONDecoder().decode(
+        FleetPairingSnapshot.self,
+        from: payload
+    )
+    #expect(rejected.canDiscardRejectedAttempt)
+
+    let awaitingApproval = try pendingPairingSnapshot()
+    #expect(!awaitingApproval.canDiscardRejectedAttempt)
 }
 
 private func enterInvitation(into state: inout FleetPairingCeremonyState) {

@@ -31,10 +31,22 @@ read-only discovery hint.
   authoritative local model mappings, and enrolls the same Mac's independent
   inference worker as **LIMITED / overflow**. Tailscale Serve is the guided
   private-HTTPS path; an existing HTTPS proxy remains an advanced option.
-- The Hub dashboard now creates one-time Mac invitations, approves or rejects
-  pending claims, assigns service class, and enables, disables, or permanently
-  revokes paired Macs. Newly activated enrollments remain disabled until the
-  administrator explicitly enables them.
+- Hub Mode settings now discover pending Macs, accept the six-digit pairing
+  code in the native app, wait for activation proof, and perform the separate
+  enable transaction. A disabled enrollment can be enabled there after an
+  interrupted ceremony. The browser dashboard remains an Advanced surface for
+  service classes, catalog overrides, revocation, and manual interoperability.
+- Pairing now defaults to a familiar six-digit-code flow: enter the Hub HTTPS
+  address on the Mac, choose **Request to Join**, then enter the displayed code
+  in the Hub Mac's native settings and choose **Pair & Enable**. The app discovers the Mac's
+  Tailscale address, keeps the strong invitation and role credentials hidden,
+  resumes automatically, and the Hub waits for activation proof before its
+  separate enable transaction. The original manual ceremony remains under
+  Advanced.
+- A Mac can explicitly discard a conclusively rejected pre-claim pairing
+  attempt and submit one fresh invitation. The recovery remains unavailable
+  after any claim or credential is issued and for ambiguous network outcomes;
+  those retain their exact-retry fence.
 - The menu-bar pool participation control uses the native macOS switch style
   while retaining the same durable join, drain, pause, and rejoin behavior.
 - Fresh installations request both the inference LaunchAgent and menu-app login

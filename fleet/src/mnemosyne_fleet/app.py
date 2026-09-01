@@ -66,6 +66,8 @@ from .pairing_api import (
     InvitationClaim,
     InvitationCreate,
     PairingAPIError,
+    PresenceClaimApproval,
+    PresencePairingRequest,
     bearer_token,
     parse_pairing_payload,
 )
@@ -85,6 +87,7 @@ from .pairing_store import (
     PairingStoreIntegrityError,
     PairingStoreTerminalError,
     PairingStoreValidationError,
+    pairing_presence_pin,
 )
 from .placement import (
     PlacementInputError,
@@ -169,6 +172,8 @@ def _pairing_exception_response(
             return _pairing_json_error(429, error.code)
         return _pairing_json_error(409, error.code)
     if isinstance(error, PairingStoreTerminalError):
+        if error.code == "pairing_presence_pin_rejected":
+            return _pairing_json_error(401, error.code)
         if public:
             if error.code in {
                 "pairing_claim_rejected",
@@ -1509,6 +1514,30 @@ def create_app(
 
     if config.pairing.enabled:
 
+        @app.post("/fleet/pairing/v1/requests")
+        async def request_presence_pairing(request: Request):
+            try:
+                payload = await parse_pairing_payload(
+                    request,
+                    PresencePairingRequest,
+                )
+                issued = await pairing_service().request_presence_pairing(payload)
+            except Exception as error:
+                return _pairing_exception_response(error, public=True)
+            return JSONResponse(
+                status_code=201,
+                headers={"Cache-Control": "no-store"},
+                content={
+                    "schema_version": 1,
+                    "invitation_id": issued.invitation_id,
+                    "pairing_secret": issued.pairing_secret,
+                    "presence_pin": pairing_presence_pin(issued.pairing_secret),
+                    "hub_origin": config.pairing.public_origin,
+                    "expires_at": issued.expires_at,
+                    "state": issued.state,
+                },
+            )
+
         @app.post(
             "/fleet/api/v1/pairing/invitations",
             dependencies=[Depends(require_admin)],
@@ -1566,6 +1595,27 @@ def create_app(
             try:
                 payload = await parse_pairing_payload(request, ClaimApproval)
                 enrollment = await pairing_service().approve_claim(
+                    claim_id,
+                    payload,
+                )
+            except Exception as error:
+                return _pairing_exception_response(error, public=False)
+            return _enrollment_payload(enrollment)
+
+        @app.post(
+            "/fleet/api/v1/pairing/claims/{claim_id}/approve-presence",
+            dependencies=[Depends(require_admin)],
+        )
+        async def approve_presence_pairing_claim(
+            claim_id: str,
+            request: Request,
+        ):
+            try:
+                payload = await parse_pairing_payload(
+                    request,
+                    PresenceClaimApproval,
+                )
+                enrollment = await pairing_service().approve_claim_with_presence(
                     claim_id,
                     payload,
                 )

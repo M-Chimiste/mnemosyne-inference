@@ -103,6 +103,16 @@ class SupportedPairingProtocol(StrictPairingModel):
     maximum: int = Field(strict=True, ge=1, le=1)
 
 
+class PresencePairingRequest(PairingPayload):
+    """A Mac-originated request for an Apple-style short-code ceremony."""
+
+    request_id: CanonicalUUID
+    mac: ClaimingMac
+    locator: SecretStr = Field(min_length=1, max_length=2048, repr=False)
+    transport: Literal["https", "tailscale", "trusted_lan_http"]
+    supported_protocol: SupportedPairingProtocol
+
+
 class InvitationClaim(PairingPayload):
     request_id: CanonicalUUID
     invitation_id: CanonicalUUID
@@ -117,6 +127,18 @@ class ClaimApproval(PairingPayload):
     locator: SecretStr = Field(min_length=1, max_length=2048, repr=False)
     service_class: Literal["primary", "opportunistic", "overflow"]
     hub_enabled: bool
+
+
+class PresenceClaimApproval(PairingPayload):
+    """Hub-admin approval proven by the short code displayed on the Mac."""
+
+    request_id: CanonicalUUID
+    presence_pin: str = Field(pattern=r"^[0-9]{6}$")
+    service_class: Literal["primary", "opportunistic", "overflow"]
+    # Presence approval proves physical/admin intent to pair. The dashboard
+    # still performs the existing explicit enable transaction only after the
+    # Mac has completed its pinned activation probe.
+    hub_enabled: Literal[False]
 
 
 class ClaimRejection(PairingPayload):

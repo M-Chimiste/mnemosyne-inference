@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
 import json
 import math
 import os
@@ -186,6 +187,15 @@ class ApprovalRequest:
 
 
 @dataclass(frozen=True, slots=True)
+class PresenceApprovalRequest:
+    request_id: str
+    claim_id: str
+    presence_pin: str = field(repr=False)
+    service_class: ServiceClass = "primary"
+    hub_enabled: bool = False
+
+
+@dataclass(frozen=True, slots=True)
 class ProvisionRequest:
     request_id: str
     claim_id: str
@@ -298,6 +308,16 @@ class PairingStore:
         _validate_approval_request(request)
         self._require_initialized()
         return await self._mutate(lambda: self._approve_claim(request))
+
+    async def approve_claim_with_presence(
+        self,
+        request: PresenceApprovalRequest,
+    ) -> EnrollmentRecord:
+        _validate_presence_approval_request(request)
+        self._require_initialized()
+        return await self._mutate(
+            lambda: self._approve_claim_with_presence(request)
+        )
 
     async def reject_claim(self, *, request_id: str, claim_id: str) -> bool:
         request_id = _canonical_uuid(request_id)
@@ -888,6 +908,85 @@ class PairingStore:
                 raise PairingStoreConflictError("pairing_duplicate_locator")
         return await self._run_sync(
             lambda: self._commit_approval_sync(request, digest=digest)
+        )
+
+    async def _approve_claim_with_presence(
+        self,
+        request: PresenceApprovalRequest,
+    ) -> EnrollmentRecord:
+        """Approve using the six-digit code displayed by the requesting Mac.
+
+        The PIN is derived from the existing high-entropy invitation secret;
+        it is never a credential and requires the separately authenticated Hub
+        administrator. Exact approval replay skips PIN verification after the
+        one-time invitation value has been retired.
+        """
+
+        digest = _request_digest(
+            "approve_claim",
+            {
+                "request_id": request.request_id,
+                "claim_id": request.claim_id,
+                "service_class": request.service_class,
+                "hub_enabled": request.hub_enabled,
+            },
+        )
+        approval = ApprovalRequest(
+            request_id=request.request_id,
+            claim_id=request.claim_id,
+            locator="presence-locator-loaded-below",
+            service_class=request.service_class,
+            hub_enabled=request.hub_enabled,
+        )
+        context = await self._run_sync(
+            lambda: self._approval_context_sync(approval, digest)
+        )
+        try:
+            if bool(context.get("idempotent_replay")):
+                locator = await self._secret_store.load_locator(
+                    str(context["pairing_id"]),
+                    str(context["locator_ref"]),
+                )
+            else:
+                material = await self._secret_store.load_pairing_material(
+                    str(context["pairing_id"]),
+                    str(context["invitation_id"]),
+                )
+                if material is None or (
+                    material.invitation.value_ref != context["invitation_ref"]
+                    or material.locator.value_ref != context["locator_ref"]
+                ):
+                    raise PairingStoreIntegrityError(
+                        "pairing_reconciliation_failed"
+                    )
+                expected_pin = pairing_presence_pin(material.invitation.value)
+                if not hmac.compare_digest(expected_pin, request.presence_pin):
+                    failed_state = await self._run_sync(
+                        lambda: self._record_failed_attempt_sync(
+                            str(context["invitation_id"]),
+                            _finite_timestamp(self._clock()),
+                        )
+                    )
+                    if failed_state == "failed":
+                        await self._delete_context_material(context)
+                        raise PairingStoreTerminalError(
+                            "pairing_attempt_budget_exhausted"
+                        )
+                    raise PairingStoreTerminalError(
+                        "pairing_presence_pin_rejected"
+                    )
+                locator = material.locator.value
+        except SecretStoreError:
+            raise PairingStoreIntegrityError("pairing_secret_store_failure") from None
+
+        return await self._approve_claim(
+            ApprovalRequest(
+                request_id=request.request_id,
+                claim_id=request.claim_id,
+                locator=locator,
+                service_class=request.service_class,
+                hub_enabled=request.hub_enabled,
+            )
         )
 
     async def _reject_claim(self, *, request_id: str, claim_id: str) -> bool:
@@ -2096,7 +2195,9 @@ class PairingStore:
             raise PairingStoreTerminalError("pairing_claim_terminal")
         if request.service_class != row["service_class"]:
             raise PairingStoreConflictError("pairing_service_class_mismatch")
-        return dict(row)
+        context = dict(row)
+        context["idempotent_replay"] = operation is not None
+        return context
 
     def _other_locator_bindings_sync(
         self,
@@ -3591,6 +3692,24 @@ def _validate_approval_request(request: object) -> None:
         raise PairingStoreValidationError("pairing_invalid_request")
 
 
+def _validate_presence_approval_request(request: object) -> None:
+    if not isinstance(request, PresenceApprovalRequest):
+        raise PairingStoreValidationError("pairing_invalid_request")
+    _canonical_uuid(request.request_id)
+    _canonical_uuid(request.claim_id)
+    if (
+        not isinstance(request.presence_pin, str)
+        or len(request.presence_pin) != 6
+        or not request.presence_pin.isascii()
+        or not request.presence_pin.isdigit()
+    ):
+        raise PairingStoreValidationError("pairing_invalid_request")
+    if request.service_class not in _SERVICE_CLASSES:
+        raise PairingStoreValidationError("pairing_invalid_request")
+    if not isinstance(request.hub_enabled, bool):
+        raise PairingStoreValidationError("pairing_invalid_request")
+
+
 def _validate_provision_request(request: object) -> None:
     if not isinstance(request, ProvisionRequest):
         raise PairingStoreValidationError("pairing_invalid_request")
@@ -3609,6 +3728,18 @@ def _canonical_uuid(value: object) -> str:
     if str(parsed) != value:
         raise PairingStoreValidationError("pairing_invalid_id")
     return value
+
+
+def pairing_presence_pin(pairing_secret: str) -> str:
+    """Derive the short-lived display code from a strong invitation secret."""
+
+    secret = _bounded_private_text(pairing_secret, maximum=4096)
+    digest = hmac.new(
+        secret.encode("utf-8"),
+        b"mnemosyne-fleet-presence-pin-v1",
+        hashlib.sha256,
+    ).digest()
+    return f"{int.from_bytes(digest[:8], 'big') % 1_000_000:06d}"
 
 
 def _bounded_text(value: object, *, maximum: int) -> str:

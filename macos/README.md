@@ -678,6 +678,36 @@ Then enroll `http://<trusted-mac-address>:1240` on the Hub and verify that it ca
 reach it. Never expose the inference listener on an untrusted LAN; bearer
 credentials protect access but do not encrypt requests or responses.
 
+The default guided Tailscale ceremony asks the Mac owner for only the Hub's
+HTTPS address. **Request to Join** discovers the Mac's MagicDNS name, asks the
+Hub for a five-minute hidden invitation, submits the existing authenticated
+claim, and displays a six-digit presence code. The authenticated Hub operator
+enters that code in the Hub Mac's native **Hub Mode** settings and chooses
+**Pair & Enable**. The Mac then polls the existing
+provisioning ceremony, stages the independent snapshot/dispatch/management
+credentials, and completes the pinned activation probe. The native Hub UI
+waits for that proof before issuing the separate enable transaction. It reads
+the private admin bearer just in time, talks only to the loopback Hub, refuses
+redirects and ambient proxies, and never places the bearer in view state. The
+code is
+derived from the high-entropy invitation secret, shares its expiry and failed-
+attempt budget, and is never a Fleet credential.
+
+The two locators deliberately use different schemes: the Mac connects to the
+Hub's Tailscale Serve origin over HTTPS, while the Hub connects to the Mac's
+inference listener at `http://<mac>.<tailnet>.ts.net:1240`. The listener on
+`1240` does not terminate TLS. A claim whose locator scheme or exact normalized
+value differs from the invitation is rejected. The original explicit
+invitation-ID/secret ceremony remains under Advanced on both sides.
+
+A conclusive pre-claim rejection leaves no Hub claim, pairing ID, credential
+generation, or pairing-owned bearer. In that exact state, **Settings →
+Inference Pool → Discard Failed Attempt…** atomically removes only the local
+failed-attempt journal and returns the Mac to unpaired state so a fresh
+invitation can be submitted. Ambiguous transport, timeout, redirect, `429`,
+`5xx`, oversized, or malformed-success outcomes remain exact-attempt retry
+fences and cannot use this recovery action.
+
 Enrollment and participation are deliberately separate. Existing enrolled
 Macs start joined for backward compatibility. The menu bar's **Contribute this
 Mac to the pool** toggle changes a durable local preference without unpairing

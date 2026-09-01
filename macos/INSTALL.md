@@ -173,18 +173,37 @@ available. Then:
    loopback gateway through private HTTPS. It does not touch the local worker.
 3. If macOS reports **Needs approval**, approve **Fleet Hub** in **System
    Settings → General → Login Items**, then toggle Hub Mode on again.
-4. Choose **Open Hub Dashboard**, paste the value from **Copy Admin Key**, and
-   use **Invite and manage Macs** to create one five-minute invitation. Select
-   `primary`, `opportunistic`, or **LIMITED / overflow** for that Mac.
-5. On the invited Mac, expose its public inference listener on the tailnet in
-   **Settings → General**, open **Settings → Inference Pool**, and enter the
-   Hub origin, invitation ID, and one-time pairing secret. The invitation
-   secret remains memory-only on the Mac.
-6. Back in the Hub dashboard, re-enter the exact Mac pool address, approve the
-   pending claim, and let the Mac resume activation. Newly activated Macs stay
-   Hub-disabled until the administrator explicitly chooses **Enable**. The
-   Mac's own **Contribute this Mac to the pool** switch remains an independent,
-   temporary join/pause control.
+4. Copy the **Public origin** shown in Hub Mode. This is the exact HTTPS Hub
+   address the other Mac should use; no browser login or copied admin key is
+   required for routine pairing.
+5. On the Mac, enable **Allow inference from the local network** in **Settings
+   → General**, save and restart the service, then open **Settings → Inference
+   Pool**. Enter only the Hub's HTTPS address and choose **Request to Join**.
+   Unified Inference discovers the Mac's Tailscale DNS name and shows a
+   six-digit code; the strong invitation secret remains hidden and memory-only.
+6. Back in Nyx's native **Hub Mode** settings, enter the six-digit code in the
+   pending row and choose **Pair & Enable**. Keep the other Mac's Settings
+   window open. The Hub
+   approves the claim, the Mac exchanges three private role credentials and
+   completes the pinned activation probe, and only then does the native app
+   issue the separate enable transaction. The Mac's own **Contribute this Mac
+   to the pool** switch remains an independent temporary join/pause control.
+
+The PIN flow uses HTTPS for the Hub, for example
+`https://nyx.example-tailnet.ts.net`, and automatically derives the Mac pool
+address as HTTP on port `1240`, for example
+`http://metis.example-tailnet.ts.net:1240`. Tailscale protects that private
+transport; port `1240` is not a TLS listener. **Advanced manual invitation** in
+the Advanced Hub dashboard and **Advanced manual pairing** on the Mac preserve
+the original invitation-ID/secret workflow and its explicit post-activation
+Enable step.
+
+If the Hub conclusively rejects the invitation before it creates a claim or
+issues credentials, the Mac preserves the failed attempt so a restart cannot
+silently substitute different invitation data. Choose **Discard Failed
+Attempt…** in **Inference Pool**, confirm, and then create and submit one fresh
+invitation. This recovery action is unavailable for an ambiguous network or
+Hub response; those attempts remain fenced to an exact retry.
 
 After an enrollment is explicitly enabled, every fresh authenticated node
 snapshot publishes all authoritative Fleet-eligible models into the Hub's

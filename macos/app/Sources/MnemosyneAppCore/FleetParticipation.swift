@@ -64,6 +64,19 @@ public struct FleetPairingSnapshot: Codable, Equatable, Sendable {
         state == "paired" || legacyCredentialsPresent == true
     }
 
+    /// A conclusive Hub refusal before claim creation is the only pending
+    /// ceremony that can be safely discarded without remote coordination.
+    public var canDiscardRejectedAttempt: Bool {
+        state == "pending"
+            && credentialsConfigured != true
+            && pairingId == nil
+            && workflow?.phase == "claiming"
+            && workflow?.claimID == nil
+            && workflow?.pairingID == nil
+            && workflow?.credentialGeneration == nil
+            && workflow?.lastErrorCode == "pairing_claim_rejected"
+    }
+
     /// Whether the pairing transaction, rather than the generic credential
     /// editor, owns the Fleet snapshot and dispatch credential slots.
     ///
