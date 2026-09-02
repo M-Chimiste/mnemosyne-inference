@@ -213,6 +213,21 @@ class LlamaCppAdapter(DS4Adapter):
             }
         )
 
+    def _target_runtime_preflight_sync(
+        self,
+        target: ResolvedTarget,
+    ) -> LlamaCppConfig:
+        """Resolve only the managed llama.cpp runtime for this target.
+
+        ``LlamaCppAdapter`` reuses DS4's managed-process lifecycle, but DS4's
+        target preflight also owns a product-specific GLM 5.3 preview gate.
+        A GGUF served by llama.cpp must not inherit that DS4 source-contract
+        requirement merely because its public alias is ``glm-5.3-flash``.
+        """
+
+        del target
+        return self._effective_config()
+
     def _build_argv(
         self,
         config: LlamaCppConfig,

@@ -87,7 +87,9 @@ final class LaunchAgentRegistration: ObservableObject {
     /// Refresh enabled registrations when the installed signed bundle changes. This
     /// covers the Mnemosyne.app rename and subsequent locally ad-hoc-signed
     /// updates without interrupting the service on ordinary menu launches.
-    func refreshChangedBundleRegistrationsIfNeeded() async {
+    func refreshChangedBundleRegistrationsIfNeeded(
+        hubConfigurationChanged: Bool = false
+    ) async {
         guard !isChangingRegistration else { return }
         let defaults = UserDefaults.standard
         let fingerprint = currentBundleFingerprint()
@@ -104,7 +106,7 @@ final class LaunchAgentRegistration: ObservableObject {
             forKey: Self.pendingHubRefreshKey
         )
         guard bundleChanged || agentRefreshPending || menuRefreshPending
-                || hubRefreshPending
+                || hubRefreshPending || hubConfigurationChanged
         else {
             return
         }
@@ -128,7 +130,7 @@ final class LaunchAgentRegistration: ObservableObject {
             state: managedState(menuLoginItem.status)
         )
         let hubAction = BundleRegistrationRefreshPolicy.action(
-            bundleChanged: bundleChanged,
+            bundleChanged: bundleChanged || hubConfigurationChanged,
             refreshPending: hubRefreshPending,
             state: managedState(hubAgent.status)
         )

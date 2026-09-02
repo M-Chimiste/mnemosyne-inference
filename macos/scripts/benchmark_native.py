@@ -99,6 +99,8 @@ async def run_sample(
     model: str,
     headers: dict[str, str],
     max_tokens: int,
+    prompt: str = PROMPT,
+    reasoning_effort: str | None = None,
 ) -> Sample:
     started = time.perf_counter()
     first_token_at: float | None = None
@@ -107,18 +109,21 @@ async def run_sample(
     status_code = 0
     headers_at = started
     try:
+        body: dict[str, Any] = {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0,
+            "max_tokens": max_tokens,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        }
+        if reasoning_effort:
+            body["reasoning_effort"] = reasoning_effort
         async with client.stream(
             "POST",
             f"{base_url.rstrip('/')}/v1/chat/completions",
             headers=headers,
-            json={
-                "model": model,
-                "messages": [{"role": "user", "content": PROMPT}],
-                "temperature": 0,
-                "max_tokens": max_tokens,
-                "stream": True,
-                "stream_options": {"include_usage": True},
-            },
+            json=body,
         ) as response:
             status_code = response.status_code
             headers_at = time.perf_counter()
@@ -145,8 +150,18 @@ async def run_sample(
                     if not isinstance(choice, dict):
                         continue
                     delta = choice.get("delta")
-                    text = delta.get("content") if isinstance(delta, dict) else None
-                    if text and first_token_at is None:
+                    token_signal = False
+                    if isinstance(delta, dict):
+                        token_signal = any(
+                            isinstance(delta.get(key), str) and bool(delta[key])
+                            for key in (
+                                "content",
+                                "reasoning_content",
+                                "reasoning",
+                                "thinking",
+                            )
+                        )
+                    if token_signal and first_token_at is None:
                         first_token_at = time.perf_counter()
         ended = time.perf_counter()
         decode_seconds = (
@@ -195,8 +210,14 @@ async def benchmark_target(
     warmups: int,
     max_tokens: int,
     timeout_seconds: float,
+    priority: str,
+    prompt_repetitions: int,
+    reasoning_effort: str | None,
 ) -> dict[str, Any]:
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    if priority:
+        headers["X-Mnemosyne-Priority"] = priority
+    prompt = ("x " * prompt_repetitions) + PROMPT
     limits = httpx.Limits(
         max_connections=max(1, concurrency),
         max_keepalive_connections=max(1, concurrency),
@@ -214,6 +235,8 @@ async def benchmark_target(
                 model=model,
                 headers=headers,
                 max_tokens=max_tokens,
+                prompt=prompt,
+                reasoning_effort=reasoning_effort,
             )
 
         semaphore = asyncio.Semaphore(concurrency)
@@ -226,6 +249,8 @@ async def benchmark_target(
                     model=model,
                     headers=headers,
                     max_tokens=max_tokens,
+                    prompt=prompt,
+                    reasoning_effort=reasoning_effort,
                 )
 
         started = time.perf_counter()
@@ -239,11 +264,26 @@ async def benchmark_target(
         "model": model,
         "concurrency": concurrency,
         "warmups": warmups,
+        "priority": priority or None,
+        "prompt_repetitions": prompt_repetitions,
+        "reasoning_effort": reasoning_effort,
         "wall_seconds": round(wall_seconds, 3),
         "request_throughput_per_second": round(requests / wall_seconds, 3)
         if wall_seconds > 0
         else None,
         "summary": summarize(samples),
+        "aggregate_prompt_tokens_per_second": round(
+            sum(sample.prompt_tokens or 0 for sample in samples) / wall_seconds,
+            3,
+        )
+        if wall_seconds > 0
+        else None,
+        "aggregate_output_tokens_per_second": round(
+            sum(sample.completion_tokens or 0 for sample in samples) / wall_seconds,
+            3,
+        )
+        if wall_seconds > 0
+        else None,
         "samples": [asdict(sample) for sample in samples],
     }
     return result
@@ -265,6 +305,23 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--warmups", type=int, default=1)
     value.add_argument("--max-tokens", type=int, default=128)
     value.add_argument("--timeout-seconds", type=float, default=900)
+    value.add_argument(
+        "--priority",
+        choices=("", "interactive", "normal", "batch"),
+        default="",
+        help="Optional Fleet priority lane.",
+    )
+    value.add_argument(
+        "--prompt-repetitions",
+        type=int,
+        default=0,
+        help="Prepend this many content-free 'x ' repetitions for prefill tests.",
+    )
+    value.add_argument(
+        "--reasoning-effort",
+        default="",
+        help="Optional portable reasoning effort such as low, medium, high, or max.",
+    )
     value.add_argument("--compare-base-url")
     value.add_argument("--compare-model")
     value.add_argument("--compare-label", default="comparison")
@@ -278,6 +335,8 @@ async def async_main(args: argparse.Namespace) -> dict[str, Any]:
         raise SystemExit("requests/concurrency must be positive and warmups non-negative")
     if args.max_tokens < 1 or args.timeout_seconds <= 0:
         raise SystemExit("max-tokens and timeout-seconds must be positive")
+    if args.prompt_repetitions < 0:
+        raise SystemExit("prompt-repetitions must be non-negative")
     targets = [
         await benchmark_target(
             label=args.label,
@@ -289,6 +348,9 @@ async def async_main(args: argparse.Namespace) -> dict[str, Any]:
             warmups=args.warmups,
             max_tokens=args.max_tokens,
             timeout_seconds=args.timeout_seconds,
+            priority=args.priority,
+            prompt_repetitions=args.prompt_repetitions,
+            reasoning_effort=args.reasoning_effort or None,
         )
     ]
     if args.compare_base_url:
@@ -307,6 +369,9 @@ async def async_main(args: argparse.Namespace) -> dict[str, Any]:
                 warmups=args.warmups,
                 max_tokens=args.max_tokens,
                 timeout_seconds=args.timeout_seconds,
+                priority=args.priority,
+                prompt_repetitions=args.prompt_repetitions,
+                reasoning_effort=args.reasoning_effort or None,
             )
         )
     return {

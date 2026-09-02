@@ -202,8 +202,10 @@ engine process.
   and persisted its node identity and ledger DSN; never kill an arbitrary
   listener on `:1240`.
 - `macos/service/runtime_updates.py` discovers releases directly from the
-  official upstreams, verifies and installs official `ggml-org/llama.cpp`
-  Apple Silicon assets, installs MFLUX from PyPI, builds an exact DS4 GitHub
+  official upstreams, selects the newest complete numbered official
+  `ggml-org/llama.cpp` Apple Silicon build (not a semantic release's frozen
+  nightly pointer), verifies and installs its exact asset, installs MFLUX from
+  PyPI, builds an exact DS4 GitHub
   commit, and provides atomic activation/rollback. Its private bounded
   lifecycle journal records only fixed transition fields, anonymous service
   instance IDs, and fixed failure codes so acceptance can prove activation,
@@ -309,12 +311,21 @@ The live `docker-compose.yml` is intentionally machine-specific and may live out
 ### Nyx Fleet gateway
 
 - Fleet exposes one authenticated OpenAI-compatible `/v1/*` endpoint and a
-  `/fleet/` dashboard. It supports only its explicit route allowlist and
-  rewrites only the model alias and authorization header.
+  `/fleet/` dashboard. Direct deployments default to the public-client bearer.
+  A macOS-managed Tailscale Serve Hub may use the closed
+  `tailscale_serve_or_bearer` mode: only a loopback proxy peer carrying
+  Serve's validated `Tailscale-User-Login` assertion may omit the bearer.
+  The fallback public-client key may be null or explicitly generated. Direct
+  LAN/Tailnet headers never authorize, tagged devices may use that fallback,
+  and admin routes always require the dashboard-admin key. The Fleet runner
+  must keep Uvicorn proxy-header rewriting disabled so authentication observes
+  the immediate loopback Serve peer rather than its `X-Forwarded-For` client.
+  Fleet supports only its explicit route allowlist and rewrites only the model
+  alias and authorization header.
 - Node enrollment is explicit. Each node has distinct snapshot and inference
   credentials, and neither credential is an admin credential. Fleet's public
-  client key, dashboard-admin key, all node credentials, and read-only ledger
-  DSN must remain distinct environment-backed secrets.
+  client key when configured, dashboard-admin key, all node credentials, and
+  read-only ledger DSN must remain distinct environment-backed secrets.
 - Dynamic Mac pairing is an opt-in, partially implemented layer over that
   boundary. With pairing disabled its routes are absent and static nodes retain
   their current environment-backed behavior. The implemented Hub foundation

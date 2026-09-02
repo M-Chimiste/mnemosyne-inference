@@ -388,6 +388,12 @@ struct SettingsView: View {
                         Text(configuration.publicOrigin)
                             .textSelection(.enabled)
                     }
+                    LabeledContent(
+                        "OpenAI client authentication",
+                        value: configuration.managedTailscaleServe
+                            ? "Tailnet identity; no API key"
+                            : "Bearer API key"
+                    )
                 }
                 Toggle(
                     "Include this Mac as an overflow inference worker",
@@ -605,10 +611,35 @@ struct SettingsView: View {
                         }
                         .disabled(!hubMode.hubHealthy)
                         Button("Copy Admin Key") { hubMode.copyAdminKey() }
-                        Button("Copy Client API Key") { hubMode.copyClientKey() }
+                        if hubMode.clientAPIKeyConfigured {
+                            Button(
+                                hubMode.configuration?.managedTailscaleServe == true
+                                    ? "Copy Optional API Key"
+                                    : "Copy Client API Key"
+                            ) { hubMode.copyClientKey() }
+                            if hubMode.configuration?.managedTailscaleServe == true {
+                                Button("Remove Optional API Key", role: .destructive) {
+                                    Task {
+                                        await hubMode.removeClientKey(
+                                            registration: registration
+                                        )
+                                    }
+                                }
+                                .disabled(hubMode.isWorking)
+                            }
+                        } else {
+                            Button("Generate Optional API Key") {
+                                Task {
+                                    await hubMode.generateClientKey(
+                                        registration: registration
+                                    )
+                                }
+                            }
+                            .disabled(hubMode.isWorking)
+                        }
                     }
                     Text(
-                        "Routine PIN pairing happens above. Use the advanced dashboard to change service classes, manage automatically published model routes, or revoke enrollments. Credentials are revealed only by an explicit copy action."
+                        "Routine PIN pairing happens above. Managed Tailscale HTTPS accepts OpenAI-compatible inference from authenticated tailnet users with no API key configured. Generate an optional client key only for clients that need a bearer token; removing it does not affect Tailnet access. The advanced dashboard and all administration always require the separate admin key."
                     )
                     .font(.caption)
                     .foregroundStyle(.secondary)

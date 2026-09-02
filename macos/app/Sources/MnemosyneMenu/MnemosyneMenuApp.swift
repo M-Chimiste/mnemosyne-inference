@@ -55,7 +55,24 @@ final class MenuAppDelegate: NSObject, NSApplicationDelegate {
             )
         }
         Task {
-            await registration.refreshChangedBundleRegistrationsIfNeeded()
+            let hubStore = HubConfigurationStore(
+                nativeEnvironmentURL: ControlConnectionConfiguration
+                    .load().environmentURL
+            )
+            let hubConfigurationChanged: Bool
+            do {
+                hubConfigurationChanged = try hubStore
+                    .refreshManagedConfiguration()
+            } catch {
+                hubConfigurationChanged = false
+                NSLog(
+                    "Unified Inference could not refresh preserved Hub configuration: %@",
+                    error.localizedDescription
+                )
+            }
+            await registration.refreshChangedBundleRegistrationsIfNeeded(
+                hubConfigurationChanged: hubConfigurationChanged
+            )
             await registration.applyStartupAtLoginDefaultsIfNeeded(
                 guidedSetupCompleted: guidedSetupCompleted
             )

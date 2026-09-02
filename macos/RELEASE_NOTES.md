@@ -31,6 +31,12 @@ read-only discovery hint.
   authoritative local model mappings, and enrolls the same Mac's independent
   inference worker as **LIMITED / overflow**. Tailscale Serve is the guided
   private-HTTPS path; an existing HTTPS proxy remains an advanced option.
+- A managed Tailscale Hub now accepts OpenAI-compatible `/v1/*` requests from
+  authenticated tailnet users without a client API key. New managed Hubs leave
+  that key unset; Hub administration can generate, copy, or remove an optional
+  bearer fallback for tagged devices and clients that need one. The gateway
+  trusts Tailscale identity only from its loopback Serve peer, and the admin
+  API always keeps its separate mandatory key.
 - Hub Mode settings now discover pending Macs, accept the six-digit pairing
   code in the native app, wait for activation proof, and perform the separate
   enable transaction. A disabled enrollment can be enabled there after an
@@ -81,6 +87,11 @@ read-only discovery hint.
   confirmed, globally drained, delegated to fixed owner commands, restarted,
   and validated. The card also reports vendor cache effectiveness and offers
   an explicit drain-safe SSD KV-cache reset that never touches model weights.
+- llama.cpp updates now follow the newest complete official numbered build
+  containing a macOS ARM64 asset. They no longer stop at the older build named
+  by a semantic release's frozen `nightly-tag.txt`; exact asset URL, published
+  size, SHA-256, runtime validation, activation barriers, and rollback remain
+  enforced.
 - DS4 discovery now exposes its current nine single-node targets across
   DeepSeek V4 and GLM 5.2. Exact Hub files and immutable revisions are verified
   before install, including all eleven shards of the supported Unsloth GLM Q4.

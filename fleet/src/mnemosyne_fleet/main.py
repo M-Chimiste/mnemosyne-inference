@@ -25,6 +25,11 @@ def main() -> None:
         host=config.server.host,
         port=config.server.port,
         log_config=None,
+        # Authentication must see the immediate socket peer. Tailscale Serve
+        # legitimately supplies X-Forwarded-For for the remote user, but
+        # rewriting ASGI scope["client"] would hide the loopback proxy and
+        # make its separately validated identity header fail closed.
+        proxy_headers=False,
         # Scheduler reservations and FIFO queues are intentionally
         # process-local in protocol v1. Do not let WEB_CONCURRENCY silently
         # create unsafe independent schedulers.

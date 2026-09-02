@@ -483,6 +483,8 @@ async def test_inference_and_admin_endpoints_require_separate_client_keys(tmp_pa
             assert "Unified signed model catalog" in dashboard.text
             assert "Hardware-aware placement" in dashboard.text
             assert "DesiredInstall delivery and progress" in dashboard.text
+
+
             assert "LIMITED / overflow" in dashboard.text
             assert "Hub enrollment" in dashboard.text
             assert "Pair and manage Macs" in dashboard.text
@@ -506,6 +508,104 @@ async def test_inference_and_admin_endpoints_require_separate_client_keys(tmp_pa
                 "/Volumes/",
             ):
                 assert forbidden not in dashboard.text
+
+
+async def test_tailscale_serve_identity_allows_keyless_inference_only_from_loopback(
+    tmp_path,
+) -> None:
+    original = fleet_config(tmp_path)
+    config = replace(
+        original,
+        server=replace(
+            original.server,
+            inference_auth_mode="tailscale_serve_or_bearer",
+        ),
+    )
+    app = create_app(config, start_polling=False)
+    identity = {"Tailscale-User-Login": "owner@example.com"}
+
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(
+                app=app,
+                client=("127.0.0.1", 43210),
+            ),
+            base_url="http://fleet",
+        ) as loopback:
+            assert (
+                await loopback.get("/v1/models", headers=identity)
+            ).status_code == 200
+            assert (await loopback.get("/v1/models")).status_code == 401
+            assert (
+                await loopback.get(
+                    "/v1/models",
+                    headers={"Tailscale-User-Name": "Owner"},
+                )
+            ).status_code == 401
+            assert (
+                await loopback.get(
+                    "/v1/models",
+                    headers={
+                        "Tailscale-User-Login": (
+                            "one@example.com,two@example.com"
+                        )
+                    },
+                )
+            ).status_code == 401
+            assert (
+                await loopback.get("/fleet/api/status", headers=identity)
+            ).status_code == 401
+            assert (
+                await loopback.get(
+                    "/v1/models",
+                    headers={"Authorization": "Bearer client-key"},
+                )
+            ).status_code == 200
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(
+                app=app,
+                client=("100.64.10.20", 43210),
+            ),
+            base_url="http://fleet",
+        ) as direct_tailnet:
+            assert (
+                await direct_tailnet.get("/v1/models", headers=identity)
+            ).status_code == 401
+
+
+async def test_tailscale_serve_mode_supports_a_null_fallback_api_key(
+    tmp_path,
+) -> None:
+    original = fleet_config(tmp_path)
+    config = replace(
+        original,
+        server=replace(
+            original.server,
+            api_key=None,
+            inference_auth_mode="tailscale_serve_or_bearer",
+        ),
+    )
+    app = create_app(config, start_polling=False)
+
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(
+                app=app,
+                client=("127.0.0.1", 43210),
+            ),
+            base_url="http://fleet",
+        ) as client:
+            identity = {"Tailscale-User-Login": "owner@example.com"}
+            assert (
+                await client.get("/v1/models", headers=identity)
+            ).status_code == 200
+            assert (
+                await client.get(
+                    "/v1/models",
+                    headers={"Authorization": "Bearer anything"},
+                )
+            ).status_code == 401
 
 
 async def test_non_finite_json_is_rejected_before_routing(tmp_path) -> None:

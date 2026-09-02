@@ -18,6 +18,7 @@ final class HubModeViewModel: ObservableObject {
     @Published private(set) var configuration: HubModeConfiguration?
     @Published private(set) var isWorking = false
     @Published private(set) var hubHealthy = false
+    @Published private(set) var clientAPIKeyConfigured = false
     @Published private(set) var statusMessage = "Hub Mode has not been configured."
     @Published private(set) var isError = false
     @Published private(set) var pendingPairingClaims: [HubPairingClaim] = []
@@ -46,11 +47,13 @@ final class HubModeViewModel: ObservableObject {
                 ? .tailscale : .existingHTTPS
             includeLocalWorker = existing.includesLocalWorker
         }
+        clientAPIKeyConfigured = ((try? store.clientKey()) ?? nil) != nil
     }
 
     func load(registration: LaunchAgentRegistration) async {
         registration.refresh()
         configuration = try? store.loadConfiguration()
+        clientAPIKeyConfigured = ((try? store.clientKey()) ?? nil) != nil
         if let configuration {
             customPublicOrigin = configuration.publicOrigin
             exposureMode = configuration.managedTailscaleServe
@@ -97,8 +100,10 @@ final class HubModeViewModel: ObservableObject {
             )
             let secrets = try store.prepareSecrets(
                 nativeCredentialStore: credentialStore,
-                provisionLocalWorker: includeLocalWorker
+                provisionLocalWorker: includeLocalWorker,
+                requireClientKey: discovery == nil
             )
+            clientAPIKeyConfigured = secrets.clientKey != nil
             var nodeID = fallbackWorkerNodeID
             var deployments: [HubPublishedDeployment] = []
             if includeLocalWorker {
@@ -406,7 +411,70 @@ final class HubModeViewModel: ObservableObject {
     }
 
     func copyClientKey() {
-        copySecret { try store.clientKey() }
+        do {
+            guard let key = try store.clientKey() else {
+                clientAPIKeyConfigured = false
+                isError = false
+                statusMessage = "No optional client API key is configured."
+                return
+            }
+            clientAPIKeyConfigured = true
+            copySecret { key }
+        } catch {
+            isError = true
+            statusMessage = error.localizedDescription
+        }
+    }
+
+    func generateClientKey(registration: LaunchAgentRegistration) async {
+        guard !isWorking else { return }
+        isWorking = true
+        isError = false
+        statusMessage = "Generating an optional client API key…"
+        defer { isWorking = false }
+        do {
+            let key = try store.generateClientKey()
+            clientAPIKeyConfigured = true
+            if registration.hubAgentStatus == .enabled,
+               !(await registration.restartHubAgent())
+            {
+                throw HubModePresentationError.registration(
+                    registration.lastError
+                        ?? "The key is saved and will become active after the Hub restarts."
+                )
+            }
+            copySecret { key }
+            statusMessage = "Optional client API key generated, activated, and copied."
+        } catch {
+            clientAPIKeyConfigured = ((try? store.clientKey()) ?? nil) != nil
+            isError = true
+            statusMessage = error.localizedDescription
+        }
+    }
+
+    func removeClientKey(registration: LaunchAgentRegistration) async {
+        guard !isWorking else { return }
+        isWorking = true
+        isError = false
+        statusMessage = "Removing the optional client API key…"
+        defer { isWorking = false }
+        do {
+            try store.removeClientKey()
+            clientAPIKeyConfigured = false
+            if registration.hubAgentStatus == .enabled,
+               !(await registration.restartHubAgent())
+            {
+                throw HubModePresentationError.registration(
+                    registration.lastError
+                        ?? "The key was removed from preserved configuration and will stop working after the Hub restarts."
+                )
+            }
+            statusMessage = "Optional client API key removed. Tailnet identity remains active."
+        } catch {
+            clientAPIKeyConfigured = ((try? store.clientKey()) ?? nil) != nil
+            isError = true
+            statusMessage = error.localizedDescription
+        }
     }
 
     func openDashboard() {

@@ -55,17 +55,13 @@ DS4_GLM53_PREVIEW_COMMIT_API_URL = (
     f"{DS4_GLM53_PREVIEW_BRANCH}"
 )
 DS4_GLM53_PREVIEW_REPO = "antirez/glm-5.3-flash-gguf"
-LLAMA_CPP_RELEASE_API_URL = (
-    "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest"
-)
-LLAMA_CPP_RELEASE_TAG_API_URL = (
-    "https://api.github.com/repos/ggml-org/llama.cpp/releases/tags/"
+LLAMA_CPP_RELEASES_API_URL = (
+    "https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=20"
 )
 LLAMA_CPP_RELEASE_DOWNLOAD_PREFIX = (
     "https://github.com/ggml-org/llama.cpp/releases/download/"
 )
-LLAMA_CPP_STABLE_POINTER_NAME = "nightly-tag.txt"
-MAX_LLAMA_CPP_STABLE_POINTER_BYTES = 32
+_LLAMA_CPP_BUILD_TAG_RE = re.compile(r"^b([1-9][0-9]*)$")
 MAX_SOURCE_ARCHIVE_BYTES = 2 * 1024**3
 _VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$")
 _ENGINES = ("llama.cpp", "omlx", "ds4", "mflux")
@@ -1564,49 +1560,26 @@ class RuntimeUpdateManager:
         )
 
     async def _official_llama_cpp(self) -> RuntimeRelease:
-        payload = await self._fetch_json(LLAMA_CPP_RELEASE_API_URL)
-        if not isinstance(payload, dict):
-            raise RuntimeUpdateError("official llama.cpp release response was invalid")
-        stable_tag = _validate_version(payload.get("tag_name"))
-        if payload.get("draft") or payload.get("prerelease"):
-            raise RuntimeUpdateError("official latest llama.cpp release was not stable")
-        release_url = str(
-            payload.get("html_url")
-            or f"https://github.com/ggml-org/llama.cpp/releases/tag/{stable_tag}"
-        )
-        tag = stable_tag
-        expected_name = f"llama-{tag}-bin-macos-arm64.tar.gz"
-        assets = payload.get("assets")
-        if not isinstance(assets, list):
-            raise RuntimeUpdateError("official llama.cpp release omitted assets")
-        asset = next(
-            (
-                value
-                for value in assets
-                if isinstance(value, dict) and value.get("name") == expected_name
-            ),
-            None,
-        )
-        if asset is None:
-            tag = await self._official_llama_cpp_stable_pointer(
-                payload,
-                stable_tag=stable_tag,
+        payload = await self._fetch_json(LLAMA_CPP_RELEASES_API_URL)
+        if not isinstance(payload, list):
+            raise RuntimeUpdateError("official llama.cpp releases response was invalid")
+
+        candidates: list[tuple[int, Mapping[str, Any], Mapping[str, Any]]] = []
+        for release in payload:
+            if not isinstance(release, dict) or release.get("draft"):
+                continue
+            tag = release.get("tag_name")
+            match = (
+                _LLAMA_CPP_BUILD_TAG_RE.fullmatch(tag)
+                if isinstance(tag, str)
+                else None
             )
-            payload = await self._fetch_json(f"{LLAMA_CPP_RELEASE_TAG_API_URL}{tag}")
-            if not isinstance(payload, dict):
-                raise RuntimeUpdateError(
-                    "official llama.cpp referenced release response was invalid"
-                )
-            if payload.get("draft") or payload.get("tag_name") != tag:
-                raise RuntimeUpdateError(
-                    "official llama.cpp stable pointer referenced an invalid release"
-                )
-            expected_name = f"llama-{tag}-bin-macos-arm64.tar.gz"
-            assets = payload.get("assets")
+            if match is None:
+                continue
+            assets = release.get("assets")
             if not isinstance(assets, list):
-                raise RuntimeUpdateError(
-                    "official referenced llama.cpp release omitted assets"
-                )
+                continue
+            expected_name = f"llama-{tag}-bin-macos-arm64.tar.gz"
             asset = next(
                 (
                     value
@@ -1615,10 +1588,24 @@ class RuntimeUpdateManager:
                 ),
                 None,
             )
-            if asset is None:
-                raise RuntimeUpdateError(
-                    f"official referenced llama.cpp release omitted {expected_name}"
-                )
+            # GitHub publishes the release object while its platform assets are
+            # still uploading. Select the newest complete Apple Silicon build
+            # instead of temporarily making runtime updates unavailable.
+            if asset is not None:
+                candidates.append((int(match.group(1)), release, asset))
+
+        if not candidates:
+            raise RuntimeUpdateError(
+                "official llama.cpp releases omitted a complete macOS ARM64 build"
+            )
+
+        _build, release, asset = max(candidates, key=lambda item: item[0])
+        tag = _validate_version(release.get("tag_name"))
+        release_url = str(
+            release.get("html_url")
+            or f"https://github.com/ggml-org/llama.cpp/releases/tag/{tag}"
+        )
+        expected_name = f"llama-{tag}-bin-macos-arm64.tar.gz"
         source_url = asset.get("browser_download_url")
         digest = asset.get("digest")
         size = asset.get("size")
@@ -1635,7 +1622,7 @@ class RuntimeUpdateManager:
             )
         if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
             raise RuntimeUpdateError("official llama.cpp asset size was invalid")
-        revision = payload.get("target_commitish")
+        revision = release.get("target_commitish")
         return RuntimeRelease(
             engine="llama.cpp",
             version=tag,
@@ -1645,91 +1632,6 @@ class RuntimeUpdateManager:
             sha256=digest.split(":", 1)[1].casefold(),
             asset_size=size,
         )
-
-    async def _official_llama_cpp_stable_pointer(
-        self,
-        payload: Mapping[str, Any],
-        *,
-        stable_tag: str,
-    ) -> str:
-        assets = payload.get("assets")
-        if not isinstance(assets, list):
-            raise RuntimeUpdateError("official llama.cpp release omitted assets")
-        pointer = next(
-            (
-                value
-                for value in assets
-                if isinstance(value, dict)
-                and value.get("name") == LLAMA_CPP_STABLE_POINTER_NAME
-            ),
-            None,
-        )
-        if pointer is None:
-            expected_name = f"llama-{stable_tag}-bin-macos-arm64.tar.gz"
-            raise RuntimeUpdateError(
-                "official llama.cpp release omitted "
-                f"{expected_name} and {LLAMA_CPP_STABLE_POINTER_NAME}"
-            )
-        expected_url = (
-            f"{LLAMA_CPP_RELEASE_DOWNLOAD_PREFIX}{stable_tag}/"
-            f"{LLAMA_CPP_STABLE_POINTER_NAME}"
-        )
-        source_url = pointer.get("browser_download_url")
-        digest = pointer.get("digest")
-        size = pointer.get("size")
-        if source_url != expected_url:
-            raise RuntimeUpdateError(
-                "official llama.cpp stable pointer URL was invalid"
-            )
-        if not isinstance(digest, str) or not re.fullmatch(
-            r"sha256:[0-9a-fA-F]{64}", digest
-        ):
-            raise RuntimeUpdateError(
-                "official llama.cpp stable pointer did not publish a SHA-256 digest"
-            )
-        if (
-            not isinstance(size, int)
-            or isinstance(size, bool)
-            or size <= 0
-            or size > MAX_LLAMA_CPP_STABLE_POINTER_BYTES
-        ):
-            raise RuntimeUpdateError(
-                "official llama.cpp stable pointer size was invalid"
-            )
-
-        body = bytearray()
-        async with self._client.stream(
-            "GET",
-            source_url,
-            headers={"Accept": "text/plain", "User-Agent": "Unified-Inference/1"},
-        ) as response:
-            response.raise_for_status()
-            async for chunk in response.aiter_bytes():
-                body.extend(chunk)
-                if len(body) > MAX_LLAMA_CPP_STABLE_POINTER_BYTES:
-                    raise RuntimeUpdateError(
-                        "official llama.cpp stable pointer exceeded its size limit"
-                    )
-        if len(body) != size:
-            raise RuntimeUpdateError(
-                "official llama.cpp stable pointer size did not match its metadata"
-            )
-        actual_digest = hashlib.sha256(body).hexdigest()
-        if not hmac.compare_digest(actual_digest, digest.split(":", 1)[1].casefold()):
-            raise RuntimeUpdateError(
-                "official llama.cpp stable pointer SHA-256 did not match its metadata"
-            )
-        try:
-            tag = bytes(body).decode("ascii").strip()
-        except UnicodeDecodeError as exc:
-            raise RuntimeUpdateError(
-                "official llama.cpp stable pointer was not ASCII"
-            ) from exc
-        if not re.fullmatch(r"b[1-9][0-9]*", tag):
-            raise RuntimeUpdateError(
-                "official llama.cpp stable pointer did not name a build release"
-            )
-        return tag
 
     async def _official_mflux(self) -> RuntimeRelease:
         payload = await self._fetch_json(MFLUX_PYPI_JSON_URL)
@@ -2133,7 +2035,9 @@ class RuntimeUpdateManager:
                             self._rollback_version(engine) is not None
                         ),
                         "management_note": (
-                            "Version and Apple Silicon binaries come directly from official ggml-org/llama.cpp GitHub releases."
+                            "The newest complete numbered build and Apple Silicon "
+                            "binary come directly from official ggml-org/llama.cpp "
+                            "GitHub releases."
                             if engine == "llama.cpp"
                             else (
                                 "The official oMLX app is recommended and includes precompiled custom kernels. oMLX remains independently owned and updated."

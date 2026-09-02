@@ -27,18 +27,31 @@ credentials. Node control-plane mutation routes remain outside the fleet
 protocol.
 
 The macOS Hub Mode pilot preserves the same boundary. It generates distinct
-random values for the public client, dashboard admin, pairing master, local
+random values for the dashboard admin, pairing master, local
 snapshot, and local Fleet-dispatch roles. Hub secrets live in a private
 mode-0600 environment below Application Support; Hub TOML names only their
-environment variables. In default Hub-only mode, the native private `.env` is
+environment variables. The fallback public-client key is nullable for managed
+Tailscale Serve and is generated only through an explicit UI action; removing
+it leaves every other secret byte-for-byte unchanged. In default Hub-only mode,
+the native private `.env` is
 not changed and the local worker is not restarted or enrolled. Only when the
 operator explicitly includes the local worker are its two values added,
 without replacing token-ledger or unrelated settings. The Hub binds loopback
 `:17400`; the guided remote exposure is a separate Tailscale Serve HTTPS
 listener. Copying the client or admin value requires an explicit UI action.
 
-LAN and Tailscale are transport choices, not identities. An address discovered
-through DNS or MagicDNS is never enrolled automatically.
+Plain LAN and direct Tailscale reachability are transport choices, not
+identities. An address discovered through DNS or MagicDNS is never enrolled
+automatically. The narrower managed Tailscale Serve HTTPS path is an
+authentication proxy: Serve strips caller-supplied identity headers and adds
+`Tailscale-User-Login` for authenticated tailnet users. Fleet accepts that
+assertion for `/v1/*` only when its immediate peer is loopback and the closed
+`tailscale_serve_or_bearer` mode is configured. The same header from a LAN or
+direct Tailnet peer is rejected. Tagged devices, which do not receive the user
+login header, may use an explicitly generated fallback bearer. The Fleet
+runner disables Uvicorn's proxy-header rewriting so `request.client` retains
+the immediate socket peer; the remote Tailnet address in
+`X-Forwarded-For` is never substituted for this trust decision.
 
 ## Protected assets
 
@@ -75,7 +88,10 @@ through DNS or MagicDNS is never enrolled automatically.
   credential fails
   snapshot discovery closed with `fleet_inference_auth_unconfigured`; it
   never advertises capacity whose enrolled inference credential is ignored.
-- Nyx uses separate client and admin credentials.
+- Nyx keeps any optional fallback-client credential separate from the mandatory
+  admin credential. Managed Tailscale Serve user identity may replace the
+  client bearer for `/v1/*` only; it never authenticates dashboard or
+  administration routes.
 - Credential values must be unique across public, admin, and every enrolled
   node role, plus the pairing master key, so compromise of one trust channel
   cannot authorize another.

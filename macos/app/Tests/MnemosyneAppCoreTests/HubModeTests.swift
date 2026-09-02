@@ -34,14 +34,14 @@ func hubModeCreatesSeparatedCredentials() throws {
         first.localWorkerSnapshotKey,
         first.localWorkerDispatchKey,
     ]).count == 5)
-    #expect(first.clientKey.count == 64)
+    #expect(first.clientKey?.count == 64)
     #expect(first.pairingMasterKey.count == 43)
 
     let nativeText = try String(contentsOf: nativeEnvironment, encoding: .utf8)
     #expect(nativeText.contains("TOKEN_LEDGER_DSN=preserved"))
     #expect(nativeText.contains("FLEET_API_KEY=\(first.localWorkerSnapshotKey)"))
     #expect(nativeText.contains("FLEET_INFERENCE_API_KEY=\(first.localWorkerDispatchKey)"))
-    #expect(!nativeText.contains(first.clientKey))
+    #expect(!nativeText.contains(first.clientKey!))
     #expect(!nativeText.contains(first.adminKey))
     #expect(!nativeText.contains(first.pairingMasterKey))
 
@@ -61,7 +61,10 @@ func hubModeRendersClosedFleetConfiguration() throws {
     let hubStore = HubConfigurationStore(
         rootURL: temporary.appending(path: "hub", directoryHint: .isDirectory)
     )
-    let secrets = try hubStore.prepareSecrets(nativeCredentialStore: nativeStore)
+    let secrets = try hubStore.prepareSecrets(
+        nativeCredentialStore: nativeStore,
+        requireClientKey: false
+    )
     let deployment = HubPublishedDeployment(
         alias: "glm-5.3-flash",
         deploymentID: "sha256:" + String(repeating: "a", count: 64),
@@ -86,17 +89,140 @@ func hubModeRendersClosedFleetConfiguration() throws {
     let config = try String(contentsOf: hubStore.configurationURL, encoding: .utf8)
     #expect(config.contains("host = \"127.0.0.1\""))
     #expect(config.contains("port = 17400"))
+    #expect(config.contains(
+        "inference_auth_mode = \"tailscale_serve_or_bearer\""
+    ))
     #expect(config.contains("url = \"http://127.0.0.1:1240\""))
     #expect(config.contains("service_class = \"overflow\""))
     #expect(config.contains("enabled = true"))
     #expect(!config.contains("[[models]]"))
     #expect(!config.contains("deployment_id = \"\(deployment.deploymentID)\""))
     #expect(config.contains("api_key_env = \"MNEMOSYNE_FLEET_CLIENT_KEY\""))
-    #expect(!config.contains(secrets.clientKey))
+    #expect(secrets.clientKey == nil)
+    #expect(try hubStore.clientKey() == nil)
     #expect(!config.contains(secrets.adminKey))
     #expect(!config.contains(secrets.pairingMasterKey))
     #expect(!config.contains(secrets.localWorkerSnapshotKey))
     #expect(!config.contains(secrets.localWorkerDispatchKey))
+}
+
+@Test("Existing HTTPS Hub configuration retains bearer-only inference")
+func existingHTTPSHubRetainsBearerAuthentication() throws {
+    let temporary = FileManager.default.temporaryDirectory
+        .appending(path: UUID().uuidString, directoryHint: .isDirectory)
+    defer { try? FileManager.default.removeItem(at: temporary) }
+    let hubStore = HubConfigurationStore(
+        rootURL: temporary.appending(path: "hub", directoryHint: .isDirectory)
+    )
+    _ = try hubStore.prepareSecrets(
+        nativeCredentialStore: CredentialStore(
+            environmentURL: temporary.appending(path: "native.env")
+        ),
+        provisionLocalWorker: false
+    )
+    _ = try hubStore.saveConfiguration(
+        publicOrigin: "https://hub.example.internal",
+        localWorkerNodeID: "",
+        managedTailscaleServe: false,
+        includesLocalWorker: false,
+        deployments: []
+    )
+    let config = try String(
+        contentsOf: hubStore.configurationURL,
+        encoding: .utf8
+    )
+    #expect(config.contains("inference_auth_mode = \"bearer\""))
+}
+
+@Test("Preserved managed Hub configuration upgrades without replacing secrets")
+func preservedManagedHubConfigurationUpgradesInPlace() throws {
+    let temporary = FileManager.default.temporaryDirectory
+        .appending(path: UUID().uuidString, directoryHint: .isDirectory)
+    defer { try? FileManager.default.removeItem(at: temporary) }
+    let nativeEnvironment = temporary.appending(path: "native.env")
+    let hubStore = HubConfigurationStore(
+        rootURL: temporary.appending(path: "hub", directoryHint: .isDirectory)
+    )
+    _ = try hubStore.prepareSecrets(
+        nativeCredentialStore: CredentialStore(environmentURL: nativeEnvironment),
+        provisionLocalWorker: false,
+        requireClientKey: false
+    )
+    _ = try hubStore.saveConfiguration(
+        publicOrigin: "https://nyx.example.ts.net",
+        localWorkerNodeID: "",
+        managedTailscaleServe: true,
+        includesLocalWorker: false,
+        deployments: []
+    )
+    let secretsBefore = try Data(contentsOf: hubStore.environmentURL)
+    #expect(!String(decoding: secretsBefore, as: UTF8.self).contains(
+        HubConfigurationStore.clientKeyName
+    ))
+    var legacy = try String(
+        contentsOf: hubStore.configurationURL,
+        encoding: .utf8
+    )
+    legacy = legacy.replacingOccurrences(
+        of: "inference_auth_mode = \"tailscale_serve_or_bearer\"\n",
+        with: ""
+    )
+    try Data(legacy.utf8).write(
+        to: hubStore.configurationURL,
+        options: [.atomic]
+    )
+
+    #expect(try hubStore.refreshManagedConfiguration())
+    #expect(!(try hubStore.refreshManagedConfiguration()))
+    let upgraded = try String(
+        contentsOf: hubStore.configurationURL,
+        encoding: .utf8
+    )
+    #expect(upgraded.contains(
+        "inference_auth_mode = \"tailscale_serve_or_bearer\""
+    ))
+    #expect(try Data(contentsOf: hubStore.environmentURL) == secretsBefore)
+}
+
+@Test("Managed Tailscale Hub can generate and remove an optional client key")
+func managedHubOptionalClientKeyLifecycle() throws {
+    let temporary = FileManager.default.temporaryDirectory
+        .appending(path: UUID().uuidString, directoryHint: .isDirectory)
+    defer { try? FileManager.default.removeItem(at: temporary) }
+    let hubStore = HubConfigurationStore(
+        rootURL: temporary.appending(path: "hub", directoryHint: .isDirectory)
+    )
+    let nativeStore = CredentialStore(
+        environmentURL: temporary.appending(path: "native.env")
+    )
+    let original = try hubStore.prepareSecrets(
+        nativeCredentialStore: nativeStore,
+        provisionLocalWorker: false,
+        requireClientKey: false
+    )
+    #expect(original.clientKey == nil)
+
+    let generated = try hubStore.generateClientKey()
+    #expect(generated.count == 64)
+    #expect(try hubStore.clientKey() == generated)
+    let withKey = try Data(contentsOf: hubStore.environmentURL)
+    #expect(String(decoding: withKey, as: UTF8.self).contains(
+        "\(HubConfigurationStore.clientKeyName)=\(generated)"
+    ))
+
+    try hubStore.removeClientKey()
+    #expect(try hubStore.clientKey() == nil)
+    let withoutKey = try String(
+        contentsOf: hubStore.environmentURL,
+        encoding: .utf8
+    )
+    #expect(!withoutKey.contains(HubConfigurationStore.clientKeyName))
+    #expect(withoutKey.contains(
+        "\(HubConfigurationStore.adminKeyName)=\(original.adminKey)"
+    ))
+    #expect(withoutKey.contains(
+        "\(HubConfigurationStore.pairingMasterKeyName)=\(original.pairingMasterKey)"
+    ))
 }
 
 @Test("Hub-only configuration does not provision or enroll the local worker")

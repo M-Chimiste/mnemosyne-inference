@@ -84,11 +84,21 @@ public struct HubModeConfiguration: Codable, Equatable, Sendable {
 /// This type intentionally has no diagnostic or string representation. Callers
 /// must never place an instance in logs, errors, preferences, or UI state.
 public struct HubModeSecrets: Sendable {
-    public let clientKey: String
+    public let clientKey: String?
     public let adminKey: String
     public let pairingMasterKey: String
     public let localWorkerSnapshotKey: String
     public let localWorkerDispatchKey: String
+
+    fileprivate func replacingClientKey(_ value: String?) -> HubModeSecrets {
+        HubModeSecrets(
+            clientKey: value,
+            adminKey: adminKey,
+            pairingMasterKey: pairingMasterKey,
+            localWorkerSnapshotKey: localWorkerSnapshotKey,
+            localWorkerDispatchKey: localWorkerDispatchKey
+        )
+    }
 }
 
 public enum HubModeError: Error, Equatable, LocalizedError {
@@ -180,20 +190,28 @@ public struct HubConfigurationStore: Sendable {
 
     public func prepareSecrets(
         nativeCredentialStore: CredentialStore,
-        provisionLocalWorker: Bool = true
+        provisionLocalWorker: Bool = true,
+        requireClientKey: Bool = true
     ) throws -> HubModeSecrets {
         try prepareRoot()
-        let secrets: HubModeSecrets
+        var secrets: HubModeSecrets
         if FileManager.default.fileExists(atPath: environmentURL.path) {
             secrets = try readSecrets()
         } else {
             secrets = HubModeSecrets(
-                clientKey: randomHex(bytes: 32),
+                clientKey: requireClientKey ? randomHex(bytes: 32) : nil,
                 adminKey: randomHex(bytes: 32),
                 pairingMasterKey: randomBase64URL(bytes: 32),
                 localWorkerSnapshotKey: randomHex(bytes: 32),
                 localWorkerDispatchKey: randomHex(bytes: 32)
             )
+            try writePrivate(
+                environmentText(for: secrets).data(using: .utf8)!,
+                to: environmentURL
+            )
+        }
+        if requireClientKey, secrets.clientKey == nil {
+            secrets = secrets.replacingClientKey(randomHex(bytes: 32))
             try writePrivate(
                 environmentText(for: secrets).data(using: .utf8)!,
                 to: environmentURL
@@ -255,12 +273,66 @@ public struct HubConfigurationStore: Sendable {
         return value
     }
 
+    /// Re-render preserved Hub metadata through the current app's closed
+    /// configuration schema. This is the in-place upgrade path for fields
+    /// added after the Hub was first promoted; it never reads or replaces
+    /// credentials, pairing state, routes, inventory, or model data.
+    @discardableResult
+    public func refreshManagedConfiguration() throws -> Bool {
+        guard let value = try loadConfiguration() else { return false }
+        try prepareRoot()
+        let expected = Data(renderTOML(value).utf8)
+        if FileManager.default.fileExists(atPath: configurationURL.path) {
+            try requireRegularFile(configurationURL)
+            if try Data(contentsOf: configurationURL) == expected {
+                return false
+            }
+        }
+        try writePrivate(expected, to: configurationURL)
+        return true
+    }
+
     public func adminKey() throws -> String {
         try readSecrets().adminKey
     }
 
-    public func clientKey() throws -> String {
+    public func clientKey() throws -> String? {
         try readSecrets().clientKey
+    }
+
+    @discardableResult
+    public func generateClientKey() throws -> String {
+        try prepareRoot()
+        var secrets = try readSecrets()
+        if let existing = secrets.clientKey { return existing }
+        let occupied = Set([
+            secrets.adminKey,
+            secrets.pairingMasterKey,
+            secrets.localWorkerSnapshotKey,
+            secrets.localWorkerDispatchKey,
+        ])
+        var generated = randomHex(bytes: 32)
+        while occupied.contains(generated) {
+            generated = randomHex(bytes: 32)
+        }
+        secrets = secrets.replacingClientKey(generated)
+        try writePrivate(
+            environmentText(for: secrets).data(using: .utf8)!,
+            to: environmentURL
+        )
+        return generated
+    }
+
+    public func removeClientKey() throws {
+        try prepareRoot()
+        let secrets = try readSecrets()
+        guard secrets.clientKey != nil else { return }
+        try writePrivate(
+            environmentText(
+                for: secrets.replacingClientKey(nil)
+            ).data(using: .utf8)!,
+            to: environmentURL
+        )
     }
 
     public static func normalizedHTTPSOrigin(_ raw: String) throws -> String {
@@ -333,6 +405,7 @@ public struct HubConfigurationStore: Sendable {
             "[server]",
             "host = \"127.0.0.1\"",
             "port = 17400",
+            "inference_auth_mode = \"\(value.managedTailscaleServe ? "tailscale_serve_or_bearer" : "bearer")\"",
             "api_key_env = \"\(Self.clientKeyName)\"",
             "admin_api_key_env = \"\(Self.adminKeyName)\"",
             "database_path = \(tomlString(state.appending(path: "fleet.db").path))",
@@ -390,15 +463,20 @@ public struct HubConfigurationStore: Sendable {
     }
 
     private func environmentText(for secrets: HubModeSecrets) -> String {
-        [
+        var lines = [
             "# Managed by Unified Inference Hub Mode. Do not share this file.",
-            "\(Self.clientKeyName)=\(secrets.clientKey)",
+        ]
+        if let clientKey = secrets.clientKey {
+            lines.append("\(Self.clientKeyName)=\(clientKey)")
+        }
+        lines.append(contentsOf: [
             "\(Self.adminKeyName)=\(secrets.adminKey)",
             "\(Self.pairingMasterKeyName)=\(secrets.pairingMasterKey)",
             "\(Self.localSnapshotKeyName)=\(secrets.localWorkerSnapshotKey)",
             "\(Self.localDispatchKeyName)=\(secrets.localWorkerDispatchKey)",
             "",
-        ].joined(separator: "\n")
+        ])
+        return lines.joined(separator: "\n")
     }
 
     private func readSecrets() throws -> HubModeSecrets {
@@ -422,19 +500,23 @@ public struct HubConfigurationStore: Sendable {
             else { throw HubModeError.invalidPrivateEnvironment }
             values[key] = value
         }
-        let names = [
-            Self.clientKeyName, Self.adminKeyName, Self.pairingMasterKeyName,
+        let requiredNames = [
+            Self.adminKeyName, Self.pairingMasterKeyName,
             Self.localSnapshotKeyName, Self.localDispatchKeyName,
         ]
-        guard names.allSatisfy({ values[$0]?.count ?? 0 >= 43 }) else {
+        guard requiredNames.allSatisfy({ values[$0]?.count ?? 0 >= 43 }) else {
             throw HubModeError.invalidPrivateEnvironment
         }
-        let distinct = Set(names.compactMap { values[$0] })
-        guard distinct.count == names.count else {
+        if let clientKey = values[Self.clientKeyName], clientKey.count < 43 {
+            throw HubModeError.invalidPrivateEnvironment
+        }
+        let names = requiredNames + [Self.clientKeyName]
+        let present = names.compactMap { values[$0] }
+        guard Set(present).count == present.count else {
             throw HubModeError.invalidPrivateEnvironment
         }
         return HubModeSecrets(
-            clientKey: values[Self.clientKeyName]!,
+            clientKey: values[Self.clientKeyName],
             adminKey: values[Self.adminKeyName]!,
             pairingMasterKey: values[Self.pairingMasterKeyName]!,
             localWorkerSnapshotKey: values[Self.localSnapshotKeyName]!,

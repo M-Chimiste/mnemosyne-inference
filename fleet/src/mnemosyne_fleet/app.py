@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import ipaddress
 import json
 import logging
 import math
@@ -432,6 +433,31 @@ def _bearer(request: Request) -> str | None:
     return value[7:]
 
 
+def _trusted_tailscale_serve_identity(request: Request) -> bool:
+    """Accept only identity asserted by a loopback Tailscale Serve proxy.
+
+    Tailscale Serve removes caller-supplied identity headers before adding its
+    own. Requiring a loopback peer preserves that guarantee and keeps a direct
+    LAN/Tailnet listener from turning the header into self-asserted authority.
+    """
+
+    peer = None if request.client is None else request.client.host
+    try:
+        if peer is None or not ipaddress.ip_address(peer).is_loopback:
+            return False
+    except ValueError:
+        return False
+    login = request.headers.get("tailscale-user-login")
+    return bool(
+        login
+        and login == login.strip()
+        and login.isascii()
+        and len(login) <= 512
+        and "," not in login
+        and all(0x21 <= ord(character) <= 0x7E for character in login)
+    )
+
+
 def create_app(
     config: FleetConfig | None = None,
     *,
@@ -621,9 +647,13 @@ def create_app(
             secret_store=secret_store,
         )
         forbidden_credentials = [
-            config.server.api_key,
-            config.server.admin_api_key,
-            pairing.master_key,
+            credential
+            for credential in (
+                config.server.api_key,
+                config.server.admin_api_key,
+                pairing.master_key,
+            )
+            if credential is not None
         ]
         forbidden_credentials.extend(
             credential
@@ -770,8 +800,23 @@ def create_app(
 
     async def require_inference(request: Request) -> None:
         token = _bearer(request)
-        if token is None or not hmac.compare_digest(token, config.server.api_key):
-            raise _unauthorized()
+        if (
+            token is not None
+            and config.server.api_key is not None
+            and hmac.compare_digest(token, config.server.api_key)
+        ):
+            return
+        if (
+            config.server.inference_auth_mode == "tailscale_serve_or_bearer"
+            and _trusted_tailscale_serve_identity(request)
+        ):
+            return
+        raise _unauthorized(
+            tailscale_serve_allowed=(
+                config.server.inference_auth_mode
+                == "tailscale_serve_or_bearer"
+            )
+        )
 
     async def require_admin(request: Request) -> None:
         token = _bearer(request)
@@ -2276,14 +2321,19 @@ def create_app(
     return app
 
 
-def _unauthorized():
+def _unauthorized(*, tailscale_serve_allowed: bool = False):
     from fastapi import HTTPException
 
     return HTTPException(
         status_code=401,
         detail={
             "error": {
-                "message": "A valid bearer token is required.",
+                "message": (
+                    "A valid bearer token or trusted Tailscale Serve identity "
+                    "is required."
+                    if tailscale_serve_allowed
+                    else "A valid bearer token is required."
+                ),
                 "type": "authentication_error",
                 "code": "unauthorized",
             }

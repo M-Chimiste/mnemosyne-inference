@@ -3,6 +3,13 @@
 # reverse proxy. The dashboard is at /fleet/.
 host = "127.0.0.1"
 port = 17400
+# bearer is the safe default for direct/private listeners. The macOS Hub Mode
+# writes tailscale_serve_or_bearer only while it owns a loopback Tailscale
+# Serve proxy whose injected Tailscale-User-Login header is trusted.
+inference_auth_mode = "bearer"
+# Required in bearer mode. In tailscale_serve_or_bearer mode this may be
+# omitted, or its environment variable may be absent, to keep the fallback
+# client key null until an operator generates one.
 api_key_env = "MNEMOSYNE_FLEET_CLIENT_KEY"
 admin_api_key_env = "MNEMOSYNE_FLEET_ADMIN_KEY"
 database_path = "/var/lib/mnemosyne-fleet/fleet.db"

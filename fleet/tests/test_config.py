@@ -9,6 +9,71 @@ PAIRING_MASTER_KEY = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 CATALOG_PUBLIC_KEY = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA"
 
 
+def test_tailnet_inference_auth_is_explicit_and_loopback_only(tmp_path) -> None:
+    path = tmp_path / "config.toml"
+    template = """
+[server]
+host = "HOST"
+inference_auth_mode = "MODE"
+api_key_env = "CLIENT"
+admin_api_key_env = "ADMIN"
+poll_interval_seconds = 1
+snapshot_ttl_seconds = 2
+
+[[nodes]]
+node_id = "node"
+url = "http://node"
+fleet_token_env = "FLEET"
+inference_token_env = "INFER"
+"""
+    environment = {
+        "CLIENT": "client",
+        "ADMIN": "admin",
+        "FLEET": "fleet",
+        "INFER": "infer",
+    }
+
+    path.write_text(
+        template.replace("HOST", "127.0.0.1").replace(
+            "MODE", "tailscale_serve_or_bearer"
+        ),
+        encoding="utf-8",
+    )
+    config = load_config(path, environ=environment)
+    assert config.server.inference_auth_mode == "tailscale_serve_or_bearer"
+    assert config.server.api_key == "client"
+
+    keyless = template.replace('api_key_env = "CLIENT"\n', "").replace(
+        "HOST", "127.0.0.1"
+    ).replace("MODE", "tailscale_serve_or_bearer")
+    path.write_text(keyless, encoding="utf-8")
+    config = load_config(path, environ=environment)
+    assert config.server.api_key is None
+
+    path.write_text(
+        keyless.replace("tailscale_serve_or_bearer", "bearer"),
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError, match="required for bearer authentication"):
+        load_config(path, environ=environment)
+
+    path.write_text(
+        template.replace("HOST", "0.0.0.0").replace(
+            "MODE", "tailscale_serve_or_bearer"
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError, match="requires server.host = 127.0.0.1"):
+        load_config(path, environ=environment)
+
+    path.write_text(
+        template.replace("HOST", "127.0.0.1").replace("MODE", "anonymous"),
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError, match="inference_auth_mode"):
+        load_config(path, environ=environment)
+
+
 def test_pairing_hub_can_start_without_static_nodes_or_models(tmp_path) -> None:
     path = tmp_path / "config.toml"
     path.write_text(

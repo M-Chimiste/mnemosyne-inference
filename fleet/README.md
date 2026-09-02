@@ -24,8 +24,22 @@ inference only with Nyx's canonical Fleet route marker; pairing never replaces
 the ordinary local `INFERENCE_API_KEY`. The management bearer is not a Mac
 control-plane or Fleet-admin credential.
 
-Fleet refuses to start unless the public-client key, admin key, pairing master
-key when enabled, and every known node credential are distinct. Secret values
+Fleet's direct-listener default requires the public-client bearer. The macOS
+Hub may instead select `tailscale_serve_or_bearer` only while the gateway binds
+`127.0.0.1` behind its managed Tailscale Serve HTTPS proxy. In that mode,
+OpenAI-compatible `/v1/*` requests with Serve's nonempty
+`Tailscale-User-Login` assertion need no bearer. The public-client key may be
+unset (`None`) or generated as an optional fallback. A header received from any
+non-loopback peer is rejected, and the admin
+API always requires its separate bearer. Tailscale Serve removes caller-
+supplied identity headers before injecting its own; plain LAN or direct
+Tailnet reachability is never identity. Fleet disables Uvicorn proxy-header
+rewriting so the authentication layer retains the immediate loopback socket
+peer instead of replacing it with Serve's `X-Forwarded-For` client address.
+
+Fleet refuses to start unless every configured fallback public-client key,
+admin key, pairing master key when enabled, and known node credential are
+distinct. Secret values
 never enter Fleet metadata SQLite, API/status responses, or route history. The
 one-time invitation response and claim-bound provisioning response are the
 deliberate exceptions needed to deliver their respective secret material; both
@@ -70,7 +84,10 @@ local-snapshot and local-dispatch secrets. The recommended UI path exposes
 only the loopback Hub through Tailscale Serve HTTPS. Hub credentials,
 enrollments, inventory, universal-catalog overrides, and route metadata live
 outside the app bundle and survive Finder replacement, disable/re-enable, and
-the preserve-data uninstaller.
+the preserve-data uninstaller. This managed Serve path accepts authenticated
+tailnet users on `/v1/*` with the fallback API key left unset; Hub Mode can
+generate or remove that optional key later. Existing HTTPS proxy mode remains
+bearer-only, and the dashboard remains admin-keyed in both modes.
 
 The same dashboard now has **Hub enrollment → Invite and manage Macs**. It can
 create a five-minute invitation, approve or reject a claim after the operator

@@ -170,7 +170,12 @@ available. Then:
    local-worker toggle off, then choose **Configure and Enable Hub**. Unified
    Inference creates private Hub credentials, preserves the existing native
    `.env`, registers the Hub at login, and asks Tailscale Serve to expose the
-   loopback gateway through private HTTPS. It does not touch the local worker.
+   loopback gateway through private HTTPS. OpenAI-compatible clients signed in
+   to the tailnet can use this HTTPS `/v1` endpoint with no client API key
+   configured. Hub administration can generate, copy, or remove an optional
+   fallback key for clients or tagged devices that cannot present a Tailscale
+   user identity. The admin dashboard always requires its separate admin key.
+   Promotion does not touch the local worker.
 3. If macOS reports **Needs approval**, approve **Fleet Hub** in **System
    Settings → General → Login Items**, then toggle Hub Mode on again.
 4. Copy the **Public origin** shown in Hub Mode. This is the exact HTTPS Hub
@@ -232,8 +237,8 @@ No Homebrew llama.cpp installation is needed.
    vision projector is selected automatically; you can choose another or opt
    out for text-only use.
 
-Unified Inference downloads the official
-[ggml-org/llama.cpp release](https://github.com/ggml-org/llama.cpp/releases/latest),
+Unified Inference selects the newest complete official numbered build from the
+[ggml-org/llama.cpp releases](https://github.com/ggml-org/llama.cpp/releases),
 verifies its published metadata and server contract, and owns the resulting
 `llama-server` process. Do not start a second `llama-server` on port `17325`.
 

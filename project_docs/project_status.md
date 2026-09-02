@@ -1,6 +1,6 @@
 # Mnemosyne Inference — Project Status
 
-**Last updated:** 2026-08-31
+**Last updated:** 2026-09-01
 
 ## Current state
 
@@ -36,6 +36,11 @@ Mac/CUDA hardware evidence remain release gates; see
 Fleet now also has a single joined Mac overview for online/joined state,
 hardware, path-free free storage, installed/resident models, active work,
 queues, recent fixed-code errors, and a read-only five-minute token rate.
+The Hub dashboard is organized into four operator workspaces—Overview, Models,
+Fleet, and Activity—rather than one continuous administration page. The
+redesign keeps the existing session-only admin credential, CSP, confirmation
+gates, and API boundaries while making health/capacity the default view and
+moving provisioning, model authority, and audit data into focused surfaces.
 Optional request headers add bounded priority, exact enrollment affinity,
 shorter maximum wait, and safe pre-work fallback policy without changing
 ordinary clients. Bounded `/v1/batches` execution groups compatible
@@ -55,9 +60,13 @@ authoritative Fleet-eligible deployment into a durable universal routing
 catalog. Exact replicas collapse, alias conflicts receive stable deployment
 suffixes, and the dashboard supports durable remove/suppress plus explicit
 re-add. The guided remote path configures Tailscale Serve HTTPS, while an
-existing HTTPS proxy is an advanced alternative. Finder replacement and
-disable/re-enable retain Hub credentials, pairings, inventory, catalog
-overrides, and route metadata.
+existing HTTPS proxy is an advanced alternative. The managed Serve path now
+accepts its proxy-validated tailnet user identity for `/v1/*` while remaining
+loopback-bound; its fallback client bearer is nullable and can be generated or
+removed in Hub administration. Direct LAN/Tailnet headers never authenticate,
+and the admin API remains separately keyed. Finder replacement upgrades the
+preserved Hub configuration in place, while disable/re-enable retains Hub
+credentials, pairings, inventory, catalog overrides, and route metadata.
 
 Mac-first pool hardening is now an active follow-on milestone. Several
 non-breaking foundations are implemented:
@@ -576,10 +585,12 @@ see
   global lease-based residency invariant. Survivor records now retain storage
   root, scope ID, and volume UUID so restart validation can reconstruct the
   protected target.
-- Runtime Updates discovers the official `ggml-org/llama.cpp` macOS arm64
-  release, requires the expected asset URL/name plus the GitHub-published size
-  and SHA-256, safely extracts it, validates the executable and required flags,
-  and activates or rolls back only behind the all-engines-empty barrier.
+- Runtime Updates scans the recent official `ggml-org/llama.cpp` numbered build
+  releases and selects the highest complete macOS arm64 build rather than a
+  semantic release's older frozen nightly pointer. It requires the expected
+  asset URL/name plus the GitHub-published size and SHA-256, safely extracts it,
+  validates the executable and required flags, and activates or rolls back only
+  behind the all-engines-empty barrier.
 - Finder-driven local discovery recognizes complete GGUF shard sets and MLX
   folders, excludes projector files as primaries, revalidates opaque candidate
   IDs and external-volume identity, and migrates matching aliases/configuration

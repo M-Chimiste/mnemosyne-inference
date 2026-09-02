@@ -650,12 +650,13 @@ def _llama_release_payload(
     version: str = "b7777",
     digest: str | None = None,
     size: int | None = None,
+    prerelease: bool = True,
 ) -> dict:
     asset_name = f"llama-{version}-bin-macos-arm64.tar.gz"
     return {
         "tag_name": version,
         "draft": False,
-        "prerelease": False,
+        "prerelease": prerelease,
         "html_url": f"https://github.com/ggml-org/llama.cpp/releases/tag/{version}",
         "target_commitish": "main",
         "assets": [
@@ -676,86 +677,31 @@ def _llama_release_payload(
     }
 
 
-def _llama_stable_release_payload(
-    nightly_version: str,
-    *,
-    stable_version: str = "v0.2.0",
-    digest: str | None = None,
-) -> tuple[dict, bytes]:
-    pointer = f"{nightly_version}\n".encode("ascii")
-    return (
-        {
-            "tag_name": stable_version,
-            "draft": False,
-            "prerelease": False,
-            "html_url": (
-                "https://github.com/ggml-org/llama.cpp/releases/tag/"
-                f"{stable_version}"
-            ),
-            "target_commitish": "main",
-            "assets": [
-                {
-                    "name": "nightly-tag.txt",
-                    "browser_download_url": (
-                        "https://github.com/ggml-org/llama.cpp/releases/download/"
-                        f"{stable_version}/nightly-tag.txt"
-                    ),
-                    "digest": (
-                        f"sha256:{digest}"
-                        if digest is not None
-                        else f"sha256:{hashlib.sha256(pointer).hexdigest()}"
-                    ),
-                    "size": len(pointer),
-                }
-            ],
-        },
-        pointer,
-    )
-
-
 def _official_handler(
     *,
     mflux_version: str = "0.19.0",
     ds4_revision: str = "a" * 40,
     llama_version: str = "b7777",
     llama_digest: str | None = None,
-    llama_stable_pointer: bool = False,
-    llama_pointer_digest: str | None = None,
 ) -> tuple[httpx.MockTransport, list[str]]:
     requests: list[str] = []
     archives = {ds4_revision: _ds4_source_archive(ds4_revision)}
     llama_archive = _llama_binary_archive(llama_version)
-    stable_payload, stable_pointer = _llama_stable_release_payload(
-        llama_version,
-        digest=llama_pointer_digest,
-    )
 
     def handler(request: httpx.Request) -> httpx.Response:
         url = str(request.url)
         requests.append(url)
-        if request.url.path.endswith("/ggml-org/llama.cpp/releases/latest"):
+        if request.url.path.endswith("/ggml-org/llama.cpp/releases"):
             return httpx.Response(
                 200,
-                json=(
-                    stable_payload
-                    if llama_stable_pointer
-                    else _llama_release_payload(
+                json=[
+                    _llama_release_payload(
                         llama_archive,
                         version=llama_version,
                         digest=llama_digest,
                     )
-                ),
+                ],
             )
-        if request.url.path.endswith(
-            f"/ggml-org/llama.cpp/releases/tags/{llama_version}"
-        ):
-            release = _llama_release_payload(
-                llama_archive,
-                version=llama_version,
-                digest=llama_digest,
-            )
-            release["prerelease"] = True
-            return httpx.Response(200, json=release)
         if request.url.path.endswith("/jundot/omlx/releases"):
             return httpx.Response(
                 200,
@@ -804,11 +750,6 @@ def _official_handler(
             return httpx.Response(200, content=body) if body else httpx.Response(404)
         if (
             request.url.host == "github.com"
-            and request.url.path.endswith("/v0.2.0/nightly-tag.txt")
-        ):
-            return httpx.Response(200, content=stable_pointer)
-        if (
-            request.url.host == "github.com"
             and request.url.path.endswith(
                 f"/llama-{llama_version}-bin-macos-arm64.tar.gz"
             )
@@ -820,14 +761,45 @@ def _official_handler(
 
 
 @pytest.mark.asyncio
-async def test_llama_cpp_update_follows_official_stable_pointer(
+async def test_llama_cpp_update_selects_newest_complete_official_build(
     tmp_path: Path,
 ) -> None:
-    transport, requests = _official_handler(
-        llama_version="b10566",
-        llama_stable_pointer=True,
+    older_archive = _llama_binary_archive("b10621")
+    newest_complete_archive = _llama_binary_archive("b10750")
+    newest_uploading = _llama_release_payload(
+        _llama_binary_archive("b10751"), version="b10751"
     )
-    client = httpx.AsyncClient(transport=transport)
+    newest_uploading["assets"] = []
+    semantic_release = {
+        "tag_name": "v0.3.0",
+        "draft": False,
+        "prerelease": False,
+        "assets": [{"name": "nightly-tag.txt"}],
+    }
+    draft = _llama_release_payload(
+        _llama_binary_archive("b99999"), version="b99999"
+    )
+    draft["draft"] = True
+    requests: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(str(request.url))
+        if request.url.path.endswith("/ggml-org/llama.cpp/releases"):
+            return httpx.Response(
+                200,
+                json=[
+                    newest_uploading,
+                    semantic_release,
+                    draft,
+                    _llama_release_payload(
+                        newest_complete_archive, version="b10750"
+                    ),
+                    _llama_release_payload(older_archive, version="b10621"),
+                ],
+            )
+        return httpx.Response(404)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     manager = RuntimeUpdateManager(
         llama_cpp=LlamaCppConfig(binary=str(tmp_path / "missing-llama-server")),
         omlx=OMLXConfig(),
@@ -841,27 +813,29 @@ async def test_llama_cpp_update_follows_official_stable_pointer(
         status = next(
             item for item in snapshot["engines"] if item["engine"] == "llama.cpp"
         )
-        assert status["available_version"] == "b10566"
-        assert status["latest_upstream_url"].endswith("/releases/tag/v0.2.0")
+        assert status["available_version"] == "b10750"
+        assert status["latest_upstream_url"].endswith("/releases/tag/b10750")
         assert status["update_available"] is True
         assert status["can_install"] is True
-        assert any(url.endswith("/v0.2.0/nightly-tag.txt") for url in requests)
-        assert any(url.endswith("/releases/tags/b10566") for url in requests)
+        assert any("/releases?per_page=20" in url for url in requests)
     finally:
         await manager.aclose()
         await client.aclose()
 
 
 @pytest.mark.asyncio
-async def test_llama_cpp_update_rejects_tampered_stable_pointer(
+async def test_llama_cpp_update_requires_a_complete_official_build(
     tmp_path: Path,
 ) -> None:
-    transport, _requests = _official_handler(
-        llama_version="b10566",
-        llama_stable_pointer=True,
-        llama_pointer_digest="0" * 64,
+    incomplete = _llama_release_payload(
+        _llama_binary_archive("b10751"), version="b10751"
     )
-    client = httpx.AsyncClient(transport=transport)
+    incomplete["assets"] = []
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, json=[incomplete])
+        )
+    )
     manager = RuntimeUpdateManager(
         llama_cpp=LlamaCppConfig(binary=str(tmp_path / "missing-llama-server")),
         omlx=OMLXConfig(),
@@ -877,7 +851,7 @@ async def test_llama_cpp_update_rejects_tampered_stable_pointer(
         )
         assert status["available_version"] is None
         assert status["update_available"] is False
-        assert "stable pointer SHA-256" in status["diagnostic"]
+        assert "complete macOS ARM64 build" in status["diagnostic"]
     finally:
         await manager.aclose()
         await client.aclose()
@@ -1801,9 +1775,9 @@ async def test_official_llama_cpp_discovery_requires_published_integrity_metadat
     client = httpx.AsyncClient(
         transport=httpx.MockTransport(
             lambda request: (
-                httpx.Response(200, json=payload)
+                httpx.Response(200, json=[payload])
                 if request.url.path.endswith(
-                    "/ggml-org/llama.cpp/releases/latest"
+                    "/ggml-org/llama.cpp/releases"
                 )
                 else httpx.Response(404)
             )

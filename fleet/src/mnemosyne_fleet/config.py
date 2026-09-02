@@ -29,6 +29,7 @@ CAPABILITIES = frozenset(
 
 ServiceClass = Literal["primary", "opportunistic", "overflow"]
 EnrollmentSource = Literal["static", "paired"]
+InferenceAuthMode = Literal["bearer", "tailscale_serve_or_bearer"]
 SERVICE_CLASSES: tuple[ServiceClass, ...] = (
     "primary",
     "opportunistic",
@@ -163,6 +164,24 @@ def _secret(env: dict[str, str], name: Any, *, field_name: str) -> str:
     value = env.get(name)
     if value is None or not value.strip():
         raise ConfigError(f"environment variable {name!r} is required")
+    return value
+
+
+def _optional_secret(
+    env: dict[str, str],
+    name: Any,
+    *,
+    field_name: str,
+) -> str | None:
+    if name is None:
+        return None
+    if not isinstance(name, str) or not name.strip():
+        raise ConfigError(f"{field_name} must name an environment variable")
+    value = env.get(name)
+    if value is None:
+        return None
+    if not value.strip():
+        raise ConfigError(f"environment variable {name!r} must not be empty")
     return value
 
 
@@ -319,7 +338,7 @@ def _catalog_public_key(raw: Any, *, key_id: str) -> str:
 class ServerConfig:
     host: str
     port: int
-    api_key: str = field(repr=False)
+    api_key: str | None = field(repr=False)
     admin_api_key: str = field(repr=False)
     database_path: Path
     request_timeout_seconds: float
@@ -327,6 +346,7 @@ class ServerConfig:
     route_history_limit: int
     poll_interval_seconds: float
     snapshot_ttl_seconds: float
+    inference_auth_mode: InferenceAuthMode = "bearer"
 
 
 @dataclass(frozen=True, slots=True)
@@ -495,6 +515,12 @@ def load_config(
     database_path = Path(
         str(server_raw.get("database_path", "/var/lib/mnemosyne-fleet/fleet.db"))
     ).expanduser()
+    inference_auth_mode = server_raw.get("inference_auth_mode", "bearer")
+    if inference_auth_mode not in {"bearer", "tailscale_serve_or_bearer"}:
+        raise ConfigError(
+            "server.inference_auth_mode must be bearer or "
+            "tailscale_serve_or_bearer"
+        )
     server = ServerConfig(
         host=str(server_raw.get("host", "127.0.0.1")),
         port=_bounded_int(
@@ -503,7 +529,7 @@ def load_config(
             minimum=1,
             maximum=65535,
         ),
-        api_key=_secret(
+        api_key=_optional_secret(
             env,
             server_raw.get("api_key_env"),
             field_name="server.api_key_env",
@@ -541,7 +567,20 @@ def load_config(
             name="server.snapshot_ttl_seconds",
             maximum=3600,
         ),
+        inference_auth_mode=cast(InferenceAuthMode, inference_auth_mode),
     )
+    if (
+        server.inference_auth_mode == "tailscale_serve_or_bearer"
+        and server.host != "127.0.0.1"
+    ):
+        raise ConfigError(
+            "tailscale_serve_or_bearer requires server.host = 127.0.0.1"
+        )
+    if server.inference_auth_mode == "bearer" and server.api_key is None:
+        raise ConfigError(
+            "server.api_key_env and its non-empty environment variable are "
+            "required for bearer authentication"
+        )
     if server.snapshot_ttl_seconds <= server.poll_interval_seconds:
         raise ConfigError(
             "server.snapshot_ttl_seconds must exceed server.poll_interval_seconds"
@@ -1048,7 +1087,9 @@ def load_config(
         raise ConfigError(
             "at least one [[nodes]] enrollment or enabled [pairing] service is required"
         )
-    credential_values = [server.api_key, server.admin_api_key]
+    credential_values = [server.admin_api_key]
+    if server.api_key is not None:
+        credential_values.append(server.api_key)
     credential_values.extend(
         credential
         for node in nodes

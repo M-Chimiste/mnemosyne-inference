@@ -34,3 +34,4 @@ def test_main_forces_single_process_scheduler(
 
     assert captured["app"] is app
     assert captured["workers"] == 1
+    assert captured["proxy_headers"] is False

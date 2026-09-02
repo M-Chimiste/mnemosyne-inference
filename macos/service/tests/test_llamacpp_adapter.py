@@ -193,6 +193,28 @@ def test_build_llama_cpp_argv_validates_model_and_projector_headers(
 
 
 @pytest.mark.asyncio
+async def test_llama_cpp_glm_alias_does_not_require_ds4_preview_runtime(
+    tmp_path: Path,
+) -> None:
+    model = _gguf(tmp_path / "GLM-5.3-Flash-Q4_K_M.gguf")
+    config = LlamaCppConfig(
+        process_state_path=str(tmp_path / "llama-process.json"),
+    )
+    adapter = LlamaCppAdapter(
+        config,
+        runtime_root=tmp_path / "managed-runtimes",
+    )
+    try:
+        resolved = await adapter._target_runtime_preflight(  # noqa: SLF001
+            _target(model, alias="glm-5.3-flash"),
+            deadline=Deadline.after(1),
+        )
+        assert resolved == config
+    finally:
+        await adapter.aclose()
+
+
+@pytest.mark.asyncio
 async def test_llama_cpp_file_validation_does_not_block_event_loop(
     tmp_path: Path,
 ) -> None:
