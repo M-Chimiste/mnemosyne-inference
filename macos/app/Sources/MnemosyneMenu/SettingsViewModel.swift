@@ -584,6 +584,7 @@ final class SettingsViewModel: ObservableObject {
                 )
             }
             Task { await refreshBenchmarks() }
+            Task { await refreshContexts() }
         } catch {
             setStatus("Could not save settings: \(error.localizedDescription)", tone: .error)
         }

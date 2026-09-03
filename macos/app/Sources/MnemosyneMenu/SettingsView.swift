@@ -3141,6 +3141,11 @@ struct SettingsView: View {
         let observed = viewModel.contextSnapshot?.models
             .first(where: { $0.alias == profile.alias })?.candidates
             .first(where: { $0.engine == profile.engine })
+        let contextPolicyPending = observed.map {
+            $0.mode != profile.context.mode
+                || (profile.context.mode == "fixed"
+                    && $0.configuredTokens != profile.context.fixedTokens)
+        } ?? false
         Section("Context window") {
             if profile.engine.isSupported {
                 Picker(
@@ -3158,6 +3163,14 @@ struct SettingsView: View {
                         "Explicit token limit",
                         value: $viewModel.settings.models[index].context.fixedTokens
                     )
+                }
+                if contextPolicyPending {
+                    Label(
+                        "Save Settings to apply this context policy. The limits below still reflect the active service configuration.",
+                        systemImage: "clock.arrow.circlepath"
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.orange)
                 }
                 LabeledContent("Detected native limit") {
                     Text(

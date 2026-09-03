@@ -213,6 +213,7 @@ async def benchmark_target(
     priority: str,
     prompt_repetitions: int,
     reasoning_effort: str | None,
+    unique_prompts: bool,
 ) -> dict[str, Any]:
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     if priority:
@@ -228,20 +229,20 @@ async def benchmark_target(
         follow_redirects=False,
         limits=limits,
     ) as client:
-        for _ in range(warmups):
+        for index in range(warmups):
             await run_sample(
                 client,
                 base_url=base_url,
                 model=model,
                 headers=headers,
                 max_tokens=max_tokens,
-                prompt=prompt,
+                prompt=(f"warmup-{index} " + prompt) if unique_prompts else prompt,
                 reasoning_effort=reasoning_effort,
             )
 
         semaphore = asyncio.Semaphore(concurrency)
 
-        async def bounded_sample() -> Sample:
+        async def bounded_sample(index: int) -> Sample:
             async with semaphore:
                 return await run_sample(
                     client,
@@ -249,13 +250,13 @@ async def benchmark_target(
                     model=model,
                     headers=headers,
                     max_tokens=max_tokens,
-                    prompt=prompt,
+                    prompt=(f"sample-{index} " + prompt) if unique_prompts else prompt,
                     reasoning_effort=reasoning_effort,
                 )
 
         started = time.perf_counter()
         samples = await asyncio.gather(
-            *(bounded_sample() for _ in range(requests))
+            *(bounded_sample(index) for index in range(requests))
         )
         wall_seconds = time.perf_counter() - started
     result = {
@@ -266,6 +267,7 @@ async def benchmark_target(
         "warmups": warmups,
         "priority": priority or None,
         "prompt_repetitions": prompt_repetitions,
+        "unique_prompts": unique_prompts,
         "reasoning_effort": reasoning_effort,
         "wall_seconds": round(wall_seconds, 3),
         "request_throughput_per_second": round(requests / wall_seconds, 3)
@@ -322,6 +324,11 @@ def parser() -> argparse.ArgumentParser:
         default="",
         help="Optional portable reasoning effort such as low, medium, high, or max.",
     )
+    value.add_argument(
+        "--unique-prompts",
+        action="store_true",
+        help="Add a per-request prefix to prevent whole-prompt cache reuse.",
+    )
     value.add_argument("--compare-base-url")
     value.add_argument("--compare-model")
     value.add_argument("--compare-label", default="comparison")
@@ -351,6 +358,7 @@ async def async_main(args: argparse.Namespace) -> dict[str, Any]:
             priority=args.priority,
             prompt_repetitions=args.prompt_repetitions,
             reasoning_effort=args.reasoning_effort or None,
+            unique_prompts=args.unique_prompts,
         )
     ]
     if args.compare_base_url:
@@ -372,6 +380,7 @@ async def async_main(args: argparse.Namespace) -> dict[str, Any]:
                 priority=args.priority,
                 prompt_repetitions=args.prompt_repetitions,
                 reasoning_effort=args.reasoning_effort or None,
+                unique_prompts=args.unique_prompts,
             )
         )
     return {
