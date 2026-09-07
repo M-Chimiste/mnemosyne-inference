@@ -391,6 +391,13 @@ The live `docker-compose.yml` is intentionally machine-specific and may live out
   owned credentials, never models, exact storage bindings, profiles, local
   inference, token history, or the usage outbox.
 - A per-user LaunchAgent owns Mnemosyne Core. The controller uses an explicit AppKit `NSStatusItem` with a SwiftUI popover; quitting it must not terminate inference. `SMAppService.agent` registers the embedded plist and the bootstrap must `execve` the bundled Python without daemonizing.
+- The menu and Settings share a bounded startup connection gate after registration
+  reconciliation. Expected startup failures retry only read-only status probes;
+  disabled/approval-required registrations and authentication errors remain
+  actionable. Hub Mode remains accessible with the local worker disabled.
+  GGUF projector discovery prefers siblings, then a matching quant folder's
+  immediate parent within the published repository or Finder-selected root.
+  Existing installs and exact Fleet artifact identities are never silently changed.
 - `ResidencyCoordinator` owns the cross-engine invariant. A request holds an epoch-tagged model lease through its complete stream. FIFO queuing stops old-target admission once a switch is pending, drains active leases, proves all enabled adapters empty, loads one target, and proves exactly one ready manager-owned resident. Engine-derived capacity is capped by optional `server.max_concurrency`; `server.max_queue_depth` and `server.queue_timeout_seconds` bound admission.
 - oMLX capacity comes from its authoritative admin
   `scheduler.max_concurrent_requests`; a missing or incompatible scheduler

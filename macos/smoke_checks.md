@@ -4,6 +4,33 @@ Run these checks on the target Apple Silicon workstation. Automated tests use
 fake engines and cannot validate Metal memory release, upstream API drift,
 LaunchAgent behavior, or model quality.
 
+After replacing an existing app that has never configured Hub Mode, launch it
+twice and confirm Settings does not report waiting for the bundled Hub service
+when macOS reports that optional registration as not found. The second launch
+must not refresh the healthy worker/menu registrations again. Also check a
+configured enabled Hub is refreshed after replacement, an explicitly disabled
+Hub stays disabled, and an interrupted Hub refresh retains its recovery notice.
+
+During a cold start or app replacement, open Settings and the menu immediately.
+Both should show a single startup indicator until registration reconciliation
+and the control connection complete, then populate without transient connection
+errors. Confirm disabled service and Login Items approval each show their own
+recovery action, a wrong control credential fails immediately, and an enabled
+service that never responds shows a retry/logs message after the bounded startup
+window. Repeated Retry and closing/reopening Settings must not let an older
+connection probe clear a newer restart state. Verify Hub Mode stays accessible
+with the local worker disabled, and saved-settings restart still verifies the
+exact applied configuration revision.
+
+For Qwen-style GGUF repositories with a `Q8_0/` shard folder and root-level
+`mmproj` files, confirm Model Library selects the shared F16 projector, the
+durable install includes it, and the resulting profile launches llama.cpp with
+that exact `--mmproj` path. Repeat with Finder import of the complete repository
+folder, then with only `Q8_0/` selected (which must not see a parent projector).
+Exercise one synthetic image request directly and through Fleet after the
+updated deployment is published. Do not count a text-only request as vision
+acceptance or silently attach a newly discovered projector to an existing job.
+
 Start every candidate pass with the evidence collector. It is read-only unless
 `--self-test` is supplied, and it writes the report atomically with mode
 `0600`. Credential-bearing fields and URLs are redacted; token counts remain

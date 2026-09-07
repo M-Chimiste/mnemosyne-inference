@@ -97,3 +97,16 @@ def test_projector_recommendation_prefers_high_fidelity_with_opt_out_elsewhere()
     )
 
     assert recommended_projector(choices, name=lambda value: value) == choices[1]
+
+
+def test_projector_parent_fallback_requires_matching_quant_folder() -> None:
+    from mnemosyne_macos.model_metadata import nearby_projector_files
+
+    projectors = ("repo/mmproj-F16.gguf", "other/mmproj-F16.gguf")
+    assert nearby_projector_files("repo/Q8_0/model-Q8_0.gguf", projectors) == projectors[:1]
+    assert nearby_projector_files(
+        "repo/UD-Q4_K_XL/model-UD-Q4_K_XL-00001-of-00002.gguf", projectors
+    ) == projectors[:1]
+    assert nearby_projector_files("repo/nested/model-Q8_0.gguf", projectors) == ()
+    assert nearby_projector_files("repo/Q8_0/model-Q4_K_M.gguf", projectors) == ()
+    assert nearby_projector_files("repo/Q8_0/deeper/model-Q8_0.gguf", projectors) == ()

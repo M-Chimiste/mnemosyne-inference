@@ -15,6 +15,7 @@ from .model_metadata import (
     markdown_summary,
     metadata_from_config,
     metadata_from_gguf_stream,
+    nearby_projector_files,
     recommended_projector,
 )
 from .models import ACTIVE_ENGINE_NAMES, EngineName
@@ -1175,7 +1176,8 @@ def validate_install_candidate(
         if selected_projector is not None:
             if selected_projector not in candidate.projector_options:
                 raise ValueError(
-                    "the selected projector is not published beside that GGUF model"
+                    "the selected projector is not published beside that GGUF model "
+                    "or in its shared quant-folder parent"
                 )
             files = tuple((*candidate.download_files, selected_projector))
             candidate = replace(
@@ -1358,12 +1360,7 @@ def gguf_files(
                 continue
         else:
             group = (filename,)
-        directory = filename.rpartition("/")[0]
-        nearby_projectors = tuple(
-            value
-            for value in projectors
-            if value.rpartition("/")[0] == directory
-        )
+        nearby_projectors = nearby_projector_files(filename, projectors)
         selected_projector = recommended_projector(
             nearby_projectors,
             name=lambda value: value.rsplit("/", 1)[-1],

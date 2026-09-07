@@ -14,6 +14,7 @@ private enum ResidencyPreset: String, CaseIterable, Identifiable {
 struct SettingsView: View {
     @ObservedObject var viewModel: SettingsViewModel
     @ObservedObject var registration: LaunchAgentRegistration
+    @ObservedObject var startup: ServiceStartupCoordinator
     let markSetupCompleted: () -> Void
     let restartService: () -> Void
     @StateObject private var hubMode = HubModeViewModel()
@@ -32,11 +33,15 @@ struct SettingsView: View {
                 Divider()
                 page
                 Divider()
-                footer
+                if startup.state == .ready { footer }
             }
         }
         .frame(minWidth: 900, minHeight: 650)
-        .task {
+        .task(id: startup.state) {
+            if !startup.state.isWaiting {
+                await hubMode.load(registration: registration)
+            }
+            guard startup.state == .ready else { return }
             await loadInitialState()
         }
         .onChange(of: viewModel.pairingOwnsFleetCredentials) { _, pairingOwns in
@@ -48,6 +53,11 @@ struct SettingsView: View {
             )
         }
         .onChange(of: viewModel.selectedSection) { _, section in
+            if section == .hub, !startup.state.isWaiting {
+                Task { await hubMode.load(registration: registration) }
+                return
+            }
+            guard startup.state == .ready else { return }
             switch section {
             case .hub:
                 Task { await hubMode.load(registration: registration) }
@@ -177,7 +187,6 @@ struct SettingsView: View {
         if !viewModel.isLoaded {
             await viewModel.load()
         }
-        await hubMode.load(registration: registration)
     }
 
     private var sidebar: some View {
@@ -247,7 +256,13 @@ struct SettingsView: View {
 
     @ViewBuilder
     private var page: some View {
-        if !viewModel.isLoaded {
+        if viewModel.selectedSection == .hub, !startup.state.isWaiting {
+            hubPage
+        } else if startup.state != .ready {
+            ServiceStartupView(startup: startup, registration: registration)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .padding(40)
+        } else if !viewModel.isLoaded {
             VStack(spacing: 16) {
                 Image(systemName: "gearshape.2")
                     .font(.system(size: 36))
@@ -1090,16 +1105,9 @@ struct SettingsView: View {
     }
 
     private func enableServiceAndLoad() async {
+        startup.prepare()
         await registration.enableAgent()
-        guard registration.agentStatus == .enabled else { return }
-        for _ in 0 ..< 30 {
-            await viewModel.load()
-            if viewModel.isLoaded {
-                await viewModel.refreshReadiness()
-                return
-            }
-            try? await Task.sleep(for: .seconds(1))
-        }
+        await startup.connect(registration: registration.startupRegistrationState)
     }
 
     private func copyReadinessDiagnostics() {

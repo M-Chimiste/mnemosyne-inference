@@ -19,11 +19,13 @@ final class MenuAppDelegate: NSObject, NSApplicationDelegate {
     private let workstationName = WorkstationIdentity.current
     private let viewModel = MenuViewModel()
     private let registration = LaunchAgentRegistration()
+    private let startup = ServiceStartupCoordinator()
     private let popover = NSPopover()
     private var statusItem: NSStatusItem?
     private var updaterController: SPUStandardUpdaterController?
     private lazy var configurationWindowController = ConfigurationWindowController(
         registration: registration,
+        startup: startup,
         markSetupCompleted: { [weak self] in
             guard let self else { return }
             GuidedSetupEvidenceStore.recordCompletion(
@@ -60,6 +62,14 @@ final class MenuAppDelegate: NSObject, NSApplicationDelegate {
                     .load().environmentURL
             )
             let hubConfigurationChanged: Bool
+            let hubConfigured: Bool
+            do {
+                hubConfigured = try hubStore.loadConfiguration() != nil
+            } catch {
+                // Unreadable existing state is not evidence that Hub was
+                // never configured; preserve discovery/recovery diagnostics.
+                hubConfigured = true
+            }
             do {
                 hubConfigurationChanged = try hubStore
                     .refreshManagedConfiguration()
@@ -71,11 +81,13 @@ final class MenuAppDelegate: NSObject, NSApplicationDelegate {
                 )
             }
             await registration.refreshChangedBundleRegistrationsIfNeeded(
-                hubConfigurationChanged: hubConfigurationChanged
+                hubConfigurationChanged: hubConfigurationChanged,
+                hubConfigured: hubConfigured
             )
             await registration.applyStartupAtLoginDefaultsIfNeeded(
                 guidedSetupCompleted: guidedSetupCompleted
             )
+            await startup.connect(registration: registration.startupRegistrationState)
         }
 
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
@@ -113,6 +125,7 @@ final class MenuAppDelegate: NSObject, NSApplicationDelegate {
                 workstationName: workstationName,
                 viewModel: viewModel,
                 registration: registration,
+                startup: startup,
                 openConfiguration: { [weak self] in
                     self?.configurationWindowController.show()
                 },

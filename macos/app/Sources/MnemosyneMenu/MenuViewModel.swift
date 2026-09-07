@@ -55,6 +55,7 @@ final class MenuViewModel: ObservableObject {
                 pairing,
                 participation
             )
+            guard !Task.isCancelled else { return }
             snapshot = newSnapshot
             models = newCatalog.models.sorted { $0.id < $1.id }
             fleetPairing = newPairing
@@ -71,6 +72,7 @@ final class MenuViewModel: ObservableObject {
             }
             connection = .online
         } catch {
+            guard !Task.isCancelled else { return }
             connection = .offline(error.localizedDescription)
         }
     }

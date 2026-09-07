@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import io
+from pathlib import PurePosixPath
 import re
 import struct
 from typing import Any, BinaryIO, Callable, Mapping, TypeVar
@@ -303,6 +304,37 @@ def markdown_summary(markdown: str | None, *, max_characters: int = 700) -> str 
     return None
 
 
+def nearby_projector_files(model: str, projectors: tuple[str, ...]) -> tuple[str, ...]:
+    """Offer siblings, or shared parent projectors for a matching quant folder.
+
+    Callers supply only already-contained/published candidates. Never search
+    outside that set, traverse arbitrary ancestors, or mix sibling model trees.
+    A layout match is discovery evidence; the engine still verifies compatibility.
+    """
+    primary = PurePosixPath(model)
+    siblings = tuple(
+        value for value in projectors
+        if PurePosixPath(value).parent == primary.parent
+    )
+    if siblings:
+        return siblings
+    quant = primary.parent.name
+    if not re.fullmatch(
+        r"(?:UD-)?(?:IQ|Q|TQ|BF|F|FP)\d+(?:_[A-Za-z0-9]+)*",
+        quant,
+        re.IGNORECASE,
+    ) or not re.search(
+        rf"(?:^|-){re.escape(quant)}(?:-\d{{5}}-of-\d{{5}})?\.gguf$",
+        primary.name,
+        re.IGNORECASE,
+    ):
+        return ()
+    return tuple(
+        value for value in projectors
+        if PurePosixPath(value).parent == primary.parent.parent
+    )
+
+
 def recommended_projector(
     values: list[_ProjectorT] | tuple[_ProjectorT, ...],
     *,
@@ -356,6 +388,7 @@ __all__ = [
     "metadata_from_config",
     "metadata_from_gguf_stream",
     "metadata_from_gguf_values",
+    "nearby_projector_files",
     "recommended_projector",
     "read_gguf_metadata",
 ]

@@ -374,6 +374,7 @@ final class SettingsViewModel: ObservableObject {
             let loaded = snapshot.config
             let serviceStatus = try? await statusRequest
             let pairingStatus = await pairingRequest
+            guard !Task.isCancelled else { return }
             let credentialStatus = try credentialStore.status()
             settings = loaded
             savedSettings = loaded
@@ -416,6 +417,7 @@ final class SettingsViewModel: ObservableObject {
             Task { await refreshContexts() }
             Task { await refreshDesiredInstalls() }
         } catch {
+            guard !Task.isCancelled else { return }
             isLoaded = false
             setStatus("Could not load settings: \(error.localizedDescription)", tone: .error)
         }

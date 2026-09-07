@@ -38,6 +38,11 @@ final class LaunchAgentRegistration: ObservableObject {
         menuLoginStatus = menuLoginItem.status
     }
 
+    var startupRegistrationState: ManagedServiceRegistrationState {
+        refresh()
+        return managedState(agentStatus)
+    }
+
     /// Apply the ordinary first-install startup behavior exactly once. Existing
     /// configured installations retain their current choices, and an explicit
     /// later disable is never undone on a subsequent app launch.
@@ -88,7 +93,8 @@ final class LaunchAgentRegistration: ObservableObject {
     /// covers the Mnemosyne.app rename and subsequent locally ad-hoc-signed
     /// updates without interrupting the service on ordinary menu launches.
     func refreshChangedBundleRegistrationsIfNeeded(
-        hubConfigurationChanged: Bool = false
+        hubConfigurationChanged: Bool = false,
+        hubConfigured: Bool = true
     ) async {
         guard !isChangingRegistration else { return }
         let defaults = UserDefaults.standard
@@ -132,7 +138,8 @@ final class LaunchAgentRegistration: ObservableObject {
         let hubAction = BundleRegistrationRefreshPolicy.action(
             bundleChanged: bundleChanged || hubConfigurationChanged,
             refreshPending: hubRefreshPending,
-            state: managedState(hubAgent.status)
+            state: managedState(hubAgent.status),
+            discoveryRequired: hubConfigured
         )
 
         if agentAction == .refresh {
@@ -157,7 +164,7 @@ final class LaunchAgentRegistration: ObservableObject {
             )
         }
 
-        if defaults.bool(forKey: Self.pendingAgentRefreshKey) {
+        if agentAction == .refresh {
             do {
                 let status = try await refreshRegistration(
                     agent,
@@ -174,7 +181,7 @@ final class LaunchAgentRegistration: ObservableObject {
             }
         }
         if !Task.isCancelled,
-           defaults.bool(forKey: Self.pendingMenuRefreshKey) {
+           menuAction == .refresh {
             do {
                 let status = try await refreshRegistration(
                     menuLoginItem,
@@ -191,7 +198,7 @@ final class LaunchAgentRegistration: ObservableObject {
             }
         }
         if !Task.isCancelled,
-           defaults.bool(forKey: Self.pendingHubRefreshKey) {
+           hubAction == .refresh {
             do {
                 let status = try await refreshRegistration(
                     hubAgent,

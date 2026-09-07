@@ -861,3 +861,47 @@ def test_validate_llama_cpp_candidate_adds_only_the_selected_projector(
     )
     assert text_only.projector_filename is None
     assert text_only.download_files == ("vision-Q4_K_M.gguf",)
+
+
+def test_quant_subdirectory_install_includes_shared_root_projector(monkeypatch) -> None:
+    """Qwen Flash publishes shards under Q8_0/ but mmproj at repo root."""
+    shards = tuple(f"Q8_0/Qwen-Flash-Q8_0-{part:05d}-of-00002.gguf" for part in (1, 2))
+    siblings = [SimpleNamespace(rfilename=name, size=100) for name in (
+        *shards, "mmproj-F16.gguf", "mmproj-BF16.gguf",
+        "other/mmproj-unrelated-F32.gguf",
+    )]
+
+    class FakeAPI:
+        def __init__(self, token=None):
+            pass
+
+        def model_info(self, *_args, **_kwargs):
+            return SimpleNamespace(sha="immutable-commit", siblings=siblings)
+
+    monkeypatch.setattr("mnemosyne_macos.model_library.HfApi", FakeAPI)
+    monkeypatch.setattr(
+        "mnemosyne_macos.model_library.model_details",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            architecture="qwen", context_length=262144, parameter_count=None,
+        ),
+    )
+    candidate = gguf_files("owner/Qwen-Flash-GGUF")[0]
+    assert candidate.projector_filename == "mmproj-F16.gguf"
+    assert candidate.projector_options == ("mmproj-BF16.gguf", "mmproj-F16.gguf")
+    selected = validate_install_candidate(
+        engine=EngineName.LLAMA_CPP, repo_id="owner/Qwen-Flash-GGUF",
+        filename=shards[0],
+    )
+    assert selected.download_files == (*shards, "mmproj-F16.gguf")
+    assert selected.resolved_revision == "immutable-commit"
+    text_only = validate_install_candidate(
+        engine=EngineName.LLAMA_CPP, repo_id="owner/Qwen-Flash-GGUF",
+        filename=shards[0], include_projector=False,
+    )
+    assert text_only.projector_filename is None
+    assert text_only.download_files == shards
+    with pytest.raises(ValueError, match="not published beside"):
+        validate_install_candidate(
+            engine=EngineName.LLAMA_CPP, repo_id="owner/Qwen-Flash-GGUF",
+            filename=shards[0], projector_filename="other/mmproj-unrelated-F32.gguf",
+        )

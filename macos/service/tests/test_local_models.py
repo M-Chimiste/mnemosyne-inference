@@ -272,3 +272,19 @@ def test_scan_local_models_requires_an_existing_directory(tmp_path: Path) -> Non
     file_path.write_text("fixture", encoding="utf-8")
     with pytest.raises(LocalModelError, match="not a directory"):
         scan_local_models(file_path)
+
+
+def test_quant_folder_projector_stays_within_finder_selected_root(tmp_path: Path) -> None:
+    repository = tmp_path / "publisher" / "Qwen-Flash"
+    model = _gguf(repository / "Q8_0" / "Qwen-Flash-Q8_0.gguf")
+    projector = _gguf(repository / "mmproj-F16.gguf")
+    _gguf(tmp_path / "publisher" / "other" / "mmproj-F32.gguf")
+    candidate = scan_local_models(tmp_path)[0]
+    assert [p.path for p in candidate.projector_options] == [str(projector)]
+    # Selecting only the shard folder does not grant access to its parent.
+    narrow = scan_local_models(model.parent)[0]
+    assert narrow.projector_options == ()
+    # An exact sibling projector takes precedence over a shared one.
+    sibling = _gguf(model.parent / "mmproj-Q8_0.gguf")
+    candidate = scan_local_models(tmp_path)[0]
+    assert [p.path for p in candidate.projector_options] == [str(sibling)]

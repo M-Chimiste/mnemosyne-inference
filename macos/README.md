@@ -375,6 +375,13 @@ automatically; the user can choose another or opt out for text-only use. The
 resolved Hub revision and exact file list are persisted so retries cannot
 silently change weights.
 
+For matching quant subfolders such as `Q8_0/model-Q8_0-00001-of-00002.gguf`,
+discovery also offers shared projectors from the immediate parent when no
+sibling projector exists. This supports repositories that publish quant shards
+in subfolders and `mmproj-F16.gguf` at the repository root. Existing text-only
+installs are not silently modified or downloaded again; select the projector
+through a new managed install or re-import an existing complete local folder.
+
 The selected-model pane keeps runtime preparation next to the model choice. It
 can install the verified managed llama.cpp or DS4 runtime, hand off to the
 official oMLX DMG, stage an engine-enable setting, and show when a service
@@ -407,12 +414,15 @@ user may select an exact nested folder such as `/Volumes/Athena/models`.
 Unified Inference rescans the folder server-side, groups complete split GGUF
 sets, excludes `mmproj` files as primary models, discovers MLX folders, and
 returns opaque candidate IDs. Models remain an explicit import choice, while
-the highest-fidelity same-directory projector is preselected for each vision
+the highest-fidelity same-directory projector (or shared quant-folder parent
+projector) is preselected for each vision
 candidate. The user chooses aliases and can select another projector or opt
 out for text-only use; the service rescans and validates those IDs again,
 records detected metadata plus the exact folder and volume UUID, and atomically
 migrates matching legacy aliases and compatible load settings. Discovery and
 import never load a model.
+Shared projectors must already be inside the Finder-selected folder; selecting
+only a quant subfolder never grants access to its parent.
 
 The ordinary Models editor does not accept raw model IDs or projector paths.
 Engine, model source, storage, served name, projector, and image family are

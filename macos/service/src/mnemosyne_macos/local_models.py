@@ -16,6 +16,7 @@ from .model_metadata import (
     markdown_summary,
     metadata_from_config,
     metadata_from_gguf_stream,
+    nearby_projector_files,
     recommended_projector,
 )
 from .models import EngineName
@@ -592,8 +593,11 @@ def scan_local_models(
             compatibility = "unavailable"
             reason = "One or more selected files do not have a valid GGUF header."
         nearby_items: list[LocalProjector] = []
+        nearby_paths = set(nearby_projector_files(
+            str(primary), tuple(str(path) for path in projectors)
+        ))
         for projector in sorted(projectors):
-            if projector.parent != primary.parent:
+            if str(projector) not in nearby_paths:
                 continue
             lexical_projector = _lexical_projection(
                 root,

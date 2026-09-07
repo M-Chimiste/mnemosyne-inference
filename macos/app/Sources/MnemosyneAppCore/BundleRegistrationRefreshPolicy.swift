@@ -13,7 +13,8 @@ public enum BundleRegistrationRefreshPolicy {
     public static func action(
         bundleChanged: Bool,
         refreshPending: Bool,
-        state: ManagedServiceRegistrationState
+        state: ManagedServiceRegistrationState,
+        discoveryRequired: Bool = true
     ) -> BundleRegistrationRefreshAction {
         guard bundleChanged || refreshPending else { return .none }
 
@@ -31,6 +32,11 @@ public enum BundleRegistrationRefreshPolicy {
             return .refresh
         case .notRegistered:
             return .preserveDisabled
+        case .notFound where !discoveryRequired:
+            // An optional service that has never been configured need not be
+            // discovered to accept a replacement. A durable refresh intent
+            // above still takes precedence, as do live enabled registrations.
+            return .none
         case .notFound, .unknown:
             return .retryDiscovery
         }

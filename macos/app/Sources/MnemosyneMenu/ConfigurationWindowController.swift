@@ -1,25 +1,29 @@
 import AppKit
+import MnemosyneAppCore
 import SwiftUI
 
 @MainActor
 final class ConfigurationWindowController: NSObject, NSWindowDelegate {
     private let registration: LaunchAgentRegistration
+    private let startup: ServiceStartupCoordinator
     private let markSetupCompleted: () -> Void
     private let viewModel = SettingsViewModel()
     private var window: NSWindow?
 
     init(
         registration: LaunchAgentRegistration,
+        startup: ServiceStartupCoordinator,
         markSetupCompleted: @escaping () -> Void = {}
     ) {
         self.registration = registration
+        self.startup = startup
         self.markSetupCompleted = markSetupCompleted
         super.init()
     }
 
     func show() {
         let window = window ?? makeWindow()
-        if !window.isVisible, !viewModel.hasUnsavedChanges {
+        if !window.isVisible, !viewModel.hasUnsavedChanges, startup.state == .ready {
             Task { await viewModel.load() }
         }
         NSApplication.shared.activate(ignoringOtherApps: true)
@@ -50,13 +54,18 @@ final class ConfigurationWindowController: NSObject, NSWindowDelegate {
         let content = SettingsView(
             viewModel: viewModel,
             registration: registration,
+            startup: startup,
             markSetupCompleted: markSetupCompleted,
             restartService: { [weak self] in
                 guard let self else { return }
                 guard self.viewModel.serviceRestartStarted() else { return }
+                self.startup.prepare()
                 Task {
                     let succeeded = await self.registration.restartAgent()
                     let error = self.registration.lastError
+                    await self.startup.connect(
+                        registration: self.registration.startupRegistrationState
+                    )
                     await self.viewModel.serviceRestartRequested(
                         succeeded: succeeded,
                         error: error

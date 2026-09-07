@@ -7,18 +7,23 @@ struct MenuContentView: View {
     let workstationName: String
     @ObservedObject var viewModel: MenuViewModel
     @ObservedObject var registration: LaunchAgentRegistration
+    @ObservedObject var startup: ServiceStartupCoordinator
     let openConfiguration: () -> Void
     let checkForUpdates: (() -> Void)?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            header
-            Divider()
-            poolParticipation
-            Divider()
-            modelController
-            usageDelivery
-            loadedModel
+            if startup.state == .ready {
+                header
+                Divider()
+                poolParticipation
+                Divider()
+                modelController
+                usageDelivery
+                loadedModel
+            } else {
+                ServiceStartupView(startup: startup, registration: registration)
+            }
             Divider()
             backgroundService
             Divider()
@@ -26,7 +31,8 @@ struct MenuContentView: View {
         }
         .padding(14)
         .frame(width: 330)
-        .task {
+        .task(id: startup.state) {
+            guard startup.state == .ready else { return }
             registration.refresh()
             while !Task.isCancelled {
                 await viewModel.refresh()
@@ -228,15 +234,23 @@ struct MenuContentView: View {
                         || registration.agentStatus == .requiresApproval
                     {
                         Button("Disable Service") {
-                            Task { await registration.disableAgent() }
+                            Task {
+                                startup.prepare()
+                                await registration.disableAgent()
+                                await startup.connect(registration: registration.startupRegistrationState)
+                            }
                         }
                     } else {
                         Button("Enable Service") {
-                            Task { await registration.enableAgent() }
+                            Task {
+                                startup.prepare()
+                                await registration.enableAgent()
+                                await startup.connect(registration: registration.startupRegistrationState)
+                            }
                         }
                     }
                 }
-                .disabled(registration.isChangingRegistration)
+                .disabled(registration.isChangingRegistration || startup.state.isWaiting)
                 Spacer()
                 if registration.agentStatus == .requiresApproval {
                     Button("Open Login Items") {
@@ -286,6 +300,7 @@ struct MenuContentView: View {
                 Button("Refresh") {
                     Task { await viewModel.refresh() }
                 }
+                .disabled(startup.state != .ready)
                 if let checkForUpdates {
                     Button("Check for App Updates…") {
                         checkForUpdates()
