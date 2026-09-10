@@ -14,6 +14,14 @@ When a staged app is supplied, the verifier also inspects the menu
 executable's Mach-O dependencies and `LC_RPATH`. The bundled Sparkle framework
 must exist and resolve through `@executable_path/../Frameworks`; a valid deep
 code signature is not sufficient if dyld cannot launch the app.
+Staging removes SwiftPM's Xcode/toolchain and checkout rpaths from the owned
+Swift executables before signing. Release verification and acceptance reject
+nonportable menu rpaths even when the bundled Sparkle path is also present:
+XProtect can reject those extra candidates on another Mac after notarization
+and pre-distribution checks have passed on the build host.
+The Fleet dashboard HTML is an explicit bundled source resource. Release
+verification requires it to match the current source byte for byte and rejects
+missing, stale, or unexpected payload files.
 
 The native deployment has a menu controller and a long-lived background
 service plus on-demand manager-owned engine processes:
@@ -231,11 +239,15 @@ CODESIGN_IDENTITY="Developer ID Application: Example Name (TEAMID)" \
 
 The default output is
 `macos/app/build/Distribution/Unified-Inference-<version>-macos-<architecture>.dmg`.
-The disk image contains the signed app and an Applications shortcut for the
-usual drag-to-install workflow. The builder validates the source app, creates
-and optionally signs the compressed image, verifies it with `hdiutil`, mounts
-it read-only, and revalidates the app and shortcut before replacing the final
-artifact.
+Developer ID images include the signed **Install Unified Inference** assistant
+inside **Install or Upgrade** (a plain folder keeps one top-level bundle for
+Sparkle's appcast generator)
+for fresh-bundle upgrades, plus the product app and Applications shortcut for
+manual fresh installs and Sparkle compatibility. The builder validates the
+source app, signs the assistant with its embedded payload, and independently
+notarizes/staples both apps when notarization is requested. It then creates
+and signs the compressed image, verifies it with `hdiutil`, mounts it read-only,
+and revalidates both apps and the shortcut before replacing the final artifact.
 
 The production service bootstrap also removes ambient `PYTHON*` controls,
 sets only the bundled runtime's `PYTHONHOME` and closed source paths, disables
@@ -336,11 +348,44 @@ and is retried on the next launch. This covers the former `Mnemosyne.app`
 filename migration and local ad-hoc-signed updates without restarting either
 registration on ordinary launches.
 
-For an ad-hoc-signed pilot update, quit the menu app and use Finder to drag the
-new **Unified Inference** onto **Applications**, choose **Replace**, and open
-the installed copy. Do not merge app-bundle directories or alter Application
-Support. An already-enabled service may keep serving while Finder replaces the
-bundle; the new menu app fingerprints the changed installed bundle and safely
+Developer ID disk images include **Install Unified Inference.app**, built by
+`build_installer.py` from the separate `installer/` Swift package. The assistant
+and its complete payload are signed and independently notarized/stapled before
+the enclosing DMG is notarized. Its sealed payload supports App Translocation;
+it never discovers a candidate from a sibling path or an external URL.
+The assistant lives inside the DMG's **Install or Upgrade** folder. The product
+is the only top-level bundle, as required by the pinned Sparkle appcast generator.
+For interrupted packaging, `--reuse-notarized-app --installer <path>` reuses
+existing valid staples only after checking exact release identity, signing
+team, and complete payload inventory; it does not bypass notarization checks.
+
+The user-launched assistant uses ordinary Applications write permission. It
+checks its own signing identity, the product's matching Developer ID team, and
+a complete SHA-256/file-mode/symlink inventory. It copies to a new same-volume
+directory, checks Gatekeeper, and uses `renameatx_np` with `RENAME_SWAP` for
+an existing app or `RENAME_EXCL` for a fresh installation. Final-path inventory,
+signature, and Gatekeeper checks precede success. A failed final check rolls
+back only while both recorded directory identities still match. A process
+lock serializes assistants; a private receipt and retained predecessor make
+an interrupted exchange explicit and block a further update pending review.
+It does not call the service lifecycle executor, spawn its gated helper,
+request root, manipulate registrations, access Application Support, or alter
+quarantine/security policy. Existing app processes must be quit before commit;
+the user should finish inference/downloads first. This is a manual application
+installation surface, not the deferred automated migration/uninstall workflow.
+
+Run `swift test --package-path macos/packaging/installer` for replacement,
+rollback, concurrent-change, lock, and inventory tests. Set
+`MNEMOSYNE_INSTALLER_ACCEPTANCE_BUNDLE` to a notarized installer and
+`MNEMOSYNE_INSTALLER_PREVIOUS_BUNDLE` to an existing signed app to exercise the
+same workflow in a disposable Applications directory. This does not launch
+the product or touch the real installation; target-Mac launch and service
+acceptance remain separate checks.
+
+For an ad-hoc pilot without the assistant, quit the app, move the previous
+bundle into a recovery folder, and copy the candidate into the vacant
+Applications destination. Do not merge app-bundle directories or alter
+Application Support. The new menu app fingerprints the changed bundle and safely
 refreshes that exact Service Management registration on first launch. Private
 configuration, `.env`, token state, storage grants, runtimes, and model weights
 live outside the application bundle and remain unchanged.

@@ -4,6 +4,32 @@ Run these checks on the target Apple Silicon workstation. Automated tests use
 fake engines and cannot validate Metal memory release, upstream API drift,
 LaunchAgent behavior, or model quality.
 
+Test the quarantined DMG on a second Mac as well as the build host. Open the
+installed app normally and confirm XProtect does not reject an Xcode/toolchain
+rpath while resolving Sparkle. `codesign`, `spctl`, and `syspolicy_check`
+passing on the build host alone did not catch this in build 85.
+
+Run a separate existing-install upgrade pass on a target Mac with the previous
+candidate installed and its usual service registrations enabled. Capture the
+installed main executable's inode before replacement, perform the normal
+upgrade using **Install Unified Inference.app**, then verify the installed app with `codesign --verify --deep --strict`,
+`gktool scan`, and a normal launch followed by Setup & Health. Preserve any
+rejected bundle and compare its file contents and symlink targets with the
+mounted app before labeling the failure a corrupt copy. Build 88 on Athena
+had matching payloads and a valid signature but failed the installed scan;
+a separately copied and validated bundle moved into the vacant Applications
+path passed and launched. Record that as recovery evidence, not proof that
+the normal replacement path is fixed. See the
+[incident record](../project_docs/mac_build88_gatekeeper_incident.md).
+
+For the install assistant, confirm the final-path Gatekeeper check passes,
+the previous complete bundle is retained unchanged, and the new executable
+has a different inode. Verify a failed final check restores the old directory
+and a concurrent replacement is preserved for review. Test a quarantined
+assistant copied off the DMG too: its embedded payload must still work under
+App Translocation. Do not count disposable-directory acceptance as a signed
+target-host service-restart or inference test.
+
 After replacing an existing app that has never configured Hub Mode, launch it
 twice and confirm Settings does not report waiting for the bundled Hub service
 when macOS reports that optional registration as not found. The second launch
@@ -769,3 +795,46 @@ artifacts.
    deleting `~/Library/Application Support/Mnemosyne`, then rerun Setup &
    Health. Configuration, weights, runtimes, bookmarks, usage, and outbox state
    must remain available.
+
+
+## Native workspace and daily controls
+
+Use the signed candidate on both a worker and a Hub-only Mac:
+
+- Open/reopen the main window and verify first-run Setup & Health, normal
+  Overview, saved window size, Command-1/2/3/4, Command-F, and Command-comma.
+  Search "port" and "projector"; verify model filtering does not remove sidebar
+  navigation, and selection/scroll survive navigation and download registration.
+- Check both system appearances, increased text size, keyboard focus, and
+  Reduce Motion. Disconnect the control service: old activity must stop animating
+  and be described as last-known. Restoring the service clears connection warnings.
+- Observe idle, load, inference, unload, missing-disk, and paused/draining Fleet
+  states. Copy Endpoint after a port change and confirmed restart.
+- Favorite a model in Models and confirm it sorts first in the menu picker.
+  Load/unload and pool pause must use the ordinary coordinator/participation APIs.
+- Compare a text-only GGUF, missing declared adapter, configured adapter, and
+  successful image test. A configured path alone must not show a vision pass.
+  Edit the profile or update its runtime: stale verification must disappear.
+- On an existing GGUF alias without a configured projector, put the compatible
+  adapter beside its weights, choose **Update Projector from Files…**, select
+  the row and adapter, and save. Confirm the exact alias gains the adapter with
+  no duplicate profile or change to tuning, alternatives, or enabled state.
+  Repeat when two aliases share the same weights; only the selected alias changes.
+- Review a registered MLX model folder with native vision metadata. Confirm it
+  is selectable without `mmproj`, preserves storage and oMLX directory settings,
+  and shows metadata as untested. Run **Test with Image** on a supported MLX
+  vision model and on a text-only model: only the successful image request may
+  show a vision pass. Confirm the ordinary text test never grants vision proof.
+- Use **Find a Complete Download** for GLM 5.3 llama.cpp and MLX profiles with
+  custom aliases. Confirm the search retains the matching engine/model hint,
+  results are visible, and neither flow demands the experimental DS4 runtime.
+- Observe active model download, ETA, registration, completion, failed retry,
+  cancel, and history dismissal. Opt into notifications and finish a download
+  with the window closed; historical completed entries must not notify again.
+- On Nyx, compare native Fleet node states and active counts to the dashboard,
+  including an offline node. Hub-only Fleet must remain usable with the local
+  worker disabled. Overview failures must not affect local inference or pairing.
+- Save a model-only change and a restart-sensitive setting. With active requests,
+  choose Wait for Idle, cancel it, and verify no restart. Repeat with clients
+  quiet and verify restart only after active/queued work ends. Lose the control
+  connection while waiting and verify the app does not treat that as idle.

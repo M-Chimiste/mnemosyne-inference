@@ -257,6 +257,7 @@ class ModelSelfTestRequest(BaseModel):
     model: str
     include_vision: bool = True
     unload_after: bool = False
+    require_vision: bool = False
 
 
 class SaveConfigurationRequest(BaseModel):
@@ -407,6 +408,7 @@ class LocalModelImportSelection(BaseModel):
     alias: str | None = None
     projector_id: str | None = None
     include_projector: bool = True
+    update_alias: str | None = None
 
 
 class LocalModelImportRequest(BaseModel):
@@ -2920,6 +2922,7 @@ def create_control_app(runtime: NativeRuntime) -> FastAPI:
                 payload.model,
                 include_vision=payload.include_vision,
                 unload_after=payload.unload_after,
+                require_vision=payload.require_vision,
             )
         except Exception as exc:
             raise HTTPException(_error_status(exc), str(exc)) from exc

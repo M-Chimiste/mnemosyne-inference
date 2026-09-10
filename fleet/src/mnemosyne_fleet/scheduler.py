@@ -4,8 +4,9 @@ import asyncio
 import time
 import uuid
 from collections import defaultdict, deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Literal
+from collections.abc import Awaitable, Callable
 
 from .config import SERVICE_CLASSES, ModelConfig, NodeConfig
 from .protocol import Deployment
@@ -191,6 +192,31 @@ class Scheduler:
                     raise ModelMutationError("model_mapping_in_use")
                 raise ModelMutationError("model_mapping_conflict")
             self._models[model.name] = model
+            self._condition.notify_all()
+
+    async def rename_model(
+        self, old_name: str, new_name: str,
+        *, persist: Callable[[], Awaitable[None]],
+    ) -> None:
+        """Fence admission through the durable commit and in-memory name swap.
+
+        The catalog owns cancellation shielding for this entire operation.
+        Busy mappings cannot be renamed, so streams and queued callers retain
+        their original reservation and accounting identity.
+        """
+        async with self._condition:
+            current = self._models.get(old_name)
+            if current is None:
+                raise ModelMutationError("model_mapping_unknown")
+            if new_name in self._models:
+                raise ModelMutationError("model_mapping_conflict")
+            if self._model_has_work(old_name):
+                raise ModelMutationError("model_mapping_in_use")
+            renamed = replace(current, name=new_name)
+            await persist()
+            self._models[new_name] = renamed
+            del self._models[old_name]
+            self._queues.pop(old_name, None)
             self._condition.notify_all()
 
     async def remove_model(self, public_model: str) -> ModelConfig:

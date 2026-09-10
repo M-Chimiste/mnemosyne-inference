@@ -16,6 +16,11 @@ final class MenuViewModel: ObservableObject {
     @Published private(set) var fleetPairing: FleetPairingSnapshot?
     @Published private(set) var fleetParticipation: FleetParticipationSnapshot?
     @Published var selectedAlias = ""
+    @Published private(set) var actionError = ""
+    @Published private(set) var lastUpdated: Date?
+    @Published private(set) var inferenceEndpoint: URL?
+    var isLive: Bool { connection == .online && (lastUpdated.map { Date().timeIntervalSince($0) < 15 } ?? false) }
+    var activity: WorkspaceActivity { WorkspaceActivity(snapshot: snapshot, isLive: isLive) }
     @Published private(set) var mutationInProgress = false
     @Published private(set) var participationMutationInProgress = false
 
@@ -39,7 +44,21 @@ final class MenuViewModel: ObservableObject {
         )
     }
 
+    #if DEBUG
+    func loadWorkspacePreview(_ fixture: WorkspacePreviewFixture) {
+        snapshot = fixture.status
+        models = fixture.catalog.models
+        fleetPairing = fixture.pairing
+        fleetParticipation = fixture.participation
+        selectedAlias = models.first?.id ?? ""
+        lastUpdated = Date().addingTimeInterval(3600)
+        connection = .online
+        inferenceEndpoint = URL(string: "http://127.0.0.1:1240/v1")
+    }
+    #endif
+
     func refresh() async {
+        let requestedAt = Date()
         if snapshot == nil {
             connection = .checking
         }
@@ -70,7 +89,16 @@ final class MenuViewModel: ObservableObject {
                     availableAliases.contains($0) ? $0 : nil
                 } ?? models.first?.id ?? ""
             }
+            lastUpdated = requestedAt
             connection = .online
+            if let port = newSnapshot.ports?.inference, (1...65535).contains(port) {
+                var url = URLComponents()
+                url.scheme = "http"
+                url.host = "127.0.0.1"
+                url.port = port
+                url.path = "/v1"
+                inferenceEndpoint = url.url
+            } else { inferenceEndpoint = nil }
         } catch {
             guard !Task.isCancelled else { return }
             connection = .offline(error.localizedDescription)
@@ -81,6 +109,7 @@ final class MenuViewModel: ObservableObject {
         guard !participationMutationInProgress, connection == .online else {
             return
         }
+        actionError = ""
         participationMutationGeneration += 1
         participationMutationInProgress = true
         defer { participationMutationInProgress = false }
@@ -90,31 +119,34 @@ final class MenuViewModel: ObservableObject {
             )
             connection = .online
         } catch {
-            connection = .offline(error.localizedDescription)
+            actionError = error.localizedDescription
         }
     }
 
     func loadSelectedModel() async {
         guard !selectedAlias.isEmpty, !mutationInProgress else { return }
+        actionError = ""
         mutationInProgress = true
         defer { mutationInProgress = false }
         do {
             snapshot = try await client.load(model: selectedAlias)
+            lastUpdated = Date()
             connection = .online
         } catch {
-            connection = .offline(error.localizedDescription)
+            actionError = error.localizedDescription
         }
     }
 
     func unloadResidentModel() async {
         guard !mutationInProgress else { return }
+        actionError = ""
         mutationInProgress = true
         defer { mutationInProgress = false }
         do {
             try await client.unload()
             await refresh()
         } catch {
-            connection = .offline(error.localizedDescription)
+            actionError = error.localizedDescription
         }
     }
 }

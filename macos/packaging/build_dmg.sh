@@ -11,6 +11,8 @@ VOLUME_NAME="Unified Inference"
 CODESIGN_IDENTITY="${CODESIGN_IDENTITY:-}"
 NOTARYTOOL_PROFILE="${NOTARYTOOL_PROFILE:-}"
 NOTARYTOOL_NO_S3_ACCELERATION="${NOTARYTOOL_NO_S3_ACCELERATION:-0}"
+REUSE_NOTARIZED_APP=0
+PREBUILT_INSTALLER=""
 PACKAGING_PYTHON="$(command -v python3)"
 PACKAGING_UV="$(command -v uv)"
 PACKAGING_TOOL_PATH="$(dirname "$PACKAGING_PYTHON"):$(dirname "$PACKAGING_UV"):/usr/bin:/bin:/usr/sbin:/sbin"
@@ -36,6 +38,8 @@ Options:
   --output PATH       Final DMG path.
   --volume-name NAME  Mounted volume name.
   --notary-profile P  Submit with a notarytool Keychain profile and staple.
+  --reuse-notarized-app  Require and reuse the app's existing valid staple.
+  --installer PATH   Reuse a notarized assistant with an exactly matching payload.
   -h, --help          Show this help.
 
 Set CODESIGN_IDENTITY to sign the DMG. The app itself must already carry a
@@ -66,6 +70,14 @@ while [[ $# -gt 0 ]]; do
             [[ $# -gt 0 ]] || { echo "--notary-profile requires a value" >&2; exit 2; }
             NOTARYTOOL_PROFILE="$1"
             ;;
+        --reuse-notarized-app)
+            REUSE_NOTARIZED_APP=1
+            ;;
+        --installer)
+            shift
+            [[ $# -gt 0 ]] || { echo "--installer requires a path" >&2; exit 2; }
+            PREBUILT_INSTALLER="$1"
+            ;;
         -h|--help)
             usage
             exit 0
@@ -78,6 +90,15 @@ while [[ $# -gt 0 ]]; do
     esac
     shift
 done
+
+if [[ "$REUSE_NOTARIZED_APP" -eq 1 && -z "$NOTARYTOOL_PROFILE" ]]; then
+    echo "--reuse-notarized-app requires notarized distribution mode." >&2
+    exit 2
+fi
+if [[ -n "$PREBUILT_INSTALLER" && -z "$NOTARYTOOL_PROFILE" ]]; then
+    echo "--installer requires notarized distribution mode." >&2
+    exit 2
+fi
 
 if [[ ! -d "$APP_PATH" ]]; then
     echo "App bundle not found: $APP_PATH" >&2
@@ -124,6 +145,7 @@ fi
 
 codesign --verify --deep --strict --verbose=2 "$APP_PATH"
 run_isolated_verify_release --app "$APP_PATH"
+APP_SIGNING_INFO="$(codesign -d --verbose=4 "$APP_PATH" 2>&1)"
 if [[ -n "$NOTARYTOOL_PROFILE" ]]; then
     if [[ -z "$CODESIGN_IDENTITY" || "$CODESIGN_IDENTITY" == "-" ]]; then
         echo "Notarization requires a Developer ID CODESIGN_IDENTITY." >&2
@@ -177,6 +199,7 @@ SOURCE_DIR="$WORK_DIR/source"
 MOUNT_DIR="$WORK_DIR/mount"
 TEMP_DMG="$WORK_DIR/$OUTPUT_NAME"
 MOUNTED=0
+INSTALLER_APP=""
 
 cleanup() {
     if [[ "$MOUNTED" -eq 1 ]]; then
@@ -189,12 +212,14 @@ trap cleanup EXIT
 mkdir -p "$SOURCE_DIR" "$MOUNT_DIR"
 
 if [[ -n "$NOTARYTOOL_PROFILE" ]]; then
-    APP_ZIP="$WORK_DIR/Unified-Inference-app.zip"
-    ditto -c -k --keepParent "$APP_PATH" "$APP_ZIP"
-    xcrun notarytool submit \
-        "$APP_ZIP" \
-        "${NOTARYTOOL_ARGS[@]}"
-    xcrun stapler staple "$APP_PATH"
+    if [[ "$REUSE_NOTARIZED_APP" -eq 0 ]]; then
+        APP_ZIP="$WORK_DIR/Unified-Inference-app.zip"
+        ditto -c -k --keepParent "$APP_PATH" "$APP_ZIP"
+        xcrun notarytool submit \
+            "$APP_ZIP" \
+            "${NOTARYTOOL_ARGS[@]}"
+        xcrun stapler staple "$APP_PATH"
+    fi
     xcrun stapler validate "$APP_PATH"
     spctl \
         --assess \
@@ -205,6 +230,35 @@ if [[ -n "$NOTARYTOOL_PROFILE" ]]; then
 fi
 
 ditto "$APP_PATH" "$SOURCE_DIR/Unified Inference.app"
+# A signed, independently notarized assistant carries its own sealed payload.
+# It also works under App Translocation; no sibling/drag-and-merge dependency.
+if [[ -n "$CODESIGN_IDENTITY" && "$CODESIGN_IDENTITY" != "-" \
+      && "$APP_SIGNING_INFO" == *"Authority=Developer ID Application:"* ]]; then
+    # Sparkle's appcast generator requires one top-level bundle. The assistant
+    # belongs in a plain folder; its own embedded payload remains translocation-safe.
+    mkdir -p "$SOURCE_DIR/Install or Upgrade"
+    INSTALLER_APP="$SOURCE_DIR/Install or Upgrade/Install Unified Inference.app"
+    if [[ -n "$PREBUILT_INSTALLER" ]]; then
+        ditto "$PREBUILT_INSTALLER" "$INSTALLER_APP"
+        "$PACKAGING_PYTHON" "$SCRIPT_DIR/build_installer.py" \
+            --app "$APP_PATH" --verify-existing "$INSTALLER_APP"
+    else
+        "$PACKAGING_PYTHON" "$SCRIPT_DIR/build_installer.py" \
+            --app "$APP_PATH" --output "$INSTALLER_APP" --identity "$CODESIGN_IDENTITY"
+    fi
+    if [[ -n "$NOTARYTOOL_PROFILE" ]]; then
+        if [[ -z "$PREBUILT_INSTALLER" ]]; then
+            INSTALLER_ZIP="$WORK_DIR/Unified-Inference-installer.zip"
+            ditto -c -k --keepParent "$INSTALLER_APP" "$INSTALLER_ZIP"
+            xcrun notarytool submit "$INSTALLER_ZIP" "${NOTARYTOOL_ARGS[@]}"
+            xcrun stapler staple "$INSTALLER_APP"
+        fi
+        xcrun stapler validate "$INSTALLER_APP"
+        spctl --assess --type execute --verbose=2 "$INSTALLER_APP"
+    fi
+    codesign --verify --deep --strict --verbose=2 "$INSTALLER_APP"
+    install -m 644 "$SCRIPT_DIR/Install Read Me.txt" "$SOURCE_DIR/START HERE - Install Read Me.txt"
+fi
 ln -s /Applications "$SOURCE_DIR/Applications"
 install -m 755 \
     "$SCRIPT_DIR/pilot_uninstall_preserving_data.command" \
@@ -265,6 +319,14 @@ if [[ ! -x "$MOUNTED_UNINSTALL" ]]; then
     exit 1
 fi
 /bin/bash -n "$MOUNTED_UNINSTALL"
+if [[ -n "$INSTALLER_APP" ]]; then
+    MOUNTED_INSTALLER="$MOUNT_DIR/Install or Upgrade/Install Unified Inference.app"
+    codesign --verify --deep --strict --verbose=2 "$MOUNTED_INSTALLER"
+    if [[ -n "$NOTARYTOOL_PROFILE" ]]; then
+        xcrun stapler validate "$MOUNTED_INSTALLER"
+        spctl --assess --type execute --verbose=2 "$MOUNTED_INSTALLER"
+    fi
+fi
 codesign --verify --deep --strict --verbose=2 "$MOUNTED_APP"
 run_isolated_verify_release --app "$MOUNTED_APP"
 if [[ -n "$NOTARYTOOL_PROFILE" ]]; then
@@ -296,6 +358,9 @@ python3 "$SCRIPT_DIR/collect_acceptance.py" "${ACCEPTANCE_ARGS[@]}"
 echo "Built $OUTPUT_PATH"
 echo "Acceptance evidence: $ACCEPTANCE_REPORT"
 echo "Volume contents verified: app, Applications shortcut, and preserve-data uninstall assistant"
+if [[ -n "$INSTALLER_APP" ]]; then
+    echo "Fresh-bundle install assistant verified: Install Unified Inference.app"
+fi
 if [[ -n "$NOTARYTOOL_PROFILE" ]]; then
     echo "DMG notarized and stapled with profile: $NOTARYTOOL_PROFILE"
 elif [[ -n "$CODESIGN_IDENTITY" && "$CODESIGN_IDENTITY" != "-" ]]; then

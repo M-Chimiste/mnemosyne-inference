@@ -18,6 +18,22 @@ For the bundled macOS Hub pilot, also require:
 - removing one managed route suppresses that exact candidate across later
   polls and Hub restart, while explicit re-add restores routing without
   changing model files or node configuration;
+- renaming a managed public alias in Models preserves the exact deployment and
+  both eligible replicas, appears under the new name in `/v1/models`, rejects
+  the old name, and survives polling and Hub restart; verify inference fan-out
+  using the new name. An occupied name or an active/queued source must reject
+  with no catalog change, and cancelling the rename dialog must do nothing;
+- the dashboard remains usable at desktop and phone widths, with keyboard
+  navigation, light/dark themes, search/readiness filtering, and preserved open
+  model details during stream updates. Ledger failure leaves the status stream
+  working; verify optional pairing and install controls on the signed Hub build;
+- Fleet's connection map renders statically enrolled and paired nodes even with
+  optional management disabled. Exercise idle, model loading, concurrent
+  inference, local-only inference, pause, and offline states: only assigned
+  Fleet requests animate hub links, and stale node counts are not shown as live.
+  Disconnect or stall the status stream and verify the map pauses with a
+  last-snapshot notice (within 18 seconds for silence), then resumes on fresh
+  events. Check both themes, phone widths, and reduced-motion preferences;
 - the Hub binds only `127.0.0.1:17400`, and its configured HTTPS origin reaches
   it through the intended private proxy;
 - invitation create, Mac claim, exact-locator approval, activation, explicit

@@ -214,7 +214,22 @@ engine process.
   Runtime activation must use the coordinator's all-engines-empty maintenance
   barrier; never introduce a repository-owned dependency manifest.
 - `macos/image-worker/` is the separately locked MFLUX runtime. It is launched only as a manager-owned child, binds loopback `:17324`, and must remain dependency-isolated from the macOS coordinator service.
-- `macos/app/` is the SwiftPM menu bar controller, typed native settings UI, secret-safe credential store, and native service bootstrap. `macos/packaging/` stages the signed app, embedded LaunchAgent plist, direct `Contents/MacOS/mnemosyne-service-bootstrap` executable, relocatable Python runtime, and verified drag-to-Applications DMG. Keep this unsandboxed `SMAppService` LaunchAgent's `BundleProgram` pointed at that direct helper; introducing a second bundle identity is unnecessary here and broke launch-requirement refresh during in-place updates. A future sandboxed or restricted-entitlement job would require its own deliberate wrapper architecture.
+- The native workspace in `WorkspaceViews.swift` presents Overview, Models,
+  Downloads, and Fleet above the existing settings pages. Keep its telemetry
+  observational and its mutations on the existing coordinator, installer, and
+  participation APIs. Vision configuration must remain distinct from a real
+  self-test; UI test evidence is session-local and invalidated by profile/runtime
+  changes. The restart idle wait is only observation, not an admission barrier.
+  Existing-model review updates an exact alias through the Finder importer;
+  it preserves tuning and engine alternatives. GGUF repair selects a scanned
+  projector, while MLX review reports native vision metadata without requiring
+  `mmproj`. Explicit image self-tests support llama.cpp and oMLX through the
+  ordinary public inference route and never fall back to text. Model Library
+  search retains the selected engine; DS4 runtime guidance must not hide or
+  impose requirements on llama.cpp or MLX results.
+  Debug-only `WorkspacePreview.swift` is for fixture-based visual QA and must
+  never bootstrap a service or be treated as signed-artifact acceptance.
+- `macos/app/` is the SwiftPM menu bar controller, typed native settings UI, secret-safe credential store, and native service bootstrap. `macos/packaging/` stages the signed app, embedded LaunchAgent plist, direct `Contents/MacOS/mnemosyne-service-bootstrap` executable, relocatable Python runtime, and verified DMG. Developer ID images also contain the separately signed/notarized `installer/` assistant with an embedded sealed payload. It uses ordinary user permission, a complete byte/mode/link inventory, pre/post Gatekeeper checks, whole-directory atomic exchange, exact-identity rollback, and a retained predecessor/receipt; an interrupted exchange blocks another install pending review. It never edits existing signed files, changes security policy, touches Application Support, or enables the gated service lifecycle executor. Keep this unsandboxed `SMAppService` LaunchAgent's `BundleProgram` pointed at the direct helper; introducing a second service bundle identity is unnecessary here and broke launch-requirement refresh during in-place updates. A future sandboxed or restricted-entitlement job would require its own deliberate wrapper architecture.
 - The Mac app also bundles the exact Fleet source and a direct
   `Contents/MacOS/mnemosyne-hub-bootstrap` executable behind the independently
   opt-in `com.mnemosyne.inference.hub` LaunchAgent. Hub Mode writes its secrets,
@@ -350,6 +365,20 @@ The live `docker-compose.yml` is intentionally machine-specific and may live out
   eligible deployment/capability identity unless it is config-owned or
   durably suppressed; aliases only propose public names. The schema, packaged
   copy, producers, validators, and golden vectors must change together.
+- The Fleet dashboard template lives in `fleet/src/mnemosyne_fleet/dashboard.html`
+  and is loaded as a packaged resource by `dashboard.py`. Keep it self-contained
+  under the existing nonce CSP, with no external UI assets. Main workflows show
+  readiness and replicas; expandable details retain identity and diagnostic
+  evidence. Optional management/ledger errors must not block the status stream.
+  The Fleet connection map joins exact enrollment metadata independently of
+  optional management features. Animate hub links only for assigned Fleet
+  requests, distinguish node activity from Fleet reservations, and pause live
+  visuals when node snapshots or the browser status stream become stale.
+- Managed public aliases can be renamed through the admin-only catalog API and
+  dashboard. Renames preserve deployment/capability identity and replicas,
+  fence stale selections by deployment ID, reject busy mappings and occupied
+  names, and hold scheduler admission through the durable commit. Never
+  implement a rename as remove-and-add or mutate local node aliases for it.
 - Scheduling is warm-first and weighted least-outstanding within a tier.
   Requests without routing controls retain the normal FIFO lane; closed
   interactive/normal/batch lanes age lower priority toward admission. Exact
@@ -584,6 +613,8 @@ The live `docker-compose.yml` is intentionally machine-specific and may live out
   `CODESIGN_IDENTITY` for a stable signing identity. Do not imply
   durable protected-folder grants survive arbitrary ad-hoc rebuilds; after a
   code-identity change, the user may need to reselect the folder.
+  Normalize owned Swift executable rpaths before signing and reject
+  build-machine Xcode/toolchain paths during release verification and acceptance.
   Every non-system dynamic framework copied into `Contents/Frameworks` must
   have a matching bundle-relative executable rpath. Release verification must
   inspect both the dependency and `LC_RPATH`; deep code-signature validation
@@ -793,6 +824,12 @@ For native service changes, run
 `uv run --project macos/service --extra dev python -m pytest macos/service/tests`.
 For MFLUX worker changes, run its independent suite under `macos/image-worker`.
 For menu/bootstrap changes, run `swift build` and `swift test` from `macos/app`.
+For application-installer changes, run
+`swift test --package-path macos/packaging/installer` plus
+`uv run --project fleet --frozen --extra dev python -m pytest -q macos/packaging/tests`.
+Signed packaging also exercises the sealed payload with the Swift inventory
+reader before notarization; real upgrade acceptance must preserve the previous
+bundle and require a fresh executable inode and final-path Gatekeeper pass.
 LaunchAgent registration, Metal memory release, and real engine swapping still
 require the target Mac and `macos/smoke_checks.md`; full Xcode is required for
 the packaged `SMAppService` smoke.

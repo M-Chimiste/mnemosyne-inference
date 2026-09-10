@@ -8,9 +8,18 @@ struct MnemosyneMenuApp: App {
     @NSApplicationDelegateAdaptor(MenuAppDelegate.self) private var appDelegate
 
     var body: some Scene {
-        Settings {
-            EmptyView()
-        }
+        Settings { EmptyView() }
+            .commands {
+                CommandGroup(replacing: .appSettings) {
+                    Button("Settings…") { appDelegate.showWorkspace(.general) }.keyboardShortcut(",", modifiers: .command)
+                    Button("Open Unified Inference") { appDelegate.showWorkspace() }.keyboardShortcut("o", modifiers: .command)
+                    Divider()
+                    Button("Overview") { appDelegate.showWorkspace(.overview) }.keyboardShortcut("1", modifiers: .command)
+                    Button("Models") { appDelegate.showWorkspace(.models) }.keyboardShortcut("2", modifiers: .command)
+                    Button("Downloads") { appDelegate.showWorkspace(.downloads) }.keyboardShortcut("3", modifiers: .command)
+                    Button("Fleet") { appDelegate.showWorkspace(.fleet) }.keyboardShortcut("4", modifiers: .command)
+                }
+            }
     }
 }
 
@@ -45,6 +54,7 @@ final class MenuAppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        if WorkspacePreview.isRequested { WorkspacePreview.show(); return }
         NSApplication.shared.setActivationPolicy(.accessory)
         let guidedSetupCompleted = UserDefaults.standard.bool(
             forKey: GuidedSetupEvidenceStore.completionKey
@@ -127,7 +137,7 @@ final class MenuAppDelegate: NSObject, NSApplicationDelegate {
                 registration: registration,
                 startup: startup,
                 openConfiguration: { [weak self] in
-                    self?.configurationWindowController.show()
+                    self?.showWorkspace()
                 },
                 checkForUpdates: checkForUpdates
             )
@@ -143,13 +153,19 @@ final class MenuAppDelegate: NSObject, NSApplicationDelegate {
         ) {
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
-                self.configurationWindowController.show()
+                self.configurationWindowController.show(section: .setup)
                 GuidedSetupEvidenceStore.recordFirstPresentation(
                     version: self.productVersion,
                     build: self.productBuild
                 )
             }
         }
+    }
+
+    func showWorkspace(_ section: SettingsViewModel.Section? = nil) {
+        if WorkspacePreview.isRequested { WorkspacePreview.navigate(section); return }
+        popover.performClose(nil)
+        configurationWindowController.show(section: section)
     }
 
     private func checkForUpdates() {
@@ -170,7 +186,7 @@ final class MenuAppDelegate: NSObject, NSApplicationDelegate {
         _ sender: NSApplication,
         hasVisibleWindows flag: Bool
     ) -> Bool {
-        configurationWindowController.show()
+        showWorkspace()
         return true
     }
 

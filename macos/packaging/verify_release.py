@@ -23,8 +23,10 @@ sys.dont_write_bytecode = True
 
 try:
     from . import build_runtime as runtime_packaging
+    from .swift_rpaths import nonportable_rpaths
 except ImportError:
     import build_runtime as runtime_packaging
+    from swift_rpaths import nonportable_rpaths
 
 
 MACOS_ROOT = Path(__file__).resolve().parents[1]
@@ -333,6 +335,8 @@ def _validate_app_runtime_links(app: Path) -> None:
 
     dependencies = _mach_o_output("/usr/bin/otool", "-L", str(executable))
     load_commands = _mach_o_output("/usr/bin/otool", "-l", str(executable))
+    if nonportable_rpaths(load_commands):
+        raise ValueError(f"{executable} contains nonportable Swift rpaths")
     if SPARKLE_DEPENDENCY not in dependencies:
         raise ValueError(
             f"{executable} does not link the packaged Sparkle framework"
@@ -1268,6 +1272,7 @@ def _validate_app_payload(
         extra_files=service_extras,
     )
     fleet_extras = {
+        Path("mnemosyne_fleet/dashboard.html"): FLEET_SOURCE_ROOT / "mnemosyne_fleet/dashboard.html",
         Path("mnemosyne_fleet/schemas/snapshot.schema.json"): FLEET_SNAPSHOT_SCHEMA,
         Path("mnemosyne_fleet/schemas/mac_inventory.schema.json"): MAC_INVENTORY_SCHEMA,
         Path("mnemosyne_fleet/schemas/desired_install.schema.json"): DESIRED_INSTALL_SCHEMA,

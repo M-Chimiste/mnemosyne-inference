@@ -8,37 +8,75 @@ struct MenuContentView: View {
     @ObservedObject var viewModel: MenuViewModel
     @ObservedObject var registration: LaunchAgentRegistration
     @ObservedObject var startup: ServiceStartupCoordinator
+    @ObservedObject private var preferences = WorkspacePreferences.shared
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let openConfiguration: () -> Void
     let checkForUpdates: (() -> Void)?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: 15) {
             if startup.state == .ready {
                 header
-                Divider()
-                poolParticipation
-                Divider()
+                VStack(alignment: .leading, spacing: 12) {
+                    HStack {
+                        Image(systemName: viewModel.activity.symbol).foregroundStyle(.indigo)
+                            .symbolEffect(.pulse, options: .repeating, isActive: viewModel.isLive && viewModel.activity.isWorking && !reduceMotion)
+                        Text(viewModel.activity.title).font(.subheadline.weight(.semibold))
+                        Spacer()
+                        if viewModel.isLive { Circle().fill(.green).frame(width: 6, height: 6) }
+                    }
+                    Text(viewModel.snapshot?.residentAlias ?? "No model in memory")
+                        .font(.callout).lineLimit(2).textSelection(.enabled)
+                    Text(viewModel.isLive ? "\(viewModel.snapshot?.inFlightRequests ?? 0) active requests" : "Last known state · waiting for an update")
+                        .font(.caption).foregroundStyle(.secondary)
+                }.padding(14).frame(maxWidth: .infinity, alignment: .leading)
+                    .background(.indigo.opacity(0.07), in: RoundedRectangle(cornerRadius: 14))
                 modelController
-                usageDelivery
-                loadedModel
-            } else {
-                ServiceStartupView(startup: startup, registration: registration)
+                Divider()
+                Toggle("Contribute to Fleet", isOn: Binding(
+                    get: { viewModel.fleetParticipation?.enabled ?? false },
+                    set: { enabled in Task { await viewModel.setFleetParticipation(enabled: enabled) } }
+                )).toggleStyle(.switch)
+                    .disabled(!viewModel.isLive || viewModel.fleetPairing?.permitsParticipationControl != true || viewModel.participationMutationInProgress)
+                if let participation = viewModel.fleetParticipation {
+                    Text(viewModel.isLive ? participationExplanation(participation.state) : "Refreshing participation status…")
+                        .font(.caption2).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                }
+                if !viewModel.actionError.isEmpty {
+                    DisclosureGroup("Action needs attention") {
+                        Text(viewModel.actionError).font(.caption).textSelection(.enabled)
+                    }.font(.caption).foregroundStyle(.orange)
+                }
+            } else { ServiceStartupView(startup: startup, registration: registration) }
+            Divider()
+            HStack {
+                Button("Open Unified Inference") { openConfiguration() }.buttonStyle(.borderedProminent)
+                Spacer()
+                Button { copyEndpoint() } label: { Image(systemName: "link") }
+                    .help("Copy local API endpoint").disabled(viewModel.inferenceEndpoint == nil)
             }
-            Divider()
-            backgroundService
-            Divider()
-            actions
-        }
-        .padding(14)
-        .frame(width: 330)
+            DisclosureGroup("Service & diagnostics") {
+                VStack(alignment: .leading, spacing: 12) {
+                    backgroundService
+                    if startup.state == .ready { usageDelivery; loadedModel }
+                    actions
+                }.padding(.top, 10)
+            }.font(.caption)
+        }.padding(18).frame(width: 360).tint(.indigo)
         .task(id: startup.state) {
             guard startup.state == .ready else { return }
             registration.refresh()
             while !Task.isCancelled {
                 await viewModel.refresh()
-                try? await Task.sleep(for: .seconds(5))
+                do { try await Task.sleep(for: .seconds(3)) } catch { return }
             }
         }
+    }
+
+    private func copyEndpoint() {
+        guard let url = viewModel.inferenceEndpoint else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(url.absoluteString, forType: .string)
     }
 
     private var poolParticipation: some View {
@@ -105,18 +143,24 @@ struct MenuContentView: View {
                     .foregroundStyle(.secondary)
                 HStack {
                     Picker("Model", selection: $viewModel.selectedAlias) {
-                        ForEach(viewModel.models) { model in
-                            Text(modelLabel(model))
+                        ForEach(viewModel.models.sorted { a, b in
+                            let x = preferences.favorites.contains(a.id), y = preferences.favorites.contains(b.id)
+                            return x == y ? a.id < b.id : x
+                        }) { model in
+                            Text((preferences.favorites.contains(model.id) ? "★ " : "") + modelLabel(model))
                                 .tag(model.id)
                         }
                     }
                     .labelsHidden()
+                    Button { preferences.toggleFavorite(viewModel.selectedAlias) } label: {
+                        Image(systemName: preferences.favorites.contains(viewModel.selectedAlias) ? "star.fill" : "star")
+                    }.buttonStyle(.plain).help("Favorite selected model").disabled(viewModel.selectedAlias.isEmpty)
                     Button("Load") {
                         Task { await viewModel.loadSelectedModel() }
                     }
                     .disabled(
                         viewModel.selectedAlias.isEmpty
-                            || viewModel.mutationInProgress
+                            || !viewModel.isLive || viewModel.mutationInProgress
                     )
                 }
             }
@@ -148,10 +192,10 @@ struct MenuContentView: View {
         if let tokenSidecar = viewModel.snapshot?.tokenSidecar,
            tokenSidecar.enabled == true
         {
-            LabeledContent(
-                "Usage outbox",
-                value: String(tokenSidecar.outboxDepth ?? 0)
-            )
+            LabeledContent("Usage outbox", value: String(tokenSidecar.outboxDepth ?? 0))
+            if let error = tokenSidecar.lastError, !error.isEmpty {
+                Text("Usage reporting: \(error)").font(.caption2).foregroundStyle(.orange)
+            }
         }
     }
 
@@ -352,13 +396,12 @@ struct MenuContentView: View {
             if let serviceDiagnostic {
                 "Degraded — \(serviceDiagnostic)"
             } else {
-                viewModel.snapshot?.status
-                    ?? "Control service online at \(viewModel.controlBaseURL.absoluteString)"
+                "Connected to this Mac"
             }
         case .checking:
-            "Checking \(viewModel.controlBaseURL.absoluteString)"
-        case let .offline(message):
-            message
+            "Connecting to this Mac…"
+        case .offline:
+            "Reconnecting to this Mac…"
         }
     }
 
@@ -372,13 +415,7 @@ struct MenuContentView: View {
         if let diagnostic = snapshot.diagnostic, !diagnostic.isEmpty {
             return diagnostic
         }
-        if let usageError = snapshot.tokenSidecar?.lastError, !usageError.isEmpty {
-            return "usage reporting: \(usageError)"
-        }
-        if snapshot.tokenSidecar?.enabled == true,
-           snapshot.tokenSidecar?.writerReady == false {
-            return "usage reporting is not ready"
-        }
+
         return nil
     }
 

@@ -60,6 +60,9 @@ public protocol ControlAPI: NativeLifecycleAuthorizationServicing, Sendable {
         includeVision: Bool,
         unloadAfter: Bool
     ) async throws -> ModelSelfTestResult
+    func selfTest(
+        model: String, includeVision: Bool, unloadAfter: Bool, requireVision: Bool
+    ) async throws -> ModelSelfTestResult
     func models() async throws -> ModelCatalogSnapshot
     func benchmarks(alias: String?) async throws -> EngineBenchmarkSnapshot
     func runBenchmark(alias: String, sampleRuns: Int) async throws -> EngineBenchmarkRun
@@ -70,6 +73,7 @@ public protocol ControlAPI: NativeLifecycleAuthorizationServicing, Sendable {
     func storageLocations() async throws -> StorageSnapshot
     func inspectStorage(path: String, bookmarkData: Data?) async throws -> StorageStatus
     func searchLibrary(query: String) async throws -> [LibraryModel]
+    func searchLibrary(query: String, engine: InferenceEngine?) async throws -> [LibraryModel]
     func libraryFiles(
         repoId: String, engine: InferenceEngine, revision: String?
     ) async throws -> [LibraryModel]
@@ -114,6 +118,19 @@ public protocol ControlAPI: NativeLifecycleAuthorizationServicing, Sendable {
 }
 
 public extension ControlAPI {
+    func selfTest(
+        model: String, includeVision: Bool, unloadAfter: Bool, requireVision: Bool
+    ) async throws -> ModelSelfTestResult {
+        guard !requireVision else {
+            throw ControlAPIError.rejected(400, "This client cannot request an explicit image test.")
+        }
+        return try await selfTest(model: model, includeVision: includeVision, unloadAfter: unloadAfter)
+    }
+    func searchLibrary(query: String, engine: InferenceEngine?) async throws -> [LibraryModel] {
+        let models = try await searchLibrary(query: query)
+        return models.filter { engine == nil || $0.engine == engine }
+    }
+
     func refreshFleetPairingAttempt() async throws -> FleetPairingSnapshot {
         try await fleetPairing()
     }
@@ -1016,10 +1033,17 @@ public struct ControlAPIClient: ControlAPI, Sendable {
         includeVision: Bool = true,
         unloadAfter: Bool = false
     ) async throws -> ModelSelfTestResult {
+        try await selfTest(model: model, includeVision: includeVision, unloadAfter: unloadAfter, requireVision: false)
+    }
+
+    public func selfTest(
+        model: String, includeVision: Bool, unloadAfter: Bool, requireVision: Bool
+    ) async throws -> ModelSelfTestResult {
         let request = try selfTestRequest(
             model: model,
             includeVision: includeVision,
-            unloadAfter: unloadAfter
+            unloadAfter: unloadAfter,
+            requireVision: requireVision
         )
         let (data, response) = try await session.data(for: request)
         try validate(response, data: data)
@@ -1032,14 +1056,16 @@ public struct ControlAPIClient: ControlAPI, Sendable {
     func selfTestRequest(
         model: String,
         includeVision: Bool,
-        unloadAfter: Bool
+        unloadAfter: Bool,
+        requireVision: Bool = false
     ) throws -> URLRequest {
         var request = makeRequest(path: "/manager/self-test", method: "POST")
         request.httpBody = try JSONEncoder.nativeSettingsEncoder().encode(
             ModelSelfTestRequest(
                 model: model,
                 includeVision: includeVision,
-                unloadAfter: unloadAfter
+                unloadAfter: unloadAfter,
+                requireVision: requireVision ? true : nil
             )
         )
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -1090,7 +1116,13 @@ public struct ControlAPIClient: ControlAPI, Sendable {
     public func searchLibrary(
         query: String
     ) async throws -> [LibraryModel] {
-        let request = librarySearchRequest(query: query)
+        try await searchLibrary(query: query, engine: nil)
+    }
+
+    public func searchLibrary(
+        query: String, engine: InferenceEngine?
+    ) async throws -> [LibraryModel] {
+        let request = librarySearchRequest(query: query, engine: engine)
         let (data, response) = try await session.data(for: request)
         try validate(response, data: data)
         return try JSONDecoder.nativeSettingsDecoder()
@@ -1402,12 +1434,15 @@ public struct ControlAPIClient: ControlAPI, Sendable {
         makeRequest(path: "/manager/model-library/local-sources")
     }
 
-    func librarySearchRequest(query: String) -> URLRequest {
+    func librarySearchRequest(query: String, engine: InferenceEngine? = nil) -> URLRequest {
         var components = URLComponents(
             url: endpointURL("/manager/model-library/search"),
             resolvingAgainstBaseURL: false
         )!
         components.queryItems = [URLQueryItem(name: "q", value: query)]
+        if let engine {
+            components.queryItems?.append(URLQueryItem(name: "engine", value: engine.rawValue))
+        }
         var request = URLRequest(url: components.url!)
         request.httpMethod = "GET"
         request.setValue("application/json", forHTTPHeaderField: "Accept")

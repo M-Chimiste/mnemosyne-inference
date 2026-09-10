@@ -72,7 +72,7 @@ jobs:
             tests/test_fleet_acceptance.py
 
       - name: Test packaging logic
-        run: python3 -m unittest discover -s macos/packaging/tests -v
+        run: uv run --project fleet --frozen --extra dev python -m pytest -q macos/packaging/tests
 
       - name: Build and test menu app
         working-directory: macos/app
@@ -80,6 +80,7 @@ jobs:
           swift package resolve
           swift build
           swift test
+          swift test --package-path ../packaging/installer
 
       - name: Build relocatable runtime and verify full ad-hoc app
         env:

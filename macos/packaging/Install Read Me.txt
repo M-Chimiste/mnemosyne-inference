@@ -1,0 +1,34 @@
+UNIFIED INFERENCE
+Install a fresh application bundle
+
+1. Finish any inference or downloads and quit Unified Inference.
+2. Open the “Install or Upgrade” folder on this disk image, then open
+   “Install Unified Inference” and choose Install.
+3. Wait for “Installed and verified by Gatekeeper”, then choose Open.
+4. Check Setup & Health in the installed app, then eject this disk image.
+
+Use the install assistant for upgrades instead of dragging onto an existing app.
+It copies the entire signed release into a new directory, verifies every file,
+and exchanges the complete application folders. Gatekeeper checks the fresh
+copy before replacement and the installed copy afterward. If that final check
+fails, the assistant attempts to restore the unchanged previous app.
+
+The previous app stays in a private recovery folder inside Applications; the
+“Previous App” button reveals it. Keep it until the new version works on this
+Mac. If an installation is interrupted during replacement, the next attempt
+stops and shows that folder for review. No existing bundle is deleted.
+
+Models, settings, credentials, history, and engine installations stay in their
+existing locations. The assistant only changes /Applications/Unified Inference.app.
+It does not change macOS security settings or disable quarantine checks.
+
+An account with permission to write to Applications is required. The assistant
+does not request root access. An administrator can run it if access is denied.
+
+The separate “Unified Inference.app” is retained for manual fresh installations
+and the ordinary signed Sparkle update workflow. For a manual upgrade, move the
+old app into a recovery folder first, then copy into the vacant destination;
+do not merge app directories or edit their contents.
+
+If macOS rejects this disk image or the install assistant itself, choose Cancel
+and keep the downloaded file for diagnosis. Do not disable Gatekeeper.

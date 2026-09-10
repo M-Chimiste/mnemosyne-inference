@@ -177,6 +177,18 @@ public struct HubPairingAdminClient: Sendable {
         return request
     }
 
+    public func workspaceOverviewRequest() -> URLRequest {
+        authorizedRequest(path: "fleet/api/overview")
+    }
+
+    public func workspaceOverview() async throws -> HubWorkspaceOverview {
+        let response: HubWorkspaceOverview = try await perform(workspaceOverviewRequest())
+        guard response.schemaVersion == 1, response.nodes.count <= 1000 else {
+            throw HubPairingAdminError.invalidResponse
+        }
+        return response
+    }
+
     public func enrollmentsRequest() -> URLRequest {
         authorizedRequest(path: "fleet/api/v1/pairing/enrollments")
     }

@@ -1082,3 +1082,93 @@ async def test_omlx_adoption_rejects_duplicate_existing_profile_id(
             str(root),
             [{"candidate_id": candidate.id, "alias": "new-copy"}],
         )
+
+
+@pytest.mark.asyncio
+async def test_projector_update_targets_exact_alias_and_preserves_other_profile_fields(tmp_path: Path) -> None:
+    root = tmp_path / 'Models'
+    model = _gguf(root / 'GLM' / 'GLM-5.3-Flash-Q4_K_M.gguf')
+    projector = _gguf(model.parent / 'mmproj-F16.gguf')
+    candidate = scan_local_models(root)[0]
+    config, config_path = _migration_config(tmp_path, root=root, model={
+        'alias': 'glm', 'engine': 'llama.cpp', 'model': str(model), 'storage': 'existing-models',
+        'served_model_name': 'private-wire-name', 'enabled': False,
+        'capabilities': ['chat/completions'],
+        'load': {'parallel': 3, 'context_length': 65536},
+        'context': {'mode': 'fixed', 'fixed_tokens': 65536},
+        'alternatives': [{'engine': 'omlx', 'model': 'glm-mlx'}],
+        'selection': {'mode': 'pinned', 'pinned_engine': 'llama.cpp'},
+    })
+    duplicate = config.models[0].model_copy(update={'alias': 'glm-2'})
+    config = config.model_copy(update={'models': [config.models[0], duplicate]})
+    save_config(config, config_path)
+    runtime = _runtime_for_adoption(config, config_path)
+
+    result = await runtime.adopt_local_models(str(root), [{
+        'candidate_id': candidate.id, 'projector_id': candidate.recommended_projector_id,
+        'update_alias': 'glm-2',
+    }])
+
+    saved = load_config(config_path)
+    assert len(saved.models) == 2
+    assert saved.models[0] == config.models[0]
+    expected = duplicate.model_dump(mode='python')
+    expected['load']['projector_path'] = str(projector)
+    assert saved.models[1].model_dump(mode='python') == expected
+    assert result['imported'][0]['alias'] == 'glm-2'
+    assert result['restart_required'] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('update_alias', ['deleted-model', 'other-model'])
+async def test_model_update_refuses_missing_or_retargeted_alias(tmp_path: Path, update_alias: str) -> None:
+    root = tmp_path / 'Models'
+    model = _gguf(root / 'GLM' / 'GLM-Q4_K_M.gguf')
+    _gguf(model.parent / 'mmproj-F16.gguf')
+    candidate = scan_local_models(root)[0]
+    config, config_path = _migration_config(tmp_path, root=root, model={
+        'alias': 'other-model', 'engine': 'llama.cpp', 'model': str(root / 'different.gguf'),
+    })
+    runtime = _runtime_for_adoption(config, config_path)
+    before = config_path.read_bytes()
+    with pytest.raises(LocalModelError, match='selected for update changed'):
+        await runtime.adopt_local_models(str(root), [{
+            'candidate_id': candidate.id, 'projector_id': candidate.recommended_projector_id,
+            'update_alias': update_alias,
+        }])
+    assert config_path.read_bytes() == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('named_storage', [True, False])
+async def test_mlx_review_preserves_existing_role_tuning_and_identity(tmp_path: Path, named_storage: bool) -> None:
+    root = tmp_path / 'Models'
+    directory = _mlx_model(root / 'publisher' / 'vision-mlx')
+    (directory / 'config.json').write_text('{"model_type":"qwen3_vl","vision_config":{"hidden_size":1024},"text_config":{}}')
+    candidate = scan_local_models(root)[0]
+    assert candidate.vision_components is True
+    assert candidate.projector_options == ()
+    config, config_path = _migration_config(tmp_path, root=root, model={
+        'alias': 'vision', 'engine': 'omlx', 'model': directory.name,
+        'storage': 'existing-models' if named_storage else None,
+        'served_model_name': 'vision-wire', 'enabled': False,
+        'capabilities': ['chat/completions'],
+        'context': {'mode': 'fixed', 'fixed_tokens': 65536},
+        'selection': {'mode': 'pinned', 'pinned_engine': 'omlx'},
+    })
+    config = config.model_copy(update={'engines': config.engines.model_copy(update={
+        'omlx': config.engines.omlx.model_copy(update={'model_directories': [str(root)]}),
+    })})
+    save_config(config, config_path)
+    runtime = _runtime_for_adoption(config, config_path)
+    async def sync_directories():
+        pytest.fail('reviewing an existing MLX model must not mutate oMLX directories')
+    runtime._sync_omlx_model_directories = sync_directories
+    result = await runtime.adopt_local_models(str(directory), [{
+        'candidate_id': scan_local_models(directory)[0].id, 'update_alias': 'vision',
+    }])
+    assert load_config(config_path).models[0] == config.models[0]
+    assert load_config(config_path).engines == config.engines
+    assert load_config(config_path).storage == config.storage
+    assert result['imported'][0]['alias'] == 'vision'
+    assert result['imported'][0]['projector_path'] is None

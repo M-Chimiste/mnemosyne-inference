@@ -41,9 +41,30 @@ public struct LocalModelCandidate: Codable, Equatable, Identifiable, Sendable {
     public let projectorOptions: [LocalProjectorCandidate]
     public let existingAlias: String?
     public let alreadyImported: Bool
+    public let visionComponents: Bool?
 
     public var isImportable: Bool {
-        compatibility != "unavailable" && !alreadyImported
+        compatibility != "unavailable" && (!alreadyImported || canUpdateExisting)
+    }
+
+    public var canUpdateExisting: Bool {
+        canUpdateProjector || (alreadyImported && engine == .omlx
+            && existingAlias != nil && compatibility != "unavailable")
+    }
+
+    public var canUpdateProjector: Bool {
+        alreadyImported && engine == .llamaCpp && existingAlias != nil
+            && compatibility != "unavailable" && !projectorOptions.isEmpty
+    }
+
+    public func matches(_ profile: ModelProfileSettings) -> Bool {
+        guard engine == profile.engine else { return false }
+        if engine == .omlx {
+            return alreadyImported
+                && (modelPath as NSString).lastPathComponent == (profile.model as NSString).lastPathComponent
+        }
+        return engine == .llamaCpp && (modelPath as NSString).standardizingPath
+            == (profile.model as NSString).standardizingPath
     }
 }
 
@@ -61,17 +82,20 @@ public struct LocalModelImportSelection: Codable, Equatable, Sendable {
     public let alias: String?
     public let projectorId: String?
     public let includeProjector: Bool
+    public let updateAlias: String?
 
     public init(
         candidateId: String,
         alias: String? = nil,
         projectorId: String? = nil,
-        includeProjector: Bool = true
+        includeProjector: Bool = true,
+        updateAlias: String? = nil
     ) {
         self.candidateId = candidateId
         self.alias = alias
         self.projectorId = projectorId
         self.includeProjector = includeProjector
+        self.updateAlias = updateAlias
     }
 }
 

@@ -125,7 +125,8 @@ jobs:
             tests/test_compatibility_catalog_ceremony.py \
             tests/test_desired_install_cross_platform_contract.py \
             tests/test_fleet_acceptance.py
-          python3 -m unittest discover -s macos/packaging/tests -v
+          uv run --project fleet --frozen --extra dev python -m pytest -q macos/packaging/tests
+          swift test --package-path macos/packaging/installer
           cd macos/app
           swift package resolve
           swift test

@@ -108,6 +108,19 @@ explicitly re-add it under a chosen public name. Static `[[models]]` entries
 remain compatible and config-owned. Symbolic revisions and unverified local
 artifacts remain visible in inventory but never enter the routing catalog.
 
+In **Models → Public model aliases**, **Rename** changes a managed public
+alias without changing its exact deployment, replicas, queue policy, or local
+Mac profiles. Clients must use the new alias after success; the old name is
+not retained as a redirect. The admin-only `POST /fleet/api/model-catalog/rename`
+accepts exactly `schema_version: 1`, `public_model`, `new_public_model`, and the
+current `deployment_id`. The expected deployment fences stale UI selections.
+Occupied names (including inactive routes), config-owned sources, and aliases
+with active or queued requests are rejected without changes. Remove a stale
+conflicting route explicitly before reusing its name. Renames persist across
+polls and restarts, do not create suppressions, and do not need live replicas.
+Admission is fenced through the database commit and scheduler update; a
+cancelled admin request cannot leave those two states on different names.
+
 Nyx liveness uses the monotonic time at which a new snapshot sequence was
 received. Replayed snapshots do not extend a node's TTL, and node wall-clock
 skew does not decide eligibility. Snapshot responses must be identity-encoded
@@ -290,9 +303,25 @@ resident models, signed catalog models and recipes, explainable placement
 candidates, and DesiredInstall delivery/acknowledgement progress. Creating a
 job requires an explicit Mac/storage selection plus browser confirmation;
 cancellation is revision-preconditioned and stop-only. With those switches
-off, these controls report disabled and static enrollment behavior is
-unchanged. Promotion into a public Fleet model remains an explicit TOML
-mapping.
+off, the capability cards show what is not enabled and the inactive forms
+remain hidden. Authoritative eligible deployments publish automatically;
+static TOML mappings remain supported.
+
+The dashboard uses a responsive sidebar and light/dark themes with no external
+fonts, scripts, or image dependencies. Overview prioritizes Mac readiness,
+resident models, and request capacity. Models puts searchable public aliases,
+readiness filters, replicas, and a keyboard-accessible rename dialog first;
+exact identities, per-node exclusion reasons, and removal controls live in
+expandable details. Fleet includes a live connection map even when optional
+management features are disabled. Its links show Fleet-assigned requests;
+node activity separately shows snapshot-reported active work, loading, idle,
+paused, and offline states. Offline snapshots never animate, and interrupted
+or silent streams pause activity and mark the display as last-known data.
+Diagnostic tables remain available under Advanced.
+Optional ledger or pairing failures do not prevent the primary status stream
+from connecting. Theme preference is stored separately from session credentials.
+The self-contained `src/mnemosyne_fleet/dashboard.html` is loaded by
+`dashboard.py` and included in both the Fleet wheel and native Hub bundle.
 
 The first dashboard section and `GET /fleet/api/overview` provide the joined
 operator view: online/joined state, hardware, aggregate path-free storage,

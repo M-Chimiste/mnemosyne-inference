@@ -17,14 +17,34 @@ struct SettingsView: View {
     @ObservedObject var startup: ServiceStartupCoordinator
     let markSetupCompleted: () -> Void
     let restartService: () -> Void
-    @StateObject private var hubMode = HubModeViewModel()
+    @StateObject var hubMode: HubModeViewModel
+    @StateObject var live: MenuViewModel
+    @ObservedObject var preferences = WorkspacePreferences.shared
+    @FocusState var searchFocused: Bool
+    @State var overviewScroll = ScrollPosition(edge: .top)
+    @State var modelsScroll = ScrollPosition(edge: .top)
+    @State var downloadsScroll = ScrollPosition(edge: .top)
+    @State var fleetScroll = ScrollPosition(edge: .top)
     @State private var previewedCredentialDrafts: Set<ManagedCredential> = []
     @State private var selfTestAlias = ""
     @State private var alternativeSourceIndex: Int?
     @State private var confirmPromoteHub = false
     private let productBuildIdentity = ProductBuildIdentity.current
 
-    var body: some View {
+    init(viewModel: SettingsViewModel, registration: LaunchAgentRegistration,
+         startup: ServiceStartupCoordinator, markSetupCompleted: @escaping () -> Void,
+         restartService: @escaping () -> Void, hubMode: HubModeViewModel? = nil,
+         live: MenuViewModel? = nil) {
+        self.viewModel = viewModel
+        self.registration = registration
+        self.startup = startup
+        self.markSetupCompleted = markSetupCompleted
+        self.restartService = restartService
+        _hubMode = StateObject(wrappedValue: hubMode ?? HubModeViewModel())
+        _live = StateObject(wrappedValue: live ?? MenuViewModel())
+    }
+
+    private var workspaceContent: some View {
         HStack(spacing: 0) {
             sidebar
             Divider()
@@ -33,16 +53,32 @@ struct SettingsView: View {
                 Divider()
                 page
                 Divider()
-                if startup.state == .ready { footer }
+                if startup.state == .ready, viewModel.hasUnsavedChanges || viewModel.requiresRestart || viewModel.isWaitingForRestart || viewModel.statusTone == .error || viewModel.statusTone == .warning { footer }
             }
         }
-        .frame(minWidth: 900, minHeight: 650)
+        .frame(minWidth: 960, minHeight: 680)
+        .tint(.indigo)
+        .background(Color(nsColor: .windowBackgroundColor))
+        .background {
+            Button("Find a model or setting") { searchFocused = true }
+                .keyboardShortcut("f", modifiers: .command).hidden()
+        }
         .task(id: startup.state) {
+            guard !WorkspacePreview.isRequested else { return }
             if !startup.state.isWaiting {
                 await hubMode.load(registration: registration)
             }
-            guard startup.state == .ready else { return }
-            await loadInitialState()
+            guard !startup.state.isWaiting else { return }
+            if startup.state == .ready { await loadInitialState() }
+            while !Task.isCancelled {
+                if startup.state == .ready {
+                    await live.refresh()
+                    if viewModel.selectedSection == .overview { await viewModel.refreshReadiness() }
+                    if viewModel.selectedSection == .downloads { await viewModel.refreshWorkspaceDownloads() }
+                }
+                if viewModel.selectedSection == .fleet || (viewModel.selectedSection == .overview && startup.state != .ready) { await hubMode.refreshWorkspaceOverview() }
+                do { try await Task.sleep(for: .seconds(3)) } catch { return }
+            }
         }
         .onChange(of: viewModel.pairingOwnsFleetCredentials) { _, pairingOwns in
             guard pairingOwns else { return }
@@ -53,7 +89,8 @@ struct SettingsView: View {
             )
         }
         .onChange(of: viewModel.selectedSection) { _, section in
-            if section == .hub, !startup.state.isWaiting {
+            guard !WorkspacePreview.isRequested else { return }
+            if (section == .hub || section == .fleet), !startup.state.isWaiting {
                 Task { await hubMode.load(registration: registration) }
                 return
             }
@@ -72,6 +109,10 @@ struct SettingsView: View {
         .onDisappear {
             viewModel.fleetPairingViewDidDisappear()
         }
+    }
+
+    var body: some View {
+        workspaceContent
         .alert("Discard unsaved changes?", isPresented: $viewModel.confirmDiscard) {
             Button("Cancel", role: .cancel) {}
             Button("Discard Changes", role: .destructive) {
@@ -190,50 +231,38 @@ struct SettingsView: View {
     }
 
     private var sidebar: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text("SETTINGS")
-                .font(.caption2.weight(.semibold))
-                .foregroundStyle(.secondary)
-                .padding(.horizontal, 12)
-                .padding(.top, 14)
-                .padding(.bottom, 4)
-            ForEach(SettingsViewModel.Section.allCases) { section in
-                Button {
-                    viewModel.selectedSection = section
-                } label: {
-                    Label(section.rawValue, systemImage: section.symbol)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 7)
-                        .background(
-                            RoundedRectangle(cornerRadius: 6)
-                                .fill(
-                                    viewModel.selectedSection == section
-                                        ? Color.accentColor.opacity(0.18) : Color.clear
-                                )
-                        )
+        VStack(alignment: .leading, spacing: 18) {
+            HStack(spacing: 10) {
+                Image(systemName: "sparkle").font(.title2).foregroundStyle(.white)
+                    .frame(width: 38, height: 38).background(.indigo.gradient, in: RoundedRectangle(cornerRadius: 12))
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Unified").font(.headline)
+                    Text("INFERENCE").font(.system(size: 9, weight: .semibold)).tracking(2).foregroundStyle(.secondary)
                 }
-                .buttonStyle(.plain)
+            }.padding(.horizontal, 10).padding(.top, 18)
+            TextField("Find a model or setting", text: $viewModel.workspaceSearch)
+                .textFieldStyle(.roundedBorder).focused($searchFocused)
+                .onSubmit { navigateFirstSearchResult() }
+                .onExitCommand { viewModel.workspaceSearch = ""; searchFocused = false }
+                .help("Search this Mac · ⌘F")
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    sidebarGroup("WORKSPACE", sections: [.overview, .models, .downloads, .fleet])
+                    sidebarGroup("EXPLORE", sections: [.library, .usage])
+                    sidebarGroup("SETTINGS", sections: [.setup, .general, .hub, .pool, .engines, .updates, .storage, .credentials, .lifecycle])
+                    if !viewModel.workspaceSearch.isEmpty { sidebarModelResults }
+                }
             }
-            Spacer()
-            HStack(alignment: .firstTextBaseline, spacing: 6) {
-                Text("Unified Inference")
-                    .font(.caption)
-                    .lineLimit(1)
-                Spacer(minLength: 2)
-                Text(productBuildIdentity.compactLabel)
-                    .font(.caption2)
-                    .monospacedDigit()
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.75)
-                    .accessibilityLabel(productBuildIdentity.accessibilityLabel)
-            }
-            .foregroundStyle(.secondary)
-            .help(productBuildIdentity.accessibilityLabel)
-            .padding(12)
+            Spacer(minLength: 0)
+            HStack(spacing: 7) {
+                Circle().fill(live.isLive || hubMode.hubHealthy ? Color.green : Color.orange).frame(width: 6, height: 6)
+                Text(live.isLive ? WorkstationIdentity.current : hubMode.hubHealthy ? "Hub connected" : "Connecting to this Mac").lineLimit(1)
+            }.font(.caption).foregroundStyle(.secondary).padding(.horizontal, 8)
+            Text(productBuildIdentity.accessibilityLabel).font(.caption2).foregroundStyle(.tertiary)
+                .padding(.horizontal, 8).padding(.bottom, 12)
         }
-        .frame(width: 180)
-        .background(Color(nsColor: .controlBackgroundColor).opacity(0.55))
+        .padding(.horizontal, 14).frame(width: 218)
+        .background(.ultraThinMaterial)
     }
 
     private var header: some View {
@@ -258,6 +287,8 @@ struct SettingsView: View {
     private var page: some View {
         if viewModel.selectedSection == .hub, !startup.state.isWaiting {
             hubPage
+        } else if !startup.state.isWaiting, viewModel.selectedSection == .fleet || (viewModel.selectedSection == .overview && hubMode.configuration != nil && startup.state != .ready) {
+            workspaceFleet
         } else if startup.state != .ready {
             ServiceStartupView(startup: startup, registration: registration)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -312,6 +343,10 @@ struct SettingsView: View {
             .padding(40)
         } else {
             switch viewModel.selectedSection {
+            case .overview: workspaceOverview
+            case .downloads: workspaceDownloads
+            case .fleet: workspaceFleet
+            case .modelSettings: modelsPage
             case .setup: setupPage
             case .general: generalPage
             case .hub: hubPage
@@ -320,7 +355,7 @@ struct SettingsView: View {
             case .updates: runtimeUpdatesPage
             case .storage: storagePage
             case .library: libraryPage
-            case .models: modelsPage
+            case .models: workspaceModels
             case .lifecycle: lifecyclePage
             case .usage: usagePage
             case .credentials: credentialsPage
@@ -1855,7 +1890,7 @@ struct SettingsView: View {
         }
     }
 
-    private func runtimeUpdateCard(_ update: EngineRuntimeUpdate) -> some View {
+    func runtimeUpdateCard(_ update: EngineRuntimeUpdate) -> some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(alignment: .firstTextBaseline) {
                 Text(update.displayName)
@@ -2268,6 +2303,20 @@ struct SettingsView: View {
                         .onSubmit { Task { await viewModel.refreshModelLibrary() } }
                     Button("Search") { Task { await viewModel.refreshModelLibrary() } }
                         .disabled(viewModel.isSearchingLibrary)
+                    Picker("Engine", selection: Binding(
+                        get: { viewModel.libraryEngineFilter },
+                        set: { engine in
+                            viewModel.libraryEngineFilter = engine
+                            viewModel.selectedLibraryModelID = nil
+                            Task { await viewModel.refreshModelLibrary() }
+                        }
+                    )) {
+                        Text("All engines").tag(InferenceEngine?.none)
+                        ForEach([InferenceEngine.llamaCpp, .omlx, .ds4, .mflux], id: \.self) { engine in
+                            Text(engine.displayName).tag(Optional(engine))
+                        }
+                    }
+                    .frame(width: 205)
                     if viewModel.isSearchingLibrary {
                         ProgressView().controlSize(.small)
                     }
@@ -2282,9 +2331,9 @@ struct SettingsView: View {
                     Image(systemName: "cpu.fill")
                         .foregroundStyle(.orange)
                     VStack(alignment: .leading, spacing: 4) {
-                        Text("GLM 5.3 Flash needs its DS4 preview runtime")
+                        Text("Optional DS4 runtime for GLM 5.3 Flash")
                             .font(.headline)
-                        Text("The exact Mac-compatible candidates stay hidden until you explicitly install the official experimental `glm-5.3-flash` runtime. Q2 requires at least 128 GB unified memory; Q4_K requires at least 256 GB. Weights and their destination are selected separately afterward.")
+                        Text("DS4's experimental candidates require its official `glm-5.3-flash` runtime. This requirement applies only to DS4. llama.cpp and oMLX results retain their own compatibility checks. DS4 Q2 requires at least 128 GB unified memory; Q4_K requires at least 256 GB. Weights are selected separately afterward.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
@@ -2844,6 +2893,34 @@ struct SettingsView: View {
                     }
                 }
 
+                if [.llamaCpp, .omlx].contains(viewModel.settings.models[index].engine) {
+                    Section("Vision readiness") {
+                        Text(viewModel.visionReadiness(viewModel.settings.models[index]).label)
+                            .font(.headline)
+                        Text(viewModel.settings.models[index].engine == .omlx
+                            ? "MLX vision models include their vision configuration and weights in the model folder. They do not use a separate GGUF projector. Only a real image test verifies vision support."
+                            : "Vision needs the compatible projection adapter as well as the model weights. A configured path is not a passed image test.")
+                            .font(.caption).foregroundStyle(.secondary)
+                        HStack {
+                            Button("Find a Complete Download") {
+                                let profile = viewModel.settings.models[index]
+                                Task { await viewModel.findCompleteDownload(for: profile) }
+                            }
+                            Button(viewModel.settings.models[index].engine == .omlx ? "Review MLX Model Files…" : "Update Projector from Files…") {
+                                let profile = viewModel.settings.models[index]
+                                Task { await viewModel.chooseExistingModelsFolder(modelToUpdate: profile) }
+                            }
+                                .disabled(viewModel.hasUnsavedChanges)
+                        }
+                        if viewModel.settings.models[index].capabilities == nil || viewModel.settings.models[index].capabilities?.contains("chat/completions") == true {
+                            Button("Test with Image") {
+                                let alias = viewModel.settings.models[index].alias
+                                Task { _ = await viewModel.runSelfTest(model: alias, requireVision: true) }
+                            }
+                            .disabled(viewModel.isRunningSelfTest || viewModel.hasUnsavedChanges || viewModel.requiresRestart)
+                        }
+                    }
+                }
                 engineSelectionOptions(index)
                 modelRoleOptions(index)
                 if viewModel.settings.models[index].engine == .mflux {
@@ -3879,6 +3956,13 @@ struct SettingsView: View {
 
     private var footer: some View {
         HStack(spacing: 12) {
+            if viewModel.isWaitingForRestart {
+                ProgressView().controlSize(.small)
+                Text(viewModel.restartWaitMessage).font(.caption)
+                Button("Cancel Restart") { viewModel.cancelRestartWait() }
+            } else if !viewModel.restartWaitMessage.isEmpty {
+                Text(viewModel.restartWaitMessage).font(.caption).foregroundStyle(.secondary)
+            }
             if !viewModel.statusMessage.isEmpty {
                 Text(viewModel.statusMessage)
                     .font(.caption)
@@ -3886,6 +3970,10 @@ struct SettingsView: View {
                     .lineLimit(2)
             }
             Spacer()
+            if viewModel.hasUnsavedChanges {
+                Label(viewModel.changeImpact.label, systemImage: viewModel.changeImpact == .restart ? "arrow.clockwise" : "checkmark.circle")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
             Button("Discard") {
                 viewModel.confirmDiscard = true
             }
@@ -3902,7 +3990,7 @@ struct SettingsView: View {
             .disabled(
                 !viewModel.hasUnsavedChanges
                     || viewModel.isWorking
-                    || !viewModel.configurationSchemaIsSupported
+                    || !viewModel.configurationSchemaIsSupported || viewModel.isWaitingForRestart
             )
         }
         .padding(.horizontal, 18)
@@ -3911,6 +3999,10 @@ struct SettingsView: View {
 
     private var sectionDescription: String {
         switch viewModel.selectedSection {
+        case .overview: "This Mac, at a glance."
+        case .downloads: "Your models and engines, getting ready for what's next."
+        case .fleet: "Independent Macs. Shared possibilities."
+        case .modelSettings: "Configure the selected model and its engine."
         case .setup: "First-run guidance, system health, recovery, and verification"
         case .general: "Ports, timeouts, model residency, and local storage"
         case .hub: "Promote this Mac, manage the gateway, and administer enrollment"
@@ -3919,7 +4011,7 @@ struct SettingsView: View {
         case .updates: "Check and install updates from each engine's official source"
         case .storage: "Choose exact internal or external folders for downloaded models"
         case .library: "Find compatible Hugging Face models and download them without loading"
-        case .models: "Create friendly aliases and tune how each model loads"
+        case .models: "Find, load, and verify the models on this Mac."
         case .lifecycle: "Inspect migration readiness and prepare a non-executing removal plan"
         case .usage: "Configure local token accounting and central reporting"
         case .credentials: "Replace or remove private API keys without revealing saved values"
@@ -4010,7 +4102,7 @@ struct SettingsView: View {
         }
     }
 
-    private func downloadInstallRow(_ install: ModelInstall) -> some View {
+    func downloadInstallRow(_ install: ModelInstall) -> some View {
         VStack(alignment: .leading, spacing: 5) {
             HStack(spacing: 8) {
                 Image(
@@ -4026,7 +4118,7 @@ struct SettingsView: View {
                 Text(install.alias)
                     .fontWeight(.medium)
                     .lineLimit(1)
-                Text(install.status.capitalized)
+                Text(downloadStageLabel(install.status))
                     .foregroundStyle(.secondary)
                 Spacer()
                 if install.isActive {
@@ -4090,14 +4182,25 @@ struct SettingsView: View {
                 Text(byteCount(install.bytesDownloaded))
                     .foregroundStyle(.secondary)
                 if let error = install.error, !error.isEmpty {
-                    Text(error)
-                        .foregroundStyle(.red)
-                        .lineLimit(2)
+                    DisclosureGroup("Download needs attention") {
+                        Text(error).font(.caption).textSelection(.enabled)
+                    }.foregroundStyle(.orange)
                 }
             }
         }
         .font(.caption)
         .padding(.vertical, 2)
+    }
+
+    private func downloadStageLabel(_ state: String) -> String {
+        switch state {
+        case "installed": "Ready to use"
+        case "registering": "Registering model"
+        case "downloaded": "Needs registration"
+        case "partial": "Interrupted"
+        case "failed": "Needs attention"
+        default: state.capitalized
+        }
     }
 
     @ViewBuilder
@@ -4367,9 +4470,9 @@ private struct ExistingModelImporterView: View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(alignment: .top) {
                 VStack(alignment: .leading, spacing: 4) {
-                    Label("Add Existing Models", systemImage: "folder.badge.plus")
+                    Label(viewModel.localModelReviewProfile.map { "Review Model · \($0.alias)" } ?? "Add or Update Existing Models", systemImage: "folder.badge.plus")
                         .font(.title2.weight(.semibold))
-                    Text("Adopt selected GGUF and MLX models in place—without copying or loading their weights.")
+                    Text("Add a model, update a GGUF projector, or refresh an existing MLX model's registration. Review the selected files before saving; weights stay in place.")
                         .font(.callout)
                         .foregroundStyle(.secondary)
                 }
@@ -4465,8 +4568,8 @@ private struct ExistingModelImporterView: View {
                 )
             )
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-        } else if let scan = viewModel.localModelScan {
-            List(scan.models) { candidate in
+        } else if viewModel.localModelScan != nil {
+            List(viewModel.visibleLocalModelCandidates) { candidate in
                 VStack(alignment: .leading, spacing: 10) {
                     HStack(alignment: .top, spacing: 12) {
                         Toggle(
@@ -4501,7 +4604,9 @@ private struct ExistingModelImporterView: View {
                                    !candidate.alreadyImported {
                                     modelBadge("Migrate \(alias)", color: .blue)
                                 }
-                                if candidate.alreadyImported {
+                                if let alias = viewModel.localModelUpdateAlias(candidate) {
+                                    modelBadge("Update \(alias)", color: .blue)
+                                } else if candidate.alreadyImported {
                                     modelBadge("Already added", color: .secondary)
                                 }
                             }
@@ -4540,6 +4645,16 @@ private struct ExistingModelImporterView: View {
                                     candidate.compatibility == "unavailable"
                                         ? Color.orange : Color.secondary
                                 )
+                            if candidate.engine == .llamaCpp && candidate.projectorOptions.isEmpty {
+                                Text("No nearby projector was found in this scan. Choose a folder containing both the model weights and its mmproj GGUF adapter.")
+                                    .font(.caption).foregroundStyle(.orange)
+                            }
+                            if candidate.engine == .omlx {
+                                Text(candidate.visionComponents == true
+                                     ? "Vision configuration detected in config.json. No separate GGUF projector is needed; an image test is still required."
+                                     : "No vision configuration was detected in this scan. An explicit image test can check what oMLX supports for this model.")
+                                    .font(.caption).foregroundStyle(.secondary)
+                            }
                             if let summary = candidate.summary {
                                 Text(summary)
                                     .font(.caption)
@@ -4557,6 +4672,7 @@ private struct ExistingModelImporterView: View {
                             )
                             .textFieldStyle(.roundedBorder)
                             .frame(minWidth: 190, maxWidth: 280)
+                            .disabled(viewModel.localModelUpdateAlias(candidate) != nil)
 
                             if !candidate.projectorOptions.isEmpty {
                                 Picker(
@@ -4592,6 +4708,13 @@ private struct ExistingModelImporterView: View {
 
     private var localImportButtonTitle: String {
         let count = viewModel.selectedLocalModelIDs.count
+        if viewModel.visibleLocalModelCandidates.contains(where: {
+            viewModel.selectedLocalModelIDs.contains($0.id) && viewModel.localModelUpdateAlias($0) != nil
+        }) {
+            return count == 1 && viewModel.visibleLocalModelCandidates.contains(where: {
+                viewModel.selectedLocalModelIDs.contains($0.id) && $0.engine == .llamaCpp
+            }) ? "Update Projector" : "Save \(count) Profile\(count == 1 ? "" : "s")"
+        }
         return count == 1 ? "Add 1 Model" : "Add \(count) Models"
     }
 

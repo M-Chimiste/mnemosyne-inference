@@ -79,6 +79,20 @@ class AcceptanceEvidenceTests(unittest.TestCase):
                     256 * 1024,
                 )
 
+            with patch(
+                "macos.packaging.collect_acceptance._run",
+                side_effect=[
+                    {"ok": True, "diagnostic": "@rpath/Sparkle.framework/Versions/B/Sparkle"},
+                    {"ok": True, "diagnostic": (
+                        "path @executable_path/../Frameworks (offset 12)\n"
+                        "path /Applications/Xcode.app/Contents/Developer/usr/lib/swift (offset 12)\n"
+                    )},
+                ],
+            ):
+                result = _app_runtime_links(app)
+                self.assertFalse(result["accepted"])
+                self.assertFalse(result["checks"]["portable_swift_rpaths"])
+
             sparkle.unlink()
             with patch(
                 "macos.packaging.collect_acceptance._run",

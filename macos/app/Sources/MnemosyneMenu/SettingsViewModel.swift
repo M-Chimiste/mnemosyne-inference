@@ -6,6 +6,10 @@ import SwiftUI
 @MainActor
 final class SettingsViewModel: ObservableObject {
     enum Section: String, CaseIterable, Identifiable {
+        case overview = "Overview"
+        case downloads = "Downloads"
+        case fleet = "Fleet"
+        case modelSettings = "Model Settings"
         case setup = "Setup & Health"
         case general = "General"
         case hub = "Hub Mode"
@@ -21,8 +25,28 @@ final class SettingsViewModel: ObservableObject {
 
         var id: String { rawValue }
 
+        var searchTerms: String {
+            let extra: String = switch self {
+            case .general: "port network api endpoint concurrency memory residency timeout login"
+            case .engines: "llama.cpp omlx ds4 mflux runtime"
+            case .storage: "disk volume ssd folder permission space"
+            case .credentials: "password key token hugging face authentication"
+            case .updates, .downloads: "install update download retry version"
+            case .usage: "tokens postgres ledger reporting analytics"
+            case .pool, .fleet, .hub: "pair join pause contribute nyx gateway"
+            case .models, .modelSettings: "vision image adapter projector quant model"
+            case .setup: "health diagnostic error connection test repair"
+            default: ""
+            }
+            return rawValue + " " + extra
+        }
+
         var symbol: String {
             switch self {
+            case .overview: "square.grid.2x2"
+            case .downloads: "arrow.down.circle"
+            case .fleet: "point.3.connected.trianglepath.dotted"
+            case .modelSettings: "slider.horizontal.3"
             case .setup: "checklist"
             case .general: "gearshape"
             case .hub: "network"
@@ -68,7 +92,18 @@ final class SettingsViewModel: ObservableObject {
         }
     }
 
-    @Published var selectedSection: Section = .setup
+    @Published var selectedSection: Section = .overview
+    @Published private(set) var isWaitingForRestart = false
+    @Published private(set) var restartWaitMessage = ""
+    private var restartWaitTask: Task<Bool, Never>?
+    @Published var workspaceSearch = ""
+    @Published var modelSearch = ""
+    @Published var modelFilter = "All"
+    @Published var downloadFilter = "All"
+    @Published private(set) var modelTestError = ""
+    @Published private(set) var testingAlias: String?
+    @Published private(set) var verifiedModelProfiles: [String: ModelProfileSettings] = [:]
+    @Published private(set) var verifiedVisionAliases: Set<String> = []
     @Published var settings = NativeSettings()
     @Published var selectedModelIndex: Int?
     @Published var credentialDrafts: [ManagedCredential: String] = [:]
@@ -90,7 +125,10 @@ final class SettingsViewModel: ObservableObject {
     @Published var selectedLocalModelIDs: Set<String> = []
     @Published var localModelAliases: [String: String] = [:]
     @Published var localModelProjectors: [String: String] = [:]
+    @Published private(set) var localModelReviewProfile: ModelProfileSettings?
+    @Published private var reviewedModelVision: [String: (profile: ModelProfileSettings, detected: Bool)] = [:]
     @Published var libraryQuery = ""
+    @Published var libraryEngineFilter: InferenceEngine?
     @Published var selectedLibraryModelID: String?
     @Published var selectedLibraryFileID: String?
     @Published var selectedLibraryProjector = ""
@@ -174,6 +212,7 @@ final class SettingsViewModel: ObservableObject {
     private var configurationRevision = ""
     private var appliedConfigurationRevision = ""
     private var libraryFileRequestID: UUID?
+    private var librarySearchRequestID: UUID?
     private var libraryDetailsRequestID: UUID?
     private var installMonitorTask: Task<Void, Never>?
     private var pendingModelCleanupProfile: ModelProfileSettings?
@@ -196,6 +235,73 @@ final class SettingsViewModel: ObservableObject {
             baseURL: configuration.baseURL,
             adminPassword: configuration.adminPassword
         )
+    }
+
+    func restartActivity() async throws -> CoreReadiness { try await client.readiness().core }
+
+    func cancelRestartWait() { restartWaitTask?.cancel() }
+
+    func waitForIdleBeforeRestart() async -> Bool {
+        guard restartWaitTask == nil else { return false }
+        isWaitingForRestart = true
+        let task = Task { [weak self] () -> Bool in
+            guard let self else { return false }
+            do {
+                let deadline = ContinuousClock.now.advanced(by: .seconds(600))
+                while ContinuousClock.now < deadline {
+                    try Task.checkCancellation()
+                    let health = try await client.readiness().core
+                    try Task.checkCancellation()
+                    guard !hasUnsavedChanges else {
+                        restartWaitMessage = "Restart cancelled because settings changed. Save or discard them first."
+                        return false
+                    }
+                    if health.inFlightRequests == 0, health.queuedRequests == 0,
+                       ["idle", "ready"].contains(health.state) { return true }
+                    restartWaitMessage = "Waiting for idle · \(health.inFlightRequests) active · \(health.queuedRequests) queued"
+                    try await Task.sleep(for: .seconds(1))
+                }
+                restartWaitMessage = "This Mac is still busy. Try restarting again when clients are quiet."
+            } catch is CancellationError {
+                restartWaitMessage = "Restart cancelled."
+            } catch {
+                restartWaitMessage = "Cannot check current work. Reconnect before restarting."
+            }
+            return false
+        }
+        restartWaitTask = task
+        let ready = await task.value
+        restartWaitTask = nil
+        isWaitingForRestart = false
+        return ready
+    }
+
+    #if DEBUG
+    func loadWorkspacePreview(_ fixture: WorkspacePreviewFixture) {
+        settings = fixture.config
+        savedSettings = fixture.config
+        readinessSnapshot = fixture.readiness
+        modelInstalls = fixture.installs
+        runtimeUpdateSnapshot = fixture.updates
+        isLoaded = true
+        selectedModelIndex = 0
+        statusMessage = ""
+    }
+    #endif
+
+    var changeImpact: ConfigurationChangeImpact {
+        ConfigurationChangeImpact(saved: savedSettings, draft: settings,
+            credentialsChanged: credentialDrafts.values.contains(where: { !$0.isEmpty }) || !credentialsToClear.isEmpty)
+    }
+
+    func hasVerifiedVision(_ profile: ModelProfileSettings) -> Bool {
+        verifiedVisionAliases.contains(profile.alias) && verifiedModelProfiles[profile.alias] == profile
+            && !requiresRestart && !hasUnsavedChanges
+    }
+
+    func refreshWorkspaceDownloads() async {
+        guard installMonitorTask == nil else { return }
+        if await refreshInstalls(), modelInstalls.contains(where: \.isActive) { beginInstallMonitoring() }
     }
 
     var hasUnsavedChanges: Bool {
@@ -278,7 +384,8 @@ final class SettingsViewModel: ObservableObject {
         GLM53PreviewPresentation.shouldOfferRuntimeInstall(
             query: libraryQuery,
             models: libraryModels,
-            ds4Update: ds4RuntimeUpdate
+            ds4Update: ds4RuntimeUpdate,
+            engine: libraryEngineFilter
         )
     }
 
@@ -376,6 +483,7 @@ final class SettingsViewModel: ObservableObject {
             let pairingStatus = await pairingRequest
             guard !Task.isCancelled else { return }
             let credentialStatus = try credentialStore.status()
+            let priorAlias = selectedModelIndex.flatMap { settings.models.indices.contains($0) ? settings.models[$0].alias : nil }
             settings = loaded
             savedSettings = loaded
             configurationRevision = snapshot.revision
@@ -388,7 +496,7 @@ final class SettingsViewModel: ObservableObject {
             credentialDrafts = [:]
             credentialsToClear = []
             updateFleetPairing(pairingStatus)
-            selectedModelIndex = loaded.models.isEmpty ? nil : 0
+            selectedModelIndex = loaded.models.firstIndex { $0.alias == priorAlias } ?? (loaded.models.isEmpty ? nil : 0)
             requiresRestart = snapshot.restartRequired
             isLoaded = true
             tokenReportingNodeID = serviceStatus?.tokenSidecar?.nodeId
@@ -428,7 +536,13 @@ final class SettingsViewModel: ObservableObject {
         isRefreshingReadiness = true
         defer { isRefreshingReadiness = false }
         do {
-            readinessSnapshot = try await client.readiness()
+            let latest = try await client.readiness()
+            if let prior = readinessSnapshot,
+               prior.engines.map({ "\($0.engine):\($0.installedVersion ?? ""):\($0.installedPath ?? "")" }) != latest.engines.map({ "\($0.engine):\($0.installedVersion ?? ""):\($0.installedPath ?? "")" }) {
+                verifiedVisionAliases.removeAll()
+                verifiedModelProfiles.removeAll()
+            }
+            readinessSnapshot = latest
         } catch {
             setStatus(
                 "Could not refresh system health: \(error.localizedDescription)",
@@ -475,19 +589,34 @@ final class SettingsViewModel: ObservableObject {
     }
 
     @discardableResult
-    func runSelfTest(model: String) async -> Bool {
+    func runSelfTest(model: String, requireVision: Bool = false) async -> Bool {
         guard !model.isEmpty, !isRunningSelfTest else { return false }
         isRunningSelfTest = true
         lastSelfTest = nil
+        modelTestError = ""
+        testingAlias = model
+        verifiedVisionAliases.remove(model)
+        verifiedModelProfiles.removeValue(forKey: model)
+        let testedProfile = settings.models.first { $0.alias == model }
         setStatus("Testing \(model) through the public inference API…", tone: .normal)
-        defer { isRunningSelfTest = false }
+        defer { isRunningSelfTest = false; testingAlias = nil }
         do {
             let result = try await client.selfTest(
                 model: model,
                 includeVision: true,
-                unloadAfter: false
+                unloadAfter: false,
+                requireVision: requireVision
             )
+            guard !requireVision || result.vision else {
+                throw ControlAPIError.rejected(400, "The service did not run an image test. Vision remains unverified.")
+            }
             lastSelfTest = result
+            if result.success, result.model == model, let testedProfile,
+               testedProfile.engine == result.engine,
+               settings.models.first(where: { $0.alias == model }) == testedProfile {
+                verifiedModelProfiles[model] = testedProfile
+                if result.vision { verifiedVisionAliases.insert(model) }
+            }
             await refreshReadiness()
             if result.usage == nil {
                 setStatus(
@@ -507,6 +636,7 @@ final class SettingsViewModel: ObservableObject {
             }
             return result.completesGuidedSetup
         } catch {
+            modelTestError = error.localizedDescription
             setStatus(
                 "Model self-test failed: \(error.localizedDescription)",
                 tone: .error
@@ -573,6 +703,8 @@ final class SettingsViewModel: ObservableObject {
                 credentialsToClear = []
             }
 
+            verifiedVisionAliases.removeAll()
+            verifiedModelProfiles.removeAll()
             requiresRestart = result.restartRequired || credentialsChanged
             if requiresRestart {
                 setStatus(
@@ -1222,6 +1354,8 @@ final class SettingsViewModel: ObservableObject {
     }
 
     func serviceRestartStarted() -> Bool {
+        verifiedVisionAliases.removeAll()
+        verifiedModelProfiles.removeAll()
         guard !isWorking else { return false }
         isWorking = true
         requiresRestart = true
@@ -1376,18 +1510,25 @@ final class SettingsViewModel: ObservableObject {
     }
 
     func refreshModelLibrary() async {
-        guard !isSearchingLibrary else { return }
+        let requestID = UUID()
+        librarySearchRequestID = requestID
+        let query = libraryQuery
+        let engine = libraryEngineFilter
         isSearchingLibrary = true
-        defer { isSearchingLibrary = false }
+        defer {
+            if librarySearchRequestID == requestID { isSearchingLibrary = false }
+        }
         do {
-            async let found = client.searchLibrary(query: libraryQuery)
+            async let found = client.searchLibrary(query: query, engine: engine)
             async let installs = client.modelInstalls()
             let foundModels = try await found
+            let currentInstalls = try await installs
+            guard librarySearchRequestID == requestID else { return }
             libraryModels = GLM53PreviewPresentation.visibleModels(
-                query: libraryQuery,
+                query: query,
                 models: foundModels
             )
-            modelInstalls = try await installs
+            modelInstalls = currentInstalls
             if modelInstalls.contains(where: \.isActive) {
                 beginInstallMonitoring()
             }
@@ -1398,8 +1539,21 @@ final class SettingsViewModel: ObservableObject {
             await refreshLibraryDetailsForSelection()
             synchronizeLibraryRole()
         } catch {
+            guard librarySearchRequestID == requestID else { return }
             setStatus("Could not browse models: \(error.localizedDescription)", tone: .error)
         }
+    }
+
+    func findCompleteDownload(for profile: ModelProfileSettings) async {
+        let destination = ModelLibraryNavigation(profile: profile, installs: modelInstalls)
+        libraryQuery = destination.query
+        libraryEngineFilter = destination.engine
+        selectedLibraryModelID = nil
+        libraryModels = []
+        libraryFileOptions = []
+        libraryDetails = nil
+        selectedSection = .library
+        await refreshModelLibrary()
     }
 
     func selectLibraryModel(id: String?) {
@@ -1764,6 +1918,8 @@ final class SettingsViewModel: ObservableObject {
     }
 
     func installRuntimeUpdate(_ update: EngineRuntimeUpdate) async {
+        verifiedVisionAliases.removeAll()
+        verifiedModelProfiles.removeAll()
         guard
             update.canInstall,
             updatingRuntimeEngine == nil,
@@ -1861,6 +2017,7 @@ final class SettingsViewModel: ObservableObject {
 
     func searchGLM53PreviewModels() {
         libraryQuery = "GLM 5.3 Flash"
+        libraryEngineFilter = .ds4
         selectedSection = .library
         Task { await refreshModelLibrary() }
     }
@@ -1961,7 +2118,10 @@ final class SettingsViewModel: ObservableObject {
         }
     }
 
-    func chooseExistingModelsFolder(source: LocalModelSource? = nil) async {
+    func chooseExistingModelsFolder(
+        source: LocalModelSource? = nil,
+        modelToUpdate: ModelProfileSettings? = nil
+    ) async {
         guard !isScanningLocalModels, !isImportingLocalModels else { return }
         guard !hasUnsavedChanges else {
             setStatus(
@@ -1971,9 +2131,13 @@ final class SettingsViewModel: ObservableObject {
             return
         }
         let panel = NSOpenPanel()
-        panel.title = source.map { "Scan \($0.displayName)" } ?? "Add Existing Models"
-        panel.message =
-            "Choose a folder containing GGUF or MLX models. Unified Inference scans it in place and does not copy or load anything."
+        panel.title = modelToUpdate.map { "Review Files for \($0.alias)" }
+            ?? source.map { "Scan \($0.displayName)" } ?? "Add Existing Models"
+        panel.message = modelToUpdate?.engine == .omlx
+            ? "Choose the existing MLX model folder containing config.json and its weights. Vision models include their vision components in that folder; no separate GGUF projector is needed."
+            : modelToUpdate == nil
+            ? "Choose a folder containing GGUF or MLX models. Unified Inference scans it in place and does not copy or load anything."
+            : "Choose the folder containing this model's weights and projector. If the projector is outside a quant folder, select their shared parent. You will review the adapter before updating the existing profile."
         panel.prompt = "Scan Folder"
         panel.canChooseFiles = false
         panel.canChooseDirectories = true
@@ -1984,6 +2148,16 @@ final class SettingsViewModel: ObservableObject {
                 fileURLWithPath: NSString(string: source.path).expandingTildeInPath,
                 isDirectory: true
             )
+        } else if let modelToUpdate {
+            if modelToUpdate.engine == .omlx {
+                if let install = modelInstalls.first(where: { $0.engine == .omlx && $0.alias == modelToUpdate.alias }) {
+                    panel.directoryURL = URL(fileURLWithPath: install.destination, isDirectory: true)
+                } else if let location = settings.storage.locations.first(where: { $0.name == modelToUpdate.storage }) {
+                    panel.directoryURL = URL(fileURLWithPath: location.path, isDirectory: true)
+                }
+            } else {
+                panel.directoryURL = URL(fileURLWithPath: modelToUpdate.model).deletingLastPathComponent()
+            }
         }
         guard panel.runModal() == .OK, let url = panel.url else { return }
         let startedScope = url.startAccessingSecurityScopedResource()
@@ -1994,6 +2168,7 @@ final class SettingsViewModel: ObservableObject {
         }
 
         showLocalModelImporter = true
+        localModelReviewProfile = modelToUpdate
         localModelScan = nil
         localModelScanError = ""
         localModelImportError = ""
@@ -2013,9 +2188,23 @@ final class SettingsViewModel: ObservableObject {
                 bookmarkData: bookmark
             )
             localModelScan = scan
+            if let modelToUpdate, !scan.models.contains(where: { $0.matches(modelToUpdate) }) {
+                localModelScanError = "The selected folder does not contain the exact weights for \(modelToUpdate.alias). Choose that model's folder or its parent."
+                return
+            }
+            for candidate in scan.models where candidate.engine == .omlx {
+                if let profile = modelToUpdate ?? settings.models.first(where: { $0.alias == candidate.existingAlias }),
+                   candidate.matches(profile), let detected = candidate.visionComponents {
+                    reviewedModelVision[profile.alias] = (profile, detected)
+                }
+            }
             var usedAliases = Set(settings.models.map(\.alias))
             var aliases: [String: String] = [:]
             for candidate in scan.models {
+                if let modelToUpdate, candidate.matches(modelToUpdate) {
+                    aliases[candidate.id] = modelToUpdate.alias
+                    continue
+                }
                 if let existingAlias = candidate.existingAlias {
                     aliases[candidate.id] = existingAlias
                     continue
@@ -2036,7 +2225,9 @@ final class SettingsViewModel: ObservableObject {
             localModelAliases = aliases
             localModelProjectors = Dictionary(
                 uniqueKeysWithValues: scan.models.compactMap { candidate in
-                    candidate.recommendedProjectorId.map { (candidate.id, $0) }
+                    let profile = modelToUpdate ?? settings.models.first { $0.alias == candidate.existingAlias }
+                    let current = candidate.projectorOptions.first { $0.path == profile?.load.projectorPath }?.id
+                    return (current ?? candidate.recommendedProjectorId).map { (candidate.id, $0) }
                 }
             )
             // Selection is deliberately empty. Model adoption is always an
@@ -2045,6 +2236,23 @@ final class SettingsViewModel: ObservableObject {
         } catch {
             localModelScanError = error.localizedDescription
         }
+    }
+
+    var visibleLocalModelCandidates: [LocalModelCandidate] {
+        (localModelScan?.models ?? []).filter { candidate in
+            localModelReviewProfile.map { candidate.matches($0) } ?? true
+        }
+    }
+
+    func localModelUpdateAlias(_ candidate: LocalModelCandidate) -> String? {
+        if let profile = localModelReviewProfile, candidate.matches(profile) { return profile.alias }
+        return candidate.canUpdateExisting ? candidate.existingAlias : nil
+    }
+
+    func visionReadiness(_ profile: ModelProfileSettings) -> ModelVisionReadiness {
+        let review = reviewedModelVision[profile.alias]
+        return ModelVisionReadiness(profile: profile, verified: hasVerifiedVision(profile),
+            visionMetadata: review?.profile == profile ? review?.detected : nil)
     }
 
     func localModelSelectionBinding(_ id: String) -> Binding<Bool> {
@@ -2079,7 +2287,10 @@ final class SettingsViewModel: ObservableObject {
               !selectedLocalModelIDs.isEmpty,
               !isImportingLocalModels
         else { return }
-        let selected = scan.models.filter { selectedLocalModelIDs.contains($0.id) }
+        let selected = visibleLocalModelCandidates.filter {
+            selectedLocalModelIDs.contains($0.id) && $0.isImportable
+        }
+        guard !selected.isEmpty else { return }
         let selections = selected.map { candidate in
             let projectorID = nonempty(localModelProjectors[candidate.id])
             return LocalModelImportSelection(
@@ -2087,7 +2298,8 @@ final class SettingsViewModel: ObservableObject {
                 alias: nonempty(localModelAliases[candidate.id]),
                 projectorId: projectorID,
                 includeProjector: candidate.projectorOptions.isEmpty
-                    || projectorID != nil
+                    || projectorID != nil,
+                updateAlias: localModelUpdateAlias(candidate)
             )
         }
         isImportingLocalModels = true
@@ -2103,6 +2315,15 @@ final class SettingsViewModel: ObservableObject {
                 )
             )
             settings = result.config
+            for item in result.imported {
+                verifiedModelProfiles[item.alias] = nil
+                verifiedVisionAliases.remove(item.alias)
+                if let candidate = selected.first(where: { $0.id == item.candidateId }),
+                   let detected = candidate.visionComponents,
+                   let profile = settings.models.first(where: { $0.alias == item.alias }) {
+                    reviewedModelVision[item.alias] = (profile, detected)
+                }
+            }
             savedSettings = result.config
             configurationRevision = result.revision
             if !result.restartRequired {
@@ -2116,7 +2337,8 @@ final class SettingsViewModel: ObservableObject {
             selectedLocalModelIDs = []
             await refreshStorageStatuses()
             setStatus(
-                "Added \(result.imported.count) existing model\(result.imported.count == 1 ? "" : "s") without copying or loading weights."
+                "Saved \(result.imported.count) model profile\(result.imported.count == 1 ? "" : "s") without copying or loading weights."
+                    + (selections.contains { $0.updateAlias != nil } ? " Existing profiles updated; run Test with Image to verify vision." : "")
                     + (result.restartRequired ? " Restart the background service to finish applying the change." : ""),
                 tone: result.restartRequired ? .warning : .success
             )
@@ -2708,6 +2930,7 @@ final class SettingsViewModel: ObservableObject {
             if refreshed {
                 let observation = observationState.observe(modelInstalls)
                 var refreshedConfiguration = false
+                for alias in observation.newlyInstalledAliases { WorkspacePreferences.shared.modelReady(alias) }
                 if !observation.newlyInstalledAliases.isEmpty {
                     await refreshConfigurationFromService(
                         announceModelChanges: true,
@@ -2761,6 +2984,7 @@ final class SettingsViewModel: ObservableObject {
                 !previousAliases.contains($0)
             }
 
+            if configurationRevision != snapshot.revision { verifiedVisionAliases.removeAll(); verifiedModelProfiles.removeAll() }
             settings = snapshot.config
             savedSettings = snapshot.config
             configurationRevision = snapshot.revision

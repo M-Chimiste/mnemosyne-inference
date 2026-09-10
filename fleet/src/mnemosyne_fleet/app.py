@@ -2230,6 +2230,24 @@ def create_app(
         )
 
     @app.post(
+        "/fleet/api/model-catalog/rename",
+        dependencies=[Depends(require_admin)],
+    )
+    async def rename_model_catalog_entry(request: Request):
+        try:
+            payload = await model_catalog_payload(request)
+            if set(payload) != {"schema_version", "public_model", "new_public_model", "deployment_id"}:
+                raise ModelCatalogError("model_catalog_request_invalid", status_code=422)
+            name = await model_catalog.rename(
+                payload["public_model"], payload["new_public_model"],
+                deployment_id=payload["deployment_id"],
+            )
+        except ModelCatalogError as error:
+            return model_catalog_error(error)
+        return {"schema_version": 1, "public_model": name,
+                "catalog": await model_catalog.status()}
+
+    @app.post(
         "/fleet/api/model-catalog/remove",
         dependencies=[Depends(require_admin)],
     )

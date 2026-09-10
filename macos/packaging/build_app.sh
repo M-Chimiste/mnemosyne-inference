@@ -176,6 +176,12 @@ if [[ ! -d "$BIN_DIR/Sparkle.framework" ]]; then
     exit 1
 fi
 ditto "$BIN_DIR/Sparkle.framework" "$FRAMEWORKS/Sparkle.framework"
+# SwiftPM may embed an absolute Xcode Swift runtime rpath. XProtect checks
+# those candidates even when Sparkle is bundled correctly. Normalize only
+# our staged Swift executables, before any final signatures are created.
+run_isolated_packaging_python "$SCRIPT_DIR/swift_rpaths.py" \
+    "$MENU_EXECUTABLE" "$SERVICE_BOOTSTRAP" "$HUB_BOOTSTRAP" \
+    "$FILE_TRASH_HELPER" "$LIFECYCLE_HELPER" "$LIFECYCLE_RUNNER"
 if [[ "$(/usr/bin/otool -l "$MENU_EXECUTABLE")" != \
       *"path @executable_path/../Frameworks "* ]]; then
     /usr/bin/install_name_tool \

@@ -1,0 +1,179 @@
+{
+  "config": [
+    {
+      "alias": "qwen3.8-flash-next",
+      "engine": "llama.cpp",
+      "model": "/Preview/models/qwen3.8-flash-next.Q8_0.gguf",
+      "enabled": true,
+      "capabilities": [
+        "chat",
+        "vision"
+      ],
+      "load": {
+        "projector_path": "/Preview/models/mmproj.gguf",
+        "extra_args": []
+      }
+    },
+    {
+      "alias": "qwen3.8-27b",
+      "engine": "llama.cpp",
+      "model": "/Preview/models/qwen3.8-27b.Q4_K_M.gguf",
+      "enabled": true,
+      "capabilities": [
+        "chat",
+        "vision"
+      ],
+      "load": {
+        "extra_args": []
+      }
+    },
+    {
+      "alias": "glm-5.3-flash",
+      "engine": "ds4",
+      "model": "/Preview/models/glm-5.3-flash.Q4_K.gguf",
+      "enabled": true,
+      "capabilities": [
+        "chat"
+      ],
+      "load": {
+        "extra_args": []
+      }
+    },
+    {
+      "alias": "gemma-4-26b",
+      "engine": "llama.cpp",
+      "model": "/Preview/models/gemma-4-26b.Q8_0.gguf",
+      "enabled": true,
+      "capabilities": [
+        "chat"
+      ],
+      "load": {
+        "extra_args": []
+      }
+    }
+  ],
+  "readiness": {
+    "schema_version": 1,
+    "product_version": "0.9.0",
+    "core": {
+      "ready": true,
+      "state": "ready",
+      "resident_alias": "qwen3.8-flash-next",
+      "in_flight_requests": 1,
+      "queued_requests": 0,
+      "omlx_model_directory_sync_pending": false
+    },
+    "engines": [
+      {
+        "engine": "llama.cpp",
+        "release_tier": "stable",
+        "enabled": true,
+        "installed": true,
+        "installed_version": "b10107",
+        "installed_path": "/Preview/runtime",
+        "service_state": "ready",
+        "authoritative": true,
+        "resident_models": [],
+        "ready": true
+      },
+      {
+        "engine": "ds4",
+        "release_tier": "stable",
+        "enabled": true,
+        "installed": true,
+        "installed_version": "b10107",
+        "installed_path": "/Preview/runtime",
+        "service_state": "ready",
+        "authoritative": true,
+        "resident_models": [],
+        "ready": true
+      }
+    ],
+    "storage": [],
+    "models": {
+      "configured": 4,
+      "callable": 4
+    },
+    "downloads": {
+      "active": 1
+    },
+    "usage": {
+      "enabled": true,
+      "node_id": "theseus",
+      "node_id_source": "computer_name",
+      "writer_ready": true,
+      "outbox_pending": 0,
+      "outbox_depth": 0,
+      "last_flush_at": null,
+      "last_flush_count": 0,
+      "last_error": null
+    },
+    "ready_for_inference": true
+  },
+  "installs": [
+    {
+      "id": "0",
+      "repo_id": "unsloth/qwen3.8-flash-next",
+      "engine": "llama.cpp",
+      "storage": "Model SSD",
+      "alias": "qwen3.8-flash-next",
+      "destination": "/Preview/models",
+      "status": "installed",
+      "bytes_downloaded": 32000000000,
+      "total_bytes": 32000000000,
+      "download_speed_bps": 87000000,
+      "created_at": 1788805442.553876,
+      "updated_at": 1788805562.5538769
+    },
+    {
+      "id": "1",
+      "repo_id": "unsloth/qwen3.8-27b",
+      "engine": "llama.cpp",
+      "storage": "Model SSD",
+      "alias": "qwen3.8-27b",
+      "destination": "/Preview/models",
+      "status": "downloading",
+      "bytes_downloaded": 14500000000,
+      "total_bytes": 32000000000,
+      "download_speed_bps": 87000000,
+      "created_at": 1788805442.553878,
+      "updated_at": 1788805562.553878
+    }
+  ],
+  "updates": {
+    "channel": "stable",
+    "core_protocol": 1,
+    "engines": [
+      {
+        "engine": "llama.cpp",
+        "display_name": "llama.cpp",
+        "ownership": "managed",
+        "installed": true,
+        "installed_version": "b10107",
+        "available_version": "b10110",
+        "update_available": true,
+        "can_install": true,
+        "can_rollback": false,
+        "management_note": "Official managed runtime"
+      },
+      {
+        "engine": "mflux",
+        "display_name": "mflux",
+        "ownership": "managed",
+        "installed": true,
+        "installed_version": "0.16.0",
+        "available_version": null,
+        "update_available": false,
+        "can_install": true,
+        "can_rollback": false,
+        "management_note": "Official managed runtime"
+      }
+    ]
+  },
+  "status": {
+    "status": "{\"status\": \"ready\", \"resident_alias\": \"qwen3.8-flash-next\", \"resident_engine\": \"llama.cpp\", \"in_flight_requests\": 1, \"ports\": {\"inference\": 1240, \"control\": 17321}, \"token_sidecar\": {\"enabled\": true, \"node_id\": \"theseus\", \"node_id_source\": \"computer_name\", \"writer_ready\": true, \"outbox_pending\": 0, \"outbox_depth\": 0, \"last_flush_at\": null, \"last_flush_count\": 0, \"last_error\": null}}",
+    "catalog": "{\"models\": [{\"id\": \"qwen3.8-flash-next\", \"engine\": \"llama.cpp\", \"capabilities\": [\"chat\", \"vision\"]}, {\"id\": \"qwen3.8-27b\", \"engine\": \"llama.cpp\", \"capabilities\": [\"chat\", \"vision\"]}, {\"id\": \"glm-5.3-flash\", \"engine\": \"ds4\", \"capabilities\": [\"chat\"]}, {\"id\": \"gemma-4-26b\", \"engine\": \"llama.cpp\", \"capabilities\": [\"chat\"]}], \"resident_alias\": \"qwen3.8-flash-next\"}",
+    "pairing": "{\"schema_version\": 1, \"available\": true, \"state\": \"paired\", \"pairing_id\": \"preview\", \"legacy_credentials_present\": false, \"credentials_configured\": true}",
+    "participation": "{\"enabled\": true, \"state\": \"joined\", \"active_requests\": 1, \"updated_at\": 1788805562.55388}"
+  }
+}

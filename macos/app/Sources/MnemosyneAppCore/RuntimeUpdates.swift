@@ -135,28 +135,21 @@ public enum GLM53PreviewPresentation {
         query: String,
         models: [LibraryModel]
     ) -> [LibraryModel] {
-        guard queryTargetsPreview(query) else { return models }
-
-        // Until the exact source-bound DS4 preview is active, do not present
-        // generic Hub matches as though another Mac runtime had verified this
-        // architecture. Installing weights remains a separate user action.
-        return models.filter { model in
-            !modelTargetsPreview(model)
-                || (
-                    model.engine == .ds4
-                        && model.family == "glm-5.3-flash"
-                        && model.releaseTier == "experimental"
-                )
-        }
+        // Each result retains its own engine and compatibility evidence. The
+        // opt-in DS4 channel has no authority to hide another engine's results.
+        models
     }
 
     public static func shouldOfferRuntimeInstall(
         query: String,
         models: [LibraryModel],
-        ds4Update: EngineRuntimeUpdate?
+        ds4Update: EngineRuntimeUpdate?,
+        engine: InferenceEngine? = nil
     ) -> Bool {
         guard
             queryTargetsPreview(query),
+            engine == nil || engine == .ds4,
+            !models.contains(where: { $0.engine != .ds4 && modelTargetsPreview($0) }),
             !models.contains(where: {
                 $0.engine == .ds4
                     && $0.family == "glm-5.3-flash"

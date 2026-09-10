@@ -21,6 +21,11 @@ import time
 from typing import Any
 from urllib import error, parse, request
 
+try:
+    from .swift_rpaths import nonportable_rpaths
+except ImportError:
+    from swift_rpaths import nonportable_rpaths
+
 
 MACOS_ROOT = Path(__file__).resolve().parents[1]
 VERSION_FILE = MACOS_ROOT / "VERSION"
@@ -229,6 +234,10 @@ def _app_runtime_links(app: Path) -> dict[str, Any]:
         output_limit=256 * 1024,
     )
     checks = {
+        "portable_swift_rpaths": bool(
+            load_commands.get("ok")
+            and not nonportable_rpaths(str(load_commands.get("diagnostic") or ""))
+        ),
         "sparkle_binary_present": sparkle.is_file(),
         "sparkle_dependency_present": bool(
             dependencies.get("ok")

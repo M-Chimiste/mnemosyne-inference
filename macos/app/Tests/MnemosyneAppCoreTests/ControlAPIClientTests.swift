@@ -1447,7 +1447,7 @@ func ds4GLM53RuntimeInstallRequestEncoding() throws {
     #expect(object["channel"] as? String == "glm-5.3-flash")
 }
 
-@Test("GLM 5.3 search waits for the exact DS4 preview instead of showing generic matches")
+@Test("DS4 preview guidance never hides other engines or claims they require DS4")
 func glm53SearchRuntimeGate() throws {
     let updatePayload = #"""
     {
@@ -1502,14 +1502,20 @@ func glm53SearchRuntimeGate() throws {
         models: models
     )
 
-    #expect(visible.map(\.displayName) == ["GLM 5.2"])
+    #expect(visible == models)
     #expect(
-        GLM53PreviewPresentation.shouldOfferRuntimeInstall(
+        !GLM53PreviewPresentation.shouldOfferRuntimeInstall(
             query: "glm-5.3-flash",
             models: visible,
             ds4Update: update
         )
     )
+    #expect(!GLM53PreviewPresentation.shouldOfferRuntimeInstall(
+        query: "GLM 5.3 Flash", models: [], ds4Update: update, engine: .llamaCpp
+    ))
+    #expect(GLM53PreviewPresentation.shouldOfferRuntimeInstall(
+        query: "GLM 5.3 Flash", models: [], ds4Update: update, engine: .ds4
+    ))
     #expect(!GLM53PreviewPresentation.queryTargetsPreview("GLM 5.2"))
     #expect(GLM53PreviewPresentation.q2MinimumMemoryGB == 128)
     #expect(GLM53PreviewPresentation.q4MinimumMemoryGB == 256)

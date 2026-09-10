@@ -3788,6 +3788,7 @@ class NativeRuntime:
                 profile.alias for profile in [*models, *legacy_profiles]
             }
             needs_omlx = False
+            needs_llama_cpp = False
             for selection, candidate_id in zip(selections, ids, strict=True):
                 candidate = by_id[candidate_id]
                 if candidate.compatibility == "unavailable":
@@ -3811,6 +3812,55 @@ class NativeRuntime:
                     None,
                 )
                 existing = models[existing_index] if existing_index is not None else None
+                update_alias = selection.get("update_alias")
+                if update_alias is not None:
+                    # An explicit repair is bound to this exact existing alias
+                    # and weight path, including when aliases share the weights.
+                    existing_index = next(
+                        (index for index, profile in enumerate(models)
+                         if profile.alias == update_alias),
+                        None,
+                    )
+                    existing = models[existing_index] if existing_index is not None else None
+                    bound_location = next(
+                        (location for location in fresh.storage.locations
+                         if existing is not None and location.name == existing.storage),
+                        None,
+                    )
+                    omlx_roots = (
+                        [bound_location.path] if bound_location is not None else [
+                            *fresh.engines.omlx.model_directories,
+                            *(os.path.join(location.path, EngineName.OMLX.value)
+                              for location in fresh.storage.locations),
+                        ]
+                    )
+                    same_omlx_model = (
+                        existing is not None
+                        and existing.engine == EngineName.OMLX
+                        and candidate.engine == EngineName.OMLX.value
+                        and Path(existing.model).name == Path(candidate.model_path).name
+                        and any(
+                            os.path.commonpath([
+                                _lexical_path(candidate.model_path), _lexical_path(root),
+                            ]) == _lexical_path(root)
+                            for root in omlx_roots
+                        )
+                    )
+                    same_gguf_model = (
+                        existing is not None
+                        and existing.engine == EngineName.LLAMA_CPP
+                        and candidate.engine == EngineName.LLAMA_CPP.value
+                        and _lexical_path(existing.model) == _lexical_path(candidate.model_path)
+                    )
+                    if (
+                        existing is None
+                        or not (same_gguf_model or same_omlx_model)
+                        or selection.get("alias") not in (None, "", update_alias)
+                    ):
+                        raise LocalModelError(
+                            "the model selected for update changed; "
+                            "refresh settings and review its files again"
+                        )
                 legacy = next(
                     (
                         profile
@@ -3820,6 +3870,8 @@ class NativeRuntime:
                     None,
                 )
                 prior = existing or legacy
+                if update_alias is not None:
+                    legacy = None
                 requested_alias = str(selection.get("alias") or "").strip()
                 alias = requested_alias or (prior.alias if prior else "")
                 if not alias:
@@ -3836,6 +3888,7 @@ class NativeRuntime:
                     raise LocalModelError(f"model alias '{alias}' is already in use")
 
                 if candidate.engine == EngineName.LLAMA_CPP.value:
+                    needs_llama_cpp = needs_llama_cpp or update_alias is None
                     projector_id = selection.get("projector_id")
                     include_projector = selection.get("include_projector", True) is not False
                     projector = next(
@@ -3942,8 +3995,27 @@ class NativeRuntime:
                         ),
                         enabled=prior.enabled if prior is not None else True,
                     )
+                    if existing is not None and existing.engine == EngineName.LLAMA_CPP:
+                        # Re-attaching an adapter must not reset context policy,
+                        # engine alternatives, selection, role, or the wire name.
+                        retained_storage = storage_name
+                        if update_alias is not None and bound_location is not None and all(
+                            os.path.commonpath([_lexical_path(path), _lexical_path(bound_location.path)])
+                            == _lexical_path(bound_location.path)
+                            for path in (candidate.model_path, load.projector_path)
+                            if path is not None
+                        ):
+                            retained_storage = existing.storage
+                        profile = ModelProfile.model_validate({
+                            **existing.model_dump(mode="python"),
+                            "alias": alias,
+                            "storage": retained_storage,
+                            "load": existing.load.model_copy(update={
+                                "projector_path": load.projector_path,
+                            }),
+                        })
                 else:
-                    needs_omlx = True
+                    needs_omlx = needs_omlx or update_alias is None
                     model_id = Path(candidate.model_path).name
                     duplicate_profile = next(
                         (
@@ -3955,7 +4027,7 @@ class NativeRuntime:
                         ),
                         None,
                     )
-                    if duplicate_profile is not None:
+                    if duplicate_profile is not None and update_alias is None:
                         raise LocalModelError(
                             f"oMLX model ID '{model_id}' is already used by "
                             f"profile '{duplicate_profile.alias}'. oMLX exposes "
@@ -3985,6 +4057,12 @@ class NativeRuntime:
                         ),
                         enabled=prior.enabled if prior is not None else True,
                     )
+                    if existing is not None and existing.engine == EngineName.OMLX:
+                        profile = ModelProfile.model_validate({
+                            **existing.model_dump(mode="python"),
+                            "alias": alias,
+                            "storage": existing.storage if update_alias is not None else storage_name,
+                        })
                 if existing_index is None:
                     models.append(profile)
                     planned_aliases.add(alias)
@@ -4015,9 +4093,7 @@ class NativeRuntime:
 
             engines = fresh.engines
             restart_required = pending_restart
-            if not engines.llama_cpp.enabled and any(
-                item["engine"] == EngineName.LLAMA_CPP.value for item in imported
-            ):
+            if not engines.llama_cpp.enabled and needs_llama_cpp:
                 engines = engines.model_copy(
                     update={"llama_cpp": engines.llama_cpp.model_copy(update={"enabled": True})}
                 )
@@ -4031,6 +4107,11 @@ class NativeRuntime:
                 )
                 restart_required = restart_required or not engines.omlx.enabled
                 engines = engines.model_copy(update={"omlx": omlx})
+            if (
+                storage_name not in {location.name for location in fresh.storage.locations}
+                and not any(profile.storage == storage_name for profile in models)
+            ):
+                locations = [location for location in locations if location.name != storage_name]
             storage = fresh.storage.model_copy(update={"locations": locations})
             migration = fresh.migration.model_copy(
                 update={"legacy_lmstudio_profiles": legacy_profiles}
@@ -4609,6 +4690,7 @@ class NativeRuntime:
         *,
         include_vision: bool = True,
         unload_after: bool = False,
+        require_vision: bool = False,
     ) -> dict:
         """Exercise the public inference listener and verify durable usage."""
 
@@ -4623,8 +4705,17 @@ class NativeRuntime:
         if inference_key:
             headers["Authorization"] = f"Bearer {inference_key}"
 
-        vision = bool(
+        if require_vision and (
+            not include_vision
+            or target.key.engine not in {EngineName.LLAMA_CPP, EngineName.OMLX}
+            or Endpoint.CHAT_COMPLETIONS not in target.capabilities
+        ):
+            raise RuntimeConfigurationError(
+                "image self-tests require a llama.cpp or oMLX chat model"
+            )
+        vision = require_vision or bool(
             include_vision
+            and Endpoint.CHAT_COMPLETIONS in target.capabilities
             and target.key.engine == EngineName.LLAMA_CPP
             and target.load_options.get("projector_path")
         )

@@ -87,6 +87,11 @@ public struct PerformanceSnapshot: Codable, Equatable, Sendable {
 /// Every field is optional so the menu app remains compatible while the native
 /// service grows its status payload. Unknown fields are ignored by `Codable`.
 public struct ServiceSnapshot: Codable, Equatable, Sendable {
+    public struct Ports: Codable, Equatable, Sendable {
+        public let inference: Int?
+        public let control: Int?
+    }
+    public let ports: Ports?
     public let status: String?
     public let residentAlias: String?
     public let residentModel: String?
@@ -99,6 +104,7 @@ public struct ServiceSnapshot: Codable, Equatable, Sendable {
 
     public init(
         status: String?,
+        ports: Ports? = nil,
         residentAlias: String?,
         residentModel: String?,
         residentEngine: String?,
@@ -109,6 +115,7 @@ public struct ServiceSnapshot: Codable, Equatable, Sendable {
         startupError: String? = nil
     ) {
         self.status = status
+        self.ports = ports
         self.residentAlias = residentAlias
         self.residentModel = residentModel
         self.residentEngine = residentEngine
@@ -121,6 +128,7 @@ public struct ServiceSnapshot: Codable, Equatable, Sendable {
 
     enum CodingKeys: String, CodingKey {
         case status
+        case ports
         case residentAlias = "resident_alias"
         case residentModel = "resident_model"
         case residentEngine = "resident_engine"

@@ -116,7 +116,7 @@ VERSION_FILE = PACKAGING_ROOT.parent / "VERSION"
 
 
 class AppLayoutTests(unittest.TestCase):
-    def test_dmg_uses_finder_replacement_and_stages_preserve_data_uninstall(self) -> None:
+    def test_dmg_stages_signed_install_assistant_and_preserve_data_uninstall(self) -> None:
         build = DMG_BUILD_SCRIPT.read_text(encoding="utf-8")
         uninstall = PILOT_UNINSTALL_SCRIPT.read_text(encoding="utf-8")
 
@@ -132,6 +132,9 @@ class AppLayoutTests(unittest.TestCase):
 
         self.assertNotIn("pilot_install_or_upgrade.command", build)
         self.assertNotIn("Install or Upgrade Unified Inference.command", build)
+        self.assertIn('"$SCRIPT_DIR/build_installer.py"', build)
+        self.assertIn('"$SOURCE_DIR/Install or Upgrade/Install Unified Inference.app"', build)
+        self.assertIn('xcrun stapler validate "$MOUNTED_INSTALLER"', build)
         self.assertIn("pilot_uninstall_preserving_data.command", build)
         self.assertIn('/bin/bash -n "$MOUNTED_UNINSTALL"', build)
 
@@ -469,6 +472,26 @@ class AppLayoutTests(unittest.TestCase):
             (staged / "alias.py").symlink_to("app.py")
             with self.assertRaisesRegex(ValueError, "must not contain symlinks"):
                 _validate_source_copy(source, staged)
+
+    def test_declared_dashboard_payload_must_be_present_and_byte_identical(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            staged = root / "staged"
+            source.mkdir()
+            staged.mkdir()
+            relative = Path("dashboard.html")
+            (source / relative).write_text("<main>Fleet</main>\n", encoding="utf-8")
+            extras = {relative: source / relative}
+            with self.assertRaisesRegex(ValueError, "source inventory mismatch"):
+                _validate_source_copy(source, staged, extra_files=extras)
+
+            (staged / relative).write_bytes((source / relative).read_bytes())
+            _validate_source_copy(source, staged, extra_files=extras)
+
+            (staged / relative).write_text("<main>Stale dashboard</main>\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "sources differ from release input"):
+                _validate_source_copy(source, staged, extra_files=extras)
 
     def test_app_symlinks_must_be_relative_and_contained(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -916,6 +939,17 @@ class AppLayoutTests(unittest.TestCase):
                     ValueError,
                     "cannot resolve Sparkle",
                 ),
+            ):
+                _validate_app_runtime_links(app)
+
+            toolchain = "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-6.2/macosx"
+            unsafe = subprocess.CompletedProcess(
+                args=[], returncode=0, stderr="",
+                stdout=f"path {APP_FRAMEWORK_RPATH} (offset 12)\npath {toolchain} (offset 12)\n",
+            )
+            with (
+                patch("macos.packaging.verify_release.subprocess.run", side_effect=[valid[0], unsafe]),
+                self.assertRaisesRegex(ValueError, "nonportable Swift rpaths"),
             ):
                 _validate_app_runtime_links(app)
 

@@ -308,6 +308,27 @@ class FleetStore:
                 ),
             )
 
+    async def rename_managed_model(
+        self, old_name: str, new_name: str, *, updated_at: float,
+    ) -> None:
+        """Change only the public name in one transaction; keep suppression intact."""
+        async with self._lock:
+            await asyncio.to_thread(
+                self._rename_managed_model_sync, old_name, new_name, updated_at,
+            )
+
+    def _rename_managed_model_sync(
+        self, old_name: str, new_name: str, updated_at: float,
+    ) -> None:
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE managed_model_catalog SET public_model=?, updated_at=? "
+                "WHERE public_model=?",
+                (new_name, updated_at, old_name),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("model_catalog_store_conflict")
+
     async def remove_managed_model(
         self,
         public_model: str,

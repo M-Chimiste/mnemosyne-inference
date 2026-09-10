@@ -9,7 +9,7 @@ cannot silently republish the mapping; an explicit add clears that fence.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import re
 import time
 
@@ -360,6 +360,55 @@ class UniversalModelCatalog:
                     for candidate in candidates
                 ],
             }
+
+    async def rename(
+        self, public_model: object, new_public_model: object, *, deployment_id: object,
+    ) -> str:
+        old_name = _public_name(public_model)
+        new_name = _public_name(new_public_model)
+        # A disconnected administrator must not abandon a database thread
+        # between its commit and the scheduler/catalog name swap.
+        if not isinstance(deployment_id, str) or _DEPLOYMENT_ID.fullmatch(deployment_id) is None:
+            raise ModelCatalogError("model_catalog_deployment_invalid", status_code=422)
+        task = asyncio.create_task(self._rename(old_name, new_name, deployment_id))
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            await asyncio.shield(task)
+            raise
+
+    async def _rename(self, old_name: str, new_name: str, deployment_id: str) -> str:
+        async with self._lock:
+            if old_name in self._configured:
+                raise ModelCatalogError("model_catalog_config_mapping_locked")
+            record = self._managed.get(old_name)
+            if record is None:
+                raise ModelCatalogError("model_catalog_mapping_unknown", status_code=404)
+            if record.deployment_id != deployment_id:
+                raise ModelCatalogError("model_catalog_mapping_changed")
+            if old_name == new_name:
+                return new_name
+            if new_name in self._configured or new_name in self._managed:
+                raise ModelCatalogError("model_catalog_mapping_conflict")
+            renamed = replace(record, public_model=new_name, updated_at=time.time())
+
+            async def persist() -> None:
+                try:
+                    await self._store.rename_managed_model(
+                        old_name, new_name, updated_at=renamed.updated_at,
+                    )
+                except Exception as exc:
+                    raise ModelCatalogError(
+                        "model_catalog_store_conflict", status_code=503,
+                    ) from exc
+
+            try:
+                await self._scheduler.rename_model(old_name, new_name, persist=persist)
+            except ModelMutationError as exc:
+                raise ModelCatalogError(exc.code) from exc
+            del self._managed[old_name]
+            self._managed[new_name] = renamed
+            return new_name
 
     async def remove(self, public_model: str) -> None:
         name = _public_name(public_model)

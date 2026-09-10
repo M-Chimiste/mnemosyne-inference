@@ -2660,6 +2660,7 @@ async def test_control_self_test_uses_public_inference_path_and_verifies_usage(
         result = response.json()
         assert result["success"] is True
         assert result["endpoint"] == "/v1/chat/completions"
+        assert result["vision"] is False
         assert result["release_tier"] == "stable"
         assert result["response_preview"] == "Alpacas are gentle camelids."
         assert result["usage"] == {
@@ -2682,8 +2683,11 @@ async def test_control_self_test_uses_public_inference_path_and_verifies_usage(
 
 
 @pytest.mark.asyncio
-async def test_control_self_test_uses_configured_llama_projector_by_default(
-    tmp_path,
+@pytest.mark.parametrize(("engine", "require_vision"), [
+    ("llama.cpp", False), ("llama.cpp", True), ("omlx", True),
+])
+async def test_control_self_test_sends_images_for_llama_and_explicit_mlx_tests(
+    tmp_path, engine: str, require_vision: bool,
 ) -> None:
     seen: dict = {}
 
@@ -2711,9 +2715,9 @@ async def test_control_self_test_uses_configured_llama_projector_by_default(
     payload = _config(tmp_path).model_dump(mode="json")
     payload["models"][0].update(
         {
-            "engine": "llama.cpp",
-            "model": "/models/vision.gguf",
-            "load": {"projector_path": "/models/mmproj-vision.gguf"},
+            "engine": engine,
+            "model": "/models/vision.gguf" if engine == "llama.cpp" else "vision-mlx",
+            "load": {"projector_path": "/models/mmproj-vision.gguf"} if engine == "llama.cpp" else {},
         }
     )
     upstream_client = httpx.AsyncClient(
@@ -2730,10 +2734,19 @@ async def test_control_self_test_uses_configured_llama_projector_by_default(
         transport=httpx.ASGITransport(app=create_inference_app(runtime)),
         base_url="http://127.0.0.1:1240",
     )
+    client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=create_control_app(runtime)),
+        base_url="http://mnemosyne-control.test",
+    )
     try:
-        result = await runtime.self_test("frontier")
+        response = await client.post("/manager/self-test", json={
+            "model": "frontier", "require_vision": require_vision,
+        })
+        assert response.status_code == 200, response.text
+        result = response.json()
 
         assert result["vision"] is True
+        assert result["engine"] == engine
         content = seen["request"]["messages"][0]["content"]
         assert content[0]["type"] == "text"
         assert content[1]["type"] == "image_url"
@@ -2742,6 +2755,7 @@ async def test_control_self_test_uses_configured_llama_projector_by_default(
         assert len(image_url) > 200
         assert result["usage_recorded"] is True
     finally:
+        await client.aclose()
         await runtime.stop()
         await upstream_client.aclose()
 

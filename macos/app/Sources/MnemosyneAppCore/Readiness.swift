@@ -102,4 +102,5 @@ struct ModelSelfTestRequest: Codable, Equatable, Sendable {
     let model: String
     let includeVision: Bool
     let unloadAfter: Bool
+    var requireVision: Bool? = nil
 }

@@ -95,10 +95,33 @@ async def test_universal_catalog_admin_can_suppress_and_restore_a_live_route(
                 },
             )
             assert restored.status_code == 201
+            rename_payload = {
+                "schema_version": 1, "public_model": "universal-qwen",
+                "new_public_model": "qwen", "deployment_id": mapping["deployment_id"],
+            }
+            denied = await client.post(
+                "/fleet/api/model-catalog/rename", json=rename_payload,
+                headers={"Authorization": "Bearer client-key"},
+            )
+            assert denied.status_code in {401, 403}
+            invalid = await client.post(
+                "/fleet/api/model-catalog/rename", headers=headers,
+                json={**rename_payload, "unexpected": True},
+            )
+            assert invalid.status_code == 422
+            renamed = await client.post(
+                "/fleet/api/model-catalog/rename", headers=headers, json=rename_payload,
+            )
+            assert renamed.status_code == 200
+            assert renamed.json()["public_model"] == "qwen"
+            models = await client.get(
+                "/v1/models", headers={"Authorization": "Bearer client-key"},
+            )
+            assert [row["id"] for row in models.json()["data"]] == ["qwen"]
             inference = await client.post(
                 "/v1/responses",
                 headers={"Authorization": "Bearer client-key"},
-                json={"model": "universal-qwen", "input": "hello"},
+                json={"model": "qwen", "input": "hello"},
             )
             assert inference.status_code == 200
 

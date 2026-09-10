@@ -25,6 +25,44 @@ release truth; a 0.9 candidate is not V1 while any required gate remains
 pending. See [release and recovery](RELEASE.md) for versioning, signing,
 notarization, signed updates, and rollback.
 
+## Native workspace
+
+Open Unified Inference from its menu-bar popover or application icon. The main
+window starts with Overview, Models, Downloads, and Fleet; setup and advanced
+configuration remain in the Settings sidebar group. First-run installs still
+open Setup & Health.
+
+- Overview shows observed local inference, the resident model, callable model
+  count, installed unified memory, downloads, and independent Fleet participation.
+  Copy Endpoint uses the running service's reported port.
+- Models supports search, favorites, callable/vision filters, explicit GGUF
+  quantization labels, and direct load/test/configure controls. Vision adapter
+  configuration is distinct from a successful image self-test. Test evidence is
+  session-local, bound to the tested profile, and invalidated on configuration,
+  observed runtime-version, or service restart changes. Review vision components
+  through complete managed downloads or the existing Finder import workflow.
+- Downloads combines existing model cancel/retry/history actions and official
+  runtime updates. ETA appears only with a usable total and positive speed;
+  registration has no invented time estimate. Completion notifications are opt-in.
+- Fleet separates local contribution from enrollment, exposes a direct dashboard
+  action on the Hub, and reads live node metadata through the existing fixed
+  loopback admin client. Optional Hub failures do not block local inference.
+  Hub-only installations can use Fleet without enabling the native worker.
+- Command-1 through Command-4 open the four workspace pages, Command-F focuses
+  search, Command-O opens the window, and Command-comma opens General settings.
+  Model search, selection, main-page scroll positions, and window size are retained.
+- Before saving, the app identifies changes that require a service restart.
+  Restarting a busy Mac offers a cancellable Wait for Idle option. It observes
+  zero active and queued requests; it is not an admission barrier, so keep API
+  clients quiet while waiting. Loss of status cancels the wait instead of assuming
+  the Mac is idle. Existing restart confirmation still verifies the saved revision.
+
+For isolated visual QA, a debug build accepts
+`--workspace-preview macos/app/PreviewFixtures/workspace.json` (optionally
+`--light`). This path skips startup/bootstrap and automatic service calls and
+uses sample snapshots. Release builds do not load these fixtures. Preview action
+buttons are not a substitute for signed-artifact acceptance on a real Mac.
+
 ## Current validation
 
 The current 0.9.0 source passes the native service, image-worker, Swift, and
@@ -375,6 +413,11 @@ automatically; the user can choose another or opt out for text-only use. The
 resolved Hub revision and exact file list are persisted so retries cannot
 silently change weights.
 
+**Find a Complete Download** searches with the selected profile's engine and
+repository hint. The engine filter remains visible, and GLM 5.3 llama.cpp and
+MLX results remain available. The experimental DS4 runtime prompt applies only
+to DS4; it is not a requirement for another engine's model.
+
 For matching quant subfolders such as `Q8_0/model-Q8_0-00001-of-00002.gguf`,
 discovery also offers shared projectors from the immediate parent when no
 sibling projector exists. This supports repositories that publish quant shards
@@ -423,6 +466,21 @@ migrates matching legacy aliases and compatible load settings. Discovery and
 import never load a model.
 Shared projectors must already be inside the Finder-selected folder; selecting
 only a quant subfolder never grants access to its parent.
+
+For an existing GGUF profile, **Update Projector from Files…** rescans its
+folder and lets you attach the discovered adapter to that exact alias, even
+when another alias shares the weights. Existing rows remain selectable for
+updates. Repairs preserve context policy, load tuning, engine alternatives,
+enabled state, and served name. **Review MLX Model Files…** uses the same
+Finder flow for oMLX models and reports native vision metadata; MLX models do
+not require a GGUF `mmproj`. Reviewing a registered MLX model preserves its
+storage and engine directory settings.
+
+**Test with Image** sends an actual image through the ordinary inference
+endpoint for either llama.cpp or oMLX. It never falls back to a text-only test.
+Vision metadata or a configured adapter is shown as untested until that image
+request succeeds. Test evidence is session-local and expires when the profile
+or runtime changes; scanning or reviewing files alone does not load a model.
 
 The ordinary Models editor does not accept raw model IDs or projector paths.
 Engine, model source, storage, served name, projector, and image family are

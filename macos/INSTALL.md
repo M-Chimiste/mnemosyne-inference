@@ -51,8 +51,11 @@ You need:
 
 ## 2. Install Unified Inference
 
-Open the Unified Inference disk image, drag **Unified Inference** to the
-**Applications** shortcut, eject the image, and launch:
+Open the signed Unified Inference disk image, open **Install or Upgrade**, and
+double-click **Install Unified Inference**. Finish any inference or downloads, quit the existing menu app,
+and choose **Install**. When the assistant reports **Installed and verified by
+Gatekeeper**, choose **Open Unified Inference**, check **Setup & Health**, and
+eject the image. You can also launch the installed app with:
 
 ```bash
 open "/Applications/Unified Inference.app"
@@ -62,15 +65,43 @@ The same signed arm64 disk image can be copied to every Apple Silicon Mac; it
 does not need to be rebuilt on Metis, Athena, or another workstation. Engine
 runtimes and model folders are prepared separately on each machine.
 
-For an existing 0.9 pilot, quit the menu app, drag the new **Unified
-Inference** onto the **Applications** shortcut, choose **Replace**, and open
-the installed app. Finder replaces only the application bundle. Unified
+For an existing 0.9 pilot, use **Install Unified Inference** instead of dragging
+over the existing bundle. The assistant stages a complete new directory,
+checks a signed inventory of every file and link, verifies Developer ID and
+Gatekeeper, then atomically exchanges the whole application directories.
+It checks the final installed path again and restores the previous bundle
+if that check fails, provided neither bundle has changed concurrently. The
+**Previous App** button reveals the retained recovery copy. Keep it until
+the new version works on that Mac. The assistant requires write access to
+Applications and does not elevate privileges. An interrupted exchange blocks
+another attempt and identifies the recovery folder for review.
+
+The assistant replaces only the application bundle. Unified
 Inference keeps configuration, `.env`, selected storage paths, weights, the
 local token ledger/outbox, node identity, and reporting DSN below the existing
 private Application Support tree, so they survive the replacement. The new
 app fingerprints its changed bundle on first launch and safely refreshes any
 previously enabled exact Service Management registrations; a registration the
 user explicitly disabled remains disabled.
+
+The separate **Unified Inference.app** and **Applications** shortcut remain
+available for manual fresh installs and the signed Sparkle update archive.
+For a manual upgrade, move the previous app into a recovery folder first,
+then copy into the vacant Applications destination. Do not merge app folders.
+
+If macOS reports that the app is **damaged** immediately after replacing an
+existing installation, choose **Cancel** and retain the disk image. A valid
+signature alone does not settle this error: compare Gatekeeper's scan of the
+installed app with the app on the mounted image. If the mounted app passes,
+preserve the rejected installed bundle in a separate recovery folder, copy the
+app from the image into a new folder, and validate that fresh copy before
+moving it into the now-vacant Applications destination. Launch the installed
+app and verify **Setup & Health** reconnects. Copying into a new directory and
+then moving the complete bundle avoids modifying existing signed files in
+place. Configuration and model data remain in their existing locations.
+The [build 88 incident record](../project_docs/mac_build88_gatekeeper_incident.md)
+documents this recovery and its limits; a passing fresh-copy check is not
+acceptance evidence for upgrading an existing installation.
 
 On a fresh installation, the first app launch requests both native Service
 Management registrations: the inference LaunchAgent starts at login with

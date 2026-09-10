@@ -12,6 +12,27 @@ final class HubModeViewModel: ObservableObject {
         var id: String { rawValue }
     }
 
+    @Published private(set) var workspaceOverview: HubWorkspaceOverview?
+    @Published private(set) var workspaceObservedAt: Date?
+    @Published private(set) var workspaceOverviewError = ""
+    private var refreshingWorkspace = false
+    var workspaceIsLive: Bool { workspaceObservedAt.map { Date().timeIntervalSince($0) < 15 } ?? false }
+
+    func refreshWorkspaceOverview() async {
+        guard configuration != nil, !refreshingWorkspace else { return }
+        refreshingWorkspace = true
+        defer { refreshingWorkspace = false }
+        do {
+            let client = try pairingAdminClient()
+            workspaceOverview = try await client.workspaceOverview()
+            workspaceObservedAt = Date()
+            workspaceOverviewError = ""
+        } catch {
+            workspaceObservedAt = nil
+            workspaceOverviewError = "Live Hub activity is unavailable. Open the dashboard or check Hub Settings."
+        }
+    }
+
     @Published var exposureMode: ExposureMode = .tailscale
     @Published var customPublicOrigin = ""
     @Published var includeLocalWorker = false

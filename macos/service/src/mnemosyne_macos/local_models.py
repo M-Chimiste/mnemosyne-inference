@@ -156,6 +156,7 @@ class LocalModel:
     model_card_markdown: str | None = None
     recommended_projector_id: str | None = None
     projector_options: tuple[LocalProjector, ...] = ()
+    vision_components: bool | None = None
 
     def to_dict(self) -> dict[str, Any]:
         value = asdict(self)
@@ -291,6 +292,14 @@ def _sentence_transformers_embedding(directory: Path) -> bool:
     )
 
 
+def _omlx_vision_metadata(config: dict[str, Any]) -> bool:
+    return (
+        isinstance(config.get("vision_config"), dict)
+        or isinstance(config.get("vit_config"), dict)
+        or bool(config.get("mm_vision_tower"))
+    )
+
+
 def _omlx_capabilities(
     directory: Path,
     config_path: Path,
@@ -410,11 +419,7 @@ def _omlx_capabilities(
             _EMBEDDING_CAPABILITIES,
         )
 
-    has_vision = (
-        isinstance(config.get("vision_config"), dict)
-        or isinstance(config.get("vit_config"), dict)
-        or bool(config.get("mm_vision_tower"))
-    )
+    has_vision = _omlx_vision_metadata(config)
     if has_vision or model_type in _OMLX_VLM_NATIVE_TEXT_MODEL_TYPES:
         return (
             "likely",
@@ -711,6 +716,7 @@ def scan_local_models(
                 parameter_count=metadata.parameter_count,
                 summary=markdown_summary(model_card),
                 model_card_markdown=model_card,
+                vision_components=_omlx_vision_metadata(config),
             )
         )
 
