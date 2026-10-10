@@ -81,6 +81,7 @@ func hubModeRendersClosedFleetConfiguration() throws {
     #expect(saved.publicOrigin == "https://nyx.example.ts.net")
     #expect(saved.localWorkerNodeID == "nyx-worker")
     #expect(saved.includesLocalWorker)
+    #expect(saved.requestTimeoutSeconds == 300)
     #expect(saved.publishedDeployments.first?.capabilities == [
         "chat/completions", "responses",
     ])
@@ -291,6 +292,146 @@ func legacyHubMetadataDefaultsToLocalWorker() throws {
         from: data
     )
     #expect(decoded.includesLocalWorker)
+    #expect(decoded.requestTimeoutSeconds == 300)
+}
+
+@Test("Hub request timeout survives refresh and reconfiguration without changing private state")
+func hubRequestTimeoutPersists() throws {
+    let temporary = FileManager.default.temporaryDirectory
+        .appending(path: UUID().uuidString, directoryHint: .isDirectory)
+    defer { try? FileManager.default.removeItem(at: temporary) }
+    let nativeEnvironment = temporary.appending(path: "native.env")
+    let hubStore = HubConfigurationStore(rootURL: temporary.appending(path: "hub"))
+    _ = try hubStore.prepareSecrets(
+        nativeCredentialStore: CredentialStore(environmentURL: nativeEnvironment)
+    )
+    let deployment = HubPublishedDeployment(
+        alias: "model",
+        deploymentID: "sha256:" + String(repeating: "c", count: 64),
+        capabilities: ["chat/completions"]
+    )
+    let original = try hubStore.saveConfiguration(
+        publicOrigin: "https://nyx.example.ts.net",
+        localWorkerNodeID: "nyx-worker",
+        managedTailscaleServe: true,
+        deployments: [deployment]
+    )
+    let secretsBefore = try Data(contentsOf: hubStore.environmentURL)
+    let nativeBefore = try Data(contentsOf: nativeEnvironment)
+    let stateFile = hubStore.rootURL.appending(path: "state/preserved.db")
+    try Data("preserved pairing and route state".utf8).write(to: stateFile)
+
+    let updated = try hubStore.updateRequestTimeout(900)
+    #expect(updated.requestTimeoutSeconds == 900)
+    #expect(updated.publicOrigin == original.publicOrigin)
+    #expect(updated.localWorkerNodeID == original.localWorkerNodeID)
+    #expect(updated.managedTailscaleServe == original.managedTailscaleServe)
+    #expect(updated.includesLocalWorker == original.includesLocalWorker)
+    #expect(updated.publishedDeployments == original.publishedDeployments)
+
+    // App-launch refresh must use the persisted timeout, even after regenerating TOML.
+    try Data("[server]\nrequest_timeout_seconds = 300\n".utf8).write(
+        to: hubStore.configurationURL
+    )
+    let reopened = HubConfigurationStore(rootURL: hubStore.rootURL)
+    #expect(try reopened.refreshManagedConfiguration())
+    #expect(!(try reopened.refreshManagedConfiguration()))
+    #expect(try reopened.loadConfiguration() == updated)
+    #expect(try String(contentsOf: reopened.configurationURL, encoding: .utf8)
+        .contains("request_timeout_seconds = 900.0"))
+
+    let reconfigured = try reopened.saveConfiguration(
+        publicOrigin: original.publicOrigin,
+        localWorkerNodeID: "",
+        managedTailscaleServe: false,
+        includesLocalWorker: false,
+        deployments: []
+    )
+    #expect(reconfigured.requestTimeoutSeconds == 900)
+    #expect(try Data(contentsOf: hubStore.environmentURL) == secretsBefore)
+    #expect(try Data(contentsOf: nativeEnvironment) == nativeBefore)
+    #expect(try String(contentsOf: stateFile, encoding: .utf8)
+        == "preserved pairing and route state")
+}
+
+@Test("Invalid Hub timeouts leave the saved configuration untouched", arguments: [
+    0.0, -1.0, 86_401.0, Double.infinity, -Double.infinity, Double.nan,
+])
+func hubRequestTimeoutRejectsInvalidValues(_ seconds: Double) throws {
+    let temporary = FileManager.default.temporaryDirectory
+        .appending(path: UUID().uuidString, directoryHint: .isDirectory)
+    defer { try? FileManager.default.removeItem(at: temporary) }
+    let store = HubConfigurationStore(rootURL: temporary.appending(path: "hub"))
+    _ = try store.saveConfiguration(
+        publicOrigin: "https://nyx.example.ts.net",
+        localWorkerNodeID: "",
+        managedTailscaleServe: true,
+        includesLocalWorker: false,
+        deployments: []
+    )
+    let metadataBefore = try Data(contentsOf: store.metadataURL)
+    let tomlBefore = try Data(contentsOf: store.configurationURL)
+    #expect(throws: HubModeError.invalidRequestTimeout) {
+        try store.updateRequestTimeout(seconds)
+    }
+    #expect(throws: HubModeError.invalidRequestTimeout) {
+        try store.saveConfiguration(
+            publicOrigin: "https://nyx.example.ts.net",
+            localWorkerNodeID: "",
+            managedTailscaleServe: true,
+            includesLocalWorker: false,
+            requestTimeoutSeconds: seconds,
+            deployments: []
+        )
+    }
+    #expect(try Data(contentsOf: store.metadataURL) == metadataBefore)
+    #expect(try Data(contentsOf: store.configurationURL) == tomlBefore)
+}
+
+@Test("Hub timeout changes require an existing Hub and accept the Fleet timeout bounds")
+func hubRequestTimeoutRequiresConfiguredHub() throws {
+    let temporary = FileManager.default.temporaryDirectory
+        .appending(path: UUID().uuidString, directoryHint: .isDirectory)
+    defer { try? FileManager.default.removeItem(at: temporary) }
+    let store = HubConfigurationStore(rootURL: temporary)
+    #expect(throws: HubModeError.hubNotConfigured) {
+        try store.updateRequestTimeout(900)
+    }
+    #expect(!FileManager.default.fileExists(atPath: temporary.path))
+    for seconds in [0.5, 86_400.0] {
+        let saved = try store.saveConfiguration(
+            publicOrigin: "https://nyx.example.ts.net",
+            localWorkerNodeID: "",
+            managedTailscaleServe: true,
+            includesLocalWorker: false,
+            requestTimeoutSeconds: seconds,
+            deployments: []
+        )
+        #expect(try store.loadConfiguration() == saved)
+    }
+}
+
+@Test("Invalid persisted Hub timeout cannot be regenerated into Fleet configuration")
+func hubRequestTimeoutRejectsInvalidMetadata() throws {
+    let temporary = FileManager.default.temporaryDirectory
+        .appending(path: UUID().uuidString, directoryHint: .isDirectory)
+    defer { try? FileManager.default.removeItem(at: temporary) }
+    let store = HubConfigurationStore(rootURL: temporary)
+    _ = try store.saveConfiguration(
+        publicOrigin: "https://nyx.example.ts.net",
+        localWorkerNodeID: "",
+        managedTailscaleServe: true,
+        includesLocalWorker: false,
+        deployments: []
+    )
+    var metadata = try #require(JSONSerialization.jsonObject(
+        with: Data(contentsOf: store.metadataURL)
+    ) as? [String: Any])
+    metadata["request_timeout_seconds"] = 0
+    try JSONSerialization.data(withJSONObject: metadata).write(to: store.metadataURL)
+    let tomlBefore = try Data(contentsOf: store.configurationURL)
+    #expect(throws: DecodingError.self) { try store.refreshManagedConfiguration() }
+    #expect(try Data(contentsOf: store.configurationURL) == tomlBefore)
 }
 
 @Test("Hub Mode refuses unsafe origins and empty deployment authority")

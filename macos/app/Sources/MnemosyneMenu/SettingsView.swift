@@ -287,6 +287,11 @@ struct SettingsView: View {
     private var page: some View {
         if viewModel.selectedSection == .hub, !startup.state.isWaiting {
             hubPage
+        } else if viewModel.selectedSection == .general,
+                  !startup.state.isWaiting, hubMode.configuration != nil,
+                  startup.state != .ready || !viewModel.isLoaded {
+            Form { hubTimeoutSection }
+                .formStyle(.grouped)
         } else if !startup.state.isWaiting, viewModel.selectedSection == .fleet || (viewModel.selectedSection == .overview && hubMode.configuration != nil && startup.state != .ready) {
             workspaceFleet
         } else if startup.state != .ready {
@@ -1314,12 +1319,55 @@ struct SettingsView: View {
                 }
             }
 
+            if hubMode.configuration != nil {
+                hubTimeoutSection
+            }
+
             Section("Local storage") {
                 TextField("State database", text: $viewModel.settings.paths.stateDatabase)
                 TextField("Log folder", text: $viewModel.settings.paths.logDirectory)
             }
         }
         .formStyle(.grouped)
+    }
+
+    private var hubTimeoutSection: some View {
+        Section("Fleet Hub") {
+            LabeledContent("Upstream request timeout") {
+                secondsField($hubMode.requestTimeoutSeconds)
+                    .disabled(hubMode.isWorking)
+                    .help("Maximum wait for upstream data, including model loading and gaps in a response stream. Greater than zero, up to 86400 seconds.")
+            }
+            HStack {
+                if !HubModeConfiguration.isValidRequestTimeout(hubMode.requestTimeoutSeconds) {
+                    Text("Enter more than 0 and at most 86400 seconds.")
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                } else if !hubMode.timeoutStatusMessage.isEmpty {
+                    Text(hubMode.timeoutStatusMessage)
+                        .font(.caption)
+                        .foregroundStyle(hubMode.timeoutIsError ? Color.red : Color.secondary)
+                }
+                Spacer()
+                Button {
+                    Task { await hubMode.saveRequestTimeout(registration: registration) }
+                } label: {
+                    Label(
+                        registration.hubAgentStatus == .enabled
+                            ? (hubMode.hasTimeoutChanges ? "Save and Restart Hub" : "Restart Hub")
+                            : "Save Hub Timeout",
+                        systemImage: registration.hubAgentStatus == .enabled
+                            ? "arrow.clockwise" : "square.and.arrow.down"
+                    )
+                }
+                .disabled(
+                    hubMode.isWorking || registration.isChangingRegistration
+                        || (!hubMode.hasTimeoutChanges && !hubMode.timeoutRestartRequired)
+                        || !HubModeConfiguration.isValidRequestTimeout(hubMode.requestTimeoutSeconds)
+                )
+                .help("Restarting the Hub interrupts its active requests and in-memory batches.")
+            }
+        }
     }
 
     private var poolPage: some View {

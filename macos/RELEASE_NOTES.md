@@ -42,6 +42,10 @@ read-only discovery hint.
   enable transaction. A disabled enrollment can be enabled there after an
   interrupted ceremony. The browser dashboard remains an Advanced surface for
   service classes, catalog overrides, revocation, and manual interoperability.
+- General settings now expose a persistent Fleet Hub upstream request timeout.
+  Saving restarts only an enabled Hub; Hub-only Macs can change the value
+  without starting their inference worker. App launches and upgrades retain
+  the chosen timeout.
 - Pairing now defaults to a familiar six-digit-code flow: enter the Hub HTTPS
   address on the Mac, choose **Request to Join**, then enter the displayed code
   in the Hub Mac's native settings and choose **Pair & Enable**. The app discovers the Mac's

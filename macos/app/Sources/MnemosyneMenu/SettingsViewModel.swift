@@ -27,7 +27,7 @@ final class SettingsViewModel: ObservableObject {
 
         var searchTerms: String {
             let extra: String = switch self {
-            case .general: "port network api endpoint concurrency memory residency timeout login"
+            case .general: "port network api endpoint concurrency memory residency timeout login fleet hub"
             case .engines: "llama.cpp omlx ds4 mflux runtime"
             case .storage: "disk volume ssd folder permission space"
             case .credentials: "password key token hugging face authentication"

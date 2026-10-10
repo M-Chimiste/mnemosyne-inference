@@ -926,6 +926,16 @@ refuses to save a schema newer than it understands. Model-only edits hot-apply;
 engine, server, storage, token-sidecar, or credential edits offer a
 background-service restart.
 
+On a configured Hub, **Settings → General → Fleet Hub → Upstream request
+timeout** controls the gateway's wait for upstream data, including model
+loading and gaps between response chunks. It defaults to 300 seconds and
+accepts positive values up to 86400 seconds. **Save and Restart Hub** persists
+the value and restarts only Fleet Hub; active Hub requests and in-memory
+batches are interrupted. With the Hub disabled, **Save Hub Timeout** stores
+the value for its next start. This setting is also available on a Hub-only Mac
+without enabling the inference worker, and survives app launches, upgrades,
+and Hub reconfiguration.
+
 The Models page's **Add Existing Models…** action opens a directory picker and
 uses `POST /manager/model-library/local-scan` plus
 `POST /manager/model-library/imports`. `GET

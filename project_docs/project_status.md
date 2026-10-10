@@ -67,6 +67,10 @@ removed in Hub administration. Direct LAN/Tailnet headers never authenticate,
 and the admin API remains separately keyed. Finder replacement upgrades the
 preserved Hub configuration in place, while disable/re-enable retains Hub
 credentials, pairings, inventory, catalog overrides, and route metadata.
+General settings also expose the Hub upstream request timeout. It defaults
+to 300 seconds, persists in private Hub metadata across config regeneration,
+and saves with a Hub-only restart when enabled. Hub-only Macs can access this
+control without starting their local inference worker.
 
 Mac-first pool hardening is now an active follow-on milestone. Several
 non-breaking foundations are implemented:

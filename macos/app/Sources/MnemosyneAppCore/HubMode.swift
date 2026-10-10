@@ -16,12 +16,18 @@ public struct HubPublishedDeployment: Codable, Equatable, Identifiable, Sendable
 
 public struct HubModeConfiguration: Codable, Equatable, Sendable {
     public static let schemaVersion = 1
+    public static let defaultRequestTimeoutSeconds = 300.0
+
+    public static func isValidRequestTimeout(_ seconds: Double) -> Bool {
+        seconds.isFinite && seconds > 0 && seconds <= 86_400
+    }
 
     public let schemaVersion: Int
     public let publicOrigin: String
     public let localWorkerNodeID: String
     public let managedTailscaleServe: Bool
     public let includesLocalWorker: Bool
+    public let requestTimeoutSeconds: Double
     public let publishedDeployments: [HubPublishedDeployment]
 
     public init(
@@ -30,6 +36,7 @@ public struct HubModeConfiguration: Codable, Equatable, Sendable {
         localWorkerNodeID: String,
         managedTailscaleServe: Bool,
         includesLocalWorker: Bool = true,
+        requestTimeoutSeconds: Double = HubModeConfiguration.defaultRequestTimeoutSeconds,
         publishedDeployments: [HubPublishedDeployment]
     ) {
         self.schemaVersion = schemaVersion
@@ -37,6 +44,7 @@ public struct HubModeConfiguration: Codable, Equatable, Sendable {
         self.localWorkerNodeID = localWorkerNodeID
         self.managedTailscaleServe = managedTailscaleServe
         self.includesLocalWorker = includesLocalWorker
+        self.requestTimeoutSeconds = requestTimeoutSeconds
         self.publishedDeployments = publishedDeployments
     }
 
@@ -46,6 +54,7 @@ public struct HubModeConfiguration: Codable, Equatable, Sendable {
         case localWorkerNodeID = "local_worker_node_id"
         case managedTailscaleServe = "managed_tailscale_serve"
         case includesLocalWorker = "includes_local_worker"
+        case requestTimeoutSeconds = "request_timeout_seconds"
         case publishedDeployments = "published_deployments"
     }
 
@@ -62,6 +71,17 @@ public struct HubModeConfiguration: Codable, Equatable, Sendable {
             Bool.self,
             forKey: .includesLocalWorker
         ) ?? true
+        requestTimeoutSeconds = try values.decodeIfPresent(
+            Double.self,
+            forKey: .requestTimeoutSeconds
+        ) ?? Self.defaultRequestTimeoutSeconds
+        guard Self.isValidRequestTimeout(requestTimeoutSeconds) else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .requestTimeoutSeconds,
+                in: values,
+                debugDescription: "Hub request timeout must be greater than zero and at most 86400 seconds."
+            )
+        }
         publishedDeployments = try values.decode(
             [HubPublishedDeployment].self,
             forKey: .publishedDeployments
@@ -75,6 +95,7 @@ public struct HubModeConfiguration: Codable, Equatable, Sendable {
         try values.encode(localWorkerNodeID, forKey: .localWorkerNodeID)
         try values.encode(managedTailscaleServe, forKey: .managedTailscaleServe)
         try values.encode(includesLocalWorker, forKey: .includesLocalWorker)
+        try values.encode(requestTimeoutSeconds, forKey: .requestTimeoutSeconds)
         try values.encode(publishedDeployments, forKey: .publishedDeployments)
     }
 }
@@ -107,6 +128,8 @@ public enum HubModeError: Error, Equatable, LocalizedError {
     case privateStateWriteFailed
     case invalidPublicOrigin
     case invalidWorkerIdentity
+    case invalidRequestTimeout
+    case hubNotConfigured
     case noEligibleModels
     case localWorkerUnavailable
     case localWorkerRejected
@@ -128,6 +151,10 @@ public enum HubModeError: Error, Equatable, LocalizedError {
             "Enter one HTTPS origin without a path, query, or credentials."
         case .invalidWorkerIdentity:
             "The local worker did not report a valid stable node identity."
+        case .invalidRequestTimeout:
+            "Enter a Hub request timeout greater than zero and at most 86400 seconds."
+        case .hubNotConfigured:
+            "Configure Hub Mode before changing its request timeout."
         case .noEligibleModels:
             "Install or import at least one Fleet-eligible model before including this Mac as a Hub worker."
         case .localWorkerUnavailable:
@@ -235,8 +262,15 @@ public struct HubConfigurationStore: Sendable {
         localWorkerNodeID: String,
         managedTailscaleServe: Bool,
         includesLocalWorker: Bool = true,
+        requestTimeoutSeconds: Double? = nil,
         deployments: [HubPublishedDeployment]
     ) throws -> HubModeConfiguration {
+        let timeout = try requestTimeoutSeconds
+            ?? loadConfiguration()?.requestTimeoutSeconds
+            ?? HubModeConfiguration.defaultRequestTimeoutSeconds
+        guard HubModeConfiguration.isValidRequestTimeout(timeout) else {
+            throw HubModeError.invalidRequestTimeout
+        }
         try prepareRoot()
         let origin = try Self.normalizedHTTPSOrigin(publicOrigin)
         var nodeID = localWorkerNodeID.trimmingCharacters(
@@ -263,6 +297,7 @@ public struct HubConfigurationStore: Sendable {
             localWorkerNodeID: nodeID,
             managedTailscaleServe: managedTailscaleServe,
             includesLocalWorker: includesLocalWorker,
+            requestTimeoutSeconds: timeout,
             publishedDeployments: models
         )
         let config = renderTOML(value)
@@ -271,6 +306,24 @@ public struct HubConfigurationStore: Sendable {
         try writePrivate(Data(config.utf8), to: configurationURL)
         try writePrivate(encoder.encode(value), to: metadataURL)
         return value
+    }
+
+    @discardableResult
+    public func updateRequestTimeout(_ seconds: Double) throws -> HubModeConfiguration {
+        guard HubModeConfiguration.isValidRequestTimeout(seconds) else {
+            throw HubModeError.invalidRequestTimeout
+        }
+        guard let current = try loadConfiguration() else {
+            throw HubModeError.hubNotConfigured
+        }
+        return try saveConfiguration(
+            publicOrigin: current.publicOrigin,
+            localWorkerNodeID: current.localWorkerNodeID,
+            managedTailscaleServe: current.managedTailscaleServe,
+            includesLocalWorker: current.includesLocalWorker,
+            requestTimeoutSeconds: seconds,
+            deployments: current.publishedDeployments
+        )
     }
 
     /// Re-render preserved Hub metadata through the current app's closed
@@ -409,7 +462,7 @@ public struct HubConfigurationStore: Sendable {
             "api_key_env = \"\(Self.clientKeyName)\"",
             "admin_api_key_env = \"\(Self.adminKeyName)\"",
             "database_path = \(tomlString(state.appending(path: "fleet.db").path))",
-            "request_timeout_seconds = 300",
+            "request_timeout_seconds = \(value.requestTimeoutSeconds)",
             "max_body_bytes = 16777216",
             "route_history_limit = 10000",
             "poll_interval_seconds = 2",

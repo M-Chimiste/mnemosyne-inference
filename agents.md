@@ -236,6 +236,11 @@ engine process.
   configuration, pairing stores, inventory, and route database below the
   private Application Support `hub` tree; the gateway remains a separate
   process on loopback `:17400` and never owns the native worker on `:1240`.
+  General settings expose the Hub upstream request timeout from its private
+  Hub metadata and regenerate Fleet TOML with that persisted value. Saving
+  restarts only an enabled Hub; Hub-only Macs can edit it without starting the
+  inference worker. Preserve the default 300 seconds for older metadata and
+  Fleet's positive, at-most-86400-second bound across saves and app upgrades.
   Routine presence-code approval lives in the native Hub Mode page: it reads
   the private admin bearer just in time, contacts only fixed loopback `:17400`
   without ambient proxies or redirects, waits for the existing activation

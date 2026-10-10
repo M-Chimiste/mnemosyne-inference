@@ -36,6 +36,10 @@ final class HubModeViewModel: ObservableObject {
     @Published var exposureMode: ExposureMode = .tailscale
     @Published var customPublicOrigin = ""
     @Published var includeLocalWorker = false
+    @Published var requestTimeoutSeconds = HubModeConfiguration.defaultRequestTimeoutSeconds
+    @Published private(set) var timeoutRestartRequired = false
+    @Published private(set) var timeoutStatusMessage = ""
+    @Published private(set) var timeoutIsError = false
     @Published private(set) var configuration: HubModeConfiguration?
     @Published private(set) var isWorking = false
     @Published private(set) var hubHealthy = false
@@ -56,6 +60,11 @@ final class HubModeViewModel: ObservableObject {
     private let snapshotClient = HubLocalSnapshotClient()
     private let tailscale = HubTailscaleManager()
 
+    var hasTimeoutChanges: Bool {
+        requestTimeoutSeconds != (configuration?.requestTimeoutSeconds
+            ?? HubModeConfiguration.defaultRequestTimeoutSeconds)
+    }
+
     init(configuration: ControlConnectionConfiguration = .load()) {
         controlConfiguration = configuration
         store = HubConfigurationStore(
@@ -67,13 +76,19 @@ final class HubModeViewModel: ObservableObject {
             exposureMode = existing.managedTailscaleServe
                 ? .tailscale : .existingHTTPS
             includeLocalWorker = existing.includesLocalWorker
+            requestTimeoutSeconds = existing.requestTimeoutSeconds
         }
         clientAPIKeyConfigured = ((try? store.clientKey()) ?? nil) != nil
     }
 
     func load(registration: LaunchAgentRegistration) async {
         registration.refresh()
+        let preserveTimeoutDraft = hasTimeoutChanges
         configuration = try? store.loadConfiguration()
+        if !preserveTimeoutDraft {
+            requestTimeoutSeconds = configuration?.requestTimeoutSeconds
+                ?? HubModeConfiguration.defaultRequestTimeoutSeconds
+        }
         clientAPIKeyConfigured = ((try? store.clientKey()) ?? nil) != nil
         if let configuration {
             customPublicOrigin = configuration.publicOrigin
@@ -101,6 +116,9 @@ final class HubModeViewModel: ObservableObject {
         defer { isWorking = false }
 
         do {
+            guard HubModeConfiguration.isValidRequestTimeout(requestTimeoutSeconds) else {
+                throw HubModeError.invalidRequestTimeout
+            }
             let discovery: HubTailscaleManager.Discovery?
             let publicOrigin: String
             switch exposureMode {
@@ -158,6 +176,7 @@ final class HubModeViewModel: ObservableObject {
                 localWorkerNodeID: nodeID,
                 managedTailscaleServe: discovery != nil,
                 includesLocalWorker: includeLocalWorker,
+                requestTimeoutSeconds: requestTimeoutSeconds,
                 deployments: deployments
             )
             configuration = saved
@@ -188,6 +207,7 @@ final class HubModeViewModel: ObservableObject {
                 try await tailscale.enableServe(using: discovery)
             }
             hubHealthy = true
+            timeoutRestartRequired = false
             isError = false
             statusMessage = includeLocalWorker
                 ? "This Mac is running Fleet Hub with its local worker enrolled as LIMITED / overflow."
@@ -197,6 +217,38 @@ final class HubModeViewModel: ObservableObject {
             hubHealthy = await healthCheck()
             isError = true
             statusMessage = error.localizedDescription
+        }
+    }
+
+    func saveRequestTimeout(registration: LaunchAgentRegistration) async {
+        guard !isWorking, !registration.isChangingRegistration,
+              configuration != nil else { return }
+        isWorking = true
+        timeoutIsError = false
+        timeoutStatusMessage = "Saving Hub request timeout..."
+        defer { isWorking = false }
+        do {
+            configuration = try store.updateRequestTimeout(requestTimeoutSeconds)
+            if registration.hubAgentStatus == .enabled {
+                timeoutRestartRequired = true
+                timeoutStatusMessage = "Restarting Fleet Hub..."
+                guard await registration.restartHubAgent() else {
+                    throw HubModePresentationError.registration(
+                        registration.lastError
+                            ?? "The timeout is saved. Restart Fleet Hub to apply it."
+                    )
+                }
+                hubHealthy = await waitForHealth()
+                guard hubHealthy else { throw HubModePresentationError.health }
+                timeoutRestartRequired = false
+                timeoutStatusMessage = "Hub request timeout saved and active."
+            } else {
+                timeoutRestartRequired = false
+                timeoutStatusMessage = "Hub request timeout saved. It applies when Fleet Hub starts."
+            }
+        } catch {
+            timeoutIsError = true
+            timeoutStatusMessage = error.localizedDescription
         }
     }
 
