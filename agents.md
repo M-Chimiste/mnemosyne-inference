@@ -11,6 +11,14 @@ remain thin managers around upstream engines and must not fork or embed their
 serving implementations. Fleet routes to those managers; it never owns an
 engine process.
 
+The user-authorized TensorFold Preview exception is confined to
+`macos/tensorfold-preview/`: an exact upstream source pin, integrity-bound
+patch, and isolated development build. This is not current engine integration
+or shipping vision/Thunderbolt support. Keep serving code and dependencies
+outside the coordinator; full GLM/Qwen vision, target-M3-Ultra cluster, and
+signed-artifact acceptance remain mandatory before delivery. Do not substitute
+oMLX or bypass the runtime maintenance barrier with the development builder.
+
 ## Repository Shape
 
 - `vllm_manager.py` is the FastAPI service entrypoint. It starts two uvicorn servers, owns manager state, launches the active inference engine, proxies `/v1/*`, serves the admin UI, and wires all HTTP routes.

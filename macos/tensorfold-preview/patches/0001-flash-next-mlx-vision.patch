@@ -1,0 +1,641 @@
+diff --git a/src/tensorfold/families/qwen4_exp/__init__.py b/src/tensorfold/families/qwen4_exp/__init__.py
+index 979582b..dbc320d 100644
+--- a/src/tensorfold/families/qwen4_exp/__init__.py
++++ b/src/tensorfold/families/qwen4_exp/__init__.py
+@@ -1,4 +1,5 @@
+ """Qwen3.8 Flash Next forward pass and fused decode with exact MTP drafting on Metal or one or two CUDA GPUs."""
++# Modified for Unified Inference's isolated TensorFold Preview: opt-in MLX vision loading.
+ 
+ from __future__ import annotations
+ 
+@@ -131,11 +132,13 @@ def weight_bytes(model_dir: Path, ple_on_ssd: bool = False) -> int:
+ 
+ 
+ def load(model_dir: Path, *, mtp_drafts: int | None = None, ple_on_ssd: bool = False,
+-         ssd_experts: float | None = None, **_: Any) -> tuple[Any, Any]:
++         ssd_experts: float | None = None, vision: bool = False,
++         vision_urls: bool = False, **_: Any) -> tuple[Any, Any]:
+     from tensorfold.families.qwen4_exp.runtime import load as load_runtime
+ 
+     drafts = mtp_drafts if has_mtp(Path(model_dir)) else 0
+-    return load_runtime(Path(model_dir), drafts=drafts, ple_on_ssd=ple_on_ssd, ssd_experts=ssd_experts)
++    return load_runtime(Path(model_dir), drafts=drafts, ple_on_ssd=ple_on_ssd, ssd_experts=ssd_experts,
++                        vision=vision, vision_urls=vision_urls)
+ 
+ 
+ def engine_settings(model: Any) -> dict[str, Any]:
+diff --git a/src/tensorfold/families/qwen4_exp/model.py b/src/tensorfold/families/qwen4_exp/model.py
+index 937ce3b..1d70d14 100644
+--- a/src/tensorfold/families/qwen4_exp/model.py
++++ b/src/tensorfold/families/qwen4_exp/model.py
+@@ -1,4 +1,5 @@
+ """Qwen3.8 Flash Next forward pass with host-computed n-gram hashes to avoid GPU waits for embedding rows."""
++# Modified for Unified Inference's isolated TensorFold Preview: shared image embeddings and unfused loading.
+ 
+ from __future__ import annotations
+ 
+@@ -262,18 +263,20 @@ class Qwen4Exp(nn.Module):
+     def make_cache(self) -> list[Any]:
+         return [LinearCache() if layer.is_linear else AttentionCache() for layer in self.layers]
+ 
+-    def hidden(self, inputs: Any, cache: list[Any]) -> mx.array:
++    def hidden(self, inputs: Any, cache: list[Any], *, inputs_embeds=None) -> mx.array:
+         """The mixed hidden state [B, L, D] after the last layer."""
+ 
+         tokens = np.asarray(inputs, dtype=np.int64)
+         if tokens.ndim == 1:
+             tokens = tokens[None]
+         fused = self.__dict__.get("fused")
+-        if fused is not None and tokens.shape[0] == 1 and tokens.shape[1] <= self.fused_rows:
++        if inputs_embeds is None and fused is not None and tokens.shape[0] == 1 and tokens.shape[1] <= self.fused_rows:
+             return fused(tokens, cache)
+-        if fused is not None and tokens.shape[0] == 1 and prefill_mm.fast_prefill():
++        if inputs_embeds is None and fused is not None and tokens.shape[0] == 1 and prefill_mm.fast_prefill():
+             return prefill_hc.hidden(self, tokens, cache)           # a prompt chunk through the prefill path
+-        h = self.model.embed_tokens(mx.array(tokens.astype(np.int32)))
++        if inputs_embeds is not None and tuple(inputs_embeds.shape) != (*tokens.shape, self.args.hidden_size):
++            raise ValueError("image embeddings must match the prompt token rows and target width")
++        h = self.model.embed_tokens(mx.array(tokens.astype(np.int32))) if inputs_embeds is None else inputs_embeds
+         h = mx.tile(h, (1, 1, self.args.hc_count))
+         queued = None
+         for i, (layer, layer_cache) in enumerate(zip(self.layers, cache)):
+@@ -369,7 +372,7 @@ def prefetch_ngrams(model: Qwen4Exp) -> None:
+ 
+ 
+ def load(model_dir: Path, *, lazy: bool = False, ple_on_ssd: bool = False,
+-         ssd_experts: float | None = None) -> tuple[Qwen4Exp, Any]:
++         ssd_experts: float | None = None, fused: bool = True) -> tuple[Qwen4Exp, Any]:
+     from tensorfold.families.tokenizer import load_tokenizer
+ 
+     on_host = ngrams_on_host(model_dir, ple_on_ssd)
+@@ -437,7 +440,7 @@ def load(model_dir: Path, *, lazy: bool = False, ple_on_ssd: bool = False,
+             raise ValueError(f"{key}: checkpoint {shipped} != derived {derived}")
+     if not lazy:
+         mx.eval(model.parameters())
+-        if os.environ.get("TF_FLASH_FUSED", "1") != "0":
++        if fused and os.environ.get("TF_FLASH_FUSED", "1") != "0":
+             from tensorfold.families.qwen4_exp.decode import FusedDecode
+ 
+             # kept out of the module tree (a plain attribute), so parameters() stays the checkpoint's
+diff --git a/src/tensorfold/families/qwen4_exp/model_layers.py b/src/tensorfold/families/qwen4_exp/model_layers.py
+index 706c249..bf94fab 100644
+--- a/src/tensorfold/families/qwen4_exp/model_layers.py
++++ b/src/tensorfold/families/qwen4_exp/model_layers.py
+@@ -1,4 +1,5 @@
+ """Configuration, caches, attention, and feed-forward layers for Qwen3.8 Flash Next."""
++# Modified for Unified Inference's isolated TensorFold Preview: image-aware attention and sparse indexing.
+ 
+ from __future__ import annotations
+ 
+@@ -55,6 +56,7 @@ class Config:
+     ple_eos: int
+     group_size: int
+     bits: int
++    mrope_section: tuple[int, ...] = (11, 11, 10)
+ 
+     @classmethod
+     def from_dict(cls, config: dict[str, Any]) -> "Config":
+@@ -107,6 +109,7 @@ class Config:
+             ple_eos=int(eos[0] if isinstance(eos, list) else eos) if eos is not None else 0,
+             group_size=int(quant.get("group_size", 32)),
+             bits=int(quant.get("bits", 4)),
++            mrope_section=tuple(rope.get("mrope_section", (11, 11, 10))),
+         )
+ 
+ 
+@@ -230,12 +233,17 @@ class AttentionCache:
+         self.index_keys: Any = None
+         self.pooled: Any = None     # normalized, rotated keys of blocks [0, pooled.shape[1])
+         self.offset = 0
++        self.index_position_ids = None
++        self.vision_enabled = False
++        self.vision_rope_delta = 0
+ 
+     def trim(self, n: int, ratio: int = 4) -> int:
+         """Forget the last ``n`` positions (and pooled blocks no longer complete)."""
+ 
+         n = min(self.offset, n)
+         self.offset -= n
++        if self.index_position_ids is not None:
++            self.index_position_ids = self.index_position_ids[..., :self.offset]
+         if self.pooled is not None and self.pooled.shape[1] > self.offset // ratio:
+             blocks = self.offset // ratio
+             self.pooled = self.pooled[:, :blocks] if blocks else None
+@@ -247,9 +255,11 @@ class AttentionCache:
+             return []
+         n = self.offset
+         out = [self.keys[:, :, :n], self.values[:, :, :n], self.index_keys[:, :n]]
+-        return out + ([self.pooled] if self.pooled is not None else [])
++        return out + ([self.pooled] if self.pooled is not None else []) + (
++            [self.index_position_ids] if self.index_position_ids is not None else [])
+ 
+-    def update(self, keys: mx.array, values: mx.array, index_keys: mx.array) -> tuple[mx.array, mx.array, mx.array]:
++    def update(self, keys: mx.array, values: mx.array, index_keys: mx.array,
++               position_ids=None) -> tuple[mx.array, mx.array, mx.array]:
+         prev, length = self.offset, keys.shape[2]
+         end = prev + length
+         if self.keys is None or end > self.keys.shape[2]:
+@@ -271,6 +281,11 @@ class AttentionCache:
+         self.keys[:, :, prev:end] = keys
+         self.values[:, :, prev:end] = values
+         self.index_keys[:, prev:end] = index_keys
++        if position_ids is not None:
++            if self.index_position_ids is None and prev:
++                raise ValueError("image indexer positions cannot be added to a text cache")
++            self.index_position_ids = position_ids if prev == 0 else mx.concatenate(
++                [self.index_position_ids[..., :prev], position_ids], axis=-1)
+         self.offset = end
+         return self.keys[:, :, :end], self.values[:, :, :end], self.index_keys[:, :end]
+ 
+@@ -328,6 +343,7 @@ class Indexer(nn.Module):
+         self.top_blocks = cfg.indexer_budget // cfg.indexer_compress_ratio
+         self.rotary_dim = cfg.rotary_dim
+         self.base = cfg.rope_theta
++        self.mrope_section = cfg.mrope_section
+         self.index_qk_proj = nn.Linear(cfg.hidden_size, (self.heads + 1) * self.dims, bias=False)
+         self.q_layernorm = CenteredRMSNorm(self.dims, cfg.rms_norm_eps)
+         self.k_layernorm = CenteredRMSNorm(self.dims, cfg.rms_norm_eps)
+@@ -337,13 +353,18 @@ class Indexer(nn.Module):
+         qk = prefill_mm.linear(self.index_qk_proj, x).reshape(batch, length, self.heads + 1, self.dims)
+         return qk[:, :, : self.heads], qk[:, :, self.heads]
+ 
+-    def _pool(self, raw: mx.array, start: int, stop: int) -> mx.array:
++    def _pool(self, raw: mx.array, start: int, stop: int, positions=None) -> mx.array:
+         """Mean of each block's raw keys, normalized, rotated to the block's first position."""
+ 
+         batch = raw.shape[0]
+         blocks = raw[:, start * self.ratio: stop * self.ratio].reshape(batch, stop - start, self.ratio, self.dims)
+         pooled = mx.mean(blocks.astype(mx.float32), axis=-2).astype(raw.dtype)
+         pooled = self.k_layernorm(pooled)
++        if positions is not None:
++            from tensorfold.vision.rotary import apply_positions
++
++            return apply_positions(pooled[:, None], positions[..., start * self.ratio:stop * self.ratio:self.ratio],
++                                   self.rotary_dim, self.base, self.mrope_section)[:, 0]
+         return mx.fast.rope(pooled[:, None], self.rotary_dim, traditional=False, base=self.base,
+                             scale=float(self.ratio), offset=start)[:, 0]
+ 
+@@ -352,14 +373,18 @@ class Indexer(nn.Module):
+ 
+         done = 0 if cache.pooled is None else cache.pooled.shape[1]
+         if blocks > done:
+-            fresh = self._pool(raw, done, blocks)
++            fresh = self._pool(raw, done, blocks, cache.index_position_ids)
+             cache.pooled = fresh if cache.pooled is None else mx.concatenate([cache.pooled, fresh], axis=1)
+         return cache.pooled[:, :blocks]
+ 
+-    def rotated(self, query: mx.array, past: int) -> mx.array:
++    def rotated(self, query: mx.array, past: int, positions=None) -> mx.array:
+         """Normed, rotated queries [B, heads, L, dims]."""
+ 
+         q = self.q_layernorm(query).transpose(0, 2, 1, 3)
++        if positions is not None:
++            from tensorfold.vision.rotary import apply_positions
++
++            return apply_positions(q, positions, self.rotary_dim, self.base, self.mrope_section)
+         return mx.fast.rope(q, self.rotary_dim, traditional=False, base=self.base, scale=1.0, offset=past)
+ 
+     def block_scores(self, query: mx.array, raw: mx.array, cache: AttentionCache, past: int) -> mx.array:
+@@ -367,7 +392,8 @@ class Indexer(nn.Module):
+ 
+         blocks = (past + query.shape[1]) // self.ratio
+         pooled = self.pool(raw, cache, blocks)[0].astype(mx.float32).T
+-        q = self.rotated(query, past)[0].astype(mx.float32)
++        positions = cache.index_position_ids
++        q = self.rotated(query, past, None if positions is None else positions[..., past:past + query.shape[1]])[0].astype(mx.float32)
+         scores = mx.maximum(q[0] @ pooled, 0)
+         for h in range(1, self.heads):
+             scores = scores + mx.maximum(q[h] @ pooled, 0)
+@@ -382,7 +408,8 @@ class Indexer(nn.Module):
+         if blocks <= self.top_blocks:
+             return None
+         pooled = self.pool(raw, cache, blocks)
+-        q = self.rotated(query, past)
++        positions = cache.index_position_ids
++        q = self.rotated(query, past, None if positions is None else positions[..., past:past + length])
+         # float32 scores: which blocks win is a discrete choice and rounding flips the ones at the cut
+         scores = q.astype(mx.float32) @ pooled.astype(mx.float32)[:, None].transpose(0, 1, 3, 2)
+         scores = mx.sum(mx.maximum(scores, 0), axis=1) / math.sqrt(self.dims)          # [B, L, blocks]
+@@ -413,6 +440,7 @@ class SparseAttention(nn.Module):
+         self.heads, self.kv_heads, self.dims = cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim
+         self.scale = self.dims ** -0.5
+         self.rotary_dim, self.base = cfg.rotary_dim, cfg.rope_theta
++        self.mrope_section = cfg.mrope_section
+         d = cfg.hidden_size
+         self.q_proj = nn.Linear(d, self.heads * self.dims * 2, bias=False)
+         self.k_proj = nn.Linear(d, self.kv_heads * self.dims, bias=False)
+@@ -432,11 +460,21 @@ class SparseAttention(nn.Module):
+         queries = self.q_norm(queries).transpose(0, 2, 1, 3)
+         keys = self.k_norm(linear(self.k_proj, x).reshape(batch, length, self.kv_heads, self.dims)).transpose(0, 2, 1, 3)
+         values = linear(self.v_proj, x).reshape(batch, length, self.kv_heads, self.dims).transpose(0, 2, 1, 3)
+-        queries = mx.fast.rope(queries, self.rotary_dim, traditional=False, base=self.base, scale=1.0, offset=past)
+-        keys = mx.fast.rope(keys, self.rotary_dim, traditional=False, base=self.base, scale=1.0, offset=past)
++        from tensorfold.vision.rotary import apply_positions, current_positions
++
++        positions = current_positions()
++        if positions is None and cache.vision_enabled:
++            positions = mx.broadcast_to((mx.arange(length, dtype=mx.int32) + past + cache.vision_rope_delta)[None, None],
++                                        (3, 1, length))
++        if positions is None:
++            queries = mx.fast.rope(queries, self.rotary_dim, traditional=False, base=self.base, scale=1.0, offset=past)
++            keys = mx.fast.rope(keys, self.rotary_dim, traditional=False, base=self.base, scale=1.0, offset=past)
++        else:
++            queries = apply_positions(queries, positions, self.rotary_dim, self.base, self.mrope_section)
++            keys = apply_positions(keys, positions, self.rotary_dim, self.base, self.mrope_section)
+         index_query, index_key = self.indexer.project(x)
+-        keys, values, raw = cache.update(keys, values, index_key)
+-        if self.__dict__.get("kernel_select") and batch == 1 and prefill.through_kernels(self, past + length):
++        keys, values, raw = cache.update(keys, values, index_key, position_ids=positions)
++        if positions is None and self.__dict__.get("kernel_select") and batch == 1 and prefill.through_kernels(self, past + length):
+             out = prefill.selected(self, queries, index_query, raw, cache, past)
+             return linear(self.o_proj, out * mx.sigmoid(gate))
+         # Queue at most two query chunks, each using keys through its last row, to bound materialized scores.
+diff --git a/src/tensorfold/families/qwen4_exp/runtime.py b/src/tensorfold/families/qwen4_exp/runtime.py
+index cb1c909..f7ac18f 100644
+--- a/src/tensorfold/families/qwen4_exp/runtime.py
++++ b/src/tensorfold/families/qwen4_exp/runtime.py
+@@ -1,4 +1,5 @@
+ """Flash Next fused decoding and MTP drafting, with every emitted token verified against the target's sample."""
++# Modified for Unified Inference's isolated TensorFold Preview: serial MLX image prefill and decode.
+ 
+ from __future__ import annotations
+ 
+@@ -114,6 +115,27 @@ class FlashNext(MTPDrafts):
+             caches.append(MTPCache())                         # last: the model's layers never reach it
+         return caches
+ 
++    def encode_vision(self, prepared: Any, cache: list[Any]) -> Any:
++        if any(item.offset for item in cache[:self.layer_count]):
++            raise ValueError("image prompts require a fresh cache")
++        encoded = self.vision.encode(prepared)
++        for item in cache[:self.layer_count]:
++            if hasattr(item, "keys"):
++                item.vision_enabled = True
++                item.vision_rope_delta = int(encoded.rope_delta)
++        return encoded
++
++    def prefill_vision(self, inputs: Any, cache: list[Any], encoded: Any, begin: int, end: int) -> Any:
++        from tensorfold.vision.rotary import vision_positions
++
++        if self.fused is not None or self.mtp is not None:
++            raise ValueError("Flash Next Preview image inputs require the unfused serial runtime")
++        with vision_positions(encoded.position_ids[:, :, begin:end]):
++            hidden = self.model.hidden(inputs, cache[:self.layer_count],
++                                       inputs_embeds=encoded.inputs_embeds[:, begin:end])
++        self._streams = self.model.__dict__["last_streams"]
++        return hidden
++
+     def release_rounds(self) -> None:
+         """Drop the last forward's rollback and draft rows when no stream is live; the next forward rebuilds them."""
+ 
+@@ -212,6 +234,8 @@ class FlashNext(MTPDrafts):
+         return out
+ 
+     def head(self, hidden: mx.array) -> mx.array:
++        if getattr(self, "vision", None) is not None:
++            return self.model.head(hidden)
+         from tensorfold.families.qwen4_exp.decode import project
+ 
+         return project(hidden, self.model.lm_head)
+@@ -423,7 +447,8 @@ class FlashNext(MTPDrafts):
+ 
+ 
+ def load(model_dir: Path, *, drafts: int | None = None, ple_on_ssd: bool = False,
+-         ssd_experts: float | None = None) -> tuple[FlashNext, Any]:
++         ssd_experts: float | None = None, vision: bool = False,
++         vision_urls: bool = False) -> tuple[FlashNext, Any]:
+     """Load with an MTP draft cap from ``drafts`` or TF_FLASH_MTP, defaulting to 3; zero disables drafts."""
+ 
+     import os
+@@ -432,8 +457,19 @@ def load(model_dir: Path, *, drafts: int | None = None, ple_on_ssd: bool = False
+     from tensorfold.families.qwen4_exp import model as q4
+     from tensorfold.families.qwen4_exp import mtp as mtp_module
+ 
+-    model, tokenizer = q4.load(Path(model_dir), ple_on_ssd=ple_on_ssd, ssd_experts=ssd_experts)
++    if vision:
++        import json
++        from tensorfold.vision.rotary import frequency_axes
++        from tensorfold.vision.config import validate_vision_config
++
++        config = json.loads((Path(model_dir) / "config.json").read_text())
++        validate_vision_config(config, "qwen4_exp")
++        cfg = q4.Config.from_dict(config)
++        frequency_axes(cfg.rotary_dim, cfg.mrope_section)
++    model, tokenizer = q4.load(Path(model_dir), ple_on_ssd=ple_on_ssd, ssd_experts=ssd_experts, fused=not vision)
+     drafts = int(os.environ.get("TF_FLASH_MTP", "3")) if drafts is None else int(drafts)
++    if vision:
++        drafts = 0
+     head = mtp_module.load(Path(model_dir), model.args) if drafts > 0 and model.__dict__.get("fused") else None
+     missed = decode.unreadable(model, head) if decode.DENSE == "lane" else {}   # simd_qmm checks a shape on first use
+     if missed:
+@@ -441,5 +477,9 @@ def load(model_dir: Path, *, drafts: int | None = None, ple_on_ssd: bool = False
+         raise SystemExit(f"[tensorfold] Qwen3.8 Flash Next: the lane matmul does not read this checkpoint's {kinds} "
+                          f"linears. Use {MODELS[0]}")
+     runtime = FlashNext(model, head, drafts=drafts)
++    if vision:
++        from tensorfold.vision.qwen_mlx import QwenVisionFrontend
++
++        runtime.vision = QwenVisionFrontend.load(model_dir, model.model.embed_tokens, allow_urls=vision_urls)
+     q4.prefetch_ngrams(model)
+     return runtime, tokenizer
+diff --git a/src/tensorfold/serve_options.py b/src/tensorfold/serve_options.py
+index 3c8d9d0..b425c9c 100644
+--- a/src/tensorfold/serve_options.py
++++ b/src/tensorfold/serve_options.py
+@@ -1,4 +1,5 @@
+ """Serve options a backend or family has no path for, refused before any weight is downloaded."""
++# Modified for Unified Inference's isolated TensorFold Preview: explicit serial Mac vision admission.
+ 
+ from __future__ import annotations
+ 
+@@ -63,8 +64,10 @@ def check(args: argparse.Namespace, family: Any, backend: str, config_dir: Any =
+         from tensorfold.vision.config import validate_vision_config
+ 
+         validate_vision_config(read_config(config_dir) if config_dir else {}, family.model_type)
+-        if family.model_type == "qwen4_exp" and backend != "cuda":
+-            raise ValueError("--vision for Flash Next runs on the CUDA engine; the MLX path has no image tower yet")
++        if family.model_type == "qwen4_exp" and backend == "mlx":
++            parallel = str(getattr(args, "parallel", "auto"))
++            if parallel != "1":
++                raise ValueError("Flash Next MLX vision Preview currently requires --parallel 1")
+     share = getattr(args, "decode_share", None)
+     if share is not None and backend == "cuda" and not getattr(family.package, "CUDA_DECODE_SHARE", False):
+         raise ValueError("--decode-share sets the Mac server's share, and Flash Next's on CUDA; this CUDA engine runs "
+diff --git a/src/tensorfold/vision/qwen_mlx.py b/src/tensorfold/vision/qwen_mlx.py
+index a67a888..d02e05f 100644
+--- a/src/tensorfold/vision/qwen_mlx.py
++++ b/src/tensorfold/vision/qwen_mlx.py
+@@ -1,4 +1,5 @@
+ """A Qwen dense vision tower shares the existing target embeddings and keeps preprocessing on the CPU."""
++# Modified for Unified Inference's isolated TensorFold Preview: the upstream Flash Next image tower.
+ 
+ from __future__ import annotations
+ 
+@@ -23,12 +24,16 @@ class EncodedVisionPrompt:
+     image_hashes: tuple[str, ...]
+ 
+ 
+-def _runtime():
++def _runtime(model_type="qwen3_5"):
+     try:
+         import mlx.core as mx
+         import mlx.nn as nn
+-        from mlx_vlm.models.qwen3_5.config import VisionConfig
+-        from mlx_vlm.models.qwen3_5.vision import VisionModel
++        if model_type == "qwen4_exp":
++            from mlx_vlm.models.qwen4_exp.config import VisionConfig
++            from mlx_vlm.models.qwen4_exp.vision import VisionModel
++        else:
++            from mlx_vlm.models.qwen3_5.config import VisionConfig
++            from mlx_vlm.models.qwen3_5.vision import VisionModel
+     except ImportError as error:
+         raise ValueError("Qwen image support requires the optional vision dependencies: pip install 'tensorfold[vision]'") from error
+     return mx, nn, VisionConfig, VisionModel
+@@ -49,13 +54,14 @@ class QwenVisionFrontend(QwenImageProcessor):
+         if not path.is_dir():
+             raise ValueError("Vision loading requires a local checkpoint directory")
+         config = json.loads((path / "config.json").read_text())
+-        if config.get("model_type") != "qwen3_5" or not config.get("vision_config"):
+-            raise ValueError("The image frontend currently supports Qwen3.5/3.8 dense multimodal checkpoints only")
++        model_type = config.get("model_type")
++        if model_type not in ("qwen3_5", "qwen4_exp") or not config.get("vision_config"):
++            raise ValueError("The image frontend requires a complete Qwen dense or Flash Next multimodal checkpoint")
+         if config["vision_config"].get("deepstack_visual_indexes"):
+             raise ValueError("Deepstack vision checkpoints are not supported by the Qwen dense image frontend")
+         tensors = vision_tensors(path)
+         prepared = QwenImageProcessor.from_directory(path)
+-        mx, nn, VisionConfig, VisionModel = _runtime()
++        mx, nn, VisionConfig, VisionModel = _runtime() if model_type == "qwen3_5" else _runtime(model_type)
+         tower = VisionModel(VisionConfig.from_dict(config["vision_config"]))
+         weights = tower.sanitize(load_vision_weights(tensors, mx))
+         if any(name.endswith(".scales") for name in weights):
+diff --git a/src/tensorfold/vision/rotary.py b/src/tensorfold/vision/rotary.py
+index a1bce92..2675f54 100644
+--- a/src/tensorfold/vision/rotary.py
++++ b/src/tensorfold/vision/rotary.py
+@@ -1,4 +1,5 @@
+ """Request-local multimodal rotary positions without changing text-only arithmetic."""
++# Modified for Unified Inference's isolated TensorFold Preview: explicit sparse-indexer image positions.
+ from __future__ import annotations
+ 
+ from contextlib import contextmanager
+@@ -39,6 +40,25 @@ def decode_positions(positions, caches, widths):
+     return out
+ 
+ 
++def current_positions():
++    return _positions.get()
++
++
++def apply_positions(x, positions, dims: int, base: float, sections: Sequence[int]):
++    """Rotate Q/K or pooled indexer keys using explicit three-axis image positions."""
++    import mlx.core as mx
++
++    if x.ndim != 4 or x.shape[0] != 1 or tuple(positions.shape) != (3, 1, x.shape[2]):
++        raise ValueError('vision rotary positions must match a single stream window')
++    axes = mx.array(frequency_axes(dims, sections) * 2, dtype=mx.int32)
++    rows = x.transpose(2, 1, 0, 3)
++    rotated = [mx.fast.rope(rows, dims, traditional=False, base=base, scale=1.0,
++                            offset=positions[axis, 0]) for axis in range(3)]
++    prefix = mx.where(axes == 1, rotated[1][..., :dims],
++                      mx.where(axes == 2, rotated[2][..., :dims], rotated[0][..., :dims]))
++    return mx.concatenate([prefix, rows[..., dims:]], axis=-1).transpose(2, 1, 0, 3)
++
++
+ def install_rotary(core: Any, sections: Sequence[int]) -> None:
+     import mlx.core as mx
+     import mlx.nn as nn
+diff --git a/tests/test_vision_flash_next_mlx.py b/tests/test_vision_flash_next_mlx.py
+new file mode 100644
+index 0000000..88e942e
+--- /dev/null
++++ b/tests/test_vision_flash_next_mlx.py
+@@ -0,0 +1,188 @@
++"""Isolated Flash Next Preview image prefill and continuation, on tiny MLX models."""
++from types import SimpleNamespace
++
++import numpy as np
++import pytest
++
++mx = pytest.importorskip("mlx.core")
++
++from tensorfold.families.qwen4_exp.runtime import FlashNext
++from tensorfold.vision.rotary import apply_positions, vision_positions
++from test_qwen4_exp_family import tiny, TEXT
++
++
++@pytest.fixture(params=[mx.cpu, mx.gpu])
++def device(request):
++    if request.param == mx.gpu and not mx.metal.is_available():
++        pytest.skip("Metal unavailable")
++    previous = mx.default_device()
++    mx.set_default_device(request.param)
++    yield
++    mx.set_default_device(previous)
++
++
++def image_prompt(model, width=24, color=1.0):
++    tokens = tuple(range(6, 6 + width))
++    positions = np.broadcast_to(np.arange(width), (3, 1, width)).copy()
++    positions[:, :, 4:8] = [[[4, 4, 4, 4]], [[4, 4, 5, 5]], [[4, 5, 4, 5]]]
++    positions[:, :, 8:] -= 2
++    embeds = model.model.embed_tokens(mx.array([tokens]))
++    embeds[:, 4:8] = color * mx.ones((1, 4, model.args.hidden_size))
++    return SimpleNamespace(token_ids=tokens, inputs_embeds=embeds,
++                           position_ids=mx.array(positions, dtype=mx.int32), rope_delta=-2)
++
++
++@pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16])
++def test_rotary_matches_official_mlx_vlm(device, dtype):
++    from mlx_vlm.models.qwen3_5.language import Qwen3_5RotaryEmbedding
++
++    positions = mx.array([[[4, 4, 4]], [[4, 5, 6]], [[4, 6, 5]]], dtype=mx.int32)
++    x = mx.array(np.arange(60, dtype=np.float32).reshape(1, 2, 3, 10) / 20).astype(dtype)
++    reference = Qwen3_5RotaryEmbedding(8, base=10000, mrope_section=[2, 1, 1])
++    expected, _ = reference.apply_rotary(x, x, positions)
++    tolerance = 0.03 if dtype == mx.bfloat16 else 2e-6
++    np.testing.assert_allclose(np.array(apply_positions(x, positions, 8, 10000, [2, 1, 1]).astype(mx.float32)),
++                               np.array(expected.astype(mx.float32)), atol=tolerance, rtol=tolerance)
++
++
++def test_image_prefill_chunking_and_decode_positions(device):
++    model = tiny(17)
++    model.layers[-1].self_attn.split_keys = 12
++    model.layers[-1].self_attn.split_rows = 3
++    runtime = FlashNext(model, drafts=0)
++    encoded = image_prompt(model)
++    runtime.vision = SimpleNamespace(encode=lambda prepared: prepared)
++    whole, chunked = runtime.make_cache(), runtime.make_cache()
++    runtime.encode_vision(encoded, whole)
++    runtime.encode_vision(encoded, chunked)
++    a = runtime.prefill_vision(mx.array([encoded.token_ids]), whole, encoded, 0, 24)
++    for begin, end in ((0, 5), (5, 11), (11, 24)):
++        b = runtime.prefill_vision(mx.array([encoded.token_ids[begin:end]]), chunked, encoded, begin, end)
++    assert a.shape == (1, 24, model.args.hidden_size)  # hidden, not vocabulary logits
++    np.testing.assert_allclose(np.array(a[:, -1]), np.array(b[:, -1]), atol=3e-4, rtol=3e-4)
++    next_a, next_b = runtime.hidden([33], whole), runtime.hidden([33], chunked)
++    np.testing.assert_allclose(np.array(next_a), np.array(next_b), atol=3e-4, rtol=3e-4)
++    expected = np.concatenate([np.array(encoded.position_ids), np.full((3, 1, 1), 22)], axis=-1)
++    for cache in (whole, chunked):
++        np.testing.assert_array_equal(np.array(cache[-1].index_position_ids), expected)
++        assert any(value is cache[-1].index_position_ids for value in cache[-1].state)
++    chunked[-1].trim(1)
++    np.testing.assert_array_equal(np.array(chunked[-1].index_position_ids), np.array(encoded.position_ids))
++
++
++def test_sparse_indexer_matches_official_image_selection(device):
++    from mlx_vlm.models.qwen4_exp.config import TextConfig
++    from mlx_vlm.models.qwen4_exp.language import QSAKVCache, Qwen4ExpQSAIndexer
++    from mlx_vlm.models.qwen3_5.language import Qwen3_5RotaryEmbedding
++
++    model = tiny(31)
++    indexer = model.layers[-1].self_attn.indexer
++    encoded = image_prompt(model)
++    x = mx.random.normal((1, 24, model.args.hidden_size))
++    query, keys = indexer.project(x)
++    cache = model.make_cache()[-1]
++    cache.index_position_ids = encoded.position_ids
++    actual = indexer.select(query, keys, cache, 0)
++    config = TextConfig.from_dict({**TEXT, "model_type": "qwen4_exp", "max_position_embeddings": 1024,
++                                 "rope_parameters": {**TEXT["rope_parameters"], "type": "default"}})
++    rope = Qwen3_5RotaryEmbedding(8, base=10000, mrope_section=[2, 1, 1])
++    reference = Qwen4ExpQSAIndexer(config, rope)
++    reference.index_qk_proj.weight = indexer.index_qk_proj.weight
++    reference.q_layernorm.weight = indexer.q_layernorm.weight
++    reference.k_layernorm.weight = indexer.k_layernorm.weight
++    expected = reference(x, QSAKVCache(), encoded.position_ids)
++    np.testing.assert_array_equal(np.array(actual), np.array(expected))
++
++
++def test_changed_visual_features_change_target_logits_and_do_not_leak(device):
++    model = tiny(5)
++    runtime = FlashNext(model, drafts=0)
++    runtime.vision = SimpleNamespace(encode=lambda prepared: prepared)
++    results = []
++    for color in (-1.0, 1.0):
++        encoded = image_prompt(model, color=color)
++        cache = runtime.make_cache()
++        runtime.encode_vision(encoded, cache)
++        hidden = runtime.prefill_vision(mx.array([encoded.token_ids]), cache, encoded, 0, 24)
++        results.append(np.array(runtime.head(hidden[:, -1:])))
++    assert not np.allclose(results[0], results[1], atol=1e-5)
++    fresh = runtime.make_cache()
++    text = runtime.hidden([8, 9, 10], fresh)
++    assert fresh[-1].index_position_ids is None and not fresh[-1].vision_enabled
++    np.testing.assert_array_equal(np.array(text), np.array(model.hidden([8, 9, 10], model.make_cache())))
++    with pytest.raises(ValueError, match="fresh cache"):
++        runtime.encode_vision(encoded, fresh)
++
++
++def test_image_prefill_refuses_fused_runtime(device):
++    runtime = FlashNext(tiny(), drafts=0)
++    encoded = image_prompt(runtime.model)
++    runtime.fused = object()
++    with pytest.raises(ValueError, match="unfused serial"):
++        runtime.prefill_vision(mx.array([encoded.token_ids]), runtime.make_cache(), encoded, 0, 24)
++
++
++@pytest.mark.parametrize("bits", [4, 6])
++def test_quantized_image_prefill_and_continuation_are_finite(device, bits):
++    import mlx.nn as nn
++
++    model = tiny(23)
++    nn.quantize(model, group_size=32, bits=bits,
++                class_predicate=lambda path, module: hasattr(module, "to_quantized")
++                and len(module.weight.shape) == 2 and module.weight.shape[-1] % 32 == 0)
++    runtime = FlashNext(model, drafts=0)
++    runtime.vision = SimpleNamespace(encode=lambda prepared: prepared)
++    encoded = image_prompt(model)
++    cache = runtime.make_cache()
++    runtime.encode_vision(encoded, cache)
++    hidden = runtime.prefill_vision(mx.array([encoded.token_ids]), cache, encoded, 0, 24)
++    assert bool(mx.all(mx.isfinite(runtime.head(hidden[:, -1:]))).item())
++    assert bool(mx.all(mx.isfinite(runtime.head(runtime.hidden([33], cache)))).item())
++
++
++def test_real_flash_next_image_tower_changes_language_outputs(device):
++    from mlx_vlm.models.qwen4_exp.config import VisionConfig
++    from mlx_vlm.models.qwen4_exp.vision import VisionModel
++    from tensorfold.vision.qwen_mlx import QwenVisionFrontend
++    from tensorfold.vision.qwen_processing import PreparedVisionPrompt
++    from tensorfold.engine.lane_engine import LaneEngine
++
++    model = tiny(9)
++    runtime = FlashNext(model, drafts=0)
++    tower = VisionModel(VisionConfig(depth=1, hidden_size=32, intermediate_size=64, out_hidden_size=64,
++                                    num_heads=4, patch_size=2, temporal_patch_size=1, spatial_merge_size=2,
++                                    num_position_embeddings=16, deepstack_visual_indexes=[]))
++    front = QwenVisionFrontend.__new__(QwenVisionFrontend)
++    front.mx, front.tower, front.embed_tokens = mx, tower, model.model.embed_tokens
++    runtime.vision = front
++    prompt = image_prompt(model)
++    predictions = []
++    for color in (0.2, 0.8):
++        prepared = PreparedVisionPrompt(prompt.token_ids, np.full((16, 12), color, np.float32),
++                                        np.array([[1, 4, 4]]), np.array(prompt.position_ids), -2,
++                                        ((4, 8),), (str(color),))
++        cache = runtime.make_cache()
++        encoded = runtime.encode_vision(prepared, cache)
++        hidden = runtime.prefill_vision(mx.array([encoded.token_ids]), cache, encoded, 0, 24)
++        predictions.append(np.array(runtime.head(hidden[:, -1:])))
++    assert not np.allclose(predictions[0], predictions[1], atol=1e-5)
++    engine = LaneEngine(runtime, max_rows=1, max_draft=0, retain_finished_caches=False)
++    last = engine._family_feed(prompt.token_ids, runtime.make_cache(), [(0, 5), (5, 24)], encoded)
++    assert last.shape == (1, 1, model.args.hidden_size)
++    np.testing.assert_allclose(np.array(runtime.head(last)), predictions[-1], atol=3e-4, rtol=3e-4)
++
++
++@pytest.mark.parametrize("parallel,accepted", [(1, True), (2, False), ("auto", False)])
++def test_mlx_vision_requires_explicit_serial_admission(tmp_path, parallel, accepted):
++    import json
++    from tensorfold.serve_options import check
++
++    (tmp_path / "config.json").write_text(json.dumps({"model_type": "qwen4_exp",
++        "text_config": {"hidden_size": 64}, "vision_config": {"out_hidden_size": 64}}))
++    args = SimpleNamespace(vision=True, parallel=parallel)
++    family = SimpleNamespace(model_type="qwen4_exp", package=SimpleNamespace(), title="Flash Next")
++    if accepted:
++        check(args, family, "mlx", tmp_path)
++    else:
++        with pytest.raises(ValueError, match="parallel 1"):
++            check(args, family, "mlx", tmp_path)

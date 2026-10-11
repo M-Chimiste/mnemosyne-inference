@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "channel": "tensorfold-preview-mlx-vision-1",
+  "upstream": "https://github.com/ashhart/TensorFold.git",
+  "revision": "cb2ebf0540f42604e2759b2ddef497861e928248",
+  "version": "0.6.6",
+  "patches": [
+    {
+      "path": "patches/0001-flash-next-mlx-vision.patch",
+      "sha256": "65c8bc4ad8b6fcff33402869599faec935986454abf4be4e370baa31383c605d"
+    }
+  ],
+  "fixture_tests": [
+    "tests/test_vision_flash_next_mlx.py",
+    "tests/test_qwen4_exp_family.py",
+    "tests/test_vision_mlx_runtime.py",
+    "tests/test_vision_qwen_mlx.py",
+    "tests/test_vision_server.py",
+    "tests/test_vision_glm_mlx.py",
+    "tests/test_vision_glm_processing.py",
+    "tests/test_vision_limits.py",
+    "tests/test_vision_images.py"
+  ]
+}

@@ -4,6 +4,26 @@
 
 ## Current state
 
+### TensorFold Preview Development (2026-10-10)
+
+The explicitly authorized isolated TensorFold Preview build lives under
+`macos/tensorfold-preview/`. It pins official Python/MLX v0.6.6 and an
+integrity-bound patch adding serial Qwen 3.8 Flash Next Mac image input alongside
+the existing GLM 5.3 Flash image path, without a second language-model engine.
+The patch shares TensorFold's language embeddings and covers image-aware sparse
+indexing and generated-token positions. Unqualified Qwen fused decoding/MTP is
+disabled for vision. A clean candidate build passed 214 vision tests on the M4
+Max, plus 108 additional text/prefill regressions with four skipped tests; seven
+builder-integrity/non-activation tests passed.
+
+This is not installed app integration or shipping Thunderbolt vision support.
+Settings/engine integration, matched multi-link peer lifecycle, actual GLM and
+Qwen image understanding on both 512 GB M3 Ultras, clustered vision, performance,
+accounting, and signed-artifact acceptance remain mandatory delivery gates.
+No new app was signed or placed on Desktop for this Preview; the existing app,
+live runtimes, EXO setup, and model weights are unchanged. See the
+[Preview development record](../macos/tensorfold-preview/README.md).
+
 **Active milestone:** M5 — Workstation-ready release
 
 The major v1 feature set is implemented: persistent installs and catalog
